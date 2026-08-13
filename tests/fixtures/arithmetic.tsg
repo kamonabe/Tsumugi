@@ -1,0 +1,7 @@
+# 算術演算
+print(1 + 2)
+print(10 - 3)
+print(4 * 5)
+print(10 / 2)
+print(1 + 2 * 3)
+print((1 + 2) * 3)

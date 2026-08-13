@@ -24,24 +24,37 @@ pub enum Token {
     Print,
 
     // 演算子
-    Plus,     // +
-    Minus,    // -
-    Star,     // *
-    Slash,    // /
-    Assign,   // =
-    Eq,       // ==
-    NotEq,    // !=
-    Lt,       // <
-    Gt,       // >
-    LtEq,    // <=
-    GtEq,    // >=
+    Plus,   // +
+    Minus,  // -
+    Star,   // *
+    Slash,  // /
+    Assign, // =
+    Eq,     // ==
+    NotEq,  // !=
+    Lt,     // <
+    Gt,     // >
+    LtEq,   // <=
+    GtEq,   // >=
 
     // 区切り
-    LParen,   // (
-    RParen,   // )
-    Comma,    // ,
+    LParen, // (
+    RParen, // )
+    Comma,  // ,
 
     // 制御
     Newline,
     Eof,
+}
+
+/// 行番号付きトークン
+#[derive(Debug, Clone, PartialEq)]
+pub struct Spanned {
+    pub token: Token,
+    pub line: usize,
+}
+
+impl Spanned {
+    pub fn new(token: Token, line: usize) -> Self {
+        Self { token, line }
+    }
 }

@@ -1,0 +1,10 @@
+# 基本動作確認
+let name = "tsumugi"
+print("hello, " + name)
+
+fn greet(target)
+    return "hi, " + target
+end
+
+let msg = greet("world")
+print(msg)
