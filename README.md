@@ -51,20 +51,83 @@ end
 - while ループ
 - REPL（複数行入力対応）
 - ファイル実行
+- 行番号付きエラーメッセージ（パースエラー・ランタイムエラー両方）
+
+## エラーメッセージ
+
+エラー発生時に行番号が表示される。
+
+```
+$ cat error.tsg
+let x = "hello"
+let y = x + 1
+
+$ tsumugi error.tsg
+2行目: 型エラー: Str("hello") Add Int(1) は計算できません
+```
+
+## テスト
+
+```bash
+# 全テスト実行（ユニットテスト + 統合テスト）
+cargo test
+
+# 特定モジュールのみ
+cargo test lexer::
+cargo test eval::
+cargo test parser::
+```
+
+### テスト構成
+
+| 種別 | 場所 | 内容 |
+|---|---|---|
+| ユニットテスト | `src/*.rs` 内 `#[cfg(test)]` | 各モジュールの個別ロジック検証 |
+| 統合テスト | `tests/integration.rs` | `.tsg` ファイル実行 → 期待出力と比較（ゴールデンテスト） |
+| テストデータ | `tests/fixtures/` | 正常系 `.tsg` + `.expected` / エラー系 `.tsg` + `.expected_err` |
+
+## CI
+
+GitHub Actions で push / PR 時に自動実行。
+
+```
+cargo fmt --check → cargo clippy -D warnings → cargo test
+```
+
+設定: `.github/workflows/ci.yml`
 
 ## プロジェクト構成
 
 ```
 src/
 ├── main.rs     # エントリポイント（REPL / ファイル実行）
-├── token.rs    # トークン型定義
-├── lexer.rs    # レキサー（ソース → トークン列）
-├── ast.rs      # AST ノード定義
-├── parser.rs   # パーサー（トークン列 → AST）
+├── token.rs    # トークン型定義（Spanned: Token + 行番号）
+├── lexer.rs    # レキサー（ソース → トークン列、行番号追跡）
+├── ast.rs      # AST ノード定義（各 Stmt に行番号を保持）
+├── parser.rs   # パーサー（トークン列 → AST、エラーに行番号付与）
 ├── value.rs    # 実行時の値型
 ├── env.rs      # 環境（変数スコープ・関数テーブル）
-└── eval.rs     # 評価器（AST → 実行）
+└── eval.rs     # 評価器（AST → 実行、エラーに行番号付与）
+
+tests/
+├── integration.rs    # 統合テスト（ゴールデンテスト）
+└── fixtures/         # テスト用 .tsg + 期待出力ファイル
+
+docs/
+├── design.md         # 設計ドキュメント
+└── language-spec.md  # 言語仕様
+
+examples/
+└── hello.tsg         # サンプルスクリプト
+
+.github/workflows/
+└── ci.yml            # CI 設定
 ```
+
+## ドキュメント
+
+- [設計ドキュメント](docs/design.md) — 設計判断の経緯・アーキテクチャ・今後の候補
+- [言語仕様](docs/language-spec.md) — 文法・データ型・演算子の一覧
 
 ## ライセンス
 

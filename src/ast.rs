@@ -1,4 +1,4 @@
-/// Tsumugi の抽象構文木（AST）
+//! Tsumugi の抽象構文木（AST）
 
 /// プログラム全体 = 文のリスト
 pub type Program = Vec<Stmt>;
@@ -7,22 +7,28 @@ pub type Program = Vec<Stmt>;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     /// let x = expr
-    Let { name: String, value: Expr },
+    Let {
+        name: String,
+        value: Expr,
+        line: usize,
+    },
 
     /// return expr
-    Return { value: Expr },
+    Return { value: Expr, line: usize },
 
     /// if cond ... else ... end
     If {
         condition: Expr,
         then_body: Vec<Stmt>,
         else_body: Vec<Stmt>,
+        line: usize,
     },
 
     /// while cond ... end
     While {
         condition: Expr,
         body: Vec<Stmt>,
+        line: usize,
     },
 
     /// fn name(params) ... end
@@ -30,10 +36,27 @@ pub enum Stmt {
         name: String,
         params: Vec<String>,
         body: Vec<Stmt>,
+        line: usize,
     },
 
     /// 式文（print(x) や add(1,2) など、式だけの行）
-    ExprStmt { expr: Expr },
+    #[allow(clippy::enum_variant_names)]
+    ExprStmt { expr: Expr, line: usize },
+}
+
+impl Stmt {
+    /// 文の行番号を取得
+    #[allow(dead_code)]
+    pub fn line(&self) -> usize {
+        match self {
+            Stmt::Let { line, .. } => *line,
+            Stmt::Return { line, .. } => *line,
+            Stmt::If { line, .. } => *line,
+            Stmt::While { line, .. } => *line,
+            Stmt::FnDef { line, .. } => *line,
+            Stmt::ExprStmt { line, .. } => *line,
+        }
+    }
 }
 
 /// 式（Expression）
@@ -65,33 +88,27 @@ pub enum Expr {
     },
 
     /// 単項演算: not expr, -expr
-    UnaryOp {
-        op: UnaryOpKind,
-        expr: Box<Expr>,
-    },
+    UnaryOp { op: UnaryOpKind, expr: Box<Expr> },
 
     /// 関数呼び出し: name(args)
-    Call {
-        name: String,
-        args: Vec<Expr>,
-    },
+    Call { name: String, args: Vec<Expr> },
 }
 
 /// 二項演算子の種類
 #[derive(Debug, Clone, PartialEq)]
 pub enum BinOpKind {
-    Add,    // +
-    Sub,    // -
-    Mul,    // *
-    Div,    // /
-    Eq,     // ==
-    NotEq,  // !=
-    Lt,     // <
-    Gt,     // >
-    LtEq,   // <=
-    GtEq,   // >=
-    And,    // and
-    Or,     // or
+    Add,   // +
+    Sub,   // -
+    Mul,   // *
+    Div,   // /
+    Eq,    // ==
+    NotEq, // !=
+    Lt,    // <
+    Gt,    // >
+    LtEq,  // <=
+    GtEq,  // >=
+    And,   // and
+    Or,    // or
 }
 
 /// 単項演算子の種類

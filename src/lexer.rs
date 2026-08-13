@@ -1,9 +1,10 @@
-use crate::token::Token;
+use crate::token::{Spanned, Token};
 
 /// ソースコードをトークン列に変換するレキサー
 pub struct Lexer {
     input: Vec<char>,
     pos: usize,
+    line: usize,
 }
 
 impl Lexer {
@@ -11,25 +12,26 @@ impl Lexer {
         Self {
             input: input.chars().collect(),
             pos: 0,
+            line: 1,
         }
     }
 
     /// 全トークンを一括で返す
-    pub fn tokenize(&mut self) -> Vec<Token> {
+    pub fn tokenize(&mut self) -> Vec<Spanned> {
         let mut tokens = Vec::new();
         loop {
-            let tok = self.next_token();
-            if tok == Token::Eof {
-                tokens.push(tok);
+            let spanned = self.next_token();
+            let is_eof = spanned.token == Token::Eof;
+            tokens.push(spanned);
+            if is_eof {
                 break;
             }
-            tokens.push(tok);
         }
         tokens
     }
 
     /// 次のトークンを1つ読み取る
-    fn next_token(&mut self) -> Token {
+    fn next_token(&mut self) -> Spanned {
         self.skip_spaces();
 
         // コメントをスキップ
@@ -38,16 +40,31 @@ impl Lexer {
             return self.next_token();
         }
 
+        let line = self.line;
+
         match self.peek() {
-            None => Token::Eof,
+            None => Spanned::new(Token::Eof, line),
             Some('\n') => {
                 self.advance();
-                Token::Newline
+                self.line += 1;
+                Spanned::new(Token::Newline, line)
             }
-            Some('"') => self.read_string(),
-            Some(c) if c.is_ascii_digit() => self.read_number(),
-            Some(c) if c.is_ascii_alphabetic() || c == '_' => self.read_ident_or_keyword(),
-            Some(c) => self.read_symbol(c),
+            Some('"') => {
+                let tok = self.read_string();
+                Spanned::new(tok, line)
+            }
+            Some(c) if c.is_ascii_digit() => {
+                let tok = self.read_number();
+                Spanned::new(tok, line)
+            }
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                let tok = self.read_ident_or_keyword();
+                Spanned::new(tok, line)
+            }
+            Some(c) => {
+                let tok = self.read_symbol(c);
+                Spanned::new(tok, line)
+            }
         }
     }
 
@@ -222,8 +239,8 @@ impl Lexer {
                     Token::NotEq
                 } else {
                     // '!' 単体は Tsumugi では使わない（not を使う）
-                    // 不明な文字として再帰
-                    self.next_token()
+                    // 不明な文字として再帰 — line は呼び出し元で記録済み
+                    self.next_token().token
                 }
             }
             '<' => {
@@ -242,7 +259,125 @@ impl Lexer {
                     Token::Gt
                 }
             }
-            _ => self.next_token(), // 不明な文字はスキップ
+            _ => self.next_token().token, // 不明な文字はスキップ
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::token::Token;
+
+    fn tokenize(input: &str) -> Vec<Spanned> {
+        Lexer::new(input).tokenize()
+    }
+
+    fn tokens_only(input: &str) -> Vec<Token> {
+        tokenize(input).into_iter().map(|s| s.token).collect()
+    }
+
+    #[test]
+    fn simple_let() {
+        let tokens = tokens_only("let x = 42");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Let,
+                Token::Ident("x".into()),
+                Token::Assign,
+                Token::Int(42),
+                Token::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn line_numbers() {
+        let spanned = tokenize("let a = 1\nlet b = 2\n");
+        // "let" on line 1
+        assert_eq!(spanned[0].line, 1);
+        assert_eq!(spanned[0].token, Token::Let);
+        // newline token is on line 1 (it ends line 1)
+        assert_eq!(spanned[3].token, Token::Int(1));
+        assert_eq!(spanned[3].line, 1);
+        // "let" on line 2
+        let second_let = spanned
+            .iter()
+            .skip(5)
+            .find(|s| s.token == Token::Let)
+            .unwrap();
+        assert_eq!(second_let.line, 2);
+    }
+
+    #[test]
+    fn string_with_escapes() {
+        let tokens = tokens_only(r#""hello\nworld""#);
+        assert_eq!(tokens, vec![Token::Str("hello\nworld".into()), Token::Eof]);
+    }
+
+    #[test]
+    fn float_literal() {
+        let tokens = tokens_only("3.14");
+        assert_eq!(tokens, vec![Token::Float(3.14), Token::Eof]);
+    }
+
+    #[test]
+    fn operators() {
+        let tokens = tokens_only("== != <= >= < >");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Eq,
+                Token::NotEq,
+                Token::LtEq,
+                Token::GtEq,
+                Token::Lt,
+                Token::Gt,
+                Token::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn keywords() {
+        let tokens =
+            tokens_only("if else while fn end return let and or not true false null print");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::If,
+                Token::Else,
+                Token::While,
+                Token::Fn,
+                Token::End,
+                Token::Return,
+                Token::Let,
+                Token::And,
+                Token::Or,
+                Token::Not,
+                Token::True,
+                Token::False,
+                Token::Null,
+                Token::Print,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn comment_skipped() {
+        let tokens = tokens_only("# this is a comment\nlet x = 1");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Newline,
+                Token::Let,
+                Token::Ident("x".into()),
+                Token::Assign,
+                Token::Int(1),
+                Token::Eof
+            ]
+        );
     }
 }

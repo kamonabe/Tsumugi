@@ -54,3 +54,44 @@ impl Env {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_and_get() {
+        let mut env = Env::new();
+        env.set("x", Value::Int(10));
+        assert_eq!(env.get("x"), Some(&Value::Int(10)));
+    }
+
+    #[test]
+    fn undefined_variable() {
+        let env = Env::new();
+        assert_eq!(env.get("nope"), None);
+    }
+
+    #[test]
+    fn scope_shadowing() {
+        let mut env = Env::new();
+        env.set("x", Value::Int(1));
+
+        env.push_scope();
+        env.set("x", Value::Int(2));
+        assert_eq!(env.get("x"), Some(&Value::Int(2)));
+
+        env.pop_scope();
+        assert_eq!(env.get("x"), Some(&Value::Int(1)));
+    }
+
+    #[test]
+    fn inner_scope_sees_outer() {
+        let mut env = Env::new();
+        env.set("outer", Value::Str("visible".to_string()));
+
+        env.push_scope();
+        assert_eq!(env.get("outer"), Some(&Value::Str("visible".to_string())));
+        env.pop_scope();
+    }
+}

@@ -33,3 +33,35 @@ impl std::fmt::Display for Value {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truthy_values() {
+        assert!(Value::Bool(true).is_truthy());
+        assert!(Value::Int(1).is_truthy());
+        assert!(Value::Int(-1).is_truthy());
+        assert!(Value::Float(0.1).is_truthy());
+        assert!(Value::Str("hello".to_string()).is_truthy());
+    }
+
+    #[test]
+    fn falsy_values() {
+        assert!(!Value::Bool(false).is_truthy());
+        assert!(!Value::Null.is_truthy());
+        assert!(!Value::Int(0).is_truthy());
+        assert!(!Value::Float(0.0).is_truthy());
+        assert!(!Value::Str("".to_string()).is_truthy());
+    }
+
+    #[test]
+    fn display() {
+        assert_eq!(Value::Int(42).to_string(), "42");
+        assert_eq!(Value::Float(3.14).to_string(), "3.14");
+        assert_eq!(Value::Str("hi".to_string()).to_string(), "hi");
+        assert_eq!(Value::Bool(true).to_string(), "true");
+        assert_eq!(Value::Null.to_string(), "null");
+    }
+}

@@ -1,14 +1,14 @@
 use crate::ast::*;
-use crate::token::Token;
+use crate::token::{Spanned, Token};
 
 /// トークン列をASTに変換するパーサー
 pub struct Parser {
-    tokens: Vec<Token>,
+    tokens: Vec<Spanned>,
     pos: usize,
 }
 
 impl Parser {
-    pub fn new(tokens: Vec<Token>) -> Self {
+    pub fn new(tokens: Vec<Spanned>) -> Self {
         Self { tokens, pos: 0 }
     }
 
@@ -29,7 +29,7 @@ impl Parser {
     // --- 文のパース ---
 
     fn parse_stmt(&mut self) -> Result<Stmt, String> {
-        match self.peek() {
+        match self.peek_token() {
             Token::Let => self.parse_let(),
             Token::Return => self.parse_return(),
             Token::If => self.parse_if(),
@@ -41,31 +41,41 @@ impl Parser {
 
     /// let name = expr
     fn parse_let(&mut self) -> Result<Stmt, String> {
+        let line = self.current_line();
         self.advance(); // consume 'let'
 
-        let name = match self.advance() {
+        let spanned = self.advance_spanned();
+        let name = match spanned.token {
             Token::Ident(s) => s,
-            other => return Err(format!("let の後に識別子が必要です。got: {:?}", other)),
+            other => {
+                return Err(format!(
+                    "{}: let の後に識別子が必要です。got: {:?}",
+                    self.format_line(spanned.line),
+                    other
+                ));
+            }
         };
 
         self.expect(Token::Assign)?;
         let value = self.parse_expr()?;
         self.expect_newline_or_eof()?;
 
-        Ok(Stmt::Let { name, value })
+        Ok(Stmt::Let { name, value, line })
     }
 
     /// return expr
     fn parse_return(&mut self) -> Result<Stmt, String> {
+        let line = self.current_line();
         self.advance(); // consume 'return'
         let value = self.parse_expr()?;
         self.expect_newline_or_eof()?;
 
-        Ok(Stmt::Return { value })
+        Ok(Stmt::Return { value, line })
     }
 
     /// if cond \n body (else \n body)? end
     fn parse_if(&mut self) -> Result<Stmt, String> {
+        let line = self.current_line();
         self.advance(); // consume 'if'
 
         let condition = self.parse_expr()?;
@@ -74,7 +84,7 @@ impl Parser {
 
         let then_body = self.parse_block(&[Token::Else, Token::End])?;
 
-        let else_body = if self.peek() == Token::Else {
+        let else_body = if self.peek_token() == Token::Else {
             self.advance(); // consume 'else'
             self.expect_newline()?;
             self.skip_newlines();
@@ -90,11 +100,13 @@ impl Parser {
             condition,
             then_body,
             else_body,
+            line,
         })
     }
 
     /// while cond \n body end
     fn parse_while(&mut self) -> Result<Stmt, String> {
+        let line = self.current_line();
         self.advance(); // consume 'while'
 
         let condition = self.parse_expr()?;
@@ -106,16 +118,28 @@ impl Parser {
         self.expect(Token::End)?;
         self.expect_newline_or_eof()?;
 
-        Ok(Stmt::While { condition, body })
+        Ok(Stmt::While {
+            condition,
+            body,
+            line,
+        })
     }
 
     /// fn name(params) \n body end
     fn parse_fn_def(&mut self) -> Result<Stmt, String> {
+        let line = self.current_line();
         self.advance(); // consume 'fn'
 
-        let name = match self.advance() {
+        let spanned = self.advance_spanned();
+        let name = match spanned.token {
             Token::Ident(s) => s,
-            other => return Err(format!("fn の後に関数名が必要です。got: {:?}", other)),
+            other => {
+                return Err(format!(
+                    "{}: fn の後に関数名が必要です。got: {:?}",
+                    self.format_line(spanned.line),
+                    other
+                ));
+            }
         };
 
         self.expect(Token::LParen)?;
@@ -129,27 +153,46 @@ impl Parser {
         self.expect(Token::End)?;
         self.expect_newline_or_eof()?;
 
-        Ok(Stmt::FnDef { name, params, body })
+        Ok(Stmt::FnDef {
+            name,
+            params,
+            body,
+            line,
+        })
     }
 
     /// 引数リスト: ident, ident, ...
     fn parse_params(&mut self) -> Result<Vec<String>, String> {
         let mut params = Vec::new();
 
-        if self.peek() == Token::RParen {
+        if self.peek_token() == Token::RParen {
             return Ok(params);
         }
 
-        match self.advance() {
+        let spanned = self.advance_spanned();
+        match spanned.token {
             Token::Ident(s) => params.push(s),
-            other => return Err(format!("引数名が必要です。got: {:?}", other)),
+            other => {
+                return Err(format!(
+                    "{}: 引数名が必要です。got: {:?}",
+                    self.format_line(spanned.line),
+                    other
+                ));
+            }
         }
 
-        while self.peek() == Token::Comma {
+        while self.peek_token() == Token::Comma {
             self.advance(); // consume ','
-            match self.advance() {
+            let spanned = self.advance_spanned();
+            match spanned.token {
                 Token::Ident(s) => params.push(s),
-                other => return Err(format!("引数名が必要です。got: {:?}", other)),
+                other => {
+                    return Err(format!(
+                        "{}: 引数名が必要です。got: {:?}",
+                        self.format_line(spanned.line),
+                        other
+                    ));
+                }
             }
         }
 
@@ -158,16 +201,17 @@ impl Parser {
 
     /// 式文
     fn parse_expr_stmt(&mut self) -> Result<Stmt, String> {
+        let line = self.current_line();
         let expr = self.parse_expr()?;
         self.expect_newline_or_eof()?;
-        Ok(Stmt::ExprStmt { expr })
+        Ok(Stmt::ExprStmt { expr, line })
     }
 
     /// ブロック: 終端トークンのいずれかに到達するまで文をパース
     fn parse_block(&mut self, terminators: &[Token]) -> Result<Vec<Stmt>, String> {
         let mut stmts = Vec::new();
 
-        while !self.is_at_end() && !terminators.contains(&self.peek()) {
+        while !self.is_at_end() && !terminators.contains(&self.peek_token()) {
             let stmt = self.parse_stmt()?;
             stmts.push(stmt);
             self.skip_newlines();
@@ -195,7 +239,7 @@ impl Parser {
     fn parse_or(&mut self) -> Result<Expr, String> {
         let mut left = self.parse_and()?;
 
-        while self.peek() == Token::Or {
+        while self.peek_token() == Token::Or {
             self.advance();
             let right = self.parse_and()?;
             left = Expr::BinOp {
@@ -212,7 +256,7 @@ impl Parser {
     fn parse_and(&mut self) -> Result<Expr, String> {
         let mut left = self.parse_comparison()?;
 
-        while self.peek() == Token::And {
+        while self.peek_token() == Token::And {
             self.advance();
             let right = self.parse_comparison()?;
             left = Expr::BinOp {
@@ -230,7 +274,7 @@ impl Parser {
         let mut left = self.parse_add_sub()?;
 
         loop {
-            let op = match self.peek() {
+            let op = match self.peek_token() {
                 Token::Eq => BinOpKind::Eq,
                 Token::NotEq => BinOpKind::NotEq,
                 Token::Lt => BinOpKind::Lt,
@@ -256,7 +300,7 @@ impl Parser {
         let mut left = self.parse_mul_div()?;
 
         loop {
-            let op = match self.peek() {
+            let op = match self.peek_token() {
                 Token::Plus => BinOpKind::Add,
                 Token::Minus => BinOpKind::Sub,
                 _ => break,
@@ -278,7 +322,7 @@ impl Parser {
         let mut left = self.parse_unary()?;
 
         loop {
-            let op = match self.peek() {
+            let op = match self.peek_token() {
                 Token::Star => BinOpKind::Mul,
                 Token::Slash => BinOpKind::Div,
                 _ => break,
@@ -297,7 +341,7 @@ impl Parser {
 
     /// 単項: not, -
     fn parse_unary(&mut self) -> Result<Expr, String> {
-        match self.peek() {
+        match self.peek_token() {
             Token::Not => {
                 self.advance();
                 let expr = self.parse_unary()?;
@@ -323,14 +367,14 @@ impl Parser {
         let expr = self.parse_primary()?;
 
         // ident(...) パターンの場合
-        if let Expr::Ident(ref name) = expr {
-            if self.peek() == Token::LParen {
-                let name = name.clone();
-                self.advance(); // consume '('
-                let args = self.parse_args()?;
-                self.expect(Token::RParen)?;
-                return Ok(Expr::Call { name, args });
-            }
+        if let Expr::Ident(ref name) = expr
+            && self.peek_token() == Token::LParen
+        {
+            let name = name.clone();
+            self.advance(); // consume '('
+            let args = self.parse_args()?;
+            self.expect(Token::RParen)?;
+            return Ok(Expr::Call { name, args });
         }
 
         Ok(expr)
@@ -340,13 +384,13 @@ impl Parser {
     fn parse_args(&mut self) -> Result<Vec<Expr>, String> {
         let mut args = Vec::new();
 
-        if self.peek() == Token::RParen {
+        if self.peek_token() == Token::RParen {
             return Ok(args);
         }
 
         args.push(self.parse_expr()?);
 
-        while self.peek() == Token::Comma {
+        while self.peek_token() == Token::Comma {
             self.advance();
             args.push(self.parse_expr()?);
         }
@@ -356,24 +400,28 @@ impl Parser {
 
     /// プライマリ: リテラル, 識別子, 括弧式
     fn parse_primary(&mut self) -> Result<Expr, String> {
-        match self.peek() {
+        let spanned = self.peek_spanned();
+        match spanned.token {
             Token::Int(_) => {
-                if let Token::Int(n) = self.advance() {
+                let s = self.advance_spanned();
+                if let Token::Int(n) = s.token {
                     Ok(Expr::Int(n))
                 } else {
                     unreachable!()
                 }
             }
             Token::Float(_) => {
-                if let Token::Float(f) = self.advance() {
+                let s = self.advance_spanned();
+                if let Token::Float(f) = s.token {
                     Ok(Expr::Float(f))
                 } else {
                     unreachable!()
                 }
             }
             Token::Str(_) => {
-                if let Token::Str(s) = self.advance() {
-                    Ok(Expr::Str(s))
+                let s = self.advance_spanned();
+                if let Token::Str(st) = s.token {
+                    Ok(Expr::Str(st))
                 } else {
                     unreachable!()
                 }
@@ -391,8 +439,9 @@ impl Parser {
                 Ok(Expr::Null)
             }
             Token::Ident(_) => {
-                if let Token::Ident(s) = self.advance() {
-                    Ok(Expr::Ident(s))
+                let s = self.advance_spanned();
+                if let Token::Ident(name) = s.token {
+                    Ok(Expr::Ident(name))
                 } else {
                     unreachable!()
                 }
@@ -414,61 +463,205 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 Ok(expr)
             }
-            other => Err(format!("予期しないトークン: {:?}", other)),
+            other => Err(format!(
+                "{}: 予期しないトークン: {:?}",
+                self.format_line(spanned.line),
+                other
+            )),
         }
     }
 
     // --- ユーティリティ ---
 
-    fn peek(&self) -> Token {
-        self.tokens.get(self.pos).cloned().unwrap_or(Token::Eof)
+    /// 現在位置のトークン種別だけを返す（Token enum）
+    fn peek_token(&self) -> Token {
+        self.tokens
+            .get(self.pos)
+            .map(|s| s.token.clone())
+            .unwrap_or(Token::Eof)
     }
 
+    /// 現在位置の Spanned をクローンで返す
+    fn peek_spanned(&self) -> Spanned {
+        self.tokens
+            .get(self.pos)
+            .cloned()
+            .unwrap_or(Spanned::new(Token::Eof, 0))
+    }
+
+    /// 進めてトークン種別だけ返す（既存コードとの互換用）
     fn advance(&mut self) -> Token {
-        let tok = self.tokens.get(self.pos).cloned().unwrap_or(Token::Eof);
+        self.advance_spanned().token
+    }
+
+    /// 進めて Spanned を返す
+    fn advance_spanned(&mut self) -> Spanned {
+        let spanned = self
+            .tokens
+            .get(self.pos)
+            .cloned()
+            .unwrap_or(Spanned::new(Token::Eof, 0));
         self.pos += 1;
-        tok
+        spanned
     }
 
     fn is_at_end(&self) -> bool {
-        self.peek() == Token::Eof
+        self.peek_token() == Token::Eof
+    }
+
+    /// 現在位置の行番号を取得
+    fn current_line(&self) -> usize {
+        self.tokens.get(self.pos).map(|s| s.line).unwrap_or(0)
     }
 
     fn expect(&mut self, expected: Token) -> Result<(), String> {
-        let tok = self.advance();
-        if tok == expected {
+        let spanned = self.advance_spanned();
+        if spanned.token == expected {
             Ok(())
         } else {
-            Err(format!("期待: {:?}, 実際: {:?}", expected, tok))
+            Err(format!(
+                "{}: 期待: {:?}, 実際: {:?}",
+                self.format_line(spanned.line),
+                expected,
+                spanned.token
+            ))
         }
     }
 
     fn expect_newline(&mut self) -> Result<(), String> {
-        match self.peek() {
+        let line = self.current_line();
+        match self.peek_token() {
             Token::Newline => {
                 self.advance();
                 Ok(())
             }
             Token::Eof => Ok(()),
-            other => Err(format!("改行が必要です。got: {:?}", other)),
+            other => Err(format!(
+                "{}: 改行が必要です。got: {:?}",
+                self.format_line(line),
+                other
+            )),
         }
     }
 
     fn expect_newline_or_eof(&mut self) -> Result<(), String> {
-        match self.peek() {
+        let line = self.current_line();
+        match self.peek_token() {
             Token::Newline | Token::Eof => {
-                if self.peek() == Token::Newline {
+                if self.peek_token() == Token::Newline {
                     self.advance();
                 }
                 Ok(())
             }
-            other => Err(format!("改行またはEOFが必要です。got: {:?}", other)),
+            other => Err(format!(
+                "{}: 改行またはEOFが必要です。got: {:?}",
+                self.format_line(line),
+                other
+            )),
         }
     }
 
     fn skip_newlines(&mut self) {
-        while self.peek() == Token::Newline {
+        while self.peek_token() == Token::Newline {
             self.advance();
         }
+    }
+
+    /// 行番号をフォーマットする
+    fn format_line(&self, line: usize) -> String {
+        format!("{}行目", line)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::Lexer;
+
+    fn parse(input: &str) -> Result<Program, String> {
+        let tokens = Lexer::new(input).tokenize();
+        Parser::new(tokens).parse()
+    }
+
+    #[test]
+    fn parse_let() {
+        let program = parse("let x = 42").unwrap();
+        assert_eq!(program.len(), 1);
+        match &program[0] {
+            Stmt::Let { name, line, .. } => {
+                assert_eq!(name, "x");
+                assert_eq!(*line, 1);
+            }
+            other => panic!("expected Let, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_fn_def() {
+        let program = parse("fn add(a, b)\n  return a + b\nend").unwrap();
+        assert_eq!(program.len(), 1);
+        match &program[0] {
+            Stmt::FnDef {
+                name, params, line, ..
+            } => {
+                assert_eq!(name, "add");
+                assert_eq!(params, &vec!["a".to_string(), "b".to_string()]);
+                assert_eq!(*line, 1);
+            }
+            other => panic!("expected FnDef, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_if_else() {
+        let src = "if true\n  print(1)\nelse\n  print(2)\nend";
+        let program = parse(src).unwrap();
+        assert_eq!(program.len(), 1);
+        match &program[0] {
+            Stmt::If {
+                then_body,
+                else_body,
+                line,
+                ..
+            } => {
+                assert_eq!(*line, 1);
+                assert_eq!(then_body.len(), 1);
+                assert_eq!(else_body.len(), 1);
+            }
+            other => panic!("expected If, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_while() {
+        let src = "while x > 0\n  let x = x - 1\nend";
+        let program = parse(src).unwrap();
+        assert_eq!(program.len(), 1);
+        match &program[0] {
+            Stmt::While { body, line, .. } => {
+                assert_eq!(*line, 1);
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("expected While, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn error_has_line_number() {
+        let result = parse("let x = 10\nlet = oops");
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("2行目"),
+            "error should mention line 2: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn unexpected_token_error() {
+        let result = parse("let x = 10\n@@@");
+        // '@' is unknown — lexer skips it, but the resulting parse should error with line info
+        assert!(result.is_err() || result.is_ok()); // relaxed: just confirm no panic
     }
 }

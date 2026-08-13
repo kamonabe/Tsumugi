@@ -1,0 +1,14 @@
+# if / else
+let x = 10
+if x > 5
+    print("big")
+else
+    print("small")
+end
+
+# while
+let count = 3
+while count > 0
+    print(count)
+    let count = count - 1
+end
