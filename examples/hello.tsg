@@ -1,0 +1,27 @@
+# Tsumugi サンプル: hello world
+let name = "tsumugi"
+print("hello, " + name)
+
+fn greet(target)
+    return "hi, " + target
+end
+
+let msg = greet("world")
+print(msg)
+
+# 条件分岐
+let x = 42
+if x > 10
+    print("x is large")
+else
+    print("x is small")
+end
+
+# ループでカウントダウン
+let count = 5
+while count > 0
+    print(count)
+    let count = count - 1
+end
+
+print("done!")
