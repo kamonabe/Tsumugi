@@ -241,3 +241,8 @@ fn golden_first_class_fn() {
 fn golden_closure() {
     run_golden_test("closure");
 }
+
+#[test]
+fn golden_higher_order() {
+    run_golden_test("higher_order");
+}

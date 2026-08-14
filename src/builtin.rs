@@ -15,6 +15,59 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::Evaluator;
 
 impl Evaluator {
+    /// Value::Fn を呼び出すヘルパー（map/filter/each 用）
+    fn call_fn_value(
+        &mut self,
+        func: &Value,
+        arg_values: Vec<Value>,
+        line: usize,
+    ) -> Result<Value, TsumugiError> {
+        match func {
+            Value::Fn {
+                name,
+                params,
+                body,
+                captured,
+            } => {
+                if arg_values.len() != params.len() {
+                    return Err(format!(
+                        "{}行目: 関数 {} は引数{}個ですが、{}個渡されました",
+                        line,
+                        name,
+                        params.len(),
+                        arg_values.len()
+                    )
+                    .into());
+                }
+                self.env.push_scope();
+                for (k, v) in captured {
+                    self.env.set(k, v.clone());
+                }
+                for (param, val) in params.iter().zip(arg_values) {
+                    self.env.set(param, val);
+                }
+                let mut result = Value::Null;
+                for stmt in body {
+                    match self.exec_stmt(stmt)? {
+                        super::EvalResult::Return(v) => {
+                            result = v;
+                            break;
+                        }
+                        super::EvalResult::Break | super::EvalResult::Continue => break,
+                        super::EvalResult::Val => {}
+                    }
+                }
+                self.env.pop_scope();
+                Ok(result)
+            }
+            _ => Err(format!(
+                "{}行目: 関数ではない値を呼び出そうとしました: {}",
+                line, func
+            )
+            .into()),
+        }
+    }
+
     /// 組み込み関数を評価する。
     /// 該当する組み込み関数があれば Ok(Some(value))、なければ Ok(None)、エラーなら Err を返す。
     pub(crate) fn eval_builtin(
@@ -29,7 +82,7 @@ impl Evaluator {
 
             // コレクション操作系
             "len" | "push" | "pop" | "keys" | "values" | "has_key" | "type" | "slice"
-            | "contains" | "sort" | "reverse" | "range" => {
+            | "contains" | "sort" | "reverse" | "range" | "map" | "filter" | "each" => {
                 self.builtin_collection(name, args, line)
             }
 
@@ -507,6 +560,87 @@ impl Evaluator {
                 };
                 let list: Vec<Value> = (start..end).map(Value::Int).collect();
                 Ok(Some(Value::List(list)))
+            }
+            "map" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "{}行目: map() は引数2個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    )
+                    .into());
+                }
+                let list = match self.eval_expr(&args[0], line)? {
+                    Value::List(v) => v,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: map() の第1引数はリストである必要があります",
+                            line
+                        )
+                        .into());
+                    }
+                };
+                let func = self.eval_expr(&args[1], line)?;
+                let mut result = Vec::new();
+                for item in list {
+                    let val = self.call_fn_value(&func, vec![item], line)?;
+                    result.push(val);
+                }
+                Ok(Some(Value::List(result)))
+            }
+            "filter" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "{}行目: filter() は引数2個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    )
+                    .into());
+                }
+                let list = match self.eval_expr(&args[0], line)? {
+                    Value::List(v) => v,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: filter() の第1引数はリストである必要があります",
+                            line
+                        )
+                        .into());
+                    }
+                };
+                let func = self.eval_expr(&args[1], line)?;
+                let mut result = Vec::new();
+                for item in list {
+                    let val = self.call_fn_value(&func, vec![item.clone()], line)?;
+                    if val.is_truthy() {
+                        result.push(item);
+                    }
+                }
+                Ok(Some(Value::List(result)))
+            }
+            "each" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "{}行目: each() は引数2個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    )
+                    .into());
+                }
+                let list = match self.eval_expr(&args[0], line)? {
+                    Value::List(v) => v,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: each() の第1引数はリストである必要があります",
+                            line
+                        )
+                        .into());
+                    }
+                };
+                let func = self.eval_expr(&args[1], line)?;
+                for item in list {
+                    self.call_fn_value(&func, vec![item], line)?;
+                }
+                Ok(Some(Value::Null))
             }
             _ => Ok(None),
         }
