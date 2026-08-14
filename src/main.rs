@@ -13,6 +13,7 @@ use std::io::{self, Write};
 use eval::Evaluator;
 use lexer::Lexer;
 use parser::Parser;
+use token::Token;
 
 fn main() {
     let args: Vec<String> = std_env::args().collect();
@@ -97,13 +98,17 @@ fn execute(source: &str, evaluator: &mut Evaluator) -> Result<(), String> {
     Ok(())
 }
 
-/// 入力が未完結か判定（if/fn/while が end で閉じられていない）
+/// 入力が未完結か判定（if/fn/while/for が end で閉じられていない）
+/// レキサーを通してトークン列で判定するため、文字列リテラル内の "if" や
+/// コメント中の "end" に影響されない。
 fn is_incomplete(input: &str) -> bool {
+    let mut lexer = Lexer::new(input);
+    let tokens = lexer.tokenize();
     let mut depth: i32 = 0;
-    for word in input.split_whitespace() {
-        match word {
-            "if" | "fn" | "while" | "for" => depth += 1,
-            "end" => depth -= 1,
+    for spanned in &tokens {
+        match &spanned.token {
+            Token::If | Token::Fn | Token::While | Token::For => depth += 1,
+            Token::End => depth -= 1,
             _ => {}
         }
     }
