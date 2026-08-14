@@ -144,6 +144,7 @@ pub enum BinOpKind {
     Sub,   // -
     Mul,   // *
     Div,   // /
+    Mod,   // %
     Eq,    // ==
     NotEq, // !=
     Lt,    // <

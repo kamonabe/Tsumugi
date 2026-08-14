@@ -131,6 +131,11 @@ fn golden_break_continue() {
     run_golden_test("break_continue");
 }
 
+#[test]
+fn golden_fizzbuzz() {
+    run_golden_test("fizzbuzz");
+}
+
 // --- エラー系テスト ---
 
 #[test]

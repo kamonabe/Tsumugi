@@ -364,12 +364,20 @@ impl Evaluator {
                     Ok(Value::Int(l / r))
                 }
             }
+            (Value::Int(l), BinOpKind::Mod, Value::Int(r)) => {
+                if *r == 0 {
+                    Err(format!("{}行目: ゼロ除算", line))
+                } else {
+                    Ok(Value::Int(l % r))
+                }
+            }
 
             // 浮動小数点
             (Value::Float(l), BinOpKind::Add, Value::Float(r)) => Ok(Value::Float(l + r)),
             (Value::Float(l), BinOpKind::Sub, Value::Float(r)) => Ok(Value::Float(l - r)),
             (Value::Float(l), BinOpKind::Mul, Value::Float(r)) => Ok(Value::Float(l * r)),
             (Value::Float(l), BinOpKind::Div, Value::Float(r)) => Ok(Value::Float(l / r)),
+            (Value::Float(l), BinOpKind::Mod, Value::Float(r)) => Ok(Value::Float(l % r)),
 
             // Int と Float の混合
             (Value::Int(l), BinOpKind::Add, Value::Float(r)) => Ok(Value::Float(*l as f64 + r)),
@@ -380,6 +388,8 @@ impl Evaluator {
             (Value::Float(l), BinOpKind::Mul, Value::Int(r)) => Ok(Value::Float(l * *r as f64)),
             (Value::Int(l), BinOpKind::Div, Value::Float(r)) => Ok(Value::Float(*l as f64 / r)),
             (Value::Float(l), BinOpKind::Div, Value::Int(r)) => Ok(Value::Float(l / *r as f64)),
+            (Value::Int(l), BinOpKind::Mod, Value::Float(r)) => Ok(Value::Float(*l as f64 % r)),
+            (Value::Float(l), BinOpKind::Mod, Value::Int(r)) => Ok(Value::Float(l % *r as f64)),
 
             // 文字列結合
             (Value::Str(l), BinOpKind::Add, Value::Str(r)) => Ok(Value::Str(format!("{}{}", l, r))),
@@ -816,5 +826,17 @@ mod tests {
         let result = run_program("continue");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("continue はループの中でのみ"));
+    }
+
+    #[test]
+    fn modulo_operator() {
+        run_program("let x = 10 % 3\nprint(x)").unwrap();
+    }
+
+    #[test]
+    fn modulo_zero_error() {
+        let result = run_program("let x = 10 % 0");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("ゼロ除算"));
     }
 }
