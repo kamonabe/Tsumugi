@@ -295,6 +295,13 @@ let result = add(3, 4)
 | `read_lines(path)` | ファイルを行ごとに読んでリストで返す。失敗時は null |
 | `write_file(path, content)` | ファイルに書き込み（上書き）。成功で true、失敗で false |
 | `append_file(path, content)` | ファイルに追記。成功で true、失敗で false |
+| `env(name)` | 環境変数を取得。未設定なら null |
+| `args()` | コマンドライン引数をリストで返す（スクリプトパスは含まない） |
+| `input()` | 標準入力から1行読み取る。EOF なら null |
+| `now()` | 現在のUNIXタイムスタンプ（秒）を整数で返す |
+| `format_time(timestamp, format)` | タイムスタンプをフォーマット（%Y, %m, %d, %H, %M, %S） |
+| `path_exists(path)` | パスが存在すれば true |
+| `path_join(parts...)` | パーツを結合してパス文字列を返す |
 
 ## 真偽判定
 

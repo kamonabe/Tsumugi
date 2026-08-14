@@ -4,6 +4,9 @@ use crate::value::Value;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{self, BufRead};
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 評価器の戻り値（通常の値 or return / break / continue による制御フロー）
 enum EvalResult {
@@ -406,6 +409,18 @@ impl Evaluator {
             // 比較演算（文字列）
             (Value::Str(l), BinOpKind::Eq, Value::Str(r)) => Ok(Value::Bool(l == r)),
             (Value::Str(l), BinOpKind::NotEq, Value::Str(r)) => Ok(Value::Bool(l != r)),
+
+            // 比較演算（null との等価比較）
+            (Value::Null, BinOpKind::Eq, Value::Null) => Ok(Value::Bool(true)),
+            (Value::Null, BinOpKind::NotEq, Value::Null) => Ok(Value::Bool(false)),
+            (_, BinOpKind::Eq, Value::Null) => Ok(Value::Bool(false)),
+            (_, BinOpKind::NotEq, Value::Null) => Ok(Value::Bool(true)),
+            (Value::Null, BinOpKind::Eq, _) => Ok(Value::Bool(false)),
+            (Value::Null, BinOpKind::NotEq, _) => Ok(Value::Bool(true)),
+
+            // 比較演算（Bool）
+            (Value::Bool(l), BinOpKind::Eq, Value::Bool(r)) => Ok(Value::Bool(l == r)),
+            (Value::Bool(l), BinOpKind::NotEq, Value::Bool(r)) => Ok(Value::Bool(l != r)),
 
             // 論理演算
             (l, BinOpKind::And, r) => Ok(Value::Bool(l.is_truthy() && r.is_truthy())),
@@ -873,6 +888,151 @@ impl Evaluator {
                     .and_then(|mut f| f.write_all(content.as_bytes()));
                 return Ok(Value::Bool(result.is_ok()));
             }
+            "env" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: env() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let name = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: env() の引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                return Ok(match std::env::var(&name) {
+                    Ok(val) => Value::Str(val),
+                    Err(_) => Value::Null,
+                });
+            }
+            "args" => {
+                if !args.is_empty() {
+                    return Err(format!(
+                        "{}行目: args() は引数0個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let argv: Vec<Value> = std::env::args()
+                    .skip(2) // skip binary name and script path
+                    .map(Value::Str)
+                    .collect();
+                return Ok(Value::List(argv));
+            }
+            "input" => {
+                if !args.is_empty() {
+                    return Err(format!(
+                        "{}行目: input() は引数0個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let stdin = io::stdin();
+                let mut line_buf = String::new();
+                return Ok(match stdin.lock().read_line(&mut line_buf) {
+                    Ok(0) => Value::Null, // EOF
+                    Ok(_) => {
+                        // 末尾の改行を除去
+                        if line_buf.ends_with('\n') {
+                            line_buf.pop();
+                            if line_buf.ends_with('\r') {
+                                line_buf.pop();
+                            }
+                        }
+                        Value::Str(line_buf)
+                    }
+                    Err(_) => Value::Null,
+                });
+            }
+            "now" => {
+                if !args.is_empty() {
+                    return Err(format!(
+                        "{}行目: now() は引数0個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                return Ok(Value::Int(timestamp));
+            }
+            "format_time" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "{}行目: format_time() は引数2個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let timestamp = match self.eval_expr(&args[0], line)? {
+                    Value::Int(n) => n,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: format_time() の第1引数は整数である必要があります",
+                            line
+                        ));
+                    }
+                };
+                let format = match self.eval_expr(&args[1], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: format_time() の第2引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                // 簡易フォーマット: %Y, %m, %d, %H, %M, %S を置換
+                let secs = timestamp;
+                // Unix timestamp を年月日時分秒に変換（簡易実装）
+                let formatted = format_unix_timestamp(secs, &format);
+                return Ok(Value::Str(formatted));
+            }
+            "path_exists" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: path_exists() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let path = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: path_exists() の引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                return Ok(Value::Bool(Path::new(&path).exists()));
+            }
+            "path_join" => {
+                if args.is_empty() {
+                    return Err(format!("{}行目: path_join() は引数が1個以上必要です", line));
+                }
+                let mut path = std::path::PathBuf::new();
+                for arg in args {
+                    let part = match self.eval_expr(arg, line)? {
+                        Value::Str(s) => s,
+                        _ => {
+                            return Err(format!(
+                                "{}行目: path_join() の引数は文字列である必要があります",
+                                line
+                            ));
+                        }
+                    };
+                    path.push(part);
+                }
+                return Ok(Value::Str(path.to_string_lossy().to_string()));
+            }
             _ => {}
         }
 
@@ -935,6 +1095,56 @@ impl Evaluator {
         self.env.pop_scope();
         Ok(result)
     }
+}
+
+/// Unix タイムスタンプを簡易フォーマットする
+/// 対応: %Y(年), %m(月), %d(日), %H(時), %M(分), %S(秒)
+fn format_unix_timestamp(timestamp: i64, format: &str) -> String {
+    // 日数計算
+    let mut days = timestamp / 86400;
+    let day_secs = timestamp % 86400;
+    let hours = day_secs / 3600;
+    let minutes = (day_secs % 3600) / 60;
+    let seconds = day_secs % 60;
+
+    // 年月日計算（1970年1月1日起点）
+    let mut year = 1970i64;
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+
+    let month_days = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut month = 1;
+    for &md in &month_days {
+        if days < md {
+            break;
+        }
+        days -= md;
+        month += 1;
+    }
+    let day = days + 1;
+
+    format
+        .replace("%Y", &format!("{:04}", year))
+        .replace("%m", &format!("{:02}", month))
+        .replace("%d", &format!("{:02}", day))
+        .replace("%H", &format!("{:02}", hours))
+        .replace("%M", &format!("{:02}", minutes))
+        .replace("%S", &format!("{:02}", seconds))
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
 #[cfg(test)]
@@ -1298,5 +1508,47 @@ mod tests {
     #[test]
     fn builtin_read_file_missing() {
         run_program("let x = read_file(\"/tmp/no_such_file_xyz.txt\")\nprint(x)").unwrap();
+    }
+
+    #[test]
+    fn builtin_env() {
+        // HOME should always be set
+        run_program("let h = env(\"HOME\")\nprint(h != null)").unwrap();
+    }
+
+    #[test]
+    fn builtin_env_missing() {
+        run_program("let x = env(\"NONEXISTENT_TSG_VAR\")\nprint(x)").unwrap();
+    }
+
+    #[test]
+    fn builtin_args() {
+        run_program("let a = args()\nprint(type(a))").unwrap();
+    }
+
+    #[test]
+    fn builtin_now() {
+        run_program("let ts = now()\nprint(ts > 0)").unwrap();
+    }
+
+    #[test]
+    fn builtin_format_time() {
+        // 2026-01-01 00:00:00 UTC = 1767225600
+        run_program("let s = format_time(1767225600, \"%Y-%m-%d\")\nprint(s)").unwrap();
+    }
+
+    #[test]
+    fn builtin_path_exists() {
+        run_program("print(path_exists(\"/tmp\"))").unwrap();
+    }
+
+    #[test]
+    fn builtin_path_exists_missing() {
+        run_program("print(path_exists(\"/no_such_dir_xyz\"))").unwrap();
+    }
+
+    #[test]
+    fn builtin_path_join() {
+        run_program("let p = path_join(\"/home\", \"user\", \"file.txt\")\nprint(p)").unwrap();
     }
 }

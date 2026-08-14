@@ -1,0 +1,25 @@
+# 環境変数
+let home = env("HOME")
+print(home != null)
+let missing = env("NONEXISTENT_TSG_VAR_XYZ")
+print(missing)
+
+# now (タイムスタンプが正の整数であること)
+let ts = now()
+print(ts > 0)
+
+# format_time (既知のタイムスタンプ)
+# 2026-01-01 00:00:00 UTC = 1767225600
+let formatted = format_time(1767225600, "%Y-%m-%d %H:%M:%S")
+print(formatted)
+
+# path_exists
+print(path_exists("/tmp"))
+print(path_exists("/no_such_path_xyz"))
+
+# path_join
+print(path_join("/usr", "local", "bin"))
+
+# args (テスト実行時は空リスト)
+let a = args()
+print(len(a))

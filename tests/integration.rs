@@ -146,6 +146,11 @@ fn golden_file_io() {
     run_golden_test("file_io");
 }
 
+#[test]
+fn golden_local_utils() {
+    run_golden_test("local_utils");
+}
+
 // --- エラー系テスト ---
 
 #[test]
