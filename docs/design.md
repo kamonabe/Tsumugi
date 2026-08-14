@@ -194,6 +194,13 @@ test = result
 - `get_mut()` は可変参照で変数を取得（インデックス代入・push で使用）
 - 関数定義はグローバルな HashMap で管理
 
+### エラー型 (error.rs)
+
+- `TsumugiError` enum でパースエラー（`Parse`）とランタイムエラー（`Runtime`）を構造的に区別
+- 各バリアントに `line: usize` と `message: String` を保持
+- `Display` 実装で「N行目: メッセージ」形式の出力を生成（従来と同じ形式を維持）
+- `From<String>` を実装し、既存の `format!("{}行目: ...")` パターンからの段階的移行を可能にしている
+
 ## テスト設計
 
 ### ユニットテスト

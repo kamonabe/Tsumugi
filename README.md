@@ -124,6 +124,7 @@ src/
 ├── parser.rs   # パーサー（トークン列 → AST、エラーに行番号付与）
 ├── value.rs    # 実行時の値型
 ├── env.rs      # 環境（変数スコープ・関数テーブル）
+├── error.rs    # エラー型（TsumugiError: Parse / Runtime）
 ├── eval.rs     # 評価器（AST → 実行、エラーに行番号付与）
 └── builtin.rs  # 組み込み関数（50個）の実装
 
@@ -133,7 +134,8 @@ tests/
 
 docs/
 ├── design.md         # 設計ドキュメント
-└── language-spec.md  # 言語仕様
+├── language-spec.md  # 言語仕様
+└── roadmap.md        # ロードマップ・設計方針
 
 examples/
 └── hello.tsg         # サンプルスクリプト
@@ -146,6 +148,7 @@ examples/
 
 - [設計ドキュメント](docs/design.md) — 設計判断の経緯・アーキテクチャ・今後の候補
 - [言語仕様](docs/language-spec.md) — 文法・データ型・演算子の一覧
+- [ロードマップ](docs/roadmap.md) — 実装済み機能・設計方針・今後の検討事項
 
 ## ライセンス
 
