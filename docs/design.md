@@ -183,6 +183,7 @@ test = result
 - 関数呼び出し時に新しいスコープを push、終了時に pop
 - `return` 文は EvalResult::Return で早期脱出を表現
 - ランタイムエラー（型エラー、未定義変数、ゼロ除算等）に `Stmt.line` を付与
+- 組み込み関数の実装は `builtin.rs` に分離（eval.rs は制御フロー・式評価に専念）
 
 ### 環境 (env.rs)
 
@@ -263,7 +264,6 @@ args           = expr ("," expr)*
 
 | 優先度 | 項目 |
 |---|---|
-| 中 | 組み込み関数の追加（pop, slice, contains 等） |
 | 低 | モジュール / import |
 | 低 | クロージャ / 高階関数 |
 | 発展 | バイトコード VM 化 |
