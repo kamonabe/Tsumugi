@@ -324,6 +324,12 @@ let result = add(3, 4)
 | `reverse(list or str)` | リストまたは文字列を反転して返す |
 | `is_file(path)` | パスがファイルなら true |
 | `is_dir(path)` | パスがディレクトリなら true |
+| `values(dict)` | 辞書の値一覧をリストで返す（キーのアルファベット順） |
+| `has_key(dict, key)` | 辞書にキーが存在すれば true（値が null でも true を返す） |
+| `floor(num)` | 小数点以下を切り捨てて整数で返す |
+| `ceil(num)` | 小数点以下を切り上げて整数で返す |
+| `round(num)` | 四捨五入して整数で返す |
+| `exit(code?)` | プロセスを終了する。引数省略時は終了コード 0 |
 
 ## 真偽判定
 
