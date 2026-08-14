@@ -1033,6 +1033,150 @@ impl Evaluator {
                 }
                 return Ok(Value::Str(path.to_string_lossy().to_string()));
             }
+            "mkdir" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: mkdir() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let path = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: mkdir() の引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                return Ok(Value::Bool(fs::create_dir_all(&path).is_ok()));
+            }
+            "remove" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: remove() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let path = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: remove() の引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                let p = Path::new(&path);
+                let result = if p.is_dir() {
+                    fs::remove_dir(&path)
+                } else {
+                    fs::remove_file(&path)
+                };
+                return Ok(Value::Bool(result.is_ok()));
+            }
+            "remove_dir" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: remove_dir() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let path = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: remove_dir() の引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                return Ok(Value::Bool(fs::remove_dir_all(&path).is_ok()));
+            }
+            "rename" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "{}行目: rename() は引数2個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let from = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: rename() の第1引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                let to = match self.eval_expr(&args[1], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: rename() の第2引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                return Ok(Value::Bool(fs::rename(&from, &to).is_ok()));
+            }
+            "list_dir" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: list_dir() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let path = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: list_dir() の引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                return Ok(match fs::read_dir(&path) {
+                    Ok(entries) => {
+                        let mut names: Vec<Value> = Vec::new();
+                        for entry in entries.flatten() {
+                            if let Some(name) = entry.file_name().to_str() {
+                                names.push(Value::Str(name.to_string()));
+                            }
+                        }
+                        names.sort_by_key(|a| a.to_string());
+                        Value::List(names)
+                    }
+                    Err(_) => Value::Null,
+                });
+            }
+            "file_size" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: file_size() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let path = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: file_size() の引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                return Ok(match fs::metadata(&path) {
+                    Ok(meta) => Value::Int(meta.len() as i64),
+                    Err(_) => Value::Null,
+                });
+            }
             _ => {}
         }
 
@@ -1550,5 +1694,47 @@ mod tests {
     #[test]
     fn builtin_path_join() {
         run_program("let p = path_join(\"/home\", \"user\", \"file.txt\")\nprint(p)").unwrap();
+    }
+
+    #[test]
+    fn builtin_mkdir_and_remove_dir() {
+        run_program(
+            "mkdir(\"/tmp/tsg_test_mkdir\")\nprint(path_exists(\"/tmp/tsg_test_mkdir\"))\nremove_dir(\"/tmp/tsg_test_mkdir\")\nprint(path_exists(\"/tmp/tsg_test_mkdir\"))",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn builtin_rename() {
+        run_program(
+            "write_file(\"/tmp/tsg_rename_src.txt\", \"x\")\nrename(\"/tmp/tsg_rename_src.txt\", \"/tmp/tsg_rename_dst.txt\")\nprint(path_exists(\"/tmp/tsg_rename_dst.txt\"))",
+        )
+        .unwrap();
+        std::fs::remove_file("/tmp/tsg_rename_dst.txt").ok();
+    }
+
+    #[test]
+    fn builtin_list_dir() {
+        run_program(
+            "mkdir(\"/tmp/tsg_list_test\")\nwrite_file(\"/tmp/tsg_list_test/a.txt\", \"\")\nlet entries = list_dir(\"/tmp/tsg_list_test\")\nprint(len(entries))\nremove_dir(\"/tmp/tsg_list_test\")",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn builtin_file_size() {
+        run_program(
+            "write_file(\"/tmp/tsg_size_test.txt\", \"hello\")\nlet s = file_size(\"/tmp/tsg_size_test.txt\")\nprint(s)",
+        )
+        .unwrap();
+        std::fs::remove_file("/tmp/tsg_size_test.txt").ok();
+    }
+
+    #[test]
+    fn builtin_remove_file() {
+        run_program(
+            "write_file(\"/tmp/tsg_remove_test.txt\", \"x\")\nprint(remove(\"/tmp/tsg_remove_test.txt\"))\nprint(path_exists(\"/tmp/tsg_remove_test.txt\"))",
+        )
+        .unwrap();
     }
 }

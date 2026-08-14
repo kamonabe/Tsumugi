@@ -302,6 +302,12 @@ let result = add(3, 4)
 | `format_time(timestamp, format)` | タイムスタンプをフォーマット（%Y, %m, %d, %H, %M, %S） |
 | `path_exists(path)` | パスが存在すれば true |
 | `path_join(parts...)` | パーツを結合してパス文字列を返す |
+| `mkdir(path)` | ディレクトリを再帰的に作成。成功で true |
+| `remove(path)` | ファイルまたは空ディレクトリを削除。成功で true |
+| `remove_dir(path)` | ディレクトリを中身ごと再帰削除。成功で true |
+| `rename(from, to)` | ファイル/ディレクトリを移動・リネーム。成功で true |
+| `list_dir(path)` | ディレクトリ内のエントリ名をリストで返す。失敗で null |
+| `file_size(path)` | ファイルサイズ（バイト）を整数で返す。失敗で null |
 
 ## 真偽判定
 

@@ -1,0 +1,28 @@
+# ディレクトリ作成
+print(mkdir("/tmp/tsg_fs_test/sub"))
+print(path_exists("/tmp/tsg_fs_test/sub"))
+
+# ファイル作成
+write_file("/tmp/tsg_fs_test/sub/a.txt", "aaa")
+write_file("/tmp/tsg_fs_test/sub/b.txt", "bb")
+
+# list_dir
+let entries = list_dir("/tmp/tsg_fs_test/sub")
+print(entries)
+
+# file_size
+print(file_size("/tmp/tsg_fs_test/sub/a.txt"))
+print(file_size("/tmp/tsg_fs_test/sub/b.txt"))
+
+# rename（移動）
+mkdir("/tmp/tsg_fs_test/old")
+print(rename("/tmp/tsg_fs_test/sub/a.txt", "/tmp/tsg_fs_test/old/a.txt"))
+print(path_exists("/tmp/tsg_fs_test/old/a.txt"))
+
+# remove（ファイル削除）
+print(remove("/tmp/tsg_fs_test/sub/b.txt"))
+print(path_exists("/tmp/tsg_fs_test/sub/b.txt"))
+
+# remove_dir（再帰削除）
+print(remove_dir("/tmp/tsg_fs_test"))
+print(path_exists("/tmp/tsg_fs_test"))
