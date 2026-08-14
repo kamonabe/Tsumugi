@@ -3,6 +3,7 @@ mod builtin;
 
 use crate::ast::*;
 use crate::env::{Env, Function};
+use crate::error::TsumugiError;
 use crate::value::Value;
 
 use std::collections::BTreeMap;
@@ -25,7 +26,7 @@ impl Evaluator {
     }
 
     /// プログラム全体を実行
-    pub fn run(&mut self, program: &Program) -> Result<(), String> {
+    pub fn run(&mut self, program: &Program) -> Result<(), TsumugiError> {
         for stmt in program {
             match self.exec_stmt(stmt)? {
                 EvalResult::Return(_) => break,
@@ -33,13 +34,15 @@ impl Evaluator {
                     return Err(format!(
                         "{}行目: break はループの中でのみ使用できます",
                         stmt.line()
-                    ));
+                    )
+                    .into());
                 }
                 EvalResult::Continue => {
                     return Err(format!(
                         "{}行目: continue はループの中でのみ使用できます",
                         stmt.line()
-                    ));
+                    )
+                    .into());
                 }
                 EvalResult::Val => {}
             }
@@ -48,7 +51,7 @@ impl Evaluator {
     }
 
     /// 文を実行
-    fn exec_stmt(&mut self, stmt: &Stmt) -> Result<EvalResult, String> {
+    fn exec_stmt(&mut self, stmt: &Stmt) -> Result<EvalResult, TsumugiError> {
         match stmt {
             Stmt::Let { name, value, line } => {
                 let val = self.eval_expr(value, *line)?;
@@ -59,7 +62,7 @@ impl Evaluator {
             Stmt::Assign { name, value, line } => {
                 let val = self.eval_expr(value, *line)?;
                 if self.env.update(name, val).is_err() {
-                    return Err(format!("{}行目: 未定義の変数に代入: {}", line, name));
+                    return Err(format!("{}行目: 未定義の変数に代入: {}", line, name).into());
                 }
                 Ok(EvalResult::Val)
             }
@@ -80,14 +83,14 @@ impl Evaluator {
                         return Err(format!(
                             "{}行目: インデックス代入の対象は変数である必要があります",
                             line
-                        ));
+                        )
+                        .into());
                     }
                 };
 
-                let target = self
-                    .env
-                    .get_mut(&var_name)
-                    .ok_or_else(|| format!("{}行目: 未定義の変数: {}", line, var_name))?;
+                let target = self.env.get_mut(&var_name).ok_or_else(|| {
+                    TsumugiError::from(format!("{}行目: 未定義の変数: {}", line, var_name))
+                })?;
 
                 match target {
                     Value::List(list) => {
@@ -97,7 +100,8 @@ impl Evaluator {
                                 return Err(format!(
                                     "{}行目: リストのインデックスは整数である必要があります",
                                     line
-                                ));
+                                )
+                                .into());
                             }
                         };
                         let len = list.len() as i64;
@@ -106,7 +110,8 @@ impl Evaluator {
                             return Err(format!(
                                 "{}行目: インデックス範囲外: {} (長さ: {})",
                                 line, i, len
-                            ));
+                            )
+                            .into());
                         }
                         list[actual_idx as usize] = val;
                     }
@@ -117,7 +122,8 @@ impl Evaluator {
                                 return Err(format!(
                                     "{}行目: 辞書のキーは文字列である必要があります",
                                     line
-                                ));
+                                )
+                                .into());
                             }
                         };
                         map.insert(key, val);
@@ -126,7 +132,8 @@ impl Evaluator {
                         return Err(format!(
                             "{}行目: インデックス代入はリストまたは辞書にのみ使用できます",
                             line
-                        ));
+                        )
+                        .into());
                     }
                 }
 
@@ -203,7 +210,8 @@ impl Evaluator {
                         return Err(format!(
                             "{}行目: for で反復できません: {:?}",
                             line, collection
-                        ));
+                        )
+                        .into());
                     }
                 };
 
@@ -251,7 +259,7 @@ impl Evaluator {
     }
 
     /// 式を評価して値を返す（line は文の行番号をエラー表示に使う）
-    pub(crate) fn eval_expr(&mut self, expr: &Expr, line: usize) -> Result<Value, String> {
+    pub(crate) fn eval_expr(&mut self, expr: &Expr, line: usize) -> Result<Value, TsumugiError> {
         match expr {
             Expr::Int(n) => Ok(Value::Int(*n)),
             Expr::Float(f) => Ok(Value::Float(*f)),
@@ -276,7 +284,8 @@ impl Evaluator {
                             return Err(format!(
                                 "{}行目: 辞書のキーは文字列である必要があります。got: {:?}",
                                 line, other
-                            ));
+                            )
+                            .into());
                         }
                     };
                     let val = self.eval_expr(val_expr, line)?;
@@ -285,11 +294,11 @@ impl Evaluator {
                 Ok(Value::Dict(map))
             }
 
-            Expr::Ident(name) => self
-                .env
-                .get(name)
-                .cloned()
-                .ok_or_else(|| format!("{}行目: 未定義の変数: {}", line, name)),
+            Expr::Ident(name) => {
+                self.env.get(name).cloned().ok_or_else(|| {
+                    TsumugiError::from(format!("{}行目: 未定義の変数: {}", line, name))
+                })
+            }
 
             Expr::BinOp { left, op, right } => {
                 let l = self.eval_expr(left, line)?;
@@ -313,16 +322,20 @@ impl Evaluator {
     }
 
     /// インデックスアクセスの評価
-    fn eval_index(&self, object: &Value, index: &Value, line: usize) -> Result<Value, String> {
+    fn eval_index(
+        &self,
+        object: &Value,
+        index: &Value,
+        line: usize,
+    ) -> Result<Value, TsumugiError> {
         match (object, index) {
             (Value::List(list), Value::Int(i)) => {
                 let len = list.len() as i64;
                 let actual = if *i < 0 { len + *i } else { *i };
                 if actual < 0 || actual >= len {
-                    return Err(format!(
-                        "{}行目: インデックス範囲外: {} (長さ: {})",
-                        line, i, len
-                    ));
+                    return Err(
+                        format!("{}行目: インデックス範囲外: {} (長さ: {})", line, i, len).into(),
+                    );
                 }
                 Ok(list[actual as usize].clone())
             }
@@ -331,10 +344,9 @@ impl Evaluator {
                 let len = s.chars().count() as i64;
                 let actual = if *i < 0 { len + *i } else { *i };
                 if actual < 0 || actual >= len {
-                    return Err(format!(
-                        "{}行目: インデックス範囲外: {} (長さ: {})",
-                        line, i, len
-                    ));
+                    return Err(
+                        format!("{}行目: インデックス範囲外: {} (長さ: {})", line, i, len).into(),
+                    );
                 }
                 let ch = s.chars().nth(actual as usize).unwrap();
                 Ok(Value::Str(ch.to_string()))
@@ -342,7 +354,8 @@ impl Evaluator {
             _ => Err(format!(
                 "{}行目: インデックスアクセスできません: {:?}[{:?}]",
                 line, object, index
-            )),
+            )
+            .into()),
         }
     }
 
@@ -353,7 +366,7 @@ impl Evaluator {
         op: &BinOpKind,
         right: &Value,
         line: usize,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, TsumugiError> {
         match (left, op, right) {
             // 整数同士の算術
             (Value::Int(l), BinOpKind::Add, Value::Int(r)) => Ok(Value::Int(l + r)),
@@ -361,14 +374,14 @@ impl Evaluator {
             (Value::Int(l), BinOpKind::Mul, Value::Int(r)) => Ok(Value::Int(l * r)),
             (Value::Int(l), BinOpKind::Div, Value::Int(r)) => {
                 if *r == 0 {
-                    Err(format!("{}行目: ゼロ除算", line))
+                    Err(format!("{}行目: ゼロ除算", line).into())
                 } else {
                     Ok(Value::Int(l / r))
                 }
             }
             (Value::Int(l), BinOpKind::Mod, Value::Int(r)) => {
                 if *r == 0 {
-                    Err(format!("{}行目: ゼロ除算", line))
+                    Err(format!("{}行目: ゼロ除算", line).into())
                 } else {
                     Ok(Value::Int(l % r))
                 }
@@ -427,12 +440,18 @@ impl Evaluator {
             _ => Err(format!(
                 "{}行目: 型エラー: {:?} {:?} {:?} は計算できません",
                 line, left, op, right
-            )),
+            )
+            .into()),
         }
     }
 
     /// 単項演算
-    fn eval_unary(&self, op: &UnaryOpKind, val: &Value, line: usize) -> Result<Value, String> {
+    fn eval_unary(
+        &self,
+        op: &UnaryOpKind,
+        val: &Value,
+        line: usize,
+    ) -> Result<Value, TsumugiError> {
         match (op, val) {
             (UnaryOpKind::Neg, Value::Int(n)) => Ok(Value::Int(-n)),
             (UnaryOpKind::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
@@ -440,24 +459,23 @@ impl Evaluator {
             _ => Err(format!(
                 "{}行目: 型エラー: {:?} {:?} は計算できません",
                 line, op, val
-            )),
+            )
+            .into()),
         }
     }
 
     /// 関数呼び出し
-    fn eval_call(&mut self, name: &str, args: &[Expr], line: usize) -> Result<Value, String> {
+    fn eval_call(&mut self, name: &str, args: &[Expr], line: usize) -> Result<Value, TsumugiError> {
         // 組み込み関数を試行
         if let Some(value) = self.eval_builtin(name, args, line)? {
             return Ok(value);
         }
 
         // ユーザー定義関数
-        let func = self
-            .env
-            .functions
-            .get(name)
-            .cloned()
-            .ok_or_else(|| format!("{}行目: 未定義の関数: {}", line, name))?;
+        let func =
+            self.env.functions.get(name).cloned().ok_or_else(|| {
+                TsumugiError::from(format!("{}行目: 未定義の関数: {}", line, name))
+            })?;
 
         if args.len() != func.params.len() {
             return Err(format!(
@@ -466,7 +484,8 @@ impl Evaluator {
                 name,
                 func.params.len(),
                 args.len()
-            ));
+            )
+            .into());
         }
 
         // 引数を評価
@@ -491,17 +510,15 @@ impl Evaluator {
                 }
                 EvalResult::Break => {
                     self.env.pop_scope();
-                    return Err(format!(
-                        "{}行目: break はループの中でのみ使用できます",
-                        line
-                    ));
+                    return Err(
+                        format!("{}行目: break はループの中でのみ使用できます", line).into(),
+                    );
                 }
                 EvalResult::Continue => {
                     self.env.pop_scope();
-                    return Err(format!(
-                        "{}行目: continue はループの中でのみ使用できます",
-                        line
-                    ));
+                    return Err(
+                        format!("{}行目: continue はループの中でのみ使用できます", line).into(),
+                    );
                 }
                 EvalResult::Val => {}
             }
@@ -518,7 +535,7 @@ mod tests {
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 
-    fn run_program(input: &str) -> Result<(), String> {
+    fn run_program(input: &str) -> Result<(), TsumugiError> {
         let tokens = Lexer::new(input).tokenize();
         let program = Parser::new(tokens).parse()?;
         let mut eval = Evaluator::new();
@@ -541,7 +558,7 @@ mod tests {
     fn undefined_variable_error() {
         let result = run_program("let x = 10\nprint(y)");
         assert!(result.is_err());
-        let msg = result.unwrap_err();
+        let msg = result.unwrap_err().to_string();
         assert!(msg.contains("2行目"), "should mention line 2: {}", msg);
         assert!(msg.contains("未定義の変数"));
     }
@@ -550,7 +567,7 @@ mod tests {
     fn zero_division_error() {
         let result = run_program("let x = 10 / 0");
         assert!(result.is_err());
-        let msg = result.unwrap_err();
+        let msg = result.unwrap_err().to_string();
         assert!(msg.contains("1行目"));
         assert!(msg.contains("ゼロ除算"));
     }
@@ -559,7 +576,7 @@ mod tests {
     fn type_error() {
         let result = run_program("let x = \"hello\" + 1");
         assert!(result.is_err());
-        let msg = result.unwrap_err();
+        let msg = result.unwrap_err().to_string();
         assert!(msg.contains("型エラー"));
     }
 
@@ -567,7 +584,7 @@ mod tests {
     fn undefined_function_error() {
         let result = run_program("foo(1, 2)");
         assert!(result.is_err());
-        let msg = result.unwrap_err();
+        let msg = result.unwrap_err().to_string();
         assert!(msg.contains("未定義の関数"));
     }
 
@@ -576,7 +593,7 @@ mod tests {
         let src = "fn f(a)\n  return a\nend\nf(1, 2)";
         let result = run_program(src);
         assert!(result.is_err());
-        let msg = result.unwrap_err();
+        let msg = result.unwrap_err().to_string();
         assert!(msg.contains("引数"));
     }
 
@@ -603,7 +620,7 @@ mod tests {
     fn assign_undefined_variable_error() {
         let result = run_program("x = 42");
         assert!(result.is_err());
-        let msg = result.unwrap_err();
+        let msg = result.unwrap_err().to_string();
         assert!(msg.contains("1行目"), "should mention line 1: {}", msg);
         assert!(msg.contains("未定義の変数に代入"));
     }
@@ -675,7 +692,12 @@ mod tests {
     fn index_out_of_bounds() {
         let result = run_program("let xs = [1, 2]\nprint(xs[5])");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("インデックス範囲外"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("インデックス範囲外")
+        );
     }
 
     #[test]
@@ -703,7 +725,12 @@ mod tests {
     fn for_loop_non_iterable_error() {
         let result = run_program("for x in 42\n  print(x)\nend");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("for で反復できません"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("for で反復できません")
+        );
     }
 
     #[test]
@@ -728,14 +755,24 @@ mod tests {
     fn break_outside_loop_error() {
         let result = run_program("break");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("break はループの中でのみ"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("break はループの中でのみ")
+        );
     }
 
     #[test]
     fn continue_outside_loop_error() {
         let result = run_program("continue");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("continue はループの中でのみ"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("continue はループの中でのみ")
+        );
     }
 
     #[test]
@@ -747,7 +784,7 @@ mod tests {
     fn modulo_zero_error() {
         let result = run_program("let x = 10 % 0");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("ゼロ除算"));
+        assert!(result.unwrap_err().to_string().contains("ゼロ除算"));
     }
 
     #[test]
@@ -777,7 +814,7 @@ mod tests {
     fn builtin_pop_empty_error() {
         let result = run_program("let xs = []\npop(xs)");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("空のリスト"));
+        assert!(result.unwrap_err().to_string().contains("空のリスト"));
     }
 
     #[test]
@@ -824,7 +861,7 @@ mod tests {
     fn builtin_to_int_error() {
         let result = run_program("to_int(\"abc\")");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("変換失敗"));
+        assert!(result.unwrap_err().to_string().contains("変換失敗"));
     }
 
     #[test]
