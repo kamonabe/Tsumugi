@@ -196,3 +196,38 @@ fn error_type() {
     );
     assert!(!output.status.success());
 }
+
+#[test]
+fn error_zero_division() {
+    run_error_test("error_zero_division");
+}
+
+#[test]
+fn error_wrong_arg_count() {
+    run_error_test("error_wrong_arg_count");
+}
+
+#[test]
+fn error_undefined_fn() {
+    run_error_test("error_undefined_fn");
+}
+
+#[test]
+fn error_break_outside_loop() {
+    run_error_test("error_break_outside_loop");
+}
+
+#[test]
+fn error_continue_outside_loop() {
+    run_error_test("error_continue_outside_loop");
+}
+
+#[test]
+fn error_index_out_of_bounds() {
+    run_error_test("error_index_out_of_bounds");
+}
+
+#[test]
+fn error_dict_key_type() {
+    run_error_test("error_dict_key_type");
+}
