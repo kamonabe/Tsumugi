@@ -269,6 +269,47 @@ args           = expr ("," expr)*
 | 低 | クラス（継承なし・合成で拡張） |
 | 発展 | バイトコード VM 化 |
 
+## クロージャ導入時の AST 変更ポイント
+
+現在の `Expr::Call` は関数名を `String` で保持している:
+
+```rust
+Expr::Call { name: String, args: Vec<Expr> }
+```
+
+クロージャ（関数を値として扱う）を実装する場合、呼び出し対象が変数や式の評価結果になるため、以下の変更が必要:
+
+```rust
+// Before: 名前でしか呼べない
+Expr::Call { name: String, args: Vec<Expr> }
+
+// After: 任意の式を呼び出し対象にできる
+Expr::Call { callee: Box<Expr>, args: Vec<Expr> }
+```
+
+### 関連する変更箇所
+
+| モジュール | 変更内容 |
+|---|---|
+| `ast.rs` | `Call` バリアントの `name` → `callee: Box<Expr>` |
+| `parser.rs` | `parse_call` で識別子以外（括弧式やインデックスアクセス結果）も呼び出し対象としてパース |
+| `eval.rs` | `eval_call` で `callee` を評価し、結果が関数値なら呼び出す |
+| `value.rs` | `Value::Fn { params, body, closure_env }` バリアントを追加 |
+| `env.rs` | クロージャが捕捉する環境のスナップショット機構を追加 |
+| `builtin.rs` | 組み込み関数の呼び出しパスを `callee` が `Expr::Ident` の場合に限定して維持 |
+
+### 移行戦略
+
+1. まず `Value::Fn` を追加し、`fn` 定義を値としても扱えるようにする
+2. `Expr::Call` の `name` を `callee: Box<Expr>` に変更する
+3. `eval_call` で `callee` を評価し、`Value::Fn` なら実行、文字列なら従来の関数テーブル参照にフォールバック
+4. 最終的に関数テーブルを廃止し、全て環境内の変数として管理する
+
+### この変更を行うタイミング
+
+- クロージャ / 高階関数の実装に着手するとき
+- `filter` / `map` のような高階関数を組み込みに追加したいとき
+
 ## 参考資料
 
 - 「Writing An Interpreter In Go」(Thorsten Ball)
