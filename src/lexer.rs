@@ -270,7 +270,7 @@ impl Lexer {
                     Token::Gt
                 }
             }
-            _ => self.next_token().token, // 不明な文字はスキップ
+            _ => Token::Unknown(c), // 不明な文字はトークンとして記録
         }
     }
 }

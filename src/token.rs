@@ -55,6 +55,9 @@ pub enum Token {
     // 制御
     Newline,
     Eof,
+
+    // 不明な文字（レキサーが認識できない文字）
+    Unknown(char),
 }
 
 /// 行番号付きトークン

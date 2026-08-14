@@ -246,3 +246,8 @@ fn golden_closure() {
 fn golden_higher_order() {
     run_golden_test("higher_order");
 }
+
+#[test]
+fn error_unknown_char() {
+    run_error_test("error_unknown_char");
+}
