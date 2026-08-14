@@ -185,7 +185,7 @@ let_stmt       = "let" IDENT "=" expr NEWLINE
 assign_stmt    = IDENT "=" expr NEWLINE
 index_assign   = postfix "[" expr "]" "=" expr NEWLINE
 return_stmt    = "return" expr NEWLINE
-if_stmt        = "if" expr NEWLINE block ("else" NEWLINE block)? "end" NEWLINE
+if_stmt        = "if" expr NEWLINE block ("elif" expr NEWLINE block)* ("else" NEWLINE block)? "end" NEWLINE
 while_stmt     = "while" expr NEWLINE block "end" NEWLINE
 for_stmt       = "for" IDENT "in" expr NEWLINE block "end" NEWLINE
 break_stmt     = "break" NEWLINE

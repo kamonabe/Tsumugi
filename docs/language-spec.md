@@ -182,7 +182,19 @@ if 条件
 else
     本体
 end
+
+if 条件
+    本体
+elif 条件
+    本体
+elif 条件
+    本体
+else
+    本体
+end
 ```
+
+`elif` はいくつでも連鎖できる。`else` は省略可能。
 
 ## ループ
 

@@ -184,19 +184,34 @@ impl Parser {
         self.expect_newline()?;
         self.skip_newlines();
 
-        let then_body = self.parse_block(&[Token::Else, Token::End])?;
+        let then_body = self.parse_block(&[Token::Else, Token::Elif, Token::End])?;
 
-        let else_body = if self.peek_token() == Token::Else {
+        let else_body = if self.peek_token() == Token::Elif {
+            // elif を再帰的に if 文としてパース（end は最後の1つだけ必要）
+            let elif_stmt = self.parse_if()?; // elif を if として再帰パース
+            vec![elif_stmt]
+        } else if self.peek_token() == Token::Else {
             self.advance(); // consume 'else'
             self.expect_newline()?;
             self.skip_newlines();
-            self.parse_block(&[Token::End])?
+            let body = self.parse_block(&[Token::End])?;
+            self.expect(Token::End)?;
+            self.expect_newline_or_eof()?;
+            return Ok(Stmt::If {
+                condition,
+                then_body,
+                else_body: body,
+                line,
+            });
         } else {
             Vec::new()
         };
 
-        self.expect(Token::End)?;
-        self.expect_newline_or_eof()?;
+        if else_body.is_empty() {
+            // end で終わるケース（elif なし、else なし）
+            self.expect(Token::End)?;
+            self.expect_newline_or_eof()?;
+        }
 
         Ok(Stmt::If {
             condition,
@@ -979,6 +994,30 @@ mod tests {
                 other => panic!("expected Break, got {:?}", other),
             },
             other => panic!("expected While, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_elif() {
+        let program =
+            parse("if x == 1\n  print(1)\nelif x == 2\n  print(2)\nelse\n  print(0)\nend").unwrap();
+        assert_eq!(program.len(), 1);
+        match &program[0] {
+            Stmt::If { else_body, .. } => {
+                // elif は内部的にネストされた If になる
+                assert_eq!(else_body.len(), 1);
+                match &else_body[0] {
+                    Stmt::If {
+                        else_body: inner_else,
+                        ..
+                    } => {
+                        // else 部分
+                        assert_eq!(inner_else.len(), 1);
+                    }
+                    other => panic!("expected nested If, got {:?}", other),
+                }
+            }
+            other => panic!("expected If, got {:?}", other),
         }
     }
 

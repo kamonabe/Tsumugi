@@ -60,7 +60,7 @@ print(keys(config))
 - 四則演算・剰余演算・文字列結合
 - 比較演算 (`==`, `!=`, `<`, `>`, `<=`, `>=`)
 - 論理演算 (`and`, `or`, `not`)
-- 条件分岐 (`if` / `else` / `end`)
+- 条件分岐 (`if` / `elif` / `else` / `end`)
 - 関数定義・呼び出し (`fn` / `return` / `end`)
 - while ループ
 - for ループ (`for item in collection ... end`)
