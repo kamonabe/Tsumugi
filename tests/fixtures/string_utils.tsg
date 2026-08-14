@@ -1,0 +1,37 @@
+# trim
+print(trim("  hello  "))
+print(trim("\n  line\t "))
+
+# starts_with / ends_with
+print(starts_with("hello world", "hello"))
+print(starts_with("hello world", "world"))
+print(ends_with("report.csv", ".csv"))
+print(ends_with("report.csv", ".txt"))
+
+# replace
+print(replace("foo bar foo", "foo", "baz"))
+
+# upper / lower
+print(upper("hello"))
+print(lower("WORLD"))
+
+# to_float
+print(to_float("2.5"))
+print(to_float(10))
+
+# abs
+print(abs(-7))
+print(abs(3))
+
+# min / max
+print(min(100, 42))
+print(max(100, 42))
+
+# sort / reverse
+print(sort(["cherry", "apple", "banana"]))
+print(reverse([1, 2, 3]))
+print(reverse("hello"))
+
+# is_file / is_dir
+print(is_dir("/tmp"))
+print(is_file("/tmp"))

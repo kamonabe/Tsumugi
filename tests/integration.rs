@@ -156,6 +156,11 @@ fn golden_filesystem() {
     run_golden_test("filesystem");
 }
 
+#[test]
+fn golden_string_utils() {
+    run_golden_test("string_utils");
+}
+
 // --- エラー系テスト ---
 
 #[test]

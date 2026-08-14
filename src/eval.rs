@@ -1177,6 +1177,317 @@ impl Evaluator {
                     Err(_) => Value::Null,
                 });
             }
+            "trim" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: trim() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let s = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: trim() の引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                return Ok(Value::Str(s.trim().to_string()));
+            }
+            "starts_with" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "{}行目: starts_with() は引数2個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let s = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: starts_with() の第1引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                let prefix = match self.eval_expr(&args[1], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: starts_with() の第2引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                return Ok(Value::Bool(s.starts_with(&prefix)));
+            }
+            "ends_with" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "{}行目: ends_with() は引数2個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let s = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: ends_with() の第1引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                let suffix = match self.eval_expr(&args[1], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: ends_with() の第2引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                return Ok(Value::Bool(s.ends_with(&suffix)));
+            }
+            "replace" => {
+                if args.len() != 3 {
+                    return Err(format!(
+                        "{}行目: replace() は引数3個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let s = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: replace() の第1引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                let old = match self.eval_expr(&args[1], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: replace() の第2引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                let new = match self.eval_expr(&args[2], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: replace() の第3引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                return Ok(Value::Str(s.replace(&old, &new)));
+            }
+            "upper" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: upper() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let s = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: upper() の引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                return Ok(Value::Str(s.to_uppercase()));
+            }
+            "lower" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: lower() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let s = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: lower() の引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                return Ok(Value::Str(s.to_lowercase()));
+            }
+            "to_float" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: to_float() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let val = self.eval_expr(&args[0], line)?;
+                let result = match &val {
+                    Value::Float(f) => *f,
+                    Value::Int(n) => *n as f64,
+                    Value::Str(s) => s
+                        .parse::<f64>()
+                        .map_err(|_| format!("{}行目: to_float() 変換失敗: \"{}\"", line, s))?,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: to_float() で変換できません: {:?}",
+                            line, val
+                        ));
+                    }
+                };
+                return Ok(Value::Float(result));
+            }
+            "abs" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: abs() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let val = self.eval_expr(&args[0], line)?;
+                return Ok(match val {
+                    Value::Int(n) => Value::Int(n.abs()),
+                    Value::Float(f) => Value::Float(f.abs()),
+                    _ => {
+                        return Err(format!("{}行目: abs() は数値にのみ使用できます", line));
+                    }
+                });
+            }
+            "min" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "{}行目: min() は引数2個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let a = self.eval_expr(&args[0], line)?;
+                let b = self.eval_expr(&args[1], line)?;
+                return Ok(match (&a, &b) {
+                    (Value::Int(x), Value::Int(y)) => Value::Int(*x.min(y)),
+                    (Value::Float(x), Value::Float(y)) => Value::Float(x.min(*y)),
+                    (Value::Int(x), Value::Float(y)) => Value::Float((*x as f64).min(*y)),
+                    (Value::Float(x), Value::Int(y)) => Value::Float(x.min(*y as f64)),
+                    _ => {
+                        return Err(format!("{}行目: min() は数値にのみ使用できます", line));
+                    }
+                });
+            }
+            "max" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "{}行目: max() は引数2個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let a = self.eval_expr(&args[0], line)?;
+                let b = self.eval_expr(&args[1], line)?;
+                return Ok(match (&a, &b) {
+                    (Value::Int(x), Value::Int(y)) => Value::Int(*x.max(y)),
+                    (Value::Float(x), Value::Float(y)) => Value::Float(x.max(*y)),
+                    (Value::Int(x), Value::Float(y)) => Value::Float((*x as f64).max(*y)),
+                    (Value::Float(x), Value::Int(y)) => Value::Float(x.max(*y as f64)),
+                    _ => {
+                        return Err(format!("{}行目: max() は数値にのみ使用できます", line));
+                    }
+                });
+            }
+            "sort" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: sort() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let val = self.eval_expr(&args[0], line)?;
+                return Ok(match val {
+                    Value::List(mut list) => {
+                        list.sort_by_key(|a| a.to_string());
+                        Value::List(list)
+                    }
+                    _ => {
+                        return Err(format!("{}行目: sort() はリストにのみ使用できます", line));
+                    }
+                });
+            }
+            "reverse" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: reverse() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let val = self.eval_expr(&args[0], line)?;
+                return Ok(match val {
+                    Value::List(mut list) => {
+                        list.reverse();
+                        Value::List(list)
+                    }
+                    Value::Str(s) => Value::Str(s.chars().rev().collect()),
+                    _ => {
+                        return Err(format!(
+                            "{}行目: reverse() はリストまたは文字列にのみ使用できます",
+                            line
+                        ));
+                    }
+                });
+            }
+            "is_file" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: is_file() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let path = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: is_file() の引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                return Ok(Value::Bool(Path::new(&path).is_file()));
+            }
+            "is_dir" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: is_dir() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let path = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: is_dir() の引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                return Ok(Value::Bool(Path::new(&path).is_dir()));
+            }
             _ => {}
         }
 
@@ -1736,5 +2047,60 @@ mod tests {
             "write_file(\"/tmp/tsg_remove_test.txt\", \"x\")\nprint(remove(\"/tmp/tsg_remove_test.txt\"))\nprint(path_exists(\"/tmp/tsg_remove_test.txt\"))",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn builtin_trim() {
+        run_program("print(trim(\"  hello  \"))").unwrap();
+    }
+
+    #[test]
+    fn builtin_starts_with() {
+        run_program("print(starts_with(\"hello\", \"hel\"))").unwrap();
+    }
+
+    #[test]
+    fn builtin_ends_with() {
+        run_program("print(ends_with(\"file.txt\", \".txt\"))").unwrap();
+    }
+
+    #[test]
+    fn builtin_replace() {
+        run_program("print(replace(\"aabbcc\", \"bb\", \"XX\"))").unwrap();
+    }
+
+    #[test]
+    fn builtin_upper_lower() {
+        run_program("print(upper(\"hello\"))\nprint(lower(\"WORLD\"))").unwrap();
+    }
+
+    #[test]
+    fn builtin_to_float() {
+        run_program("print(to_float(\"3.14\"))\nprint(to_float(42))").unwrap();
+    }
+
+    #[test]
+    fn builtin_abs() {
+        run_program("print(abs(-5))\nprint(abs(3))").unwrap();
+    }
+
+    #[test]
+    fn builtin_min_max() {
+        run_program("print(min(10, 3))\nprint(max(10, 3))").unwrap();
+    }
+
+    #[test]
+    fn builtin_sort() {
+        run_program("print(sort([3, 1, 2]))").unwrap();
+    }
+
+    #[test]
+    fn builtin_reverse() {
+        run_program("print(reverse([1, 2, 3]))\nprint(reverse(\"abc\"))").unwrap();
+    }
+
+    #[test]
+    fn builtin_is_file_is_dir() {
+        run_program("print(is_dir(\"/tmp\"))\nprint(is_file(\"/tmp\"))").unwrap();
     }
 }
