@@ -28,17 +28,18 @@ pub enum Token {
     Print,
 
     // 演算子
-    Plus,   // +
-    Minus,  // -
-    Star,   // *
-    Slash,  // /
-    Assign, // =
-    Eq,     // ==
-    NotEq,  // !=
-    Lt,     // <
-    Gt,     // >
-    LtEq,   // <=
-    GtEq,   // >=
+    Plus,    // +
+    Minus,   // -
+    Star,    // *
+    Slash,   // /
+    Percent, // %
+    Assign,  // =
+    Eq,      // ==
+    NotEq,   // !=
+    Lt,      // <
+    Gt,      // >
+    LtEq,    // <=
+    GtEq,    // >=
 
     // 区切り
     LParen,   // (

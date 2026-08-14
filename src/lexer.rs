@@ -226,6 +226,7 @@ impl Lexer {
             '-' => Token::Minus,
             '*' => Token::Star,
             '/' => Token::Slash,
+            '%' => Token::Percent,
             '(' => Token::LParen,
             ')' => Token::RParen,
             '[' => Token::LBracket,

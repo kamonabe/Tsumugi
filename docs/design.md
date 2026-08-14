@@ -199,7 +199,7 @@ or_expr        = and_expr ("or" and_expr)*
 and_expr       = cmp_expr ("and" cmp_expr)*
 cmp_expr       = add_expr (("==" | "!=" | "<" | ">" | "<=" | ">=") add_expr)*
 add_expr       = mul_expr (("+" | "-") mul_expr)*
-mul_expr       = unary_expr (("*" | "/") unary_expr)*
+mul_expr       = unary_expr (("*" | "/" | "%") unary_expr)*
 unary_expr     = ("not" | "-") unary_expr | postfix
 postfix        = primary ( "(" args? ")" | "[" expr "]" )*
 primary        = INT | FLOAT | STRING | "true" | "false" | "null"
@@ -214,7 +214,6 @@ args           = expr ("," expr)*
 | 優先度 | 項目 |
 |---|---|
 | 中 | 組み込み関数の追加（pop, slice, contains 等） |
-| 中 | 剰余演算子 `%` |
 | 低 | モジュール / import |
 | 低 | クロージャ / 高階関数 |
 | 発展 | バイトコード VM 化 |

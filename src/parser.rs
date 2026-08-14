@@ -478,6 +478,7 @@ impl Parser {
             let op = match self.peek_token() {
                 Token::Star => BinOpKind::Mul,
                 Token::Slash => BinOpKind::Div,
+                Token::Percent => BinOpKind::Mod,
                 _ => break,
             };
             self.advance();
