@@ -224,6 +224,11 @@ impl Lexer {
             '/' => Token::Slash,
             '(' => Token::LParen,
             ')' => Token::RParen,
+            '[' => Token::LBracket,
+            ']' => Token::RBracket,
+            '{' => Token::LBrace,
+            '}' => Token::RBrace,
+            ':' => Token::Colon,
             ',' => Token::Comma,
             '=' => {
                 if self.peek() == Some('=') {

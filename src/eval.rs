@@ -2,6 +2,8 @@ use crate::ast::*;
 use crate::env::{Env, Function};
 use crate::value::Value;
 
+use std::collections::BTreeMap;
+
 /// 評価器の戻り値（通常の値 or return による早期脱出）
 enum EvalResult {
     Val,
@@ -35,6 +37,83 @@ impl Evaluator {
             Stmt::Let { name, value, line } => {
                 let val = self.eval_expr(value, *line)?;
                 self.env.set(name, val);
+                Ok(EvalResult::Val)
+            }
+
+            Stmt::Assign { name, value, line } => {
+                let val = self.eval_expr(value, *line)?;
+                if self.env.update(name, val).is_err() {
+                    return Err(format!("{}行目: 未定義の変数に代入: {}", line, name));
+                }
+                Ok(EvalResult::Val)
+            }
+
+            Stmt::IndexAssign {
+                object,
+                index,
+                value,
+                line,
+            } => {
+                let idx = self.eval_expr(index, *line)?;
+                let val = self.eval_expr(value, *line)?;
+
+                // object は変数参照であるはず
+                let var_name = match object {
+                    Expr::Ident(name) => name.clone(),
+                    _ => {
+                        return Err(format!(
+                            "{}行目: インデックス代入の対象は変数である必要があります",
+                            line
+                        ));
+                    }
+                };
+
+                let target = self
+                    .env
+                    .get_mut(&var_name)
+                    .ok_or_else(|| format!("{}行目: 未定義の変数: {}", line, var_name))?;
+
+                match target {
+                    Value::List(list) => {
+                        let i = match &idx {
+                            Value::Int(n) => *n,
+                            _ => {
+                                return Err(format!(
+                                    "{}行目: リストのインデックスは整数である必要があります",
+                                    line
+                                ));
+                            }
+                        };
+                        let len = list.len() as i64;
+                        let actual_idx = if i < 0 { len + i } else { i };
+                        if actual_idx < 0 || actual_idx >= len {
+                            return Err(format!(
+                                "{}行目: インデックス範囲外: {} (長さ: {})",
+                                line, i, len
+                            ));
+                        }
+                        list[actual_idx as usize] = val;
+                    }
+                    Value::Dict(map) => {
+                        let key = match &idx {
+                            Value::Str(s) => s.clone(),
+                            _ => {
+                                return Err(format!(
+                                    "{}行目: 辞書のキーは文字列である必要があります",
+                                    line
+                                ));
+                            }
+                        };
+                        map.insert(key, val);
+                    }
+                    _ => {
+                        return Err(format!(
+                            "{}行目: インデックス代入はリストまたは辞書にのみ使用できます",
+                            line
+                        ));
+                    }
+                }
+
                 Ok(EvalResult::Val)
             }
 
@@ -109,6 +188,32 @@ impl Evaluator {
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Null => Ok(Value::Null),
 
+            Expr::List(items) => {
+                let mut values = Vec::new();
+                for item in items {
+                    values.push(self.eval_expr(item, line)?);
+                }
+                Ok(Value::List(values))
+            }
+
+            Expr::Dict(pairs) => {
+                let mut map = BTreeMap::new();
+                for (key_expr, val_expr) in pairs {
+                    let key = match self.eval_expr(key_expr, line)? {
+                        Value::Str(s) => s,
+                        other => {
+                            return Err(format!(
+                                "{}行目: 辞書のキーは文字列である必要があります。got: {:?}",
+                                line, other
+                            ));
+                        }
+                    };
+                    let val = self.eval_expr(val_expr, line)?;
+                    map.insert(key, val);
+                }
+                Ok(Value::Dict(map))
+            }
+
             Expr::Ident(name) => self
                 .env
                 .get(name)
@@ -127,6 +232,48 @@ impl Evaluator {
             }
 
             Expr::Call { name, args } => self.eval_call(name, args, line),
+
+            Expr::Index { object, index } => {
+                let obj = self.eval_expr(object, line)?;
+                let idx = self.eval_expr(index, line)?;
+                self.eval_index(&obj, &idx, line)
+            }
+        }
+    }
+
+    /// インデックスアクセスの評価
+    fn eval_index(&self, object: &Value, index: &Value, line: usize) -> Result<Value, String> {
+        match (object, index) {
+            (Value::List(list), Value::Int(i)) => {
+                let len = list.len() as i64;
+                let actual = if *i < 0 { len + *i } else { *i };
+                if actual < 0 || actual >= len {
+                    return Err(format!(
+                        "{}行目: インデックス範囲外: {} (長さ: {})",
+                        line, i, len
+                    ));
+                }
+                Ok(list[actual as usize].clone())
+            }
+            (Value::Dict(map), Value::Str(key)) => {
+                Ok(map.get(key).cloned().unwrap_or(Value::Null))
+            }
+            (Value::Str(s), Value::Int(i)) => {
+                let len = s.chars().count() as i64;
+                let actual = if *i < 0 { len + *i } else { *i };
+                if actual < 0 || actual >= len {
+                    return Err(format!(
+                        "{}行目: インデックス範囲外: {} (長さ: {})",
+                        line, i, len
+                    ));
+                }
+                let ch = s.chars().nth(actual as usize).unwrap();
+                Ok(Value::Str(ch.to_string()))
+            }
+            _ => Err(format!(
+                "{}行目: インデックスアクセスできません: {:?}[{:?}]",
+                line, object, index
+            )),
         }
     }
 
@@ -209,14 +356,118 @@ impl Evaluator {
     /// 関数呼び出し
     fn eval_call(&mut self, name: &str, args: &[Expr], line: usize) -> Result<Value, String> {
         // 組み込み関数
-        if name == "print" {
-            let mut parts = Vec::new();
-            for arg in args {
-                let val = self.eval_expr(arg, line)?;
-                parts.push(val.to_string());
+        match name {
+            "print" => {
+                let mut parts = Vec::new();
+                for arg in args {
+                    let val = self.eval_expr(arg, line)?;
+                    parts.push(val.to_string());
+                }
+                println!("{}", parts.join(" "));
+                return Ok(Value::Null);
             }
-            println!("{}", parts.join(" "));
-            return Ok(Value::Null);
+            "len" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: len() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let val = self.eval_expr(&args[0], line)?;
+                let length = match &val {
+                    Value::Str(s) => s.chars().count() as i64,
+                    Value::List(v) => v.len() as i64,
+                    Value::Dict(m) => m.len() as i64,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: len() は文字列・リスト・辞書にのみ使用できます",
+                            line
+                        ));
+                    }
+                };
+                return Ok(Value::Int(length));
+            }
+            "push" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "{}行目: push() は引数2個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                // 第1引数は変数名（リストへの参照）
+                let var_name = match &args[0] {
+                    Expr::Ident(name) => name.clone(),
+                    _ => {
+                        return Err(format!(
+                            "{}行目: push() の第1引数はリスト変数である必要があります",
+                            line
+                        ));
+                    }
+                };
+                let val = self.eval_expr(&args[1], line)?;
+                let target = self
+                    .env
+                    .get_mut(&var_name)
+                    .ok_or_else(|| format!("{}行目: 未定義の変数: {}", line, var_name))?;
+                match target {
+                    Value::List(list) => {
+                        list.push(val);
+                    }
+                    _ => {
+                        return Err(format!(
+                            "{}行目: push() はリストにのみ使用できます",
+                            line
+                        ));
+                    }
+                }
+                return Ok(Value::Null);
+            }
+            "keys" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: keys() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let val = self.eval_expr(&args[0], line)?;
+                match val {
+                    Value::Dict(map) => {
+                        let key_list: Vec<Value> =
+                            map.keys().map(|k| Value::Str(k.clone())).collect();
+                        return Ok(Value::List(key_list));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "{}行目: keys() は辞書にのみ使用できます",
+                            line
+                        ));
+                    }
+                }
+            }
+            "type" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: type() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let val = self.eval_expr(&args[0], line)?;
+                let type_name = match &val {
+                    Value::Int(_) => "int",
+                    Value::Float(_) => "float",
+                    Value::Str(_) => "str",
+                    Value::Bool(_) => "bool",
+                    Value::Null => "null",
+                    Value::List(_) => "list",
+                    Value::Dict(_) => "dict",
+                };
+                return Ok(Value::Str(type_name.to_string()));
+            }
+            _ => {}
         }
 
         // ユーザー定義関数
@@ -342,6 +593,34 @@ mod tests {
     }
 
     #[test]
+    fn assign_variable() {
+        let src = "let x = 1\nx = 2\nprint(x)";
+        run_program(src).unwrap();
+    }
+
+    #[test]
+    fn assign_in_while_loop() {
+        let src = "let count = 3\nwhile count > 0\n  count = count - 1\nend\nprint(count)";
+        run_program(src).unwrap();
+    }
+
+    #[test]
+    fn assign_undefined_variable_error() {
+        let result = run_program("x = 42");
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("1行目"), "should mention line 1: {}", msg);
+        assert!(msg.contains("未定義の変数に代入"));
+    }
+
+    #[test]
+    fn assign_updates_outer_scope() {
+        // 関数内から引数を再代入して、関数内で反映されることを確認
+        let src = "fn countdown(n)\n  while n > 0\n    print(n)\n    n = n - 1\n  end\n  return n\nend\nlet r = countdown(3)\nprint(r)";
+        run_program(src).unwrap();
+    }
+
+    #[test]
     fn if_else() {
         let src = "if false\n  print(1)\nelse\n  print(2)\nend";
         run_program(src).unwrap();
@@ -355,5 +634,52 @@ mod tests {
     #[test]
     fn logical_ops() {
         run_program("let x = true and false\nlet y = true or false\nlet z = not true").unwrap();
+    }
+
+    #[test]
+    fn list_literal_and_index() {
+        run_program("let xs = [1, 2, 3]\nprint(xs[0])\nprint(xs[-1])").unwrap();
+    }
+
+    #[test]
+    fn list_index_assign() {
+        run_program("let xs = [1, 2, 3]\nxs[1] = 99\nprint(xs[1])").unwrap();
+    }
+
+    #[test]
+    fn dict_literal_and_access() {
+        run_program("let d = {\"a\": 1, \"b\": 2}\nprint(d[\"a\"])").unwrap();
+    }
+
+    #[test]
+    fn dict_index_assign() {
+        run_program("let d = {}\nd[\"x\"] = 42\nprint(d[\"x\"])").unwrap();
+    }
+
+    #[test]
+    fn builtin_len() {
+        run_program("let xs = [1, 2, 3]\nprint(len(xs))\nprint(len(\"hello\"))").unwrap();
+    }
+
+    #[test]
+    fn builtin_push() {
+        run_program("let xs = []\npush(xs, 1)\npush(xs, 2)\nprint(len(xs))").unwrap();
+    }
+
+    #[test]
+    fn builtin_keys() {
+        run_program("let d = {\"a\": 1}\nlet ks = keys(d)\nprint(len(ks))").unwrap();
+    }
+
+    #[test]
+    fn builtin_type() {
+        run_program("print(type(42))\nprint(type([]))\nprint(type({}))").unwrap();
+    }
+
+    #[test]
+    fn index_out_of_bounds() {
+        let result = run_program("let xs = [1, 2]\nprint(xs[5])");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("インデックス範囲外"));
     }
 }

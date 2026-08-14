@@ -111,11 +111,26 @@ fn golden_logic() {
     run_golden_test("logic");
 }
 
+#[test]
+fn golden_assign() {
+    run_golden_test("assign");
+}
+
+#[test]
+fn golden_list_dict() {
+    run_golden_test("list_dict");
+}
+
 // --- エラー系テスト ---
 
 #[test]
 fn error_undefined_var() {
     run_error_test("error_undefined_var");
+}
+
+#[test]
+fn error_assign_undefined() {
+    run_error_test("error_assign_undefined");
 }
 
 #[test]

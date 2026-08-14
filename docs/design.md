@@ -32,7 +32,7 @@
 
 - 入門レベルでは型チェッカーを作るコストが大きい
 - 動的型付けなら実行時にエラーを出せば済むので実装が楽
-- 型: Int, Float, Str, Bool, Null
+- 型: Int, Float, Str, Bool, Null, List, Dict
 
 ### 実行方式: ツリーウォークインタプリタ
 
@@ -58,6 +58,32 @@
 - AST の各 `Stmt` バリアントにも `line` フィールドを保持
 - パースエラー・ランタイムエラーの両方で「N行目: ...」形式のメッセージを表示
 - REPL では入力ごとに1行目からカウント（ファイル実行時はファイル先頭から通し番号）
+
+### 変数の再代入: `let` なしの代入文
+
+- `let x = 1` で宣言、`x = 2` で再代入の2段階方式を採用
+- 未宣言の変数への代入はランタイムエラーとする（typo 防止）
+- 再代入時はスコープを内側→外側へ探索し、最初に見つかった変数を更新する（クロージャ的なセマンティクス）
+- これにより `while` ループ内でカウンタ変数を自然に更新できるようになった
+- 代替案: Python のように代入文を変数宣言と区別しない方式もあったが、「明示的な宣言を必須とする」方が学習者に変数のライフサイクルを意識させやすいと判断
+
+### リスト・辞書: コレクション型
+
+設計判断:
+- リストは `Vec<Value>` で実装。型混在を許容する（動的型付けと整合）
+- 辞書は `BTreeMap<String, Value>` で実装。キーを文字列に限定することでシンプルさを維持
+- `HashMap` ではなく `BTreeMap` を採用した理由: `print()` 時の出力がキー順で安定し、テストが書きやすい
+- インデックスアクセスは `expr[expr]` 構文でリスト・辞書・文字列に統一的に使える
+- インデックス代入は `Stmt::IndexAssign` で表現。`Env::get_mut()` で変数を可変参照で取得し直接更新する方式
+- 負のインデックス対応（Python 風）: `-1` で末尾要素にアクセス可能
+- 辞書の存在しないキーへのアクセスは `null` を返す（エラーにしない）— 存在チェックは `== null` で判定する想定
+
+### 組み込み関数の拡充
+
+- `print` に加えて `len` / `push` / `keys` / `type` を追加
+- `push` は破壊的操作として設計（`Env::get_mut()` で直接リストを変更）
+- 関数的スタイル（新しいリストを返す `append`）も検討したが、入門レベルでは破壊的操作の方が直感的と判断
+- `type()` はデバッグや型チェック用途。動的型付け言語では実行時に型を確認したい場面が多い
 
 ## アーキテクチャ
 
@@ -112,6 +138,9 @@
 
 - スコープのスタック（Vec<HashMap>）
 - 変数検索は内側 → 外側の順
+- `set()` は現在のスコープに変数を新規定義
+- `update()` は内側→外側へ探索し、既存変数を更新（見つからなければエラー）
+- `get_mut()` は可変参照で変数を取得（インデックス代入・push で使用）
 - 関数定義はグローバルな HashMap で管理
 
 ## テスト設計
@@ -122,11 +151,11 @@
 
 | モジュール | テスト観点 |
 |---|---|
-| `value.rs` | `is_truthy` 判定、`Display` 表示 |
-| `env.rs` | 変数 set/get、スコープ shadowing、外側スコープ参照 |
+| `value.rs` | `is_truthy` 判定（List/Dict含む）、`Display` 表示 |
+| `env.rs` | 変数 set/get/get_mut、スコープ shadowing、外側スコープ参照、update（再代入） |
 | `lexer.rs` | トークン化、行番号付与、エスケープ、演算子、キーワード、コメント |
-| `parser.rs` | 各文のAST生成、エラー時の行番号含有 |
-| `eval.rs` | 算術・比較・論理、関数呼び出し、エラーケース全般 |
+| `parser.rs` | 各文のAST生成、リスト/辞書リテラル、インデックスアクセス/代入、エラー時の行番号含有 |
+| `eval.rs` | 算術・比較・論理、関数呼び出し、リスト/辞書操作、組み込み関数、エラーケース全般 |
 
 ### 統合テスト（ゴールデンテスト）
 
@@ -145,41 +174,45 @@ GitHub Actions (`.github/workflows/ci.yml`) で push / PR 時に自動実行:
 2. `cargo clippy -- -D warnings` — 静的解析
 3. `cargo test` — 全テスト実行
 
-## 文法仕様 (v0.1)
+## 文法仕様 (v0.2)
 
 ```
-program     = stmt*
-stmt        = let_stmt | return_stmt | if_stmt | while_stmt | fn_def | expr_stmt
-let_stmt    = "let" IDENT "=" expr NEWLINE
-return_stmt = "return" expr NEWLINE
-if_stmt     = "if" expr NEWLINE block ("else" NEWLINE block)? "end" NEWLINE
-while_stmt  = "while" expr NEWLINE block "end" NEWLINE
-fn_def      = "fn" IDENT "(" params? ")" NEWLINE block "end" NEWLINE
-expr_stmt   = expr NEWLINE
-block       = stmt*
-params      = IDENT ("," IDENT)*
-expr        = or_expr
-or_expr     = and_expr ("or" and_expr)*
-and_expr    = cmp_expr ("and" cmp_expr)*
-cmp_expr    = add_expr (("==" | "!=" | "<" | ">" | "<=" | ">=") add_expr)*
-add_expr    = mul_expr (("+" | "-") mul_expr)*
-mul_expr    = unary_expr (("*" | "/") unary_expr)*
-unary_expr  = ("not" | "-") unary_expr | call_expr
-call_expr   = primary ("(" args? ")")?
-primary     = INT | FLOAT | STRING | "true" | "false" | "null" | IDENT | "(" expr ")"
-args        = expr ("," expr)*
+program        = stmt*
+stmt           = let_stmt | assign_stmt | index_assign | return_stmt
+               | if_stmt | while_stmt | fn_def | expr_stmt
+let_stmt       = "let" IDENT "=" expr NEWLINE
+assign_stmt    = IDENT "=" expr NEWLINE
+index_assign   = postfix "[" expr "]" "=" expr NEWLINE
+return_stmt    = "return" expr NEWLINE
+if_stmt        = "if" expr NEWLINE block ("else" NEWLINE block)? "end" NEWLINE
+while_stmt     = "while" expr NEWLINE block "end" NEWLINE
+fn_def         = "fn" IDENT "(" params? ")" NEWLINE block "end" NEWLINE
+expr_stmt      = expr NEWLINE
+block          = stmt*
+params         = IDENT ("," IDENT)*
+expr           = or_expr
+or_expr        = and_expr ("or" and_expr)*
+and_expr       = cmp_expr ("and" cmp_expr)*
+cmp_expr       = add_expr (("==" | "!=" | "<" | ">" | "<=" | ">=") add_expr)*
+add_expr       = mul_expr (("+" | "-") mul_expr)*
+mul_expr       = unary_expr (("*" | "/") unary_expr)*
+unary_expr     = ("not" | "-") unary_expr | postfix
+postfix        = primary ( "(" args? ")" | "[" expr "]" )*
+primary        = INT | FLOAT | STRING | "true" | "false" | "null"
+               | IDENT | "(" expr ")" | list_literal | dict_literal
+list_literal   = "[" (expr ("," expr)* ","?)? "]"
+dict_literal   = "{" (expr ":" expr ("," expr ":" expr)* ","?)? "}"
+args           = expr ("," expr)*
 ```
 
 ## 今後の候補
 
 | 優先度 | 項目 |
 |---|---|
-| 高 | 変数の再代入（`let` なしの代入文） |
-| 中 | 配列リテラル・インデックスアクセス |
-| 中 | 組み込み関数の追加（len, type, to_string 等） |
-| 低 | ハッシュマップ |
-| 低 | for ループ（配列のイテレーション） |
+| 中 | for ループ（リストのイテレーション） |
+| 中 | 組み込み関数の追加（pop, slice, contains 等） |
 | 低 | モジュール / import |
+| 低 | クロージャ / 高階関数 |
 | 発展 | バイトコード VM 化 |
 
 ## 参考資料

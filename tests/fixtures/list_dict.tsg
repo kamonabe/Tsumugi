@@ -1,0 +1,47 @@
+# リスト基本操作
+let fruits = ["apple", "banana", "cherry"]
+print(len(fruits))
+print(fruits[0])
+print(fruits[-1])
+
+# リスト更新
+fruits[1] = "blueberry"
+print(fruits[1])
+
+# push
+push(fruits, "date")
+print(len(fruits))
+
+# 辞書基本操作
+let person = {"name": "tsumugi", "age": 1}
+print(person["name"])
+print(person["age"])
+print(len(person))
+
+# 辞書更新・追加
+person["age"] = 2
+person["lang"] = "rust"
+print(person["age"])
+print(person["lang"])
+
+# keys
+let ks = keys(person)
+print(len(ks))
+
+# type
+print(type(fruits))
+print(type(person))
+print(type(42))
+print(type("hi"))
+print(type(null))
+
+# 空リスト・空辞書
+let empty_list = []
+let empty_dict = {}
+print(len(empty_list))
+print(len(empty_dict))
+
+# リスト内の辞書
+let items = [{"id": 1}, {"id": 2}]
+print(items[0]["id"])
+print(items[1]["id"])
