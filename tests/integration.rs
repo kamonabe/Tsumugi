@@ -151,6 +151,11 @@ fn golden_local_utils() {
     run_golden_test("local_utils");
 }
 
+#[test]
+fn golden_filesystem() {
+    run_golden_test("filesystem");
+}
+
 // --- エラー系テスト ---
 
 #[test]
