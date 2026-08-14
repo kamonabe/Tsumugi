@@ -121,6 +121,11 @@ fn golden_list_dict() {
     run_golden_test("list_dict");
 }
 
+#[test]
+fn golden_for_loop() {
+    run_golden_test("for_loop");
+}
+
 // --- エラー系テスト ---
 
 #[test]

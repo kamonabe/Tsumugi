@@ -102,7 +102,7 @@ fn is_incomplete(input: &str) -> bool {
     let mut depth: i32 = 0;
     for word in input.split_whitespace() {
         match word {
-            "if" | "fn" | "while" => depth += 1,
+            "if" | "fn" | "while" | "for" => depth += 1,
             "end" => depth -= 1,
             _ => {}
         }

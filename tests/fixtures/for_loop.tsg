@@ -1,0 +1,30 @@
+# リストのイテレーション
+let fruits = ["apple", "banana", "cherry"]
+for fruit in fruits
+    print(fruit)
+end
+
+# 合計の計算
+let nums = [10, 20, 30]
+let total = 0
+for n in nums
+    total = total + n
+end
+print(total)
+
+# 辞書のイテレーション（キー順）
+let d = {"a": 1, "b": 2, "c": 3}
+for key in d
+    print(key)
+end
+
+# 文字列のイテレーション
+for ch in "abc"
+    print(ch)
+end
+
+# 空リストではループしない
+for x in []
+    print("never")
+end
+print("done")

@@ -185,10 +185,40 @@ end
 
 ## ループ
 
+### while
+
 ```
 while 条件
     本体
 end
+```
+
+### for
+
+リスト・辞書・文字列を反復する。
+
+```
+for item in collection
+    本体
+end
+```
+
+対応するコレクション:
+- リスト — 各要素を順にバインド
+- 辞書 — キーをアルファベット順にバインド
+- 文字列 — 各文字を順にバインド
+
+```
+let fruits = ["apple", "banana", "cherry"]
+for fruit in fruits
+    print(fruit)
+end
+
+let total = 0
+for n in [1, 2, 3, 4, 5]
+    total = total + n
+end
+print(total)  # 15
 ```
 
 ## 関数

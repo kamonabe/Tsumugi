@@ -202,6 +202,8 @@ impl Lexer {
             "if" => Token::If,
             "else" => Token::Else,
             "while" => Token::While,
+            "for" => Token::For,
+            "in" => Token::In,
             "end" => Token::End,
             "and" => Token::And,
             "or" => Token::Or,
@@ -347,13 +349,15 @@ mod tests {
     #[test]
     fn keywords() {
         let tokens =
-            tokens_only("if else while fn end return let and or not true false null print");
+            tokens_only("if else while for in fn end return let and or not true false null print");
         assert_eq!(
             tokens,
             vec![
                 Token::If,
                 Token::Else,
                 Token::While,
+                Token::For,
+                Token::In,
                 Token::Fn,
                 Token::End,
                 Token::Return,
