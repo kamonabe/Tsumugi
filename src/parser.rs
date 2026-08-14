@@ -641,6 +641,7 @@ impl Parser {
             }
             Token::LBracket => self.parse_list_literal(),
             Token::LBrace => self.parse_dict_literal(),
+            Token::Fn => self.parse_anonymous_fn(),
             other => Err(TsumugiError::parse(
                 spanned.line,
                 format!("予期しないトークン: {:?}", other),
@@ -701,6 +702,37 @@ impl Parser {
 
         self.expect(Token::RBrace)?;
         Ok(Expr::Dict(pairs))
+    }
+
+    /// 無名関数式: fn(params) body end
+    /// 複数行: fn(params)\n body \n end
+    /// 1行:    fn(params) expr end
+    fn parse_anonymous_fn(&mut self) -> Result<Expr, TsumugiError> {
+        self.advance(); // consume 'fn'
+        self.expect(Token::LParen)?;
+        let params = self.parse_params()?;
+        self.expect(Token::RParen)?;
+
+        // 改行があれば複数行、なければ1行（暗黙 return）
+        if self.peek_token() == Token::Newline {
+            self.advance(); // consume newline
+            let body = self.parse_block(&[Token::End])?;
+            self.advance(); // consume 'end'
+            Ok(Expr::Lambda { params, body })
+        } else {
+            // 1行ラムダ: fn(x) expr end → 暗黙的に return 扱い
+            let line = self.current_line();
+            // "return" キーワードがあれば消費
+            if self.peek_token() == Token::Return {
+                self.advance();
+            }
+            let expr = self.parse_expr()?;
+            self.expect(Token::End)?;
+            Ok(Expr::Lambda {
+                params,
+                body: vec![Stmt::Return { value: expr, line }],
+            })
+        }
     }
 
     // --- ユーティリティ ---
