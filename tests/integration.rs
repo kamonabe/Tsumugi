@@ -3,23 +3,9 @@
 use std::path::Path;
 use std::process::Command;
 
-/// テストバイナリのパスを取得
-fn tsumugi_bin() -> String {
-    // cargo test で実行されるので、target ディレクトリに debug ビルドがある
-    let mut path = std::env::current_exe().unwrap();
-    // tests/integration-xxx → 上に上がって target/debug/ を見つける
-    path.pop(); // deps/
-    path.pop(); // debug/ or release/
-    path.push("debug");
-    path.push("tsumugi");
-
-    // fallback: cargo build で生成される場所
-    if !path.exists() {
-        path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target/debug/tsumugi")
-            .to_path_buf();
-    }
-    path.to_string_lossy().to_string()
+/// テストバイナリのパスを取得（Cargo が提供する環境変数を使用）
+fn tsumugi_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_tsumugi")
 }
 
 fn fixtures_dir() -> std::path::PathBuf {
