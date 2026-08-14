@@ -125,7 +125,7 @@ src/
 ├── value.rs    # 実行時の値型
 ├── env.rs      # 環境（変数スコープ・関数テーブル）
 ├── eval.rs     # 評価器（AST → 実行、エラーに行番号付与）
-└── builtin.rs  # 組み込み関数（44個）の実装
+└── builtin.rs  # 組み込み関数（50個）の実装
 
 tests/
 ├── integration.rs    # 統合テスト（ゴールデンテスト）
