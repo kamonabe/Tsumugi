@@ -538,6 +538,239 @@ impl Evaluator {
                 };
                 return Ok(Value::Str(type_name.to_string()));
             }
+            "pop" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: pop() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let var_name = match &args[0] {
+                    Expr::Ident(name) => name.clone(),
+                    _ => {
+                        return Err(format!(
+                            "{}行目: pop() の引数はリスト変数である必要があります",
+                            line
+                        ));
+                    }
+                };
+                let target = self
+                    .env
+                    .get_mut(&var_name)
+                    .ok_or_else(|| format!("{}行目: 未定義の変数: {}", line, var_name))?;
+                match target {
+                    Value::List(list) => {
+                        if list.is_empty() {
+                            return Err(format!("{}行目: 空のリストから pop できません", line));
+                        }
+                        let val = list.pop().unwrap();
+                        return Ok(val);
+                    }
+                    _ => {
+                        return Err(format!("{}行目: pop() はリストにのみ使用できます", line));
+                    }
+                }
+            }
+            "slice" => {
+                if args.len() != 3 {
+                    return Err(format!(
+                        "{}行目: slice() は引数3個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let collection = self.eval_expr(&args[0], line)?;
+                let start = match self.eval_expr(&args[1], line)? {
+                    Value::Int(n) => n as usize,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: slice() の第2引数は整数である必要があります",
+                            line
+                        ));
+                    }
+                };
+                let end = match self.eval_expr(&args[2], line)? {
+                    Value::Int(n) => n as usize,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: slice() の第3引数は整数である必要があります",
+                            line
+                        ));
+                    }
+                };
+                match collection {
+                    Value::List(list) => {
+                        let end = end.min(list.len());
+                        let start = start.min(end);
+                        return Ok(Value::List(list[start..end].to_vec()));
+                    }
+                    Value::Str(s) => {
+                        let chars: Vec<char> = s.chars().collect();
+                        let end = end.min(chars.len());
+                        let start = start.min(end);
+                        return Ok(Value::Str(chars[start..end].iter().collect()));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "{}行目: slice() はリストまたは文字列にのみ使用できます",
+                            line
+                        ));
+                    }
+                }
+            }
+            "contains" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "{}行目: contains() は引数2個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let collection = self.eval_expr(&args[0], line)?;
+                let target = self.eval_expr(&args[1], line)?;
+                let result = match (&collection, &target) {
+                    (Value::List(list), val) => list.contains(val),
+                    (Value::Dict(map), Value::Str(key)) => map.contains_key(key),
+                    (Value::Str(s), Value::Str(sub)) => s.contains(sub.as_str()),
+                    _ => {
+                        return Err(format!(
+                            "{}行目: contains() はリスト・辞書・文字列にのみ使用できます",
+                            line
+                        ));
+                    }
+                };
+                return Ok(Value::Bool(result));
+            }
+            "split" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "{}行目: split() は引数2個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let s = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: split() の第1引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                let sep = match self.eval_expr(&args[1], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: split() の第2引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                let parts: Vec<Value> = s.split(&sep).map(|p| Value::Str(p.to_string())).collect();
+                return Ok(Value::List(parts));
+            }
+            "join" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "{}行目: join() は引数2個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let list = match self.eval_expr(&args[0], line)? {
+                    Value::List(v) => v,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: join() の第1引数はリストである必要があります",
+                            line
+                        ));
+                    }
+                };
+                let sep = match self.eval_expr(&args[1], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: join() の第2引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                let parts: Vec<String> = list.iter().map(|v| v.to_string()).collect();
+                return Ok(Value::Str(parts.join(&sep)));
+            }
+            "to_int" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: to_int() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let val = self.eval_expr(&args[0], line)?;
+                let result = match &val {
+                    Value::Int(n) => *n,
+                    Value::Float(f) => *f as i64,
+                    Value::Str(s) => s
+                        .parse::<i64>()
+                        .map_err(|_| format!("{}行目: to_int() 変換失敗: \"{}\"", line, s))?,
+                    Value::Bool(b) => {
+                        if *b {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    _ => {
+                        return Err(format!(
+                            "{}行目: to_int() で変換できません: {:?}",
+                            line, val
+                        ));
+                    }
+                };
+                return Ok(Value::Int(result));
+            }
+            "to_str" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: to_str() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let val = self.eval_expr(&args[0], line)?;
+                return Ok(Value::Str(val.to_string()));
+            }
+            "range" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "{}行目: range() は引数2個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let start = match self.eval_expr(&args[0], line)? {
+                    Value::Int(n) => n,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: range() の引数は整数である必要があります",
+                            line
+                        ));
+                    }
+                };
+                let end = match self.eval_expr(&args[1], line)? {
+                    Value::Int(n) => n,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: range() の引数は整数である必要があります",
+                            line
+                        ));
+                    }
+                };
+                let list: Vec<Value> = (start..end).map(Value::Int).collect();
+                return Ok(Value::List(list));
+            }
             _ => {}
         }
 
@@ -856,5 +1089,79 @@ mod tests {
     #[test]
     fn elif_no_else() {
         run_program("let x = 2\nif x == 1\n  print(1)\nelif x == 2\n  print(2)\nend").unwrap();
+    }
+
+    #[test]
+    fn builtin_pop() {
+        run_program("let xs = [1, 2, 3]\nlet v = pop(xs)\nprint(v)\nprint(len(xs))").unwrap();
+    }
+
+    #[test]
+    fn builtin_pop_empty_error() {
+        let result = run_program("let xs = []\npop(xs)");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("空のリスト"));
+    }
+
+    #[test]
+    fn builtin_slice_list() {
+        run_program("let xs = [1, 2, 3, 4]\nlet s = slice(xs, 1, 3)\nprint(len(s))").unwrap();
+    }
+
+    #[test]
+    fn builtin_slice_string() {
+        run_program("let s = slice(\"hello\", 0, 3)\nprint(s)").unwrap();
+    }
+
+    #[test]
+    fn builtin_contains_list() {
+        run_program("print(contains([1, 2, 3], 2))").unwrap();
+    }
+
+    #[test]
+    fn builtin_contains_string() {
+        run_program("print(contains(\"hello\", \"ell\"))").unwrap();
+    }
+
+    #[test]
+    fn builtin_contains_dict() {
+        run_program("print(contains({\"a\": 1}, \"a\"))").unwrap();
+    }
+
+    #[test]
+    fn builtin_split() {
+        run_program("let parts = split(\"a,b,c\", \",\")\nprint(len(parts))").unwrap();
+    }
+
+    #[test]
+    fn builtin_join() {
+        run_program("let s = join([\"a\", \"b\"], \"-\")\nprint(s)").unwrap();
+    }
+
+    #[test]
+    fn builtin_to_int() {
+        run_program("print(to_int(\"42\"))\nprint(to_int(3.7))").unwrap();
+    }
+
+    #[test]
+    fn builtin_to_int_error() {
+        let result = run_program("to_int(\"abc\")");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("変換失敗"));
+    }
+
+    #[test]
+    fn builtin_to_str() {
+        run_program("let s = to_str(42)\nprint(s)").unwrap();
+    }
+
+    #[test]
+    fn builtin_range() {
+        run_program("let xs = range(0, 5)\nprint(len(xs))").unwrap();
+    }
+
+    #[test]
+    fn builtin_range_in_for() {
+        run_program("for i in range(1, 4)\n  print(i)\nend").unwrap();
     }
 }

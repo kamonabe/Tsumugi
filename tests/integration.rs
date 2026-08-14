@@ -136,6 +136,11 @@ fn golden_fizzbuzz() {
     run_golden_test("fizzbuzz");
 }
 
+#[test]
+fn golden_builtins() {
+    run_golden_test("builtins");
+}
+
 // --- エラー系テスト ---
 
 #[test]
