@@ -3,6 +3,7 @@ use crate::env::{Env, Function};
 use crate::value::Value;
 
 use std::collections::BTreeMap;
+use std::fs;
 
 /// 評価器の戻り値（通常の値 or return / break / continue による制御フロー）
 enum EvalResult {
@@ -771,6 +772,107 @@ impl Evaluator {
                 let list: Vec<Value> = (start..end).map(Value::Int).collect();
                 return Ok(Value::List(list));
             }
+            "read_file" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: read_file() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let path = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: read_file() の引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                return Ok(match fs::read_to_string(&path) {
+                    Ok(content) => Value::Str(content),
+                    Err(_) => Value::Null,
+                });
+            }
+            "read_lines" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: read_lines() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let path = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: read_lines() の引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                return Ok(match fs::read_to_string(&path) {
+                    Ok(content) => {
+                        let lines: Vec<Value> =
+                            content.lines().map(|l| Value::Str(l.to_string())).collect();
+                        Value::List(lines)
+                    }
+                    Err(_) => Value::Null,
+                });
+            }
+            "write_file" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "{}行目: write_file() は引数2個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let path = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: write_file() の第1引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                let content = match self.eval_expr(&args[1], line)? {
+                    Value::Str(s) => s,
+                    other => other.to_string(),
+                };
+                return Ok(Value::Bool(fs::write(&path, &content).is_ok()));
+            }
+            "append_file" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "{}行目: append_file() は引数2個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let path = match self.eval_expr(&args[0], line)? {
+                    Value::Str(s) => s,
+                    _ => {
+                        return Err(format!(
+                            "{}行目: append_file() の第1引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                };
+                let content = match self.eval_expr(&args[1], line)? {
+                    Value::Str(s) => s,
+                    other => other.to_string(),
+                };
+                use std::fs::OpenOptions;
+                use std::io::Write;
+                let result = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .and_then(|mut f| f.write_all(content.as_bytes()));
+                return Ok(Value::Bool(result.is_ok()));
+            }
             _ => {}
         }
 
@@ -1163,5 +1265,38 @@ mod tests {
     #[test]
     fn builtin_range_in_for() {
         run_program("for i in range(1, 4)\n  print(i)\nend").unwrap();
+    }
+
+    #[test]
+    fn builtin_write_and_read_file() {
+        run_program(
+            "write_file(\"/tmp/tsumugi_unit_test.txt\", \"hello\")\nlet c = read_file(\"/tmp/tsumugi_unit_test.txt\")\nprint(c)",
+        )
+        .unwrap();
+        // cleanup
+        std::fs::remove_file("/tmp/tsumugi_unit_test.txt").ok();
+    }
+
+    #[test]
+    fn builtin_read_lines() {
+        run_program(
+            "write_file(\"/tmp/tsumugi_lines_test.txt\", \"a\\nb\\nc\")\nlet lines = read_lines(\"/tmp/tsumugi_lines_test.txt\")\nprint(len(lines))",
+        )
+        .unwrap();
+        std::fs::remove_file("/tmp/tsumugi_lines_test.txt").ok();
+    }
+
+    #[test]
+    fn builtin_append_file() {
+        run_program(
+            "write_file(\"/tmp/tsumugi_append_test.txt\", \"a\")\nappend_file(\"/tmp/tsumugi_append_test.txt\", \"b\")\nlet c = read_file(\"/tmp/tsumugi_append_test.txt\")\nprint(c)",
+        )
+        .unwrap();
+        std::fs::remove_file("/tmp/tsumugi_append_test.txt").ok();
+    }
+
+    #[test]
+    fn builtin_read_file_missing() {
+        run_program("let x = read_file(\"/tmp/no_such_file_xyz.txt\")\nprint(x)").unwrap();
     }
 }

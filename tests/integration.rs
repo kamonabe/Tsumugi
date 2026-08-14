@@ -141,6 +141,11 @@ fn golden_builtins() {
     run_golden_test("builtins");
 }
 
+#[test]
+fn golden_file_io() {
+    run_golden_test("file_io");
+}
+
 // --- エラー系テスト ---
 
 #[test]
