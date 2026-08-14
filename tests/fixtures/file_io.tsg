@@ -1,0 +1,20 @@
+# ファイル書き込み
+let ok = write_file("/tmp/tsumugi_golden_test.txt", "line1\nline2\nline3")
+print(ok)
+
+# ファイル読み込み
+let content = read_file("/tmp/tsumugi_golden_test.txt")
+print(contains(content, "line2"))
+
+# 行ごとに読み込み
+let lines = read_lines("/tmp/tsumugi_golden_test.txt")
+print(len(lines))
+
+# 追記
+append_file("/tmp/tsumugi_golden_test.txt", "\nline4")
+let updated = read_lines("/tmp/tsumugi_golden_test.txt")
+print(len(updated))
+
+# 存在しないファイル
+let missing = read_file("/tmp/no_such_tsumugi_file.txt")
+print(missing)

@@ -65,7 +65,7 @@ print(keys(config))
 - while ループ
 - for ループ (`for item in collection ... end`)
 - break / continue
-- 組み込み関数 (`print`, `len`, `push`, `pop`, `keys`, `type`, `slice`, `contains`, `split`, `join`, `to_int`, `to_str`, `range`)
+- 組み込み関数 (`print`, `len`, `push`, `pop`, `keys`, `type`, `slice`, `contains`, `split`, `join`, `to_int`, `to_str`, `range`, `read_file`, `read_lines`, `write_file`, `append_file`)
 - REPL（複数行入力対応）
 - ファイル実行
 - 行番号付きエラーメッセージ（パースエラー・ランタイムエラー両方）

@@ -291,6 +291,10 @@ let result = add(3, 4)
 | `to_int(val)` | 値を整数に変換（文字列/Float/Bool対応） |
 | `to_str(val)` | 値を文字列に変換 |
 | `range(start, end)` | start から end の手前までの整数リストを生成 |
+| `read_file(path)` | ファイル全体を文字列で返す。失敗時は null |
+| `read_lines(path)` | ファイルを行ごとに読んでリストで返す。失敗時は null |
+| `write_file(path, content)` | ファイルに書き込み（上書き）。成功で true、失敗で false |
+| `append_file(path, content)` | ファイルに追記。成功で true、失敗で false |
 
 ## 真偽判定
 
