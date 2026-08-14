@@ -308,6 +308,20 @@ let result = add(3, 4)
 | `rename(from, to)` | ファイル/ディレクトリを移動・リネーム。成功で true |
 | `list_dir(path)` | ディレクトリ内のエントリ名をリストで返す。失敗で null |
 | `file_size(path)` | ファイルサイズ（バイト）を整数で返す。失敗で null |
+| `trim(str)` | 前後の空白を除去 |
+| `starts_with(str, prefix)` | 接頭辞チェック |
+| `ends_with(str, suffix)` | 接尾辞チェック |
+| `replace(str, old, new)` | 文字列置換（全出現箇所） |
+| `upper(str)` | 大文字に変換 |
+| `lower(str)` | 小文字に変換 |
+| `to_float(val)` | 浮動小数点に変換 |
+| `abs(num)` | 絶対値 |
+| `min(a, b)` | 小さい方を返す |
+| `max(a, b)` | 大きい方を返す |
+| `sort(list)` | リストをソートして返す（文字列表現で比較） |
+| `reverse(list or str)` | リストまたは文字列を反転して返す |
+| `is_file(path)` | パスがファイルなら true |
+| `is_dir(path)` | パスがディレクトリなら true |
 
 ## 真偽判定
 
