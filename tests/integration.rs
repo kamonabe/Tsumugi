@@ -126,6 +126,11 @@ fn golden_for_loop() {
     run_golden_test("for_loop");
 }
 
+#[test]
+fn golden_break_continue() {
+    run_golden_test("break_continue");
+}
+
 // --- エラー系テスト ---
 
 #[test]

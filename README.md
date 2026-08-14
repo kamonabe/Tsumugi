@@ -64,6 +64,7 @@ print(keys(config))
 - 関数定義・呼び出し (`fn` / `return` / `end`)
 - while ループ
 - for ループ (`for item in collection ... end`)
+- break / continue
 - 組み込み関数 (`print`, `len`, `push`, `keys`, `type`)
 - REPL（複数行入力対応）
 - ファイル実行

@@ -221,6 +221,32 @@ end
 print(total)  # 15
 ```
 
+### break / continue
+
+`break` はループを即座に抜ける。`continue` は現在のイテレーションをスキップして次へ進む。
+
+```
+# 5で停止
+let i = 0
+while true
+    if i == 5
+        break
+    end
+    i = i + 1
+end
+
+# 3をスキップ
+for n in [1, 2, 3, 4, 5]
+    if n == 3
+        continue
+    end
+    print(n)
+end
+```
+
+- `while` / `for` のどちらでも使用可能
+- ループの外で使うとランタイムエラー
+
 ## 関数
 
 ```

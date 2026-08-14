@@ -36,6 +36,8 @@ impl Parser {
             Token::While => self.parse_while(),
             Token::For => self.parse_for(),
             Token::Fn => self.parse_fn_def(),
+            Token::Break => self.parse_break(),
+            Token::Continue => self.parse_continue(),
             Token::Ident(_) => {
                 // 識別子 + '=' なら再代入文
                 // 識別子 + '[' ... ']' + '=' ならインデックス代入文
@@ -258,6 +260,22 @@ impl Parser {
             body,
             line,
         })
+    }
+
+    /// break
+    fn parse_break(&mut self) -> Result<Stmt, String> {
+        let line = self.current_line();
+        self.advance(); // consume 'break'
+        self.expect_newline_or_eof()?;
+        Ok(Stmt::Break { line })
+    }
+
+    /// continue
+    fn parse_continue(&mut self) -> Result<Stmt, String> {
+        let line = self.current_line();
+        self.advance(); // consume 'continue'
+        self.expect_newline_or_eof()?;
+        Ok(Stmt::Continue { line })
     }
 
     /// fn name(params) \n body end
@@ -947,6 +965,30 @@ mod tests {
                 assert_eq!(*line, 1);
                 assert_eq!(body.len(), 1);
             }
+            other => panic!("expected For, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_break() {
+        let program = parse("while true\n  break\nend").unwrap();
+        match &program[0] {
+            Stmt::While { body, .. } => match &body[0] {
+                Stmt::Break { line } => assert_eq!(*line, 2),
+                other => panic!("expected Break, got {:?}", other),
+            },
+            other => panic!("expected While, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_continue() {
+        let program = parse("for x in xs\n  continue\nend").unwrap();
+        match &program[0] {
+            Stmt::For { body, .. } => match &body[0] {
+                Stmt::Continue { line } => assert_eq!(*line, 2),
+                other => panic!("expected Continue, got {:?}", other),
+            },
             other => panic!("expected For, got {:?}", other),
         }
     }

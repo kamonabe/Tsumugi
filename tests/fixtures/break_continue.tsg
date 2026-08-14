@@ -1,0 +1,27 @@
+# while + break
+let i = 0
+while true
+    if i == 5
+        break
+    end
+    print(i)
+    i = i + 1
+end
+print("after break")
+
+# for + continue（3をスキップ）
+for n in [1, 2, 3, 4, 5]
+    if n == 3
+        continue
+    end
+    print(n)
+end
+
+# for + break（3で止める）
+for n in [10, 20, 30, 40]
+    if n == 30
+        break
+    end
+    print(n)
+end
+print("done")

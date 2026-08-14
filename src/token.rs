@@ -19,6 +19,8 @@ pub enum Token {
     While,
     For,
     In,
+    Break,
+    Continue,
     End,
     And,
     Or,
