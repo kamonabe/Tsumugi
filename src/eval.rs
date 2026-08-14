@@ -255,9 +255,7 @@ impl Evaluator {
                 }
                 Ok(list[actual as usize].clone())
             }
-            (Value::Dict(map), Value::Str(key)) => {
-                Ok(map.get(key).cloned().unwrap_or(Value::Null))
-            }
+            (Value::Dict(map), Value::Str(key)) => Ok(map.get(key).cloned().unwrap_or(Value::Null)),
             (Value::Str(s), Value::Int(i)) => {
                 let len = s.chars().count() as i64;
                 let actual = if *i < 0 { len + *i } else { *i };
@@ -416,10 +414,7 @@ impl Evaluator {
                         list.push(val);
                     }
                     _ => {
-                        return Err(format!(
-                            "{}行目: push() はリストにのみ使用できます",
-                            line
-                        ));
+                        return Err(format!("{}行目: push() はリストにのみ使用できます", line));
                     }
                 }
                 return Ok(Value::Null);
@@ -440,10 +435,7 @@ impl Evaluator {
                         return Ok(Value::List(key_list));
                     }
                     _ => {
-                        return Err(format!(
-                            "{}行目: keys() は辞書にのみ使用できます",
-                            line
-                        ));
+                        return Err(format!("{}行目: keys() は辞書にのみ使用できます", line));
                     }
                 }
             }
