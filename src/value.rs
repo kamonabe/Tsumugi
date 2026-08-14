@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 /// Tsumugi の実行時の値
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -6,6 +8,8 @@ pub enum Value {
     Str(String),
     Bool(bool),
     Null,
+    List(Vec<Value>),
+    Dict(BTreeMap<String, Value>),
 }
 
 impl Value {
@@ -17,6 +21,8 @@ impl Value {
             Value::Int(0) => false,
             Value::Float(f) => *f != 0.0,
             Value::Str(s) => !s.is_empty(),
+            Value::List(v) => !v.is_empty(),
+            Value::Dict(m) => !m.is_empty(),
             _ => true,
         }
     }
@@ -30,7 +36,26 @@ impl std::fmt::Display for Value {
             Value::Str(s) => write!(f, "{}", s),
             Value::Bool(b) => write!(f, "{}", b),
             Value::Null => write!(f, "null"),
+            Value::List(items) => {
+                let parts: Vec<String> = items.iter().map(format_value_repr).collect();
+                write!(f, "[{}]", parts.join(", "))
+            }
+            Value::Dict(map) => {
+                let parts: Vec<String> = map
+                    .iter()
+                    .map(|(k, v)| format!("\"{}\": {}", k, format_value_repr(v)))
+                    .collect();
+                write!(f, "{{{}}}", parts.join(", "))
+            }
         }
+    }
+}
+
+/// Display 用に値を repr 形式（文字列はクォート付き）で表示する
+fn format_value_repr(v: &Value) -> String {
+    match v {
+        Value::Str(s) => format!("\"{}\"", s),
+        other => other.to_string(),
     }
 }
 
@@ -45,6 +70,8 @@ mod tests {
         assert!(Value::Int(-1).is_truthy());
         assert!(Value::Float(0.1).is_truthy());
         assert!(Value::Str("hello".to_string()).is_truthy());
+        assert!(Value::List(vec![Value::Int(1)]).is_truthy());
+        assert!(Value::Dict(BTreeMap::from([("a".into(), Value::Int(1))])).is_truthy());
     }
 
     #[test]
@@ -54,6 +81,8 @@ mod tests {
         assert!(!Value::Int(0).is_truthy());
         assert!(!Value::Float(0.0).is_truthy());
         assert!(!Value::Str("".to_string()).is_truthy());
+        assert!(!Value::List(vec![]).is_truthy());
+        assert!(!Value::Dict(BTreeMap::new()).is_truthy());
     }
 
     #[test]
@@ -63,5 +92,13 @@ mod tests {
         assert_eq!(Value::Str("hi".to_string()).to_string(), "hi");
         assert_eq!(Value::Bool(true).to_string(), "true");
         assert_eq!(Value::Null.to_string(), "null");
+        assert_eq!(
+            Value::List(vec![Value::Int(1), Value::Str("a".into())]).to_string(),
+            "[1, \"a\"]"
+        );
+        assert_eq!(
+            Value::Dict(BTreeMap::from([("x".into(), Value::Int(10))])).to_string(),
+            "{\"x\": 10}"
+        );
     }
 }

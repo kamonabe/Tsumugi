@@ -44,10 +44,31 @@ impl Env {
         }
     }
 
+    /// 既存の変数を更新（内側→外側へ探索）。見つからなければ Err を返す
+    pub fn update(&mut self, name: &str, value: Value) -> Result<(), ()> {
+        for scope in self.scopes.iter_mut().rev() {
+            if scope.contains_key(name) {
+                scope.insert(name.to_string(), value);
+                return Ok(());
+            }
+        }
+        Err(())
+    }
+
     /// 変数を検索（現在のスコープ → 外側へ）
     pub fn get(&self, name: &str) -> Option<&Value> {
         for scope in self.scopes.iter().rev() {
             if let Some(v) = scope.get(name) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// 変数を可変参照で検索（現在のスコープ → 外側へ）
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut Value> {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(v) = scope.get_mut(name) {
                 return Some(v);
             }
         }
@@ -93,5 +114,30 @@ mod tests {
         env.push_scope();
         assert_eq!(env.get("outer"), Some(&Value::Str("visible".to_string())));
         env.pop_scope();
+    }
+
+    #[test]
+    fn update_existing_variable() {
+        let mut env = Env::new();
+        env.set("x", Value::Int(1));
+        assert!(env.update("x", Value::Int(2)).is_ok());
+        assert_eq!(env.get("x"), Some(&Value::Int(2)));
+    }
+
+    #[test]
+    fn update_undefined_variable_fails() {
+        let mut env = Env::new();
+        assert!(env.update("nope", Value::Int(1)).is_err());
+    }
+
+    #[test]
+    fn update_outer_scope_variable() {
+        let mut env = Env::new();
+        env.set("x", Value::Int(1));
+        env.push_scope();
+        // 内側スコープから外側の変数を更新できる
+        assert!(env.update("x", Value::Int(99)).is_ok());
+        env.pop_scope();
+        assert_eq!(env.get("x"), Some(&Value::Int(99)));
     }
 }

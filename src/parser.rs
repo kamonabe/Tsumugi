@@ -35,8 +35,107 @@ impl Parser {
             Token::If => self.parse_if(),
             Token::While => self.parse_while(),
             Token::Fn => self.parse_fn_def(),
+            Token::Ident(_) => {
+                // 識別子 + '=' なら再代入文
+                // 識別子 + '[' ... ']' + '=' ならインデックス代入文
+                if self.is_assign_stmt() {
+                    self.parse_assign()
+                } else if self.is_index_assign_stmt() {
+                    self.parse_index_assign()
+                } else {
+                    self.parse_expr_stmt()
+                }
+            }
             _ => self.parse_expr_stmt(),
         }
+    }
+
+    /// 現在位置が「ident =」パターン（再代入）か判定
+    fn is_assign_stmt(&self) -> bool {
+        if let Some(next) = self.tokens.get(self.pos + 1) {
+            next.token == Token::Assign
+        } else {
+            false
+        }
+    }
+
+    /// 現在位置が「ident[...] =」パターン（インデックス代入）か判定
+    fn is_index_assign_stmt(&self) -> bool {
+        // ident の次が '[' かチェック
+        if let Some(next) = self.tokens.get(self.pos + 1) {
+            if next.token != Token::LBracket {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        // '[' の対応する ']' を探し、その次が '=' かチェック
+        let mut depth = 0;
+        let mut i = self.pos + 1;
+        while i < self.tokens.len() {
+            match &self.tokens[i].token {
+                Token::LBracket => depth += 1,
+                Token::RBracket => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // ']' の次が '=' なら index assign
+                        if let Some(after) = self.tokens.get(i + 1) {
+                            return after.token == Token::Assign;
+                        }
+                        return false;
+                    }
+                }
+                Token::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// name = expr（再代入）
+    fn parse_assign(&mut self) -> Result<Stmt, String> {
+        let line = self.current_line();
+        let spanned = self.advance_spanned();
+        let name = match spanned.token {
+            Token::Ident(s) => s,
+            _ => unreachable!(),
+        };
+
+        self.advance(); // consume '='
+        let value = self.parse_expr()?;
+        self.expect_newline_or_eof()?;
+
+        Ok(Stmt::Assign { name, value, line })
+    }
+
+    /// ident[expr] = expr（インデックス代入）
+    fn parse_index_assign(&mut self) -> Result<Stmt, String> {
+        let line = self.current_line();
+        // パースは式として左辺を読み取り、Index ノードを得る
+        let object_expr = self.parse_expr()?;
+
+        // object_expr が Expr::Index であることを期待
+        let (object, index) = match object_expr {
+            Expr::Index { object, index } => (*object, *index),
+            _ => {
+                return Err(format!(
+                    "{}: インデックス代入の左辺が不正です",
+                    self.format_line(line)
+                ));
+            }
+        };
+
+        self.expect(Token::Assign)?;
+        let value = self.parse_expr()?;
+        self.expect_newline_or_eof()?;
+
+        Ok(Stmt::IndexAssign {
+            object,
+            index,
+            value,
+            line,
+        })
     }
 
     /// let name = expr
@@ -362,19 +461,30 @@ impl Parser {
         }
     }
 
-    /// 関数呼び出し or プライマリ
+    /// 関数呼び出し / インデックスアクセス or プライマリ
     fn parse_call(&mut self) -> Result<Expr, String> {
-        let expr = self.parse_primary()?;
+        let mut expr = self.parse_primary()?;
 
-        // ident(...) パターンの場合
-        if let Expr::Ident(ref name) = expr
-            && self.peek_token() == Token::LParen
-        {
-            let name = name.clone();
-            self.advance(); // consume '('
-            let args = self.parse_args()?;
-            self.expect(Token::RParen)?;
-            return Ok(Expr::Call { name, args });
+        loop {
+            if let Expr::Ident(ref name) = expr
+                && self.peek_token() == Token::LParen
+            {
+                let name = name.clone();
+                self.advance(); // consume '('
+                let args = self.parse_args()?;
+                self.expect(Token::RParen)?;
+                expr = Expr::Call { name, args };
+            } else if self.peek_token() == Token::LBracket {
+                self.advance(); // consume '['
+                let index = self.parse_expr()?;
+                self.expect(Token::RBracket)?;
+                expr = Expr::Index {
+                    object: Box::new(expr),
+                    index: Box::new(index),
+                };
+            } else {
+                break;
+            }
         }
 
         Ok(expr)
@@ -398,7 +508,7 @@ impl Parser {
         Ok(args)
     }
 
-    /// プライマリ: リテラル, 識別子, 括弧式
+    /// プライマリ: リテラル, 識別子, 括弧式, リスト, 辞書
     fn parse_primary(&mut self) -> Result<Expr, String> {
         let spanned = self.peek_spanned();
         match spanned.token {
@@ -463,12 +573,69 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 Ok(expr)
             }
+            Token::LBracket => self.parse_list_literal(),
+            Token::LBrace => self.parse_dict_literal(),
             other => Err(format!(
                 "{}: 予期しないトークン: {:?}",
                 self.format_line(spanned.line),
                 other
             )),
         }
+    }
+
+    /// リストリテラル: [expr, expr, ...]
+    fn parse_list_literal(&mut self) -> Result<Expr, String> {
+        self.advance(); // consume '['
+        let mut items = Vec::new();
+
+        if self.peek_token() == Token::RBracket {
+            self.advance(); // consume ']'
+            return Ok(Expr::List(items));
+        }
+
+        items.push(self.parse_expr()?);
+        while self.peek_token() == Token::Comma {
+            self.advance(); // consume ','
+            // 末尾カンマ対応
+            if self.peek_token() == Token::RBracket {
+                break;
+            }
+            items.push(self.parse_expr()?);
+        }
+
+        self.expect(Token::RBracket)?;
+        Ok(Expr::List(items))
+    }
+
+    /// 辞書リテラル: {expr: expr, ...}
+    fn parse_dict_literal(&mut self) -> Result<Expr, String> {
+        self.advance(); // consume '{'
+        let mut pairs = Vec::new();
+
+        if self.peek_token() == Token::RBrace {
+            self.advance(); // consume '}'
+            return Ok(Expr::Dict(pairs));
+        }
+
+        let key = self.parse_expr()?;
+        self.expect(Token::Colon)?;
+        let value = self.parse_expr()?;
+        pairs.push((key, value));
+
+        while self.peek_token() == Token::Comma {
+            self.advance(); // consume ','
+            // 末尾カンマ対応
+            if self.peek_token() == Token::RBrace {
+                break;
+            }
+            let key = self.parse_expr()?;
+            self.expect(Token::Colon)?;
+            let value = self.parse_expr()?;
+            pairs.push((key, value));
+        }
+
+        self.expect(Token::RBrace)?;
+        Ok(Expr::Dict(pairs))
     }
 
     // --- ユーティリティ ---
@@ -656,6 +823,80 @@ mod tests {
             "error should mention line 2: {}",
             msg
         );
+    }
+
+    #[test]
+    fn parse_assign() {
+        let program = parse("let x = 1\nx = 2").unwrap();
+        assert_eq!(program.len(), 2);
+        match &program[1] {
+            Stmt::Assign { name, line, .. } => {
+                assert_eq!(name, "x");
+                assert_eq!(*line, 2);
+            }
+            other => panic!("expected Assign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_assign_with_expr() {
+        let program = parse("let x = 10\nx = x + 1").unwrap();
+        assert_eq!(program.len(), 2);
+        match &program[1] {
+            Stmt::Assign { name, .. } => {
+                assert_eq!(name, "x");
+            }
+            other => panic!("expected Assign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_list_literal() {
+        let program = parse("let xs = [1, 2, 3]").unwrap();
+        assert_eq!(program.len(), 1);
+        match &program[0] {
+            Stmt::Let { value, .. } => match value {
+                Expr::List(items) => assert_eq!(items.len(), 3),
+                other => panic!("expected List, got {:?}", other),
+            },
+            other => panic!("expected Let, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_dict_literal() {
+        let program = parse("let d = {\"a\": 1}").unwrap();
+        assert_eq!(program.len(), 1);
+        match &program[0] {
+            Stmt::Let { value, .. } => match value {
+                Expr::Dict(pairs) => assert_eq!(pairs.len(), 1),
+                other => panic!("expected Dict, got {:?}", other),
+            },
+            other => panic!("expected Let, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_index_access() {
+        let program = parse("let x = xs[0]").unwrap();
+        assert_eq!(program.len(), 1);
+        match &program[0] {
+            Stmt::Let { value, .. } => match value {
+                Expr::Index { .. } => {}
+                other => panic!("expected Index, got {:?}", other),
+            },
+            other => panic!("expected Let, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_index_assign() {
+        let program = parse("let xs = [1]\nxs[0] = 99").unwrap();
+        assert_eq!(program.len(), 2);
+        match &program[1] {
+            Stmt::IndexAssign { .. } => {}
+            other => panic!("expected IndexAssign, got {:?}", other),
+        }
     }
 
     #[test]

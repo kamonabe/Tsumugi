@@ -1,0 +1,15 @@
+# 変数の再代入テスト
+let x = 1
+print(x)
+x = 2
+print(x)
+x = x + 10
+print(x)
+
+# whileループ内での再代入
+let count = 3
+while count > 0
+    print(count)
+    count = count - 1
+end
+print(count)

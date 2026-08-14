@@ -37,9 +37,14 @@ pub enum Token {
     GtEq,   // >=
 
     // 区切り
-    LParen, // (
-    RParen, // )
-    Comma,  // ,
+    LParen,   // (
+    RParen,   // )
+    LBracket, // [
+    RBracket, // ]
+    LBrace,   // {
+    RBrace,   // }
+    Comma,    // ,
+    Colon,    // :
 
     // 制御
     Newline,

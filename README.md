@@ -35,20 +35,35 @@ print(add(3, 4))
 let count = 3
 while count > 0
     print(count)
-    let count = count - 1
+    count = count - 1
 end
+
+# リスト
+let fruits = ["apple", "banana", "cherry"]
+print(fruits[0])
+push(fruits, "date")
+print(len(fruits))
+
+# 辞書
+let config = {"host": "localhost", "port": 8080}
+print(config["host"])
+config["debug"] = true
+print(keys(config))
 ```
 
 ## 対応機能
 
 - 整数・浮動小数点・文字列・真偽値・null
-- 変数束縛 (`let`)
+- リスト (`[1, 2, 3]`) と辞書 (`{"key": value}`)
+- 変数束縛 (`let`) と再代入 (`x = expr`)
+- インデックスアクセス (`xs[0]`, `d["key"]`) と代入 (`xs[0] = val`)
 - 四則演算・文字列結合
 - 比較演算 (`==`, `!=`, `<`, `>`, `<=`, `>=`)
 - 論理演算 (`and`, `or`, `not`)
 - 条件分岐 (`if` / `else` / `end`)
 - 関数定義・呼び出し (`fn` / `return` / `end`)
 - while ループ
+- 組み込み関数 (`print`, `len`, `push`, `keys`, `type`)
 - REPL（複数行入力対応）
 - ファイル実行
 - 行番号付きエラーメッセージ（パースエラー・ランタイムエラー両方）
