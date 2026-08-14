@@ -1061,6 +1061,127 @@ impl Evaluator {
                 };
                 return Ok(Some(Value::Bool(Path::new(&path).is_dir())));
             }
+            "values" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: values() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let val = self.eval_expr(&args[0], line)?;
+                match val {
+                    Value::Dict(map) => {
+                        let value_list: Vec<Value> = map.into_values().collect();
+                        return Ok(Some(Value::List(value_list)));
+                    }
+                    _ => {
+                        return Err(format!("{}行目: values() は辞書にのみ使用できます", line));
+                    }
+                }
+            }
+            "has_key" => {
+                if args.len() != 2 {
+                    return Err(format!(
+                        "{}行目: has_key() は引数2個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let dict = self.eval_expr(&args[0], line)?;
+                let key = self.eval_expr(&args[1], line)?;
+                match (&dict, &key) {
+                    (Value::Dict(map), Value::Str(k)) => {
+                        return Ok(Some(Value::Bool(map.contains_key(k))));
+                    }
+                    (Value::Dict(_), _) => {
+                        return Err(format!(
+                            "{}行目: has_key() の第2引数は文字列である必要があります",
+                            line
+                        ));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "{}行目: has_key() の第1引数は辞書である必要があります",
+                            line
+                        ));
+                    }
+                }
+            }
+            "floor" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: floor() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let val = self.eval_expr(&args[0], line)?;
+                match val {
+                    Value::Float(f) => return Ok(Some(Value::Int(f.floor() as i64))),
+                    Value::Int(n) => return Ok(Some(Value::Int(n))),
+                    _ => {
+                        return Err(format!("{}行目: floor() は数値にのみ使用できます", line));
+                    }
+                }
+            }
+            "ceil" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: ceil() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let val = self.eval_expr(&args[0], line)?;
+                match val {
+                    Value::Float(f) => return Ok(Some(Value::Int(f.ceil() as i64))),
+                    Value::Int(n) => return Ok(Some(Value::Int(n))),
+                    _ => {
+                        return Err(format!("{}行目: ceil() は数値にのみ使用できます", line));
+                    }
+                }
+            }
+            "round" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "{}行目: round() は引数1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let val = self.eval_expr(&args[0], line)?;
+                match val {
+                    Value::Float(f) => return Ok(Some(Value::Int(f.round() as i64))),
+                    Value::Int(n) => return Ok(Some(Value::Int(n))),
+                    _ => {
+                        return Err(format!("{}行目: round() は数値にのみ使用できます", line));
+                    }
+                }
+            }
+            "exit" => {
+                if args.len() > 1 {
+                    return Err(format!(
+                        "{}行目: exit() は引数0〜1個ですが、{}個渡されました",
+                        line,
+                        args.len()
+                    ));
+                }
+                let code = if args.is_empty() {
+                    0
+                } else {
+                    match self.eval_expr(&args[0], line)? {
+                        Value::Int(n) => n as i32,
+                        _ => {
+                            return Err(format!(
+                                "{}行目: exit() の引数は整数である必要があります",
+                                line
+                            ));
+                        }
+                    }
+                };
+                std::process::exit(code);
+            }
             _ => {}
         }
 
