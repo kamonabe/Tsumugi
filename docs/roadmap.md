@@ -8,14 +8,15 @@
 - [x] 変数宣言（let）と再代入
 - [x] 四則演算 + 剰余演算子（%）
 - [x] 比較演算・論理演算（and / or / not）
-- [x] 条件分岐（if / else / end）
+- [x] 条件分岐（if / elif / else / end）
 - [x] while ループ
 - [x] for ループ（リスト・辞書・文字列のイテレーション）
 - [x] break / continue
 - [x] 関数定義・呼び出し（fn / return / end）
 - [x] リスト・辞書
 - [x] インデックスアクセス・代入
-- [x] 組み込み関数（print, len, push, keys, type）
+- [x] 組み込み関数（print, len, push, pop, keys, type, slice, contains, split, join, to_int, to_str, range）
+- [x] ファイルI/O（read_file, read_lines, write_file, append_file）
 - [x] REPL（複数行入力対応）
 - [x] 行番号付きエラーメッセージ
 - [x] CI（fmt + clippy + test）
@@ -24,7 +25,6 @@
 
 | 優先度 | 項目 | メモ |
 |---|---|---|
-| 中 | 組み込み関数の追加（pop, slice, contains 等） | コレクション操作の充実 |
 | 低 | モジュール / import | ファイル分割 |
 | 低 | クロージャ / 高階関数 | 関数を値として扱う |
 | 発展 | バイトコード VM 化 | 実行速度の向上・学習の深化 |
@@ -63,3 +63,32 @@ Tsumugi は現状「閉じた世界」で動く言語（外部I/Oなし）のた
 - Deno: 権限付与モデル（--allow-net 等）
 - Go/Rust Playground: タイムアウトによる暴走防止
 - Lua: debug.sethook による命令数コールバック
+
+## 検討事項: HTTP アクセス機能
+
+### 背景
+
+`requests.get(url)` のような HTTP クライアント機能があれば、API呼び出しやWebスクレイピング的な処理が可能になる。
+ただし Rust の標準ライブラリには HTTP クライアントがないため、外部 crate の追加が必要。
+
+### 方針: ureq crate を使う
+
+- `ureq` は同期的な HTTP クライアントで依存が比較的少ない
+- curl コマンド呼び出し方式も検討したが、Windows 非対応になるため却下
+- Tsumugi の「依存ゼロ」は崩れるが、クロスプラットフォーム対応を優先する
+
+### 想定する組み込み関数
+
+```
+let resp = http_get("https://example.com/api")
+let resp = http_post("https://example.com/api", body)
+```
+
+- 成功時: レスポンスボディを文字列で返す
+- 失敗時: null を返す（ファイルI/O と同じ方針）
+
+### 実装タイミング
+
+- 「HTTP が本当に必要なユースケースが明確になったとき」に入れる
+- 現時点ではファイルI/O だけで十分な範囲をカバーできている
+- 入れる場合は cargo-audit の CI 追加も同時に行う（外部依存が初めて入るため）
