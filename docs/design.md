@@ -262,8 +262,11 @@ unary_expr     = ("not" | "-") unary_expr | postfix
 postfix        = primary ( "(" args? ")" | "[" expr "]" )*
 primary        = INT | FLOAT | STRING | "true" | "false" | "null"
                | IDENT | "(" expr ")" | list_literal | dict_literal
+               | lambda
 list_literal   = "[" (expr ("," expr)* ","?)? "]"
 dict_literal   = "{" (expr ":" expr ("," expr ":" expr)* ","?)? "}"
+lambda         = "fn" "(" params? ")" NEWLINE block "end"
+               | "fn" "(" params? ")" expr "end"
 args           = expr ("," expr)*
 ```
 
@@ -271,51 +274,69 @@ args           = expr ("," expr)*
 
 | 優先度 | 項目 |
 |---|---|
+| 中 | map / filter / each（組み込み高階関数） |
 | 低 | モジュール / import |
-| 低 | クロージャ / 高階関数 |
 | 低 | クラス（継承なし・合成で拡張） |
+| 低 | 参照キャプチャ（カウンターパターン対応） |
 | 発展 | バイトコード VM 化 |
 
-## クロージャ導入時の AST 変更ポイント
+## クロージャ・無名関数の設計判断
 
-現在の `Expr::Call` は関数名を `String` で保持している:
+### 実装状況（実施済み）
 
-```rust
-Expr::Call { name: String, args: Vec<Expr> }
-```
+Phase 1 で `Expr::Call { callee: Box<Expr> }` への構造変更と `Value::Fn` の追加を行い、Phase 2 で無名関数（ラムダ）とクロージャ（値キャプチャ方式）を実装した。
 
-クロージャ（関数を値として扱う）を実装する場合、呼び出し対象が変数や式の評価結果になるため、以下の変更が必要:
+### AST 変更（実施済み）
 
 ```rust
-// Before: 名前でしか呼べない
-Expr::Call { name: String, args: Vec<Expr> }
-
-// After: 任意の式を呼び出し対象にできる
+// Call: 任意の式を呼び出し対象にできる
 Expr::Call { callee: Box<Expr>, args: Vec<Expr> }
+
+// Lambda: 無名関数式
+Expr::Lambda { params: Vec<String>, body: Vec<Stmt> }
 ```
 
-### 関連する変更箇所
+### 値キャプチャ方式の採用理由
 
-| モジュール | 変更内容 |
-|---|---|
-| `ast.rs` | `Call` バリアントの `name` → `callee: Box<Expr>` |
-| `parser.rs` | `parse_call` で識別子以外（括弧式やインデックスアクセス結果）も呼び出し対象としてパース |
-| `eval.rs` | `eval_call` で `callee` を評価し、結果が関数値なら呼び出す |
-| `value.rs` | `Value::Fn { params, body, closure_env }` バリアントを追加 |
-| `env.rs` | クロージャが捕捉する環境のスナップショット機構を追加 |
-| `builtin.rs` | 組み込み関数の呼び出しパスを `callee` が `Expr::Ident` の場合に限定して維持 |
+検討した選択肢:
 
-### 移行戦略
+| 方式 | 挙動 | カウンター | 採用 |
+|---|---|---|---|
+| 値キャプチャ（clone） | 定義時の値をコピー | ❌ | ✅ 採用 |
+| 参照キャプチャ（`Rc<RefCell>`） | 定義元と値を共有 | ✅ | — |
 
-1. まず `Value::Fn` を追加し、`fn` 定義を値としても扱えるようにする
-2. `Expr::Call` の `name` を `callee: Box<Expr>` に変更する
-3. `eval_call` で `callee` を評価し、`Value::Fn` なら実行、文字列なら従来の関数テーブル参照にフォールバック
-4. 最終的に関数テーブルを廃止し、全て環境内の変数として管理する
+値キャプチャを選んだ理由:
+- 学習目的として「クロージャとは何か」を体験するには十分
+- `make_adder` パターン（読み取り専用キャプチャ）は正しく動作する
+- `Rc<RefCell>` を導入すると `Value` の `PartialEq` / `Clone` が崩れ、影響範囲が大きい
+- 将来的に参照キャプチャへの進化は可能（`Value::Fn` の `captured` フィールドを `Rc<RefCell<HashMap>>` に変えるだけ）
 
-### この変更を行うタイミング
+### スコープキャプチャ方式
 
-- クロージャ / 高階関数の実装に着手するとき
-- `filter` / `map` のような高階関数を組み込みに追加したいとき
+定義時のスコープ全体をフラットな `HashMap` に統合してコピーする（`Env::snapshot()`）。
+
+- 暗黙キャプチャ（自由変数解析）は静的解析が必要でパーサーを複雑にするため不採用
+- 全スコープ clone は無駄が多いが、学習目的には十分。将来最適化するなら自由変数解析を入れればよい
+
+### 1行ラムダの構文判断
+
+```
+# 複数行
+let f = fn(x)
+    return x * 2
+end
+
+# 1行（return 省略可）
+let f = fn(x) x * 2 end
+```
+
+1行ラムダでは `fn(params)` の後に改行がなければ式を1つだけ読み、暗黙的に `return` 扱いとする。`return` を明示してもよい。
+
+### 制約（既知の制限）
+
+- キャプチャした変数への再代入は元のスコープに反映されない
+- カウンターパターン（状態を保持するクロージャ）は未サポート
+- 関数テーブル（`Env::functions`）がまだ残っている。将来的に廃止して全て環境内の変数として管理する案がある
 
 ## 参考資料
 
