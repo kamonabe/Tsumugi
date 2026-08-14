@@ -130,8 +130,8 @@ pub enum Expr {
     /// 単項演算: not expr, -expr
     UnaryOp { op: UnaryOpKind, expr: Box<Expr> },
 
-    /// 関数呼び出し: name(args)
-    Call { name: String, args: Vec<Expr> },
+    /// 関数呼び出し: expr(args)
+    Call { callee: Box<Expr>, args: Vec<Expr> },
 
     /// インデックスアクセス: expr[expr]
     Index { object: Box<Expr>, index: Box<Expr> },

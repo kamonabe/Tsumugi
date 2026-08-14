@@ -231,3 +231,8 @@ fn error_index_out_of_bounds() {
 fn error_dict_key_type() {
     run_error_test("error_dict_key_type");
 }
+
+#[test]
+fn golden_first_class_fn() {
+    run_golden_test("first_class_fn");
+}

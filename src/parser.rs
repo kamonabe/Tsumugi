@@ -532,14 +532,14 @@ impl Parser {
         let mut expr = self.parse_primary()?;
 
         loop {
-            if let Expr::Ident(ref name) = expr
-                && self.peek_token() == Token::LParen
-            {
-                let name = name.clone();
+            if self.peek_token() == Token::LParen {
                 self.advance(); // consume '('
                 let args = self.parse_args()?;
                 self.expect(Token::RParen)?;
-                expr = Expr::Call { name, args };
+                expr = Expr::Call {
+                    callee: Box::new(expr),
+                    args,
+                };
             } else if self.peek_token() == Token::LBracket {
                 self.advance(); // consume '['
                 let index = self.parse_expr()?;
@@ -629,7 +629,7 @@ impl Parser {
                 let args = self.parse_args()?;
                 self.expect(Token::RParen)?;
                 Ok(Expr::Call {
-                    name: "print".to_string(),
+                    callee: Box::new(Expr::Ident("print".to_string())),
                     args,
                 })
             }
