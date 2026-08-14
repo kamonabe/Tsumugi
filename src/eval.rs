@@ -244,6 +244,15 @@ impl Evaluator {
                     body: body.clone(),
                 };
                 self.env.functions.insert(name.clone(), func);
+                // 関数を値としても環境にセット（let f = add のように参照可能にする）
+                self.env.set(
+                    name,
+                    Value::Fn {
+                        name: name.clone(),
+                        params: params.clone(),
+                        body: body.clone(),
+                    },
+                );
                 Ok(EvalResult::Val)
             }
 
@@ -311,7 +320,7 @@ impl Evaluator {
                 self.eval_unary(op, &val, line)
             }
 
-            Expr::Call { name, args } => self.eval_call(name, args, line),
+            Expr::Call { callee, args } => self.eval_call(callee, args, line),
 
             Expr::Index { object, index } => {
                 let obj = self.eval_expr(object, line)?;
@@ -465,24 +474,65 @@ impl Evaluator {
     }
 
     /// 関数呼び出し
-    fn eval_call(&mut self, name: &str, args: &[Expr], line: usize) -> Result<Value, TsumugiError> {
-        // 組み込み関数を試行
-        if let Some(value) = self.eval_builtin(name, args, line)? {
+    fn eval_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<Value, TsumugiError> {
+        // callee が識別子の場合、組み込み関数を先に試行
+        if let Expr::Ident(name) = callee
+            && let Some(value) = self.eval_builtin(name, args, line)?
+        {
             return Ok(value);
         }
 
-        // ユーザー定義関数
-        let func =
-            self.env.functions.get(name).cloned().ok_or_else(|| {
-                TsumugiError::from(format!("{}行目: 未定義の関数: {}", line, name))
-            })?;
+        // callee を評価して関数値を取得
+        // 識別子の場合: 変数 → 関数テーブルの順で検索
+        let (func_name, params, body) = if let Expr::Ident(name) = callee {
+            // 変数として検索
+            if let Some(val) = self.env.get(name).cloned() {
+                match val {
+                    Value::Fn {
+                        name: fn_name,
+                        params,
+                        body,
+                    } => (fn_name, params, body),
+                    _ => {
+                        return Err(format!(
+                            "{}行目: 関数ではない値を呼び出そうとしました: {}",
+                            line, val
+                        )
+                        .into());
+                    }
+                }
+            } else if let Some(func) = self.env.functions.get(name).cloned() {
+                // 関数テーブルから検索
+                (name.clone(), func.params, func.body)
+            } else {
+                return Err(format!("{}行目: 未定義の関数: {}", line, name).into());
+            }
+        } else {
+            // 識別子以外（式の評価結果を呼び出す）
+            let func_value = self.eval_expr(callee, line)?;
+            match func_value {
+                Value::Fn { name, params, body } => (name, params, body),
+                _ => {
+                    return Err(format!(
+                        "{}行目: 関数ではない値を呼び出そうとしました: {}",
+                        line, func_value
+                    )
+                    .into());
+                }
+            }
+        };
 
-        if args.len() != func.params.len() {
+        if args.len() != params.len() {
             return Err(format!(
                 "{}行目: 関数 {} は引数{}個ですが、{}個渡されました",
                 line,
-                name,
-                func.params.len(),
+                func_name,
+                params.len(),
                 args.len()
             )
             .into());
@@ -496,13 +546,13 @@ impl Evaluator {
 
         // 新しいスコープを作って引数をバインド
         self.env.push_scope();
-        for (param, val) in func.params.iter().zip(arg_values) {
+        for (param, val) in params.iter().zip(arg_values) {
             self.env.set(param, val);
         }
 
         // 関数本体を実行
         let mut result = Value::Null;
-        for stmt in &func.body {
+        for stmt in &body {
             match self.exec_stmt(stmt)? {
                 EvalResult::Return(v) => {
                     result = v;

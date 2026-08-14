@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use crate::ast::Stmt;
+
 /// Tsumugi の実行時の値
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -10,6 +12,12 @@ pub enum Value {
     Null,
     List(Vec<Value>),
     Dict(BTreeMap<String, Value>),
+    /// 関数値（ユーザー定義関数を値として扱う）
+    Fn {
+        name: String,
+        params: Vec<String>,
+        body: Vec<Stmt>,
+    },
 }
 
 impl Value {
@@ -23,6 +31,7 @@ impl Value {
             Value::Str(s) => !s.is_empty(),
             Value::List(v) => !v.is_empty(),
             Value::Dict(m) => !m.is_empty(),
+            Value::Fn { .. } => true,
             _ => true,
         }
     }
@@ -46,6 +55,9 @@ impl std::fmt::Display for Value {
                     .map(|(k, v)| format!("\"{}\": {}", k, format_value_repr(v)))
                     .collect();
                 write!(f, "{{{}}}", parts.join(", "))
+            }
+            Value::Fn { name, params, .. } => {
+                write!(f, "<fn {}({})>", name, params.join(", "))
             }
         }
     }

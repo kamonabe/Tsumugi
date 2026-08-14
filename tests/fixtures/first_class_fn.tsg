@@ -1,0 +1,26 @@
+# 関数を値として扱う（Phase 1）
+
+fn add(a, b)
+    return a + b
+end
+
+# 関数を変数に代入して呼び出す
+let f = add
+print(f(1, 2))
+
+# 関数を引数として渡す
+fn apply(func, val)
+    return func(val)
+end
+
+fn double(x)
+    return x * 2
+end
+
+print(apply(double, 5))
+
+# type() で型を確認
+print(type(add))
+
+# print で表示
+print(add)
