@@ -74,6 +74,18 @@ impl Env {
         }
         None
     }
+
+    /// 現在の全スコープをフラットな HashMap に統合して返す（クロージャ用）
+    /// 内側のスコープが外側を上書きする
+    pub fn snapshot(&self) -> HashMap<String, Value> {
+        let mut flat = HashMap::new();
+        for scope in &self.scopes {
+            for (k, v) in scope {
+                flat.insert(k.clone(), v.clone());
+            }
+        }
+        flat
+    }
 }
 
 #[cfg(test)]

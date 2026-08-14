@@ -133,6 +133,12 @@ pub enum Expr {
     /// 関数呼び出し: expr(args)
     Call { callee: Box<Expr>, args: Vec<Expr> },
 
+    /// 無名関数（ラムダ）: fn(params) body end
+    Lambda {
+        params: Vec<String>,
+        body: Vec<Stmt>,
+    },
+
     /// インデックスアクセス: expr[expr]
     Index { object: Box<Expr>, index: Box<Expr> },
 }

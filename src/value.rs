@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use crate::ast::Stmt;
 
@@ -17,6 +18,7 @@ pub enum Value {
         name: String,
         params: Vec<String>,
         body: Vec<Stmt>,
+        captured: HashMap<String, Value>,
     },
 }
 

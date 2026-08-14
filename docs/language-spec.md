@@ -278,6 +278,80 @@ end
 let result = add(3, 4)
 ```
 
+### 第一級関数
+
+関数は値として扱える。変数に代入したり、別の関数に引数として渡したりできる。
+
+```
+fn double(x)
+    return x * 2
+end
+
+let f = double
+print(f(3))       # 6
+print(type(f))    # fn
+```
+
+### 無名関数（ラムダ）
+
+名前のない関数を式として書ける。
+
+複数行:
+```
+let add = fn(a, b)
+    return a + b
+end
+print(add(1, 2))  # 3
+```
+
+1行（`return` 省略可）:
+```
+let square = fn(x) x * x end
+print(square(5))  # 25
+```
+
+1行で `return` を明示してもよい:
+```
+let neg = fn(x) return -x end
+```
+
+### クロージャ
+
+無名関数は定義時のスコープにある変数を捕捉（キャプチャ）する。
+
+```
+fn make_adder(n)
+    return fn(x) return x + n end
+end
+
+let add5 = make_adder(5)
+print(add5(3))   # 8
+print(add5(10))  # 15
+```
+
+キャプチャは**値コピー**で行われる。定義時点の値がコピーされるため、後から元の変数を変更してもクロージャ内の値は変わらない。
+
+```
+let base = 10
+let adder = fn(x) return x + base end
+base = 999
+print(adder(1))  # 11（base=10 の時点のコピーを使う）
+```
+
+> **制約**: キャプチャした変数への再代入は元のスコープに反映されない（値キャプチャ方式）。カウンターのような「状態を保持するクロージャ」は現在サポートされていない。
+
+### 高階関数
+
+関数を引数として受け取る関数を書ける。
+
+```
+fn apply(func, val)
+    return func(val)
+end
+
+print(apply(fn(x) x * 3 end, 7))  # 21
+```
+
 ## 組み込み関数
 
 | 関数 | 説明 |

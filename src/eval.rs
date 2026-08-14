@@ -251,6 +251,7 @@ impl Evaluator {
                         name: name.clone(),
                         params: params.clone(),
                         body: body.clone(),
+                        captured: std::collections::HashMap::new(),
                     },
                 );
                 Ok(EvalResult::Val)
@@ -321,6 +322,17 @@ impl Evaluator {
             }
 
             Expr::Call { callee, args } => self.eval_call(callee, args, line),
+
+            Expr::Lambda { params, body } => {
+                // 無名関数: 定義時のスコープをキャプチャして Value::Fn を生成
+                let captured = self.env.snapshot();
+                Ok(Value::Fn {
+                    name: "<anonymous>".to_string(),
+                    params: params.clone(),
+                    body: body.clone(),
+                    captured,
+                })
+            }
 
             Expr::Index { object, index } => {
                 let obj = self.eval_expr(object, line)?;
@@ -489,7 +501,7 @@ impl Evaluator {
 
         // callee を評価して関数値を取得
         // 識別子の場合: 変数 → 関数テーブルの順で検索
-        let (func_name, params, body) = if let Expr::Ident(name) = callee {
+        let (func_name, params, body, captured) = if let Expr::Ident(name) = callee {
             // 変数として検索
             if let Some(val) = self.env.get(name).cloned() {
                 match val {
@@ -497,7 +509,8 @@ impl Evaluator {
                         name: fn_name,
                         params,
                         body,
-                    } => (fn_name, params, body),
+                        captured,
+                    } => (fn_name, params, body, captured),
                     _ => {
                         return Err(format!(
                             "{}行目: 関数ではない値を呼び出そうとしました: {}",
@@ -508,7 +521,12 @@ impl Evaluator {
                 }
             } else if let Some(func) = self.env.functions.get(name).cloned() {
                 // 関数テーブルから検索
-                (name.clone(), func.params, func.body)
+                (
+                    name.clone(),
+                    func.params,
+                    func.body,
+                    std::collections::HashMap::new(),
+                )
             } else {
                 return Err(format!("{}行目: 未定義の関数: {}", line, name).into());
             }
@@ -516,7 +534,12 @@ impl Evaluator {
             // 識別子以外（式の評価結果を呼び出す）
             let func_value = self.eval_expr(callee, line)?;
             match func_value {
-                Value::Fn { name, params, body } => (name, params, body),
+                Value::Fn {
+                    name,
+                    params,
+                    body,
+                    captured,
+                } => (name, params, body, captured),
                 _ => {
                     return Err(format!(
                         "{}行目: 関数ではない値を呼び出そうとしました: {}",
@@ -544,8 +567,11 @@ impl Evaluator {
             arg_values.push(self.eval_expr(arg, line)?);
         }
 
-        // 新しいスコープを作って引数をバインド
+        // 新しいスコープを作ってキャプチャ変数 + 引数をバインド
         self.env.push_scope();
+        for (k, v) in &captured {
+            self.env.set(k, v.clone());
+        }
         for (param, val) in params.iter().zip(arg_values) {
             self.env.set(param, val);
         }

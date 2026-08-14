@@ -236,3 +236,8 @@ fn error_dict_key_type() {
 fn golden_first_class_fn() {
     run_golden_test("first_class_fn");
 }
+
+#[test]
+fn golden_closure() {
+    run_golden_test("closure");
+}

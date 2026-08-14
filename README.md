@@ -49,6 +49,19 @@ let config = {"host": "localhost", "port": 8080}
 print(config["host"])
 config["debug"] = true
 print(keys(config))
+
+# クロージャ
+fn make_adder(n)
+    return fn(x) return x + n end
+end
+let add5 = make_adder(5)
+print(add5(3))    # 8
+
+# 無名関数を引数に渡す
+fn apply(func, val)
+    return func(val)
+end
+print(apply(fn(x) x * x end, 6))  # 36
 ```
 
 ## 対応機能
@@ -62,6 +75,9 @@ print(keys(config))
 - 論理演算 (`and`, `or`, `not`)
 - 条件分岐 (`if` / `elif` / `else` / `end`)
 - 関数定義・呼び出し (`fn` / `return` / `end`)
+- 第一級関数（関数を変数に代入、引数として渡す）
+- 無名関数 / ラムダ (`fn(x) x * 2 end`)
+- クロージャ（外側の変数をキャプチャ）
 - while ループ
 - for ループ (`for item in collection ... end`)
 - break / continue
