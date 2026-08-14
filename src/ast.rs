@@ -62,6 +62,12 @@ pub enum Stmt {
         line: usize,
     },
 
+    /// break
+    Break { line: usize },
+
+    /// continue
+    Continue { line: usize },
+
     /// 式文（print(x) や add(1,2) など、式だけの行）
     #[allow(clippy::enum_variant_names)]
     ExprStmt { expr: Expr, line: usize },
@@ -80,6 +86,8 @@ impl Stmt {
             Stmt::While { line, .. } => *line,
             Stmt::For { line, .. } => *line,
             Stmt::FnDef { line, .. } => *line,
+            Stmt::Break { line } => *line,
+            Stmt::Continue { line } => *line,
             Stmt::ExprStmt { line, .. } => *line,
         }
     }

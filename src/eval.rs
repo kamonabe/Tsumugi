@@ -4,10 +4,12 @@ use crate::value::Value;
 
 use std::collections::BTreeMap;
 
-/// 評価器の戻り値（通常の値 or return による早期脱出）
+/// 評価器の戻り値（通常の値 or return / break / continue による制御フロー）
 enum EvalResult {
     Val,
     Return(Value),
+    Break,
+    Continue,
 }
 
 /// AST を評価して実行する
@@ -23,9 +25,21 @@ impl Evaluator {
     /// プログラム全体を実行
     pub fn run(&mut self, program: &Program) -> Result<(), String> {
         for stmt in program {
-            if let EvalResult::Return(_) = self.exec_stmt(stmt)? {
-                // トップレベルの return は無視
-                break;
+            match self.exec_stmt(stmt)? {
+                EvalResult::Return(_) => break,
+                EvalResult::Break => {
+                    return Err(format!(
+                        "{}行目: break はループの中でのみ使用できます",
+                        stmt.line()
+                    ));
+                }
+                EvalResult::Continue => {
+                    return Err(format!(
+                        "{}行目: continue はループの中でのみ使用できます",
+                        stmt.line()
+                    ));
+                }
+                EvalResult::Val => {}
             }
         }
         Ok(())
@@ -135,8 +149,9 @@ impl Evaluator {
                     else_body
                 };
                 for s in body {
-                    if let EvalResult::Return(v) = self.exec_stmt(s)? {
-                        return Ok(EvalResult::Return(v));
+                    match self.exec_stmt(s)? {
+                        EvalResult::Val => {}
+                        other => return Ok(other),
                     }
                 }
                 Ok(EvalResult::Val)
@@ -152,10 +167,20 @@ impl Evaluator {
                     if !cond.is_truthy() {
                         break;
                     }
+                    let mut should_break = false;
                     for s in body {
-                        if let EvalResult::Return(v) = self.exec_stmt(s)? {
-                            return Ok(EvalResult::Return(v));
+                        match self.exec_stmt(s)? {
+                            EvalResult::Return(v) => return Ok(EvalResult::Return(v)),
+                            EvalResult::Break => {
+                                should_break = true;
+                                break;
+                            }
+                            EvalResult::Continue => break,
+                            EvalResult::Val => {}
                         }
+                    }
+                    if should_break {
+                        break;
                     }
                 }
                 Ok(EvalResult::Val)
@@ -182,10 +207,20 @@ impl Evaluator {
 
                 for item in items {
                     self.env.set(var, item);
+                    let mut should_break = false;
                     for s in body {
-                        if let EvalResult::Return(v) = self.exec_stmt(s)? {
-                            return Ok(EvalResult::Return(v));
+                        match self.exec_stmt(s)? {
+                            EvalResult::Return(v) => return Ok(EvalResult::Return(v)),
+                            EvalResult::Break => {
+                                should_break = true;
+                                break;
+                            }
+                            EvalResult::Continue => break,
+                            EvalResult::Val => {}
                         }
+                    }
+                    if should_break {
+                        break;
                     }
                 }
                 Ok(EvalResult::Val)
@@ -201,6 +236,10 @@ impl Evaluator {
                 self.env.functions.insert(name.clone(), func);
                 Ok(EvalResult::Val)
             }
+
+            Stmt::Break { .. } => Ok(EvalResult::Break),
+
+            Stmt::Continue { .. } => Ok(EvalResult::Continue),
 
             Stmt::ExprStmt { expr, line } => {
                 self.eval_expr(expr, *line)?;
@@ -530,6 +569,20 @@ impl Evaluator {
                     result = v;
                     break;
                 }
+                EvalResult::Break => {
+                    self.env.pop_scope();
+                    return Err(format!(
+                        "{}行目: break はループの中でのみ使用できます",
+                        line
+                    ));
+                }
+                EvalResult::Continue => {
+                    self.env.pop_scope();
+                    return Err(format!(
+                        "{}行目: continue はループの中でのみ使用できます",
+                        line
+                    ));
+                }
                 EvalResult::Val => {}
             }
         }
@@ -731,5 +784,37 @@ mod tests {
         let result = run_program("for x in 42\n  print(x)\nend");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("for で反復できません"));
+    }
+
+    #[test]
+    fn break_in_while() {
+        run_program("let i = 0\nwhile true\n  if i == 3\n    break\n  end\n  i = i + 1\nend")
+            .unwrap();
+    }
+
+    #[test]
+    fn break_in_for() {
+        run_program("for n in [1, 2, 3, 4, 5]\n  if n == 3\n    break\n  end\n  print(n)\nend")
+            .unwrap();
+    }
+
+    #[test]
+    fn continue_in_for() {
+        run_program("for n in [1, 2, 3, 4, 5]\n  if n == 3\n    continue\n  end\n  print(n)\nend")
+            .unwrap();
+    }
+
+    #[test]
+    fn break_outside_loop_error() {
+        let result = run_program("break");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("break はループの中でのみ"));
+    }
+
+    #[test]
+    fn continue_outside_loop_error() {
+        let result = run_program("continue");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("continue はループの中でのみ"));
     }
 }

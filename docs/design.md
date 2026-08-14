@@ -179,7 +179,8 @@ GitHub Actions (`.github/workflows/ci.yml`) で push / PR 時に自動実行:
 ```
 program        = stmt*
 stmt           = let_stmt | assign_stmt | index_assign | return_stmt
-               | if_stmt | while_stmt | for_stmt | fn_def | expr_stmt
+               | if_stmt | while_stmt | for_stmt | break_stmt | continue_stmt
+               | fn_def | expr_stmt
 let_stmt       = "let" IDENT "=" expr NEWLINE
 assign_stmt    = IDENT "=" expr NEWLINE
 index_assign   = postfix "[" expr "]" "=" expr NEWLINE
@@ -187,6 +188,8 @@ return_stmt    = "return" expr NEWLINE
 if_stmt        = "if" expr NEWLINE block ("else" NEWLINE block)? "end" NEWLINE
 while_stmt     = "while" expr NEWLINE block "end" NEWLINE
 for_stmt       = "for" IDENT "in" expr NEWLINE block "end" NEWLINE
+break_stmt     = "break" NEWLINE
+continue_stmt  = "continue" NEWLINE
 fn_def         = "fn" IDENT "(" params? ")" NEWLINE block "end" NEWLINE
 expr_stmt      = expr NEWLINE
 block          = stmt*
@@ -211,7 +214,7 @@ args           = expr ("," expr)*
 | 優先度 | 項目 |
 |---|---|
 | 中 | 組み込み関数の追加（pop, slice, contains 等） |
-| 中 | break / continue |
+| 中 | 剰余演算子 `%` |
 | 低 | モジュール / import |
 | 低 | クロージャ / 高階関数 |
 | 発展 | バイトコード VM 化 |
