@@ -81,7 +81,7 @@ print(apply(fn(x) x * x end, 6))  # 36
 - while ループ
 - for ループ (`for item in collection ... end`)
 - break / continue
-- 組み込み関数 50個（文字列操作、リスト操作、ファイルI/O、パス操作、環境変数、日時など）
+- 組み込み関数 53個（文字列操作、リスト操作、高階関数、ファイルI/O、パス操作、環境変数、日時など）
 - REPL（複数行入力対応）
 - ファイル実行
 - 行番号付きエラーメッセージ（パースエラー・ランタイムエラー両方）
@@ -142,7 +142,7 @@ src/
 ├── env.rs      # 環境（変数スコープ・関数テーブル）
 ├── error.rs    # エラー型（TsumugiError: Parse / Runtime）
 ├── eval.rs     # 評価器（AST → 実行、エラーに行番号付与）
-└── builtin.rs  # 組み込み関数（50個）の実装
+└── builtin.rs  # 組み込み関数（53個）の実装
 
 tests/
 ├── integration.rs    # 統合テスト（ゴールデンテスト）

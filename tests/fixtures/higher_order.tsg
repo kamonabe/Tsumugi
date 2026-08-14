@@ -1,0 +1,34 @@
+# 高階関数（Phase 3: map / filter / each）
+
+let nums = [1, 2, 3, 4, 5]
+
+# map: 各要素に関数を適用して新しいリストを返す
+let doubled = map(nums, fn(x) x * 2 end)
+print(doubled)
+
+# filter: 条件を満たす要素だけ残す
+let evens = filter(nums, fn(x) x % 2 == 0 end)
+print(evens)
+
+let big = filter(nums, fn(x) x > 3 end)
+print(big)
+
+# each: 各要素に対して処理を実行（副作用用途）
+each([10, 20, 30], fn(x) print(x) end)
+
+# クロージャと組み合わせ
+fn make_multiplier(factor)
+    return fn(x) x * factor end
+end
+let times3 = make_multiplier(3)
+let tripled = map(nums, times3)
+print(tripled)
+
+# filter + map の連鎖
+let processed = map(filter(nums, fn(x) x % 2 == 1 end), fn(x) x * 10 end)
+print(processed)
+
+# map で文字列操作
+let names = ["alice", "bob", "charlie"]
+let upper_names = map(names, fn(s) upper(s) end)
+print(upper_names)
