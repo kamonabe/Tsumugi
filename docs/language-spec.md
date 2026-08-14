@@ -281,8 +281,16 @@ let result = add(3, 4)
 | `print(値, ...)` | 値を標準出力に表示。複数引数はスペース区切りで出力 |
 | `len(x)` | 文字列・リスト・辞書の長さを返す |
 | `push(list, val)` | リストの末尾に値を追加（破壊的操作） |
+| `pop(list)` | リストの末尾の値を取り出して返す（破壊的操作） |
 | `keys(dict)` | 辞書のキー一覧をリストで返す |
-| `type(x)` | 値の型名を文字列で返す（`"int"`, `"float"`, `"str"`, `"bool"`, `"null"`, `"list"`, `"dict"`） |
+| `type(x)` | 値の型名を文字列で返す |
+| `slice(collection, start, end)` | リスト/文字列の部分を切り出す（start から end の手前まで） |
+| `contains(collection, val)` | リスト/辞書/文字列に値が含まれていれば true |
+| `split(str, sep)` | 文字列をセパレータで分割しリストで返す |
+| `join(list, sep)` | リストの各要素をセパレータで結合して文字列で返す |
+| `to_int(val)` | 値を整数に変換（文字列/Float/Bool対応） |
+| `to_str(val)` | 値を文字列に変換 |
+| `range(start, end)` | start から end の手前までの整数リストを生成 |
 
 ## 真偽判定
 
