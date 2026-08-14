@@ -16,6 +16,7 @@ pub enum Token {
     Return,
     If,
     Else,
+    Elif,
     While,
     For,
     In,

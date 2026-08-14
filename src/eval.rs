@@ -839,4 +839,22 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("ゼロ除算"));
     }
+
+    #[test]
+    fn elif_basic() {
+        run_program(
+            "let x = 5\nif x == 1\n  print(1)\nelif x == 5\n  print(5)\nelse\n  print(0)\nend",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn elif_multiple() {
+        run_program("let x = 3\nif x == 1\n  print(1)\nelif x == 2\n  print(2)\nelif x == 3\n  print(3)\nelse\n  print(0)\nend").unwrap();
+    }
+
+    #[test]
+    fn elif_no_else() {
+        run_program("let x = 2\nif x == 1\n  print(1)\nelif x == 2\n  print(2)\nend").unwrap();
+    }
 }
