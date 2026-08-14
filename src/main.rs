@@ -1,5 +1,6 @@
 mod ast;
 mod env;
+mod error;
 mod eval;
 mod lexer;
 mod parser;
@@ -87,7 +88,7 @@ fn run_repl() {
 }
 
 /// ソースを実行する共通関数
-fn execute(source: &str, evaluator: &mut Evaluator) -> Result<(), String> {
+fn execute(source: &str, evaluator: &mut Evaluator) -> Result<(), error::TsumugiError> {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize();
 

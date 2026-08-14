@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::error::TsumugiError;
 use crate::token::{Spanned, Token};
 
 /// トークン列をASTに変換するパーサー
@@ -13,7 +14,7 @@ impl Parser {
     }
 
     /// プログラム全体をパースする
-    pub fn parse(&mut self) -> Result<Program, String> {
+    pub fn parse(&mut self) -> Result<Program, TsumugiError> {
         let mut stmts = Vec::new();
         self.skip_newlines();
 
@@ -28,7 +29,7 @@ impl Parser {
 
     // --- 文のパース ---
 
-    fn parse_stmt(&mut self) -> Result<Stmt, String> {
+    fn parse_stmt(&mut self) -> Result<Stmt, TsumugiError> {
         match self.peek_token() {
             Token::Let => self.parse_let(),
             Token::Return => self.parse_return(),
@@ -97,7 +98,7 @@ impl Parser {
     }
 
     /// name = expr（再代入）
-    fn parse_assign(&mut self) -> Result<Stmt, String> {
+    fn parse_assign(&mut self) -> Result<Stmt, TsumugiError> {
         let line = self.current_line();
         let spanned = self.advance_spanned();
         let name = match spanned.token {
@@ -113,7 +114,7 @@ impl Parser {
     }
 
     /// ident[expr] = expr（インデックス代入）
-    fn parse_index_assign(&mut self) -> Result<Stmt, String> {
+    fn parse_index_assign(&mut self) -> Result<Stmt, TsumugiError> {
         let line = self.current_line();
         // パースは式として左辺を読み取り、Index ノードを得る
         let object_expr = self.parse_expr()?;
@@ -122,9 +123,9 @@ impl Parser {
         let (object, index) = match object_expr {
             Expr::Index { object, index } => (*object, *index),
             _ => {
-                return Err(format!(
-                    "{}: インデックス代入の左辺が不正です",
-                    self.format_line(line)
+                return Err(TsumugiError::parse(
+                    line,
+                    "インデックス代入の左辺が不正です",
                 ));
             }
         };
@@ -142,7 +143,7 @@ impl Parser {
     }
 
     /// let name = expr
-    fn parse_let(&mut self) -> Result<Stmt, String> {
+    fn parse_let(&mut self) -> Result<Stmt, TsumugiError> {
         let line = self.current_line();
         self.advance(); // consume 'let'
 
@@ -150,10 +151,9 @@ impl Parser {
         let name = match spanned.token {
             Token::Ident(s) => s,
             other => {
-                return Err(format!(
-                    "{}: let の後に識別子が必要です。got: {:?}",
-                    self.format_line(spanned.line),
-                    other
+                return Err(TsumugiError::parse(
+                    spanned.line,
+                    format!("let の後に識別子が必要です。got: {:?}", other),
                 ));
             }
         };
@@ -166,7 +166,7 @@ impl Parser {
     }
 
     /// return expr
-    fn parse_return(&mut self) -> Result<Stmt, String> {
+    fn parse_return(&mut self) -> Result<Stmt, TsumugiError> {
         let line = self.current_line();
         self.advance(); // consume 'return'
         let value = self.parse_expr()?;
@@ -176,7 +176,7 @@ impl Parser {
     }
 
     /// if cond \n body (else \n body)? end
-    fn parse_if(&mut self) -> Result<Stmt, String> {
+    fn parse_if(&mut self) -> Result<Stmt, TsumugiError> {
         let line = self.current_line();
         self.advance(); // consume 'if'
 
@@ -222,7 +222,7 @@ impl Parser {
     }
 
     /// while cond \n body end
-    fn parse_while(&mut self) -> Result<Stmt, String> {
+    fn parse_while(&mut self) -> Result<Stmt, TsumugiError> {
         let line = self.current_line();
         self.advance(); // consume 'while'
 
@@ -243,7 +243,7 @@ impl Parser {
     }
 
     /// for var in expr \n body end
-    fn parse_for(&mut self) -> Result<Stmt, String> {
+    fn parse_for(&mut self) -> Result<Stmt, TsumugiError> {
         let line = self.current_line();
         self.advance(); // consume 'for'
 
@@ -251,10 +251,9 @@ impl Parser {
         let var = match spanned.token {
             Token::Ident(s) => s,
             other => {
-                return Err(format!(
-                    "{}: for の後に変数名が必要です。got: {:?}",
-                    self.format_line(spanned.line),
-                    other
+                return Err(TsumugiError::parse(
+                    spanned.line,
+                    format!("for の後に変数名が必要です。got: {:?}", other),
                 ));
             }
         };
@@ -278,7 +277,7 @@ impl Parser {
     }
 
     /// break
-    fn parse_break(&mut self) -> Result<Stmt, String> {
+    fn parse_break(&mut self) -> Result<Stmt, TsumugiError> {
         let line = self.current_line();
         self.advance(); // consume 'break'
         self.expect_newline_or_eof()?;
@@ -286,7 +285,7 @@ impl Parser {
     }
 
     /// continue
-    fn parse_continue(&mut self) -> Result<Stmt, String> {
+    fn parse_continue(&mut self) -> Result<Stmt, TsumugiError> {
         let line = self.current_line();
         self.advance(); // consume 'continue'
         self.expect_newline_or_eof()?;
@@ -294,7 +293,7 @@ impl Parser {
     }
 
     /// fn name(params) \n body end
-    fn parse_fn_def(&mut self) -> Result<Stmt, String> {
+    fn parse_fn_def(&mut self) -> Result<Stmt, TsumugiError> {
         let line = self.current_line();
         self.advance(); // consume 'fn'
 
@@ -302,10 +301,9 @@ impl Parser {
         let name = match spanned.token {
             Token::Ident(s) => s,
             other => {
-                return Err(format!(
-                    "{}: fn の後に関数名が必要です。got: {:?}",
-                    self.format_line(spanned.line),
-                    other
+                return Err(TsumugiError::parse(
+                    spanned.line,
+                    format!("fn の後に関数名が必要です。got: {:?}", other),
                 ));
             }
         };
@@ -330,7 +328,7 @@ impl Parser {
     }
 
     /// 引数リスト: ident, ident, ...
-    fn parse_params(&mut self) -> Result<Vec<String>, String> {
+    fn parse_params(&mut self) -> Result<Vec<String>, TsumugiError> {
         let mut params = Vec::new();
 
         if self.peek_token() == Token::RParen {
@@ -341,10 +339,9 @@ impl Parser {
         match spanned.token {
             Token::Ident(s) => params.push(s),
             other => {
-                return Err(format!(
-                    "{}: 引数名が必要です。got: {:?}",
-                    self.format_line(spanned.line),
-                    other
+                return Err(TsumugiError::parse(
+                    spanned.line,
+                    format!("引数名が必要です。got: {:?}", other),
                 ));
             }
         }
@@ -355,10 +352,9 @@ impl Parser {
             match spanned.token {
                 Token::Ident(s) => params.push(s),
                 other => {
-                    return Err(format!(
-                        "{}: 引数名が必要です。got: {:?}",
-                        self.format_line(spanned.line),
-                        other
+                    return Err(TsumugiError::parse(
+                        spanned.line,
+                        format!("引数名が必要です。got: {:?}", other),
                     ));
                 }
             }
@@ -368,7 +364,7 @@ impl Parser {
     }
 
     /// 式文
-    fn parse_expr_stmt(&mut self) -> Result<Stmt, String> {
+    fn parse_expr_stmt(&mut self) -> Result<Stmt, TsumugiError> {
         let line = self.current_line();
         let expr = self.parse_expr()?;
         self.expect_newline_or_eof()?;
@@ -376,7 +372,7 @@ impl Parser {
     }
 
     /// ブロック: 終端トークンのいずれかに到達するまで文をパース
-    fn parse_block(&mut self, terminators: &[Token]) -> Result<Vec<Stmt>, String> {
+    fn parse_block(&mut self, terminators: &[Token]) -> Result<Vec<Stmt>, TsumugiError> {
         let mut stmts = Vec::new();
 
         while !self.is_at_end() && !terminators.contains(&self.peek_token()) {
@@ -399,12 +395,12 @@ impl Parser {
     //   not -（単項）
     //   関数呼び出し・リテラル・括弧
 
-    fn parse_expr(&mut self) -> Result<Expr, String> {
+    fn parse_expr(&mut self) -> Result<Expr, TsumugiError> {
         self.parse_or()
     }
 
     /// or
-    fn parse_or(&mut self) -> Result<Expr, String> {
+    fn parse_or(&mut self) -> Result<Expr, TsumugiError> {
         let mut left = self.parse_and()?;
 
         while self.peek_token() == Token::Or {
@@ -421,7 +417,7 @@ impl Parser {
     }
 
     /// and
-    fn parse_and(&mut self) -> Result<Expr, String> {
+    fn parse_and(&mut self) -> Result<Expr, TsumugiError> {
         let mut left = self.parse_comparison()?;
 
         while self.peek_token() == Token::And {
@@ -438,7 +434,7 @@ impl Parser {
     }
 
     /// == != < > <= >=
-    fn parse_comparison(&mut self) -> Result<Expr, String> {
+    fn parse_comparison(&mut self) -> Result<Expr, TsumugiError> {
         let mut left = self.parse_add_sub()?;
 
         loop {
@@ -464,7 +460,7 @@ impl Parser {
     }
 
     /// + -
-    fn parse_add_sub(&mut self) -> Result<Expr, String> {
+    fn parse_add_sub(&mut self) -> Result<Expr, TsumugiError> {
         let mut left = self.parse_mul_div()?;
 
         loop {
@@ -486,7 +482,7 @@ impl Parser {
     }
 
     /// * /
-    fn parse_mul_div(&mut self) -> Result<Expr, String> {
+    fn parse_mul_div(&mut self) -> Result<Expr, TsumugiError> {
         let mut left = self.parse_unary()?;
 
         loop {
@@ -509,7 +505,7 @@ impl Parser {
     }
 
     /// 単項: not, -
-    fn parse_unary(&mut self) -> Result<Expr, String> {
+    fn parse_unary(&mut self) -> Result<Expr, TsumugiError> {
         match self.peek_token() {
             Token::Not => {
                 self.advance();
@@ -532,7 +528,7 @@ impl Parser {
     }
 
     /// 関数呼び出し / インデックスアクセス or プライマリ
-    fn parse_call(&mut self) -> Result<Expr, String> {
+    fn parse_call(&mut self) -> Result<Expr, TsumugiError> {
         let mut expr = self.parse_primary()?;
 
         loop {
@@ -561,7 +557,7 @@ impl Parser {
     }
 
     /// 呼び出し引数リスト
-    fn parse_args(&mut self) -> Result<Vec<Expr>, String> {
+    fn parse_args(&mut self) -> Result<Vec<Expr>, TsumugiError> {
         let mut args = Vec::new();
 
         if self.peek_token() == Token::RParen {
@@ -579,7 +575,7 @@ impl Parser {
     }
 
     /// プライマリ: リテラル, 識別子, 括弧式, リスト, 辞書
-    fn parse_primary(&mut self) -> Result<Expr, String> {
+    fn parse_primary(&mut self) -> Result<Expr, TsumugiError> {
         let spanned = self.peek_spanned();
         match spanned.token {
             Token::Int(_) => {
@@ -645,16 +641,15 @@ impl Parser {
             }
             Token::LBracket => self.parse_list_literal(),
             Token::LBrace => self.parse_dict_literal(),
-            other => Err(format!(
-                "{}: 予期しないトークン: {:?}",
-                self.format_line(spanned.line),
-                other
+            other => Err(TsumugiError::parse(
+                spanned.line,
+                format!("予期しないトークン: {:?}", other),
             )),
         }
     }
 
     /// リストリテラル: [expr, expr, ...]
-    fn parse_list_literal(&mut self) -> Result<Expr, String> {
+    fn parse_list_literal(&mut self) -> Result<Expr, TsumugiError> {
         self.advance(); // consume '['
         let mut items = Vec::new();
 
@@ -678,7 +673,7 @@ impl Parser {
     }
 
     /// 辞書リテラル: {expr: expr, ...}
-    fn parse_dict_literal(&mut self) -> Result<Expr, String> {
+    fn parse_dict_literal(&mut self) -> Result<Expr, TsumugiError> {
         self.advance(); // consume '{'
         let mut pairs = Vec::new();
 
@@ -751,21 +746,19 @@ impl Parser {
         self.tokens.get(self.pos).map(|s| s.line).unwrap_or(0)
     }
 
-    fn expect(&mut self, expected: Token) -> Result<(), String> {
+    fn expect(&mut self, expected: Token) -> Result<(), TsumugiError> {
         let spanned = self.advance_spanned();
         if spanned.token == expected {
             Ok(())
         } else {
-            Err(format!(
-                "{}: 期待: {:?}, 実際: {:?}",
-                self.format_line(spanned.line),
-                expected,
-                spanned.token
+            Err(TsumugiError::parse(
+                spanned.line,
+                format!("期待: {:?}, 実際: {:?}", expected, spanned.token),
             ))
         }
     }
 
-    fn expect_newline(&mut self) -> Result<(), String> {
+    fn expect_newline(&mut self) -> Result<(), TsumugiError> {
         let line = self.current_line();
         match self.peek_token() {
             Token::Newline => {
@@ -773,15 +766,14 @@ impl Parser {
                 Ok(())
             }
             Token::Eof => Ok(()),
-            other => Err(format!(
-                "{}: 改行が必要です。got: {:?}",
-                self.format_line(line),
-                other
+            other => Err(TsumugiError::parse(
+                line,
+                format!("改行が必要です。got: {:?}", other),
             )),
         }
     }
 
-    fn expect_newline_or_eof(&mut self) -> Result<(), String> {
+    fn expect_newline_or_eof(&mut self) -> Result<(), TsumugiError> {
         let line = self.current_line();
         match self.peek_token() {
             Token::Newline | Token::Eof => {
@@ -790,10 +782,9 @@ impl Parser {
                 }
                 Ok(())
             }
-            other => Err(format!(
-                "{}: 改行またはEOFが必要です。got: {:?}",
-                self.format_line(line),
-                other
+            other => Err(TsumugiError::parse(
+                line,
+                format!("改行またはEOFが必要です。got: {:?}", other),
             )),
         }
     }
@@ -803,11 +794,6 @@ impl Parser {
             self.advance();
         }
     }
-
-    /// 行番号をフォーマットする
-    fn format_line(&self, line: usize) -> String {
-        format!("{}行目", line)
-    }
 }
 
 #[cfg(test)]
@@ -815,7 +801,7 @@ mod tests {
     use super::*;
     use crate::lexer::Lexer;
 
-    fn parse(input: &str) -> Result<Program, String> {
+    fn parse(input: &str) -> Result<Program, TsumugiError> {
         let tokens = Lexer::new(input).tokenize();
         Parser::new(tokens).parse()
     }
@@ -887,12 +873,8 @@ mod tests {
     fn error_has_line_number() {
         let result = parse("let x = 10\nlet = oops");
         assert!(result.is_err());
-        let msg = result.unwrap_err();
-        assert!(
-            msg.contains("2行目"),
-            "error should mention line 2: {}",
-            msg
-        );
+        let err = result.unwrap_err();
+        assert_eq!(err.line(), 2, "error should be on line 2: {}", err);
     }
 
     #[test]
