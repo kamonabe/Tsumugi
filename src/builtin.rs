@@ -1101,7 +1101,10 @@ impl Evaluator {
                         ));
                     }
                     _ => {
-                        return Err(format!("{}行目: has_key() の第1引数は辞書である必要があります", line));
+                        return Err(format!(
+                            "{}行目: has_key() の第1引数は辞書である必要があります",
+                            line
+                        ));
                     }
                 }
             }
