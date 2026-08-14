@@ -161,6 +161,36 @@ impl Evaluator {
                 Ok(EvalResult::Val)
             }
 
+            Stmt::For {
+                var,
+                iter,
+                body,
+                line,
+            } => {
+                let collection = self.eval_expr(iter, *line)?;
+                let items: Vec<Value> = match &collection {
+                    Value::List(list) => list.clone(),
+                    Value::Dict(map) => map.keys().map(|k| Value::Str(k.clone())).collect(),
+                    Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
+                    _ => {
+                        return Err(format!(
+                            "{}行目: for で反復できません: {:?}",
+                            line, collection
+                        ));
+                    }
+                };
+
+                for item in items {
+                    self.env.set(var, item);
+                    for s in body {
+                        if let EvalResult::Return(v) = self.exec_stmt(s)? {
+                            return Ok(EvalResult::Return(v));
+                        }
+                    }
+                }
+                Ok(EvalResult::Val)
+            }
+
             Stmt::FnDef {
                 name, params, body, ..
             } => {
@@ -673,5 +703,33 @@ mod tests {
         let result = run_program("let xs = [1, 2]\nprint(xs[5])");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("インデックス範囲外"));
+    }
+
+    #[test]
+    fn for_loop_list() {
+        run_program("let xs = [1, 2, 3]\nfor x in xs\n  print(x)\nend").unwrap();
+    }
+
+    #[test]
+    fn for_loop_dict() {
+        run_program("let d = {\"a\": 1}\nfor k in d\n  print(k)\nend").unwrap();
+    }
+
+    #[test]
+    fn for_loop_string() {
+        run_program("for ch in \"hi\"\n  print(ch)\nend").unwrap();
+    }
+
+    #[test]
+    fn for_loop_accumulate() {
+        run_program("let total = 0\nfor n in [1, 2, 3]\n  total = total + n\nend\nprint(total)")
+            .unwrap();
+    }
+
+    #[test]
+    fn for_loop_non_iterable_error() {
+        let result = run_program("for x in 42\n  print(x)\nend");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("for で反復できません"));
     }
 }

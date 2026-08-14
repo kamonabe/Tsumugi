@@ -34,6 +34,7 @@ impl Parser {
             Token::Return => self.parse_return(),
             Token::If => self.parse_if(),
             Token::While => self.parse_while(),
+            Token::For => self.parse_for(),
             Token::Fn => self.parse_fn_def(),
             Token::Ident(_) => {
                 // 識別子 + '=' なら再代入文
@@ -219,6 +220,41 @@ impl Parser {
 
         Ok(Stmt::While {
             condition,
+            body,
+            line,
+        })
+    }
+
+    /// for var in expr \n body end
+    fn parse_for(&mut self) -> Result<Stmt, String> {
+        let line = self.current_line();
+        self.advance(); // consume 'for'
+
+        let spanned = self.advance_spanned();
+        let var = match spanned.token {
+            Token::Ident(s) => s,
+            other => {
+                return Err(format!(
+                    "{}: for の後に変数名が必要です。got: {:?}",
+                    self.format_line(spanned.line),
+                    other
+                ));
+            }
+        };
+
+        self.expect(Token::In)?;
+        let iter = self.parse_expr()?;
+        self.expect_newline()?;
+        self.skip_newlines();
+
+        let body = self.parse_block(&[Token::End])?;
+
+        self.expect(Token::End)?;
+        self.expect_newline_or_eof()?;
+
+        Ok(Stmt::For {
+            var,
+            iter,
             body,
             line,
         })
@@ -896,6 +932,22 @@ mod tests {
         match &program[1] {
             Stmt::IndexAssign { .. } => {}
             other => panic!("expected IndexAssign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_for() {
+        let program = parse("for x in xs\n  print(x)\nend").unwrap();
+        assert_eq!(program.len(), 1);
+        match &program[0] {
+            Stmt::For {
+                var, body, line, ..
+            } => {
+                assert_eq!(var, "x");
+                assert_eq!(*line, 1);
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("expected For, got {:?}", other),
         }
     }
 

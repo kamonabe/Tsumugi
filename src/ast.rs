@@ -46,6 +46,14 @@ pub enum Stmt {
         line: usize,
     },
 
+    /// for item in collection ... end
+    For {
+        var: String,
+        iter: Expr,
+        body: Vec<Stmt>,
+        line: usize,
+    },
+
     /// fn name(params) ... end
     FnDef {
         name: String,
@@ -70,6 +78,7 @@ impl Stmt {
             Stmt::Return { line, .. } => *line,
             Stmt::If { line, .. } => *line,
             Stmt::While { line, .. } => *line,
+            Stmt::For { line, .. } => *line,
             Stmt::FnDef { line, .. } => *line,
             Stmt::ExprStmt { line, .. } => *line,
         }

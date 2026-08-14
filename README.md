@@ -63,6 +63,7 @@ print(keys(config))
 - 条件分岐 (`if` / `else` / `end`)
 - 関数定義・呼び出し (`fn` / `return` / `end`)
 - while ループ
+- for ループ (`for item in collection ... end`)
 - 組み込み関数 (`print`, `len`, `push`, `keys`, `type`)
 - REPL（複数行入力対応）
 - ファイル実行
