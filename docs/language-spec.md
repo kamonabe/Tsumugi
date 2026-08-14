@@ -352,6 +352,23 @@ end
 print(apply(fn(x) x * 3 end, 7))  # 21
 ```
 
+組み込み高階関数 `map` / `filter` / `each`:
+
+```
+let nums = [1, 2, 3, 4, 5]
+
+# map: 各要素を変換して新しいリストを返す
+let doubled = map(nums, fn(x) x * 2 end)
+print(doubled)  # [2, 4, 6, 8, 10]
+
+# filter: 条件を満たす要素だけ残す
+let evens = filter(nums, fn(x) x % 2 == 0 end)
+print(evens)  # [2, 4]
+
+# each: 各要素に処理を実行（戻り値なし）
+each(nums, fn(x) print(x) end)
+```
+
 ## 組み込み関数
 
 | 関数 | 説明 |

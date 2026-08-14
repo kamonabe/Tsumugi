@@ -27,6 +27,7 @@
 - [x] eval.rs の分割（組み込み関数を builtin.rs に切り出し）
 - [x] エラー型の構造化（TsumugiError enum: Parse / Runtime）
 - [x] builtin.rs のカテゴリ別分割（I/O・コレクション・文字列・数値・ファイル・パス・日時）
+- [x] 高階関数（map / filter / each）
 
 ## 設計方針: 組み込み関数の境界線
 
@@ -53,6 +54,7 @@
 |---|---|---|
 | 文字列操作（trim, split, replace 等） | プロセス内メモリ操作 | ✅ 組み込み |
 | リスト操作（push, sort, reverse 等） | プロセス内メモリ操作 | ✅ 組み込み |
+| 高階関数（map, filter, each） | プロセス内メモリ操作 | ✅ 組み込み |
 | ファイルI/O（read_file, write_file, mkdir 等） | OS syscall | ✅ 組み込み |
 | パス操作（path_exists, is_dir 等） | OS syscall | ✅ 組み込み |
 | 環境変数・引数（env, args） | OS プロセスのメタデータ | ✅ 組み込み |
@@ -77,7 +79,6 @@
 
 | 優先度 | 項目 | メモ |
 |---|---|---|
-| 中 | map / filter / each | 組み込み高階関数。クロージャ基盤の上に追加 |
 | 低 | 参照キャプチャ | カウンターパターン対応（`Rc<RefCell>` 導入） |
 | 低 | モジュール / import | ファイル分割 |
 | 低 | クラス（継承なし） | データと操作の束ね方。合成で拡張する方針 |
