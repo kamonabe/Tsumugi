@@ -475,19 +475,28 @@ impl Compiler {
                 }
             }
             Expr::Call { callee, args } => {
-                // print は専用命令で処理
-                if let Expr::Ident(name) = callee.as_ref()
-                    && name == "print"
-                {
-                    let arg_count = args.len();
-                    for arg in args {
-                        self.compile_expr(arg, line)?;
+                // 組み込み関数かチェック
+                if let Expr::Ident(name) = callee.as_ref() {
+                    if name == "print" {
+                        let arg_count = args.len();
+                        for arg in args {
+                            self.compile_expr(arg, line)?;
+                        }
+                        self.chunk.emit(OpCode::Print(arg_count), line);
+                        self.chunk.emit_constant(Value::Null, line);
+                        return Ok(());
                     }
-                    self.chunk.emit(OpCode::Print(arg_count), line);
-                    self.chunk.emit_constant(Value::Null, line);
-                    return Ok(());
+                    if is_builtin(name) {
+                        let arg_count = args.len();
+                        for arg in args {
+                            self.compile_expr(arg, line)?;
+                        }
+                        self.chunk
+                            .emit(OpCode::CallBuiltin(name.clone(), arg_count), line);
+                        return Ok(());
+                    }
                 }
-                // 汎用関数呼び出し: callee を評価 → 引数を評価 → Call
+                // ユーザー定義関数呼び出し: callee を評価 → 引数を評価 → Call
                 self.compile_expr(callee, line)?;
                 let arg_count = args.len();
                 for arg in args {
@@ -682,4 +691,45 @@ impl Compiler {
         }
         None
     }
+}
+
+/// 組み込み関数かどうかを判定する
+fn is_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "len"
+            | "push"
+            | "pop"
+            | "keys"
+            | "values"
+            | "has_key"
+            | "type"
+            | "slice"
+            | "contains"
+            | "split"
+            | "join"
+            | "to_int"
+            | "to_str"
+            | "to_float"
+            | "range"
+            | "map"
+            | "filter"
+            | "each"
+            | "sort"
+            | "reverse"
+            | "trim"
+            | "upper"
+            | "lower"
+            | "starts_with"
+            | "ends_with"
+            | "replace"
+            | "abs"
+            | "min"
+            | "max"
+            | "floor"
+            | "ceil"
+            | "round"
+            | "input"
+            | "exit"
+    )
 }

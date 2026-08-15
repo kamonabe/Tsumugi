@@ -33,6 +33,7 @@
 - [x] バイトコード VM: Phase 3（制御フロー — if/elif/else / while / for / break / continue / and / or）
 - [x] バイトコード VM: Phase 4（関数 — FnDef / Call / ReturnValue / 再帰対応）
 - [x] バイトコード VM: Phase 5（クロージャ — upvalue / MakeClosure / Lambda）
+- [x] バイトコード VM: Phase 6（組み込み関数 — 33個対応）
 
 ## 設計方針: 組み込み関数の境界線
 
@@ -89,7 +90,7 @@
 | 3 | 比較 + 条件ジャンプ（if / while / for） + break/continue | ✅ 完了 |
 | 4 | 関数定義・呼び出し（コールフレーム） | ✅ 完了 |
 | 5 | クロージャ（upvalue） | ✅ 完了 |
-| 6 | 組み込み関数（len, push, pop 等） | 未着手 |
+| 6 | 組み込み関数（len, push, pop 等） | ✅ 完了 |
 
 ## 次の候補（言語機能）
 
