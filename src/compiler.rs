@@ -103,7 +103,12 @@ impl Compiler {
             }
             Stmt::Assign { name, value, line } => {
                 self.compile_expr(value, *line)?;
-                let slot = self.resolve_local(name, *line)?;
+                let slot = self
+                    .resolve_local(name, *line)
+                    .map_err(|_| TsumugiError::Runtime {
+                        line: *line,
+                        message: format!("未定義の変数に代入: {}", name),
+                    })?;
                 self.chunk.emit(OpCode::SetLocal(slot), *line);
                 self.chunk.emit(OpCode::Pop, *line);
             }
@@ -363,7 +368,7 @@ impl Compiler {
     fn compile_break(&mut self, line: usize) -> Result<(), TsumugiError> {
         let loop_state = self.loops.last().ok_or_else(|| TsumugiError::Runtime {
             line,
-            message: "ループの外で break は使えません".to_string(),
+            message: "break はループの中でのみ使用できます".to_string(),
         })?;
 
         // ループ内で宣言されたローカル変数をクリーンアップ
@@ -383,7 +388,7 @@ impl Compiler {
     fn compile_continue(&mut self, line: usize) -> Result<(), TsumugiError> {
         let loop_state = self.loops.last().ok_or_else(|| TsumugiError::Runtime {
             line,
-            message: "ループの外で continue は使えません".to_string(),
+            message: "continue はループの中でのみ使用できます".to_string(),
         })?;
         let continue_target = loop_state.continue_target;
         let continue_resolved = loop_state.continue_resolved;
@@ -544,6 +549,17 @@ impl Compiler {
                     }
                 }
                 // ユーザー定義関数呼び出し: callee を評価 → 引数を評価 → Call
+                if let Expr::Ident(name) = callee.as_ref() {
+                    // 関数呼び出しのコンテキストでは「未定義の関数」エラーを出す
+                    if self.resolve_local(name, line).is_err()
+                        && self.resolve_upvalue(name).is_none()
+                    {
+                        return Err(TsumugiError::Runtime {
+                            line,
+                            message: format!("未定義の関数: {}", name),
+                        });
+                    }
+                }
                 self.compile_expr(callee, line)?;
                 let arg_count = args.len();
                 for arg in args {

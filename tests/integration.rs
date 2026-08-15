@@ -1,4 +1,7 @@
 //! 統合テスト: .tsg ファイルを実行して期待出力と比較するゴールデンテスト
+//!
+//! ツリーウォーク版（デフォルト）と VM 版（--vm）の両方で同じ fixture を回し、
+//! 両実行方式で同じ言語仕様を満たすことを保証する。
 
 use std::path::Path;
 use std::process::Command;
@@ -14,6 +17,16 @@ fn fixtures_dir() -> std::path::PathBuf {
 
 /// 正常系: .tsg を実行して stdout が .expected と一致することを確認
 fn run_golden_test(name: &str) {
+    run_golden_test_mode(name, false);
+}
+
+/// 正常系（VM版）: --vm フラグ付きで実行
+fn run_golden_test_vm(name: &str) {
+    run_golden_test_mode(name, true);
+}
+
+/// 正常系の共通実装
+fn run_golden_test_mode(name: &str, use_vm: bool) {
     let dir = fixtures_dir();
     let script = dir.join(format!("{}.tsg", name));
     let expected_file = dir.join(format!("{}.expected", name));
@@ -21,17 +34,22 @@ fn run_golden_test(name: &str) {
     let expected = std::fs::read_to_string(&expected_file)
         .unwrap_or_else(|_| panic!("期待出力ファイルが読めません: {:?}", expected_file));
 
-    let output = Command::new(tsumugi_bin())
-        .arg(script.to_str().unwrap())
-        .output()
-        .expect("tsumugi バイナリの実行に失敗");
+    let mut cmd = Command::new(tsumugi_bin());
+    if use_vm {
+        cmd.arg("--vm");
+    }
+    cmd.arg(script.to_str().unwrap());
+
+    let output = cmd.output().expect("tsumugi バイナリの実行に失敗");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let mode = if use_vm { "VM" } else { "tree-walk" };
 
     assert_eq!(
         stdout.trim_end(),
         expected.trim_end(),
-        "ゴールデンテスト失敗: {}\n--- 実際の出力 ---\n{}\n--- 期待出力 ---\n{}",
+        "ゴールデンテスト失敗 [{}]: {}\n--- 実際の出力 ---\n{}\n--- 期待出力 ---\n{}",
+        mode,
         name,
         stdout,
         expected
@@ -40,6 +58,16 @@ fn run_golden_test(name: &str) {
 
 /// エラー系: .tsg を実行して stderr に期待メッセージが含まれることを確認
 fn run_error_test(name: &str) {
+    run_error_test_mode(name, false);
+}
+
+/// エラー系（VM版）
+fn run_error_test_vm(name: &str) {
+    run_error_test_mode(name, true);
+}
+
+/// エラー系の共通実装
+fn run_error_test_mode(name: &str, use_vm: bool) {
     let dir = fixtures_dir();
     let script = dir.join(format!("{}.tsg", name));
     let expected_err_file = dir.join(format!("{}.expected_err", name));
@@ -47,12 +75,16 @@ fn run_error_test(name: &str) {
     let expected_err = std::fs::read_to_string(&expected_err_file)
         .unwrap_or_else(|_| panic!("期待エラーファイルが読めません: {:?}", expected_err_file));
 
-    let output = Command::new(tsumugi_bin())
-        .arg(script.to_str().unwrap())
-        .output()
-        .expect("tsumugi バイナリの実行に失敗");
+    let mut cmd = Command::new(tsumugi_bin());
+    if use_vm {
+        cmd.arg("--vm");
+    }
+    cmd.arg(script.to_str().unwrap());
+
+    let output = cmd.output().expect("tsumugi バイナリの実行に失敗");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let mode = if use_vm { "VM" } else { "tree-walk" };
 
     for line in expected_err.lines() {
         let line = line.trim();
@@ -61,7 +93,8 @@ fn run_error_test(name: &str) {
         }
         assert!(
             stderr.contains(line),
-            "エラーテスト失敗: {}\nstderr に期待文字列が含まれません: {:?}\n--- stderr ---\n{}",
+            "エラーテスト失敗 [{}]: {}\nstderr に期待文字列が含まれません: {:?}\n--- stderr ---\n{}",
+            mode,
             name,
             line,
             stderr
@@ -70,12 +103,15 @@ fn run_error_test(name: &str) {
 
     assert!(
         !output.status.success(),
-        "エラーケースなのに終了コード0で終了しました: {}",
+        "エラーケースなのに終了コード0で終了しました [{}]: {}",
+        mode,
         name
     );
 }
 
-// --- 正常系ゴールデンテスト ---
+// =============================================================
+// 正常系ゴールデンテスト（ツリーウォーク）
+// =============================================================
 
 #[test]
 fn golden_hello() {
@@ -147,7 +183,113 @@ fn golden_string_utils() {
     run_golden_test("string_utils");
 }
 
-// --- エラー系テスト ---
+#[test]
+fn golden_first_class_fn() {
+    run_golden_test("first_class_fn");
+}
+
+#[test]
+fn golden_closure() {
+    run_golden_test("closure");
+}
+
+#[test]
+fn golden_higher_order() {
+    run_golden_test("higher_order");
+}
+
+// =============================================================
+// 正常系ゴールデンテスト（VM）
+// =============================================================
+
+#[test]
+fn vm_golden_hello() {
+    run_golden_test_vm("hello");
+}
+
+#[test]
+fn vm_golden_arithmetic() {
+    run_golden_test_vm("arithmetic");
+}
+
+#[test]
+fn vm_golden_control_flow() {
+    run_golden_test_vm("control_flow");
+}
+
+#[test]
+fn vm_golden_logic() {
+    run_golden_test_vm("logic");
+}
+
+#[test]
+fn vm_golden_assign() {
+    run_golden_test_vm("assign");
+}
+
+#[test]
+fn vm_golden_list_dict() {
+    run_golden_test_vm("list_dict");
+}
+
+#[test]
+fn vm_golden_for_loop() {
+    run_golden_test_vm("for_loop");
+}
+
+#[test]
+fn vm_golden_break_continue() {
+    run_golden_test_vm("break_continue");
+}
+
+#[test]
+fn vm_golden_fizzbuzz() {
+    run_golden_test_vm("fizzbuzz");
+}
+
+#[test]
+fn vm_golden_builtins() {
+    run_golden_test_vm("builtins");
+}
+
+#[test]
+fn vm_golden_file_io() {
+    run_golden_test_vm("file_io");
+}
+
+#[test]
+fn vm_golden_local_utils() {
+    run_golden_test_vm("local_utils");
+}
+
+#[test]
+fn vm_golden_filesystem() {
+    run_golden_test_vm("filesystem");
+}
+
+#[test]
+fn vm_golden_string_utils() {
+    run_golden_test_vm("string_utils");
+}
+
+#[test]
+fn vm_golden_first_class_fn() {
+    run_golden_test_vm("first_class_fn");
+}
+
+#[test]
+fn vm_golden_closure() {
+    run_golden_test_vm("closure");
+}
+
+#[test]
+fn vm_golden_higher_order() {
+    run_golden_test_vm("higher_order");
+}
+
+// =============================================================
+// エラー系テスト（ツリーウォーク）
+// =============================================================
 
 #[test]
 fn error_undefined_var() {
@@ -233,21 +375,100 @@ fn error_dict_key_type() {
 }
 
 #[test]
-fn golden_first_class_fn() {
-    run_golden_test("first_class_fn");
-}
-
-#[test]
-fn golden_closure() {
-    run_golden_test("closure");
-}
-
-#[test]
-fn golden_higher_order() {
-    run_golden_test("higher_order");
-}
-
-#[test]
 fn error_unknown_char() {
     run_error_test("error_unknown_char");
+}
+
+// =============================================================
+// エラー系テスト（VM）
+// =============================================================
+
+#[test]
+fn vm_error_undefined_var() {
+    run_error_test_vm("error_undefined_var");
+}
+
+#[test]
+fn vm_error_assign_undefined() {
+    run_error_test_vm("error_assign_undefined");
+}
+
+#[test]
+fn vm_error_parse() {
+    let dir = fixtures_dir();
+    let script = dir.join("error_parse.tsg");
+
+    let output = Command::new(tsumugi_bin())
+        .arg("--vm")
+        .arg(script.to_str().unwrap())
+        .output()
+        .expect("tsumugi バイナリの実行に失敗");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("2行目"),
+        "[VM] parse error should mention line 2: {}",
+        stderr
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn vm_error_type() {
+    let dir = fixtures_dir();
+    let script = dir.join("error_type.tsg");
+
+    let output = Command::new(tsumugi_bin())
+        .arg("--vm")
+        .arg(script.to_str().unwrap())
+        .output()
+        .expect("tsumugi バイナリの実行に失敗");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("型エラー"),
+        "[VM] should contain type error: {}",
+        stderr
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn vm_error_zero_division() {
+    run_error_test_vm("error_zero_division");
+}
+
+#[test]
+fn vm_error_wrong_arg_count() {
+    run_error_test_vm("error_wrong_arg_count");
+}
+
+#[test]
+fn vm_error_undefined_fn() {
+    run_error_test_vm("error_undefined_fn");
+}
+
+#[test]
+fn vm_error_break_outside_loop() {
+    run_error_test_vm("error_break_outside_loop");
+}
+
+#[test]
+fn vm_error_continue_outside_loop() {
+    run_error_test_vm("error_continue_outside_loop");
+}
+
+#[test]
+fn vm_error_index_out_of_bounds() {
+    run_error_test_vm("error_index_out_of_bounds");
+}
+
+#[test]
+fn vm_error_dict_key_type() {
+    run_error_test_vm("error_dict_key_type");
+}
+
+#[test]
+fn vm_error_unknown_char() {
+    run_error_test_vm("error_unknown_char");
 }
