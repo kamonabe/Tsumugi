@@ -1,31 +1,53 @@
 mod ast;
+mod chunk;
+mod compiler;
 mod env;
 mod error;
 mod eval;
 mod lexer;
+mod opcode;
 mod parser;
 mod token;
 mod value;
+mod vm;
 
 use std::env as std_env;
 use std::fs;
 use std::io::{self, Write};
 
+use compiler::Compiler;
 use eval::Evaluator;
 use lexer::Lexer;
 use parser::Parser;
 use token::Token;
+use vm::Vm;
 
 fn main() {
     let args: Vec<String> = std_env::args().collect();
 
-    match args.len() {
+    // --vm フラグの検出
+    let use_vm = args.iter().any(|a| a == "--vm");
+    let file_args: Vec<&String> = args[1..].iter().filter(|a| *a != "--vm").collect();
+
+    match file_args.len() {
         // 引数なし → REPL
-        1 => run_repl(),
+        0 => {
+            if use_vm {
+                run_repl_vm();
+            } else {
+                run_repl();
+            }
+        }
         // 引数あり → ファイル実行
-        2 => run_file(&args[1]),
+        1 => {
+            if use_vm {
+                run_file_vm(file_args[0]);
+            } else {
+                run_file(file_args[0]);
+            }
+        }
         _ => {
-            eprintln!("使い方: tsumugi [script.tsg]");
+            eprintln!("使い方: tsumugi [--vm] [script.tsg]");
             std::process::exit(1);
         }
     }
@@ -114,4 +136,71 @@ fn is_incomplete(input: &str) -> bool {
         }
     }
     depth > 0
+}
+
+// =============================================
+// VM モード
+// =============================================
+
+/// VMモードでファイルを実行
+fn run_file_vm(path: &str) {
+    let source = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("エラー: ファイルを開けません: {} ({})", path, e);
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = execute_vm(&source) {
+        eprintln!("{}", e);
+        std::process::exit(1);
+    }
+}
+
+/// VMモードのREPL
+fn run_repl_vm() {
+    println!("Tsumugi v0.1.0 [VM mode] — 終了するには Ctrl+D");
+    let mut input = String::new();
+
+    loop {
+        if input.is_empty() {
+            print!("tsumugi:vm> ");
+        } else {
+            print!("         .. ");
+        }
+        io::stdout().flush().unwrap();
+
+        let mut line = String::new();
+        let bytes = io::stdin().read_line(&mut line).unwrap();
+        if bytes == 0 {
+            println!();
+            break;
+        }
+
+        input.push_str(&line);
+
+        if is_incomplete(&input) {
+            continue;
+        }
+
+        if let Err(e) = execute_vm(&input) {
+            eprintln!("  エラー: {}", e);
+        }
+
+        input.clear();
+    }
+}
+
+/// VMモードの実行関数
+fn execute_vm(source: &str) -> Result<(), error::TsumugiError> {
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize();
+
+    let mut parser = Parser::new(tokens);
+    let program = parser.parse()?;
+
+    let chunk = Compiler::new().compile(&program)?;
+    let mut vm = Vm::new(chunk);
+    vm.run()
 }
