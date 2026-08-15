@@ -160,7 +160,6 @@ impl Vm {
                 }
 
                 OpCode::Print(arg_count) => {
-                    // スタックから arg_count 個の値を取り出す（逆順に注意）
                     let mut values = Vec::with_capacity(arg_count);
                     for _ in 0..arg_count {
                         values.push(self.pop(line)?);
@@ -173,6 +172,71 @@ impl Vm {
 
                 OpCode::Pop => {
                     self.pop(line)?;
+                }
+
+                OpCode::PopN(count) => {
+                    for _ in 0..count {
+                        self.pop(line)?;
+                    }
+                }
+
+                OpCode::Jump(target) => {
+                    self.ip = target;
+                }
+
+                OpCode::JumpIfFalse(target) => {
+                    let value = self.pop(line)?;
+                    if !value.is_truthy() {
+                        self.ip = target;
+                    }
+                }
+
+                OpCode::Loop(target) => {
+                    self.ip = target;
+                }
+
+                OpCode::Len => {
+                    let value = self.pop(line)?;
+                    let length = match &value {
+                        Value::List(v) => v.len() as i64,
+                        Value::Str(s) => s.chars().count() as i64,
+                        Value::Dict(m) => m.len() as i64,
+                        _ => {
+                            return Err(TsumugiError::Runtime {
+                                line,
+                                message: format!(
+                                    "型エラー: {} の長さは取得できません",
+                                    type_name(&value)
+                                ),
+                            });
+                        }
+                    };
+                    self.stack.push(Value::Int(length));
+                }
+
+                OpCode::Index => {
+                    let index = self.pop(line)?;
+                    let collection = self.pop(line)?;
+                    let result = self.eval_index(collection, index, line)?;
+                    self.stack.push(result);
+                }
+
+                OpCode::ListPush => {
+                    let value = self.pop(line)?;
+                    // スタックトップがリスト
+                    let list = self.stack.last_mut().ok_or_else(|| TsumugiError::Runtime {
+                        line,
+                        message: "内部エラー: スタックが空です".to_string(),
+                    })?;
+                    if let Value::List(v) = list {
+                        v.push(value);
+                    } else {
+                        return Err(TsumugiError::Runtime {
+                            line,
+                            message: "内部エラー: ListPush の対象がリストではありません"
+                                .to_string(),
+                        });
+                    }
                 }
 
                 OpCode::Return => {
@@ -189,6 +253,51 @@ impl Vm {
             line,
             message: "内部エラー: スタックが空です".to_string(),
         })
+    }
+
+    /// インデックスアクセス
+    fn eval_index(
+        &self,
+        collection: Value,
+        index: Value,
+        line: usize,
+    ) -> Result<Value, TsumugiError> {
+        match (&collection, &index) {
+            (Value::List(list), Value::Int(i)) => {
+                let idx = if *i < 0 {
+                    (list.len() as i64 + i) as usize
+                } else {
+                    *i as usize
+                };
+                list.get(idx).cloned().ok_or_else(|| TsumugiError::Runtime {
+                    line,
+                    message: format!("インデックス範囲外: {} (長さ: {})", i, list.len()),
+                })
+            }
+            (Value::Str(s), Value::Int(i)) => {
+                let chars: Vec<char> = s.chars().collect();
+                let idx = if *i < 0 {
+                    (chars.len() as i64 + i) as usize
+                } else {
+                    *i as usize
+                };
+                chars
+                    .get(idx)
+                    .map(|c| Value::Str(c.to_string()))
+                    .ok_or_else(|| TsumugiError::Runtime {
+                        line,
+                        message: format!("インデックス範囲外: {} (長さ: {})", i, chars.len()),
+                    })
+            }
+            (Value::Dict(map), Value::Str(key)) => Ok(map.get(key).cloned().unwrap_or(Value::Null)),
+            _ => Err(TsumugiError::Runtime {
+                line,
+                message: format!(
+                    "型エラー: {:?} に対して {:?} でインデックスアクセスできません",
+                    collection, index
+                ),
+            }),
+        }
     }
 
     // --- 算術演算 ---
@@ -497,5 +606,73 @@ mod tests {
     fn vm_undefined_var_error() {
         let result = run_vm("print(z)");
         assert!(result.is_err());
+    }
+
+    // --- Phase 3: 制御フロー ---
+
+    #[test]
+    fn vm_if_true() {
+        assert!(run_vm("let x = 10\nif x > 5\n    print(x)\nend").is_ok());
+    }
+
+    #[test]
+    fn vm_if_else() {
+        assert!(
+            run_vm("let x = 3\nif x > 5\n    print(\"big\")\nelse\n    print(\"small\")\nend")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn vm_if_elif() {
+        assert!(run_vm("let x = 5\nif x > 10\n    print(\"a\")\nelif x > 3\n    print(\"b\")\nelse\n    print(\"c\")\nend").is_ok());
+    }
+
+    #[test]
+    fn vm_while_loop() {
+        assert!(run_vm("let i = 3\nwhile i > 0\n    print(i)\n    i = i - 1\nend").is_ok());
+    }
+
+    #[test]
+    fn vm_while_break() {
+        assert!(run_vm("let i = 0\nwhile true\n    i = i + 1\n    if i == 3\n        break\n    end\nend\nprint(i)").is_ok());
+    }
+
+    #[test]
+    fn vm_while_continue() {
+        assert!(run_vm("let i = 0\nwhile i < 5\n    i = i + 1\n    if i == 3\n        continue\n    end\n    print(i)\nend").is_ok());
+    }
+
+    #[test]
+    fn vm_for_loop() {
+        assert!(run_vm("for x in [1, 2, 3]\n    print(x)\nend").is_ok());
+    }
+
+    #[test]
+    fn vm_for_break() {
+        assert!(
+            run_vm(
+                "for x in [1, 2, 3, 4, 5]\n    if x == 3\n        break\n    end\n    print(x)\nend"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn vm_for_continue() {
+        assert!(run_vm("for x in [1, 2, 3, 4, 5]\n    if x == 3\n        continue\n    end\n    print(x)\nend").is_ok());
+    }
+
+    #[test]
+    fn vm_and_or() {
+        assert!(run_vm("print(true and false)\nprint(true or false)").is_ok());
+    }
+
+    #[test]
+    fn vm_nested_loops() {
+        assert!(
+            run_vm("for i in [1, 2]\n    for j in [10, 20]\n        print(i, j)\n    end\nend")
+                .is_ok()
+        );
     }
 }

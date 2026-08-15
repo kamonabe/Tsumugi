@@ -37,12 +37,35 @@ pub enum OpCode {
     /// operand: スタック上のスロット位置
     SetLocal(usize),
 
+    // --- ジャンプ ---
+    /// 無条件ジャンプ（ip を指定位置に設定）
+    Jump(usize),
+
+    /// スタックトップが偽ならジャンプ（値をpop）
+    JumpIfFalse(usize),
+
+    /// 後方ジャンプ（ループ先頭に戻る: ip を指定位置に設定）
+    Loop(usize),
+
     // --- 組み込み関数呼び出し ---
     /// print: 引数の数を operand で指定
     Print(usize),
 
     /// スタックトップを捨てる（式文の結果を破棄）
     Pop,
+
+    /// 複数のスタックスロットを一度に捨てる（スコープ離脱時）
+    PopN(usize),
+
+    // --- コレクション操作 ---
+    /// スタックトップのコレクションの長さを取得
+    Len,
+
+    /// collection[index]: スタックから index, collection の順に pop → 要素を push
+    Index,
+
+    /// リストビルド用: スタックの [list, value] → list に value を push → list を残す
+    ListPush,
 
     /// プログラム終了
     Return,

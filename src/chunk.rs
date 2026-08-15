@@ -42,4 +42,27 @@ impl Chunk {
         let idx = self.add_constant(value);
         self.emit(OpCode::LoadConst(idx), line);
     }
+
+    /// 現在の命令列の長さ（次の命令のインデックス）を返す
+    pub fn len(&self) -> usize {
+        self.code.len()
+    }
+
+    /// ジャンプ命令を仮の値（0）で発行し、その命令のインデックスを返す（後でパッチする）
+    pub fn emit_jump(&mut self, op: OpCode, line: usize) -> usize {
+        let offset = self.code.len();
+        self.emit(op, line);
+        offset
+    }
+
+    /// 仮で発行したジャンプ命令の飛び先を現在位置にパッチする
+    pub fn patch_jump(&mut self, offset: usize) {
+        let target = self.code.len();
+        match &mut self.code[offset] {
+            OpCode::Jump(addr) | OpCode::JumpIfFalse(addr) => {
+                *addr = target;
+            }
+            _ => panic!("patch_jump: ジャンプ命令ではないオフセットが指定されました"),
+        }
+    }
 }
