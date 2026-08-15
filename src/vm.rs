@@ -141,6 +141,24 @@ impl Vm {
                     self.stack.push(result);
                 }
 
+                OpCode::GetLocal(slot) => {
+                    let value = self.stack[slot].clone();
+                    self.stack.push(value);
+                }
+
+                OpCode::SetLocal(slot) => {
+                    // スタックトップの値でスロットを上書き（値はスタックに残す）
+                    let value =
+                        self.stack
+                            .last()
+                            .cloned()
+                            .ok_or_else(|| TsumugiError::Runtime {
+                                line,
+                                message: "内部エラー: スタックが空です".to_string(),
+                            })?;
+                    self.stack[slot] = value;
+                }
+
                 OpCode::Print(arg_count) => {
                     // スタックから arg_count 個の値を取り出す（逆順に注意）
                     let mut values = Vec::with_capacity(arg_count);
@@ -446,5 +464,38 @@ mod tests {
     #[test]
     fn vm_print_multiple_args() {
         assert!(run_vm(r#"print("hello", "world")"#).is_ok());
+    }
+
+    // --- Phase 2: 変数 ---
+
+    #[test]
+    fn vm_let_and_print() {
+        assert!(run_vm("let x = 42\nprint(x)").is_ok());
+    }
+
+    #[test]
+    fn vm_let_multiple_vars() {
+        assert!(run_vm("let a = 10\nlet b = 20\nprint(a + b)").is_ok());
+    }
+
+    #[test]
+    fn vm_assign() {
+        assert!(run_vm("let x = 1\nx = 99\nprint(x)").is_ok());
+    }
+
+    #[test]
+    fn vm_assign_arithmetic() {
+        assert!(run_vm("let x = 10\nx = x + 5\nprint(x)").is_ok());
+    }
+
+    #[test]
+    fn vm_multiple_assigns() {
+        assert!(run_vm("let a = 1\nlet b = 2\na = a + b\nb = a * 2\nprint(a, b)").is_ok());
+    }
+
+    #[test]
+    fn vm_undefined_var_error() {
+        let result = run_vm("print(z)");
+        assert!(result.is_err());
     }
 }

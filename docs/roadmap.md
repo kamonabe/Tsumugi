@@ -29,6 +29,7 @@
 - [x] builtin.rs のカテゴリ別分割（I/O・コレクション・文字列・数値・ファイル・パス・日時）
 - [x] 高階関数（map / filter / each）
 - [x] バイトコード VM: Phase 1（OpCode + Chunk + Compiler + VM + 算術 + Print）
+- [x] バイトコード VM: Phase 2（変数 — let / 再代入 / GetLocal / SetLocal）
 
 ## 設計方針: 組み込み関数の境界線
 
@@ -81,7 +82,7 @@
 | Phase | 内容 | 状態 |
 |---|---|---|
 | 0+1 | OpCode + Chunk + Compiler + VM + 定数 + 算術 + Print | ✅ 完了 |
-| 2 | 変数（let / 再代入 / 参照） | 未着手 |
+| 2 | 変数（let / 再代入 / 参照） | ✅ 完了 |
 | 3 | 比較 + 条件ジャンプ（if / while / for） + break/continue | 未着手 |
 | 4 | 関数定義・呼び出し（コールフレーム） | 未着手 |
 | 5 | クロージャ（upvalue） | 未着手 |

@@ -28,6 +28,15 @@ pub enum OpCode {
     // --- 単項演算 ---
     Negate,
 
+    // --- 変数操作 ---
+    /// ローカル変数の値をスタックトップにコピー
+    /// operand: スタック上のスロット位置
+    GetLocal(usize),
+
+    /// スタックトップの値でローカル変数を上書き（値はスタックに残る）
+    /// operand: スタック上のスロット位置
+    SetLocal(usize),
+
     // --- 組み込み関数呼び出し ---
     /// print: 引数の数を operand で指定
     Print(usize),
