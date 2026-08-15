@@ -6,6 +6,7 @@ Rust で作るミニプログラミング言語。言語処理系の学習を目
 
 Tsumugi は Ruby 風の文法を持つ動的型付けインタプリタ言語。
 ソースコードを レキサー → パーサー → 評価器 の3段パイプラインで実行する。
+バイトコードコンパイラ + スタックVM による実行モード（`--vm`）も備えている。
 
 ## クイックスタート
 
@@ -15,6 +16,9 @@ cargo build
 
 # ファイル実行
 cargo run -- examples/hello.tsg
+
+# バイトコードVM モードで実行
+cargo run -- --vm examples/hello.tsg
 
 # REPL（対話モード）
 cargo run
@@ -133,16 +137,24 @@ cargo fmt --check → cargo clippy -D warnings → cargo test
 
 ```
 src/
-├── main.rs     # エントリポイント（REPL / ファイル実行）
-├── token.rs    # トークン型定義（Spanned: Token + 行番号）
-├── lexer.rs    # レキサー（ソース → トークン列、行番号追跡）
-├── ast.rs      # AST ノード定義（各 Stmt に行番号を保持）
-├── parser.rs   # パーサー（トークン列 → AST、エラーに行番号付与）
-├── value.rs    # 実行時の値型
-├── env.rs      # 環境（変数スコープ・関数テーブル）
-├── error.rs    # エラー型（TsumugiError: Parse / Runtime）
-├── eval.rs     # 評価器（AST → 実行、エラーに行番号付与）
-└── builtin.rs  # 組み込み関数（53個）の実装
+├── main.rs       # エントリポイント（REPL / ファイル実行 / --vm 切り替え）
+├── token.rs      # トークン型定義（Spanned: Token + 行番号）
+├── lexer.rs      # レキサー（ソース → トークン列、行番号追跡）
+├── ast.rs        # AST ノード定義（各 Stmt に行番号を保持）
+├── parser.rs     # パーサー（トークン列 → AST、エラーに行番号付与）
+├── value.rs      # 実行時の値型
+├── error.rs      # エラー型（TsumugiError: Parse / Runtime）
+│
+│  --- ツリーウォーク実行（デフォルト） ---
+├── env.rs        # 環境（変数スコープ・関数テーブル）
+├── eval.rs       # 評価器（AST → 実行）
+├── builtin.rs    # 組み込み関数（ツリーウォーク版）
+│
+│  --- バイトコードVM実行（--vm） ---
+├── opcode.rs     # バイトコード命令セット
+├── chunk.rs      # 命令列 + 定数テーブル
+├── compiler.rs   # コンパイラ（AST → Chunk）
+└── vm.rs         # スタックマシン VM + 組み込み関数
 
 tests/
 ├── integration.rs    # 統合テスト（ゴールデンテスト）
