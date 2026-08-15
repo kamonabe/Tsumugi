@@ -93,13 +93,42 @@ impl Compiler {
         match stmt {
             Stmt::Let { name, value, line } => {
                 self.compile_expr(value, *line)?;
-                self.add_local(name.clone());
+                // 同じスコープに同名の変数が既にあれば上書き（ツリーウォーク版互換）
+                if let Some(slot) = self.find_local_in_current_scope(name) {
+                    self.chunk.emit(OpCode::SetLocal(slot), *line);
+                    self.chunk.emit(OpCode::Pop, *line);
+                } else {
+                    self.add_local(name.clone());
+                }
             }
             Stmt::Assign { name, value, line } => {
                 self.compile_expr(value, *line)?;
                 let slot = self.resolve_local(name, *line)?;
                 self.chunk.emit(OpCode::SetLocal(slot), *line);
                 self.chunk.emit(OpCode::Pop, *line);
+            }
+            Stmt::IndexAssign {
+                object,
+                index,
+                value,
+                line,
+            } => {
+                // object が変数参照の場合、更新後の値を元のスロットに書き戻す
+                if let Expr::Ident(name) = object {
+                    let slot = self.resolve_local(name, *line)?;
+                    self.chunk.emit(OpCode::GetLocal(slot), *line);
+                    self.compile_expr(index, *line)?;
+                    self.compile_expr(value, *line)?;
+                    self.chunk.emit(OpCode::SetIndex, *line);
+                    self.chunk.emit(OpCode::SetLocal(slot), *line);
+                    self.chunk.emit(OpCode::Pop, *line);
+                } else {
+                    // ネストされたインデックス代入は未サポート
+                    return Err(TsumugiError::Runtime {
+                        line: *line,
+                        message: "VM未対応: ネストされたインデックス代入".to_string(),
+                    });
+                }
             }
             Stmt::ExprStmt { expr, line } => {
                 self.compile_expr(expr, *line)?;
@@ -145,13 +174,6 @@ impl Compiler {
             Stmt::Return { value, line } => {
                 self.compile_expr(value, *line)?;
                 self.chunk.emit(OpCode::ReturnValue, *line);
-            }
-            _ => {
-                let line = stmt.line();
-                return Err(TsumugiError::Runtime {
-                    line,
-                    message: "VM未対応の文です".to_string(),
-                });
             }
         }
         Ok(())
@@ -221,12 +243,10 @@ impl Compiler {
         self.compile_expr(condition, line)?;
         let exit_jump = self.chunk.emit_jump(OpCode::JumpIfFalse(0), line);
 
-        // ループ本体
-        self.begin_scope();
+        // ループ本体（ツリーウォーク版に合わせてスコープを開始しない）
         for stmt in body {
             self.compile_stmt(stmt)?;
         }
-        self.end_scope(line);
 
         // ループ先頭に戻る
         self.chunk.emit(OpCode::Loop(loop_start), line);
@@ -257,6 +277,8 @@ impl Compiler {
 
         // コレクションを評価してスタックに積む（隠しローカル変数として）
         self.compile_expr(iter, line)?;
+        // 辞書/文字列をリストに変換（リストはそのまま）
+        self.chunk.emit(OpCode::ToIterList, line);
         let collection_slot = self.locals.len();
         self.add_local("__collection__".to_string());
 
@@ -295,12 +317,10 @@ impl Compiler {
         self.chunk.emit(OpCode::SetLocal(var_slot), line);
         self.chunk.emit(OpCode::Pop, line);
 
-        // ループ本体
-        self.begin_scope();
+        // ループ本体（ツリーウォーク版に合わせてスコープを開始しない）
         for stmt in body {
             self.compile_stmt(stmt)?;
         }
-        self.end_scope(line);
 
         // continue の飛び先 = インクリメント処理の先頭
         let increment_start = self.chunk.len();
@@ -487,6 +507,33 @@ impl Compiler {
                         return Ok(());
                     }
                     if is_builtin(name) {
+                        // push/pop は第一引数のリストを破壊的に変更する
+                        // → 実行後に元の変数スロットを更新する
+                        if (name == "push" || name == "pop")
+                            && !args.is_empty()
+                            && let Expr::Ident(var_name) = &args[0]
+                        {
+                            let slot = self.resolve_local(var_name, line)?;
+                            let arg_count = args.len();
+                            for arg in args {
+                                self.compile_expr(arg, line)?;
+                            }
+                            self.chunk
+                                .emit(OpCode::CallBuiltin(name.clone(), arg_count), line);
+                            if name == "push" {
+                                self.chunk.emit(OpCode::SetLocal(slot), line);
+                                self.chunk.emit(OpCode::Pop, line);
+                                self.chunk.emit_constant(Value::Null, line);
+                            }
+                            if name == "pop" {
+                                self.chunk.emit(OpCode::GetLocal(slot), line);
+                                self.chunk
+                                    .emit(OpCode::CallBuiltin("__pop_update".to_string(), 1), line);
+                                self.chunk.emit(OpCode::SetLocal(slot), line);
+                                self.chunk.emit(OpCode::Pop, line);
+                            }
+                            return Ok(());
+                        }
                         let arg_count = args.len();
                         for arg in args {
                             self.compile_expr(arg, line)?;
@@ -511,14 +558,22 @@ impl Compiler {
                     self.chunk.emit(OpCode::ListPush, line);
                 }
             }
+            Expr::Dict(pairs) => {
+                self.chunk
+                    .emit_constant(Value::Dict(std::collections::BTreeMap::new()), line);
+                for (key, val) in pairs {
+                    self.compile_expr(key, line)?;
+                    self.compile_expr(val, line)?;
+                    self.chunk.emit(OpCode::DictInsert, line);
+                }
+            }
+            Expr::Index { object, index } => {
+                self.compile_expr(object, line)?;
+                self.compile_expr(index, line)?;
+                self.chunk.emit(OpCode::Index, line);
+            }
             Expr::Lambda { params, body } => {
                 self.compile_lambda(params, body, line)?;
-            }
-            _ => {
-                return Err(TsumugiError::Runtime {
-                    line,
-                    message: "VM未対応の式です".to_string(),
-                });
             }
         }
         Ok(())
@@ -583,8 +638,9 @@ impl Compiler {
         let fn_value = Value::VmFn {
             name: name.to_string(),
             arity: params.len(),
+            params: params.to_vec(),
             chunk: fn_chunk,
-            upvalues: Vec::new(), // MakeClosure で埋める or upvalueなしならそのまま
+            upvalues: Vec::new(),
         };
         self.chunk.emit_constant(fn_value, line);
 
@@ -633,6 +689,7 @@ impl Compiler {
         let fn_value = Value::VmFn {
             name: "<lambda>".to_string(),
             arity: params.len(),
+            params: params.to_vec(),
             chunk: fn_chunk,
             upvalues: Vec::new(),
         };
@@ -653,6 +710,19 @@ impl Compiler {
             name,
             depth: self.scope_depth,
         });
+    }
+
+    /// 同じスコープ深さに同名の変数があればそのスロットを返す
+    fn find_local_in_current_scope(&self, name: &str) -> Option<usize> {
+        for (i, local) in self.locals.iter().enumerate().rev() {
+            if local.depth < self.scope_depth {
+                break;
+            }
+            if local.name == name {
+                return Some(i);
+            }
+        }
+        None
     }
 
     fn resolve_local(&self, name: &str, line: usize) -> Result<usize, TsumugiError> {
@@ -731,5 +801,23 @@ fn is_builtin(name: &str) -> bool {
             | "round"
             | "input"
             | "exit"
+            | "read_file"
+            | "read_lines"
+            | "write_file"
+            | "append_file"
+            | "env"
+            | "args"
+            | "now"
+            | "format_time"
+            | "path_exists"
+            | "path_join"
+            | "mkdir"
+            | "remove"
+            | "remove_dir"
+            | "rename"
+            | "list_dir"
+            | "file_size"
+            | "is_file"
+            | "is_dir"
     )
 }

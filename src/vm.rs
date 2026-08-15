@@ -204,12 +204,17 @@ impl Vm {
                 upvalues.reverse();
                 let fn_value = self.pop(line)?;
                 if let Value::VmFn {
-                    name, arity, chunk, ..
+                    name,
+                    arity,
+                    params,
+                    chunk,
+                    ..
                 } = fn_value
                 {
                     self.stack.push(Value::VmFn {
                         name,
                         arity,
+                        params,
                         chunk,
                         upvalues,
                     });
@@ -309,6 +314,55 @@ impl Vm {
                     });
                 }
             }
+            OpCode::DictInsert => {
+                let value = self.pop(line)?;
+                let key = self.pop(line)?;
+                let dict = self.stack.last_mut().ok_or_else(|| TsumugiError::Runtime {
+                    line,
+                    message: "内部エラー: スタックが空です".to_string(),
+                })?;
+                if let Value::Dict(map) = dict {
+                    if let Value::Str(k) = key {
+                        map.insert(k, value);
+                    } else {
+                        return Err(TsumugiError::Runtime {
+                            line,
+                            message: "辞書のキーは文字列である必要があります".to_string(),
+                        });
+                    }
+                } else {
+                    return Err(TsumugiError::Runtime {
+                        line,
+                        message: "内部エラー: DictInsert の対象が辞書ではありません".to_string(),
+                    });
+                }
+            }
+            OpCode::SetIndex => {
+                let value = self.pop(line)?;
+                let index = self.pop(line)?;
+                let collection = self.pop(line)?;
+                let updated = self.set_index(collection, index, value, line)?;
+                self.stack.push(updated);
+            }
+            OpCode::ToIterList => {
+                let value = self.pop(line)?;
+                let list = match value {
+                    Value::List(_) => value,
+                    Value::Dict(ref map) => {
+                        Value::List(map.keys().map(|k| Value::Str(k.clone())).collect())
+                    }
+                    Value::Str(ref s) => {
+                        Value::List(s.chars().map(|c| Value::Str(c.to_string())).collect())
+                    }
+                    _ => {
+                        return Err(TsumugiError::Runtime {
+                            line,
+                            message: format!("型エラー: {:?} はイテレートできません", value),
+                        });
+                    }
+                };
+                self.stack.push(list);
+            }
             OpCode::CallBuiltin(ref name, arg_count) => {
                 let mut args = Vec::with_capacity(arg_count);
                 for _ in 0..arg_count {
@@ -379,6 +433,41 @@ impl Vm {
         }
     }
 
+    /// インデックス代入
+    fn set_index(
+        &self,
+        mut collection: Value,
+        index: Value,
+        value: Value,
+        line: usize,
+    ) -> Result<Value, TsumugiError> {
+        match (&mut collection, &index) {
+            (Value::List(list), Value::Int(i)) => {
+                let idx = if *i < 0 {
+                    (list.len() as i64 + i) as usize
+                } else {
+                    *i as usize
+                };
+                if idx >= list.len() {
+                    return Err(TsumugiError::Runtime {
+                        line,
+                        message: format!("インデックス範囲外: {} (長さ: {})", i, list.len()),
+                    });
+                }
+                list[idx] = value;
+                Ok(collection)
+            }
+            (Value::Dict(map), Value::Str(key)) => {
+                map.insert(key.clone(), value);
+                Ok(collection)
+            }
+            _ => Err(TsumugiError::Runtime {
+                line,
+                message: "インデックス代入はリストまたは辞書に対してのみ使えます".to_string(),
+            }),
+        }
+    }
+
     // --- 組み込み関数 ---
 
     fn exec_builtin(
@@ -423,6 +512,19 @@ impl Vm {
                     }
                 } else {
                     Err(self.type_error(line, "pop はリストに対してのみ使えます"))
+                }
+            }
+            "__pop_update" => {
+                // pop した後のリスト（末尾を1つ削除）を返す
+                self.check_arity(name, &args, 1, line)?;
+                let mut list = args[0].clone();
+                if let Value::List(ref mut v) = list {
+                    if !v.is_empty() {
+                        v.pop();
+                    }
+                    Ok(list)
+                } else {
+                    Ok(args[0].clone())
                 }
             }
             "keys" => {
@@ -760,6 +862,185 @@ impl Vm {
                 };
                 std::process::exit(code);
             }
+            "read_file" => {
+                self.check_arity(name, &args, 1, line)?;
+                if let Value::Str(path) = &args[0] {
+                    match std::fs::read_to_string(path) {
+                        Ok(content) => Ok(Value::Str(content)),
+                        Err(_) => Ok(Value::Null),
+                    }
+                } else {
+                    Err(self.type_error(line, "read_file(str) の形式で使います"))
+                }
+            }
+            "read_lines" => {
+                self.check_arity(name, &args, 1, line)?;
+                if let Value::Str(path) = &args[0] {
+                    match std::fs::read_to_string(path) {
+                        Ok(content) => {
+                            let lines: Vec<Value> =
+                                content.lines().map(|l| Value::Str(l.to_string())).collect();
+                            Ok(Value::List(lines))
+                        }
+                        Err(_) => Ok(Value::Null),
+                    }
+                } else {
+                    Err(self.type_error(line, "read_lines(str) の形式で使います"))
+                }
+            }
+            "write_file" => {
+                self.check_arity(name, &args, 2, line)?;
+                if let (Value::Str(path), Value::Str(content)) = (&args[0], &args[1]) {
+                    Ok(Value::Bool(std::fs::write(path, content).is_ok()))
+                } else {
+                    Err(self.type_error(line, "write_file(str, str) の形式で使います"))
+                }
+            }
+            "append_file" => {
+                self.check_arity(name, &args, 2, line)?;
+                if let (Value::Str(path), Value::Str(content)) = (&args[0], &args[1]) {
+                    use std::fs::OpenOptions;
+                    use std::io::Write;
+                    let result = OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(path)
+                        .and_then(|mut f| f.write_all(content.as_bytes()));
+                    Ok(Value::Bool(result.is_ok()))
+                } else {
+                    Err(self.type_error(line, "append_file(str, str) の形式で使います"))
+                }
+            }
+            "env" => {
+                self.check_arity(name, &args, 1, line)?;
+                if let Value::Str(key) = &args[0] {
+                    match std::env::var(key) {
+                        Ok(val) => Ok(Value::Str(val)),
+                        Err(_) => Ok(Value::Null),
+                    }
+                } else {
+                    Err(self.type_error(line, "env(str) の形式で使います"))
+                }
+            }
+            "args" => {
+                let argv: Vec<Value> = std::env::args()
+                    .skip(1)
+                    .filter(|a| a != "--vm")
+                    .skip(1) // スクリプトパスをスキップ
+                    .map(Value::Str)
+                    .collect();
+                Ok(Value::List(argv))
+            }
+            "now" => {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                Ok(Value::Int(secs))
+            }
+            "format_time" => {
+                self.check_arity(name, &args, 2, line)?;
+                if let (Value::Int(ts), Value::Str(fmt)) = (&args[0], &args[1]) {
+                    Ok(Value::Str(format_unix_timestamp(*ts, fmt)))
+                } else {
+                    Err(self.type_error(line, "format_time(int, str) の形式で使います"))
+                }
+            }
+            "path_exists" => {
+                self.check_arity(name, &args, 1, line)?;
+                if let Value::Str(path) = &args[0] {
+                    Ok(Value::Bool(std::path::Path::new(path).exists()))
+                } else {
+                    Err(self.type_error(line, "path_exists(str) の形式で使います"))
+                }
+            }
+            "path_join" => {
+                let mut path = std::path::PathBuf::new();
+                for arg in &args {
+                    if let Value::Str(s) = arg {
+                        path.push(s);
+                    }
+                }
+                Ok(Value::Str(path.to_string_lossy().to_string()))
+            }
+            "mkdir" => {
+                self.check_arity(name, &args, 1, line)?;
+                if let Value::Str(path) = &args[0] {
+                    Ok(Value::Bool(std::fs::create_dir_all(path).is_ok()))
+                } else {
+                    Err(self.type_error(line, "mkdir(str) の形式で使います"))
+                }
+            }
+            "remove" => {
+                self.check_arity(name, &args, 1, line)?;
+                if let Value::Str(path) = &args[0] {
+                    Ok(Value::Bool(std::fs::remove_file(path).is_ok()))
+                } else {
+                    Err(self.type_error(line, "remove(str) の形式で使います"))
+                }
+            }
+            "remove_dir" => {
+                self.check_arity(name, &args, 1, line)?;
+                if let Value::Str(path) = &args[0] {
+                    Ok(Value::Bool(std::fs::remove_dir_all(path).is_ok()))
+                } else {
+                    Err(self.type_error(line, "remove_dir(str) の形式で使います"))
+                }
+            }
+            "rename" => {
+                self.check_arity(name, &args, 2, line)?;
+                if let (Value::Str(from), Value::Str(to)) = (&args[0], &args[1]) {
+                    Ok(Value::Bool(std::fs::rename(from, to).is_ok()))
+                } else {
+                    Err(self.type_error(line, "rename(str, str) の形式で使います"))
+                }
+            }
+            "list_dir" => {
+                self.check_arity(name, &args, 1, line)?;
+                if let Value::Str(path) = &args[0] {
+                    match std::fs::read_dir(path) {
+                        Ok(entries) => {
+                            let mut names: Vec<Value> = entries
+                                .filter_map(|e| e.ok())
+                                .map(|e| Value::Str(e.file_name().to_string_lossy().to_string()))
+                                .collect();
+                            names.sort_by_key(|v| v.to_string());
+                            Ok(Value::List(names))
+                        }
+                        Err(_) => Ok(Value::Null),
+                    }
+                } else {
+                    Err(self.type_error(line, "list_dir(str) の形式で使います"))
+                }
+            }
+            "file_size" => {
+                self.check_arity(name, &args, 1, line)?;
+                if let Value::Str(path) = &args[0] {
+                    match std::fs::metadata(path) {
+                        Ok(meta) => Ok(Value::Int(meta.len() as i64)),
+                        Err(_) => Ok(Value::Null),
+                    }
+                } else {
+                    Err(self.type_error(line, "file_size(str) の形式で使います"))
+                }
+            }
+            "is_file" => {
+                self.check_arity(name, &args, 1, line)?;
+                if let Value::Str(path) = &args[0] {
+                    Ok(Value::Bool(std::path::Path::new(path).is_file()))
+                } else {
+                    Err(self.type_error(line, "is_file(str) の形式で使います"))
+                }
+            }
+            "is_dir" => {
+                self.check_arity(name, &args, 1, line)?;
+                if let Value::Str(path) = &args[0] {
+                    Ok(Value::Bool(std::path::Path::new(path).is_dir()))
+                } else {
+                    Err(self.type_error(line, "is_dir(str) の形式で使います"))
+                }
+            }
             _ => Err(TsumugiError::Runtime {
                 line,
                 message: format!("未定義の組み込み関数: {}", name),
@@ -1076,6 +1357,53 @@ fn type_name(value: &Value) -> &'static str {
         Value::Fn { .. } => "Fn",
         Value::VmFn { .. } => "Fn",
     }
+}
+
+/// UNIX タイムスタンプをフォーマットするヘルパー（簡易実装）
+fn format_unix_timestamp(timestamp: i64, format: &str) -> String {
+    let secs_per_day: i64 = 86400;
+    let mut days = timestamp / secs_per_day;
+    let day_secs = (timestamp % secs_per_day) as u32;
+    let hours = day_secs / 3600;
+    let minutes = (day_secs % 3600) / 60;
+    let seconds = day_secs % 60;
+
+    // 1970-01-01 からの日数 → 年月日
+    let mut year: i64 = 1970;
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+    let month_days = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month: u32 = 1;
+    for md in month_days {
+        if days < md {
+            break;
+        }
+        days -= md;
+        month += 1;
+    }
+    let day = days + 1;
+
+    format
+        .replace("%Y", &format!("{:04}", year))
+        .replace("%m", &format!("{:02}", month))
+        .replace("%d", &format!("{:02}", day))
+        .replace("%H", &format!("{:02}", hours))
+        .replace("%M", &format!("{:02}", minutes))
+        .replace("%S", &format!("{:02}", seconds))
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
 #[cfg(test)]
