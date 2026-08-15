@@ -184,10 +184,7 @@ impl Vm {
             (Value::Str(a), Value::Str(b)) => Ok(Value::Str(format!("{}{}", a, b))),
             _ => Err(TsumugiError::Runtime {
                 line,
-                message: format!(
-                    "型エラー: {:?} Add {:?} は計算できません",
-                    left, right
-                ),
+                message: format!("型エラー: {:?} Add {:?} は計算できません", left, right),
             }),
         }
     }
@@ -200,10 +197,7 @@ impl Vm {
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a - *b as f64)),
             _ => Err(TsumugiError::Runtime {
                 line,
-                message: format!(
-                    "型エラー: {:?} Sub {:?} は計算できません",
-                    left, right
-                ),
+                message: format!("型エラー: {:?} Sub {:?} は計算できません", left, right),
             }),
         }
     }
@@ -216,10 +210,7 @@ impl Vm {
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a * *b as f64)),
             _ => Err(TsumugiError::Runtime {
                 line,
-                message: format!(
-                    "型エラー: {:?} Mul {:?} は計算できません",
-                    left, right
-                ),
+                message: format!("型エラー: {:?} Mul {:?} は計算できません", left, right),
             }),
         }
     }
@@ -260,10 +251,7 @@ impl Vm {
             }
             _ => Err(TsumugiError::Runtime {
                 line,
-                message: format!(
-                    "型エラー: {:?} Div {:?} は計算できません",
-                    left, right
-                ),
+                message: format!("型エラー: {:?} Div {:?} は計算できません", left, right),
             }),
         }
     }
@@ -304,10 +292,7 @@ impl Vm {
             }
             _ => Err(TsumugiError::Runtime {
                 line,
-                message: format!(
-                    "型エラー: {:?} Mod {:?} は計算できません",
-                    left, right
-                ),
+                message: format!("型エラー: {:?} Mod {:?} は計算できません", left, right),
             }),
         }
     }
@@ -323,10 +308,7 @@ impl Vm {
             (Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a < b)),
             _ => Err(TsumugiError::Runtime {
                 line,
-                message: format!(
-                    "型エラー: {:?} と {:?} は比較できません",
-                    left, right
-                ),
+                message: format!("型エラー: {:?} と {:?} は比較できません", left, right),
             }),
         }
     }
@@ -340,10 +322,7 @@ impl Vm {
             (Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a > b)),
             _ => Err(TsumugiError::Runtime {
                 line,
-                message: format!(
-                    "型エラー: {:?} と {:?} は比較できません",
-                    left, right
-                ),
+                message: format!("型エラー: {:?} と {:?} は比較できません", left, right),
             }),
         }
     }
@@ -357,10 +336,7 @@ impl Vm {
             (Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a <= b)),
             _ => Err(TsumugiError::Runtime {
                 line,
-                message: format!(
-                    "型エラー: {:?} と {:?} は比較できません",
-                    left, right
-                ),
+                message: format!("型エラー: {:?} と {:?} は比較できません", left, right),
             }),
         }
     }
@@ -374,10 +350,7 @@ impl Vm {
             (Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a >= b)),
             _ => Err(TsumugiError::Runtime {
                 line,
-                message: format!(
-                    "型エラー: {:?} と {:?} は比較できません",
-                    left, right
-                ),
+                message: format!("型エラー: {:?} と {:?} は比較できません", left, right),
             }),
         }
     }
