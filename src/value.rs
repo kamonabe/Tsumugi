@@ -25,6 +25,7 @@ pub enum Value {
     VmFn {
         name: String,
         arity: usize,
+        params: Vec<String>,
         chunk: Chunk,
         /// クロージャがキャプチャした値（値キャプチャ方式）
         upvalues: Vec<Value>,
@@ -70,8 +71,8 @@ impl std::fmt::Display for Value {
             Value::Fn { name, params, .. } => {
                 write!(f, "<fn {}({})>", name, params.join(", "))
             }
-            Value::VmFn { name, arity, .. } => {
-                write!(f, "<fn {}({} args)>", name, arity)
+            Value::VmFn { name, params, .. } => {
+                write!(f, "<fn {}({})>", name, params.join(", "))
             }
         }
     }

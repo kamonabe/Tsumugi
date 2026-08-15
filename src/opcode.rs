@@ -82,6 +82,16 @@ pub enum OpCode {
     /// リストビルド用: スタックの [list, value] → list に value を push → list を残す
     ListPush,
 
+    /// 辞書ビルド用: スタックの [dict, key, value] → dict に key:value を挿入 → dict を残す
+    DictInsert,
+
+    /// インデックス代入: スタックの [collection, index, value] → collection[index] = value
+    SetIndex,
+
+    /// for ループ用: コレクションをイテレート可能なリストに変換
+    /// List → そのまま、Dict → keys のリスト、Str → 1文字ずつのリスト
+    ToIterList,
+
     /// 組み込み関数呼び出し
     /// operand: (関数名, 引数の数)
     CallBuiltin(String, usize),
