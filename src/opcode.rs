@@ -82,6 +82,10 @@ pub enum OpCode {
     /// リストビルド用: スタックの [list, value] → list に value を push → list を残す
     ListPush,
 
+    /// 組み込み関数呼び出し
+    /// operand: (関数名, 引数の数)
+    CallBuiltin(String, usize),
+
     /// プログラム終了
     Return,
 }

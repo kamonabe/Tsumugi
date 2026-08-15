@@ -51,308 +51,276 @@ impl Vm {
 
             let instruction = frame.chunk.code[frame.ip].clone();
             let line = frame.chunk.lines[frame.ip];
-            // ip を進める（frames の可変参照）
             self.frames.last_mut().unwrap().ip += 1;
 
-            match instruction {
-                OpCode::LoadConst(idx) => {
-                    let value = self.frames.last().unwrap().chunk.constants[idx].clone();
-                    self.stack.push(value);
-                }
-
-                OpCode::Add => {
-                    let right = self.pop(line)?;
-                    let left = self.pop(line)?;
-                    let result = self.binary_add(left, right, line)?;
-                    self.stack.push(result);
-                }
-
-                OpCode::Sub => {
-                    let right = self.pop(line)?;
-                    let left = self.pop(line)?;
-                    let result = self.binary_sub(left, right, line)?;
-                    self.stack.push(result);
-                }
-
-                OpCode::Mul => {
-                    let right = self.pop(line)?;
-                    let left = self.pop(line)?;
-                    let result = self.binary_mul(left, right, line)?;
-                    self.stack.push(result);
-                }
-
-                OpCode::Div => {
-                    let right = self.pop(line)?;
-                    let left = self.pop(line)?;
-                    let result = self.binary_div(left, right, line)?;
-                    self.stack.push(result);
-                }
-
-                OpCode::Mod => {
-                    let right = self.pop(line)?;
-                    let left = self.pop(line)?;
-                    let result = self.binary_mod(left, right, line)?;
-                    self.stack.push(result);
-                }
-
-                OpCode::Eq => {
-                    let right = self.pop(line)?;
-                    let left = self.pop(line)?;
-                    self.stack.push(Value::Bool(left == right));
-                }
-
-                OpCode::NotEq => {
-                    let right = self.pop(line)?;
-                    let left = self.pop(line)?;
-                    self.stack.push(Value::Bool(left != right));
-                }
-
-                OpCode::Lt => {
-                    let right = self.pop(line)?;
-                    let left = self.pop(line)?;
-                    let result = self.compare_lt(left, right, line)?;
-                    self.stack.push(result);
-                }
-
-                OpCode::Gt => {
-                    let right = self.pop(line)?;
-                    let left = self.pop(line)?;
-                    let result = self.compare_gt(left, right, line)?;
-                    self.stack.push(result);
-                }
-
-                OpCode::LtEq => {
-                    let right = self.pop(line)?;
-                    let left = self.pop(line)?;
-                    let result = self.compare_lteq(left, right, line)?;
-                    self.stack.push(result);
-                }
-
-                OpCode::GtEq => {
-                    let right = self.pop(line)?;
-                    let left = self.pop(line)?;
-                    let result = self.compare_gteq(left, right, line)?;
-                    self.stack.push(result);
-                }
-
-                OpCode::Not => {
-                    let value = self.pop(line)?;
-                    self.stack.push(Value::Bool(!value.is_truthy()));
-                }
-
-                OpCode::Negate => {
-                    let value = self.pop(line)?;
-                    let result = match value {
-                        Value::Int(n) => Value::Int(-n),
-                        Value::Float(n) => Value::Float(-n),
-                        other => {
-                            return Err(TsumugiError::Runtime {
-                                line,
-                                message: format!(
-                                    "型エラー: -{} は計算できません",
-                                    type_name(&other)
-                                ),
-                            });
-                        }
-                    };
-                    self.stack.push(result);
-                }
-
-                OpCode::GetLocal(slot) => {
-                    let base = self.frames.last().unwrap().base;
-                    let value = self.stack[base + slot].clone();
-                    self.stack.push(value);
-                }
-
-                OpCode::SetLocal(slot) => {
-                    let base = self.frames.last().unwrap().base;
-                    let value =
-                        self.stack
-                            .last()
-                            .cloned()
-                            .ok_or_else(|| TsumugiError::Runtime {
-                                line,
-                                message: "内部エラー: スタックが空です".to_string(),
-                            })?;
-                    self.stack[base + slot] = value;
-                }
-
-                OpCode::Print(arg_count) => {
-                    let mut values = Vec::with_capacity(arg_count);
-                    for _ in 0..arg_count {
-                        values.push(self.pop(line)?);
-                    }
-                    values.reverse();
-
-                    let output: Vec<String> = values.iter().map(|v| v.to_string()).collect();
-                    println!("{}", output.join(" "));
-                }
-
-                OpCode::Pop => {
-                    self.pop(line)?;
-                }
-
-                OpCode::PopN(count) => {
-                    for _ in 0..count {
-                        self.pop(line)?;
-                    }
-                }
-
-                OpCode::Jump(target) => {
-                    self.frames.last_mut().unwrap().ip = target;
-                }
-
-                OpCode::JumpIfFalse(target) => {
-                    let value = self.pop(line)?;
-                    if !value.is_truthy() {
-                        self.frames.last_mut().unwrap().ip = target;
-                    }
-                }
-
-                OpCode::Loop(target) => {
-                    self.frames.last_mut().unwrap().ip = target;
-                }
-
-                OpCode::Len => {
-                    let value = self.pop(line)?;
-                    let length = match &value {
-                        Value::List(v) => v.len() as i64,
-                        Value::Str(s) => s.chars().count() as i64,
-                        Value::Dict(m) => m.len() as i64,
-                        _ => {
-                            return Err(TsumugiError::Runtime {
-                                line,
-                                message: format!(
-                                    "型エラー: {} の長さは取得できません",
-                                    type_name(&value)
-                                ),
-                            });
-                        }
-                    };
-                    self.stack.push(Value::Int(length));
-                }
-
-                OpCode::Index => {
-                    let index = self.pop(line)?;
-                    let collection = self.pop(line)?;
-                    let result = self.eval_index(collection, index, line)?;
-                    self.stack.push(result);
-                }
-
-                OpCode::ListPush => {
-                    let value = self.pop(line)?;
-                    // スタックトップがリスト
-                    let list = self.stack.last_mut().ok_or_else(|| TsumugiError::Runtime {
-                        line,
-                        message: "内部エラー: スタックが空です".to_string(),
-                    })?;
-                    if let Value::List(v) = list {
-                        v.push(value);
-                    } else {
-                        return Err(TsumugiError::Runtime {
-                            line,
-                            message: "内部エラー: ListPush の対象がリストではありません"
-                                .to_string(),
-                        });
-                    }
-                }
-
-                OpCode::GetUpvalue(index) => {
-                    let value = self.frames.last().unwrap().upvalues[index].clone();
-                    self.stack.push(value);
-                }
-
-                OpCode::MakeClosure(upvalue_count) => {
-                    // スタック: [..., VmFn, upval0, upval1, ...]
-                    // upvalue を取り出す
-                    let mut upvalues = Vec::with_capacity(upvalue_count);
-                    for _ in 0..upvalue_count {
-                        upvalues.push(self.pop(line)?);
-                    }
-                    upvalues.reverse();
-
-                    // VmFn を取り出して upvalues を設定
-                    let fn_value = self.pop(line)?;
-                    if let Value::VmFn {
-                        name, arity, chunk, ..
-                    } = fn_value
-                    {
-                        self.stack.push(Value::VmFn {
-                            name,
-                            arity,
-                            chunk,
-                            upvalues,
-                        });
-                    } else {
-                        return Err(TsumugiError::Runtime {
-                            line,
-                            message: "内部エラー: MakeClosure の対象が VmFn ではありません"
-                                .to_string(),
-                        });
-                    }
-                }
-
-                OpCode::Call(arg_count) => {
-                    // スタック: [..., fn_value, arg0, arg1, ...]
-                    let fn_pos = self.stack.len() - 1 - arg_count;
-                    let fn_value = self.stack[fn_pos].clone();
-
-                    if let Value::VmFn {
-                        arity,
-                        chunk,
-                        upvalues,
-                        ..
-                    } = fn_value
-                    {
-                        if arg_count != arity {
-                            return Err(TsumugiError::Runtime {
-                                line,
-                                message: format!(
-                                    "引数の数が合いません: {}個必要ですが{}個渡されました",
-                                    arity, arg_count
-                                ),
-                            });
-                        }
-                        let base = fn_pos;
-                        self.frames.push(CallFrame {
-                            chunk,
-                            ip: 0,
-                            base,
-                            upvalues,
-                        });
-                    } else {
-                        return Err(TsumugiError::Runtime {
-                            line,
-                            message: format!(
-                                "関数ではない値を呼び出そうとしました: {:?}",
-                                fn_value
-                            ),
-                        });
-                    }
-                }
-
+            match &instruction {
                 OpCode::ReturnValue => {
-                    // 戻り値をスタックトップから取得
                     let return_value = self.pop(line)?;
-
-                    // 現在のフレームを pop
                     let frame = self.frames.pop().unwrap();
-
-                    // フレームのローカル変数をスタックからクリーンアップ
                     self.stack.truncate(frame.base);
-
-                    // トップレベルからの ReturnValue なら終了
                     if self.frames.is_empty() {
                         return Ok(());
                     }
-
-                    // 戻り値をスタックに積む
                     self.stack.push(return_value);
                 }
-
                 OpCode::Return => {
                     return Ok(());
                 }
+                _ => {
+                    self.dispatch(instruction, line)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 命令をディスパッチ（ReturnValue / Return 以外）
+    fn dispatch(&mut self, instruction: OpCode, line: usize) -> Result<(), TsumugiError> {
+        match instruction {
+            OpCode::LoadConst(idx) => {
+                let value = self.frames.last().unwrap().chunk.constants[idx].clone();
+                self.stack.push(value);
+            }
+            OpCode::Add => {
+                let right = self.pop(line)?;
+                let left = self.pop(line)?;
+                let result = self.binary_add(left, right, line)?;
+                self.stack.push(result);
+            }
+            OpCode::Sub => {
+                let right = self.pop(line)?;
+                let left = self.pop(line)?;
+                let result = self.binary_sub(left, right, line)?;
+                self.stack.push(result);
+            }
+            OpCode::Mul => {
+                let right = self.pop(line)?;
+                let left = self.pop(line)?;
+                let result = self.binary_mul(left, right, line)?;
+                self.stack.push(result);
+            }
+            OpCode::Div => {
+                let right = self.pop(line)?;
+                let left = self.pop(line)?;
+                let result = self.binary_div(left, right, line)?;
+                self.stack.push(result);
+            }
+            OpCode::Mod => {
+                let right = self.pop(line)?;
+                let left = self.pop(line)?;
+                let result = self.binary_mod(left, right, line)?;
+                self.stack.push(result);
+            }
+            OpCode::Eq => {
+                let right = self.pop(line)?;
+                let left = self.pop(line)?;
+                self.stack.push(Value::Bool(left == right));
+            }
+            OpCode::NotEq => {
+                let right = self.pop(line)?;
+                let left = self.pop(line)?;
+                self.stack.push(Value::Bool(left != right));
+            }
+            OpCode::Lt => {
+                let right = self.pop(line)?;
+                let left = self.pop(line)?;
+                let result = self.compare_lt(left, right, line)?;
+                self.stack.push(result);
+            }
+            OpCode::Gt => {
+                let right = self.pop(line)?;
+                let left = self.pop(line)?;
+                let result = self.compare_gt(left, right, line)?;
+                self.stack.push(result);
+            }
+            OpCode::LtEq => {
+                let right = self.pop(line)?;
+                let left = self.pop(line)?;
+                let result = self.compare_lteq(left, right, line)?;
+                self.stack.push(result);
+            }
+            OpCode::GtEq => {
+                let right = self.pop(line)?;
+                let left = self.pop(line)?;
+                let result = self.compare_gteq(left, right, line)?;
+                self.stack.push(result);
+            }
+            OpCode::Not => {
+                let value = self.pop(line)?;
+                self.stack.push(Value::Bool(!value.is_truthy()));
+            }
+            OpCode::Negate => {
+                let value = self.pop(line)?;
+                let result = match value {
+                    Value::Int(n) => Value::Int(-n),
+                    Value::Float(n) => Value::Float(-n),
+                    other => {
+                        return Err(TsumugiError::Runtime {
+                            line,
+                            message: format!("型エラー: -{} は計算できません", type_name(&other)),
+                        });
+                    }
+                };
+                self.stack.push(result);
+            }
+            OpCode::GetLocal(slot) => {
+                let base = self.frames.last().unwrap().base;
+                let value = self.stack[base + slot].clone();
+                self.stack.push(value);
+            }
+            OpCode::SetLocal(slot) => {
+                let base = self.frames.last().unwrap().base;
+                let value = self
+                    .stack
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| TsumugiError::Runtime {
+                        line,
+                        message: "内部エラー: スタックが空です".to_string(),
+                    })?;
+                self.stack[base + slot] = value;
+            }
+            OpCode::Jump(target) => {
+                self.frames.last_mut().unwrap().ip = target;
+            }
+            OpCode::JumpIfFalse(target) => {
+                let value = self.pop(line)?;
+                if !value.is_truthy() {
+                    self.frames.last_mut().unwrap().ip = target;
+                }
+            }
+            OpCode::Loop(target) => {
+                self.frames.last_mut().unwrap().ip = target;
+            }
+            OpCode::GetUpvalue(index) => {
+                let value = self.frames.last().unwrap().upvalues[index].clone();
+                self.stack.push(value);
+            }
+            OpCode::MakeClosure(upvalue_count) => {
+                let mut upvalues = Vec::with_capacity(upvalue_count);
+                for _ in 0..upvalue_count {
+                    upvalues.push(self.pop(line)?);
+                }
+                upvalues.reverse();
+                let fn_value = self.pop(line)?;
+                if let Value::VmFn {
+                    name, arity, chunk, ..
+                } = fn_value
+                {
+                    self.stack.push(Value::VmFn {
+                        name,
+                        arity,
+                        chunk,
+                        upvalues,
+                    });
+                } else {
+                    return Err(TsumugiError::Runtime {
+                        line,
+                        message: "内部エラー: MakeClosure の対象が VmFn ではありません".to_string(),
+                    });
+                }
+            }
+            OpCode::Call(arg_count) => {
+                let fn_pos = self.stack.len() - 1 - arg_count;
+                let fn_value = self.stack[fn_pos].clone();
+                if let Value::VmFn {
+                    arity,
+                    chunk,
+                    upvalues,
+                    ..
+                } = fn_value
+                {
+                    if arg_count != arity {
+                        return Err(TsumugiError::Runtime {
+                            line,
+                            message: format!(
+                                "引数の数が合いません: {}個必要ですが{}個渡されました",
+                                arity, arg_count
+                            ),
+                        });
+                    }
+                    let base = fn_pos;
+                    self.frames.push(CallFrame {
+                        chunk,
+                        ip: 0,
+                        base,
+                        upvalues,
+                    });
+                } else {
+                    return Err(TsumugiError::Runtime {
+                        line,
+                        message: format!("関数ではない値を呼び出そうとしました: {:?}", fn_value),
+                    });
+                }
+            }
+            OpCode::Print(arg_count) => {
+                let mut values = Vec::with_capacity(arg_count);
+                for _ in 0..arg_count {
+                    values.push(self.pop(line)?);
+                }
+                values.reverse();
+                let output: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+                println!("{}", output.join(" "));
+            }
+            OpCode::Pop => {
+                self.pop(line)?;
+            }
+            OpCode::PopN(count) => {
+                for _ in 0..count {
+                    self.pop(line)?;
+                }
+            }
+            OpCode::Len => {
+                let value = self.pop(line)?;
+                let length = match &value {
+                    Value::List(v) => v.len() as i64,
+                    Value::Str(s) => s.chars().count() as i64,
+                    Value::Dict(m) => m.len() as i64,
+                    _ => {
+                        return Err(TsumugiError::Runtime {
+                            line,
+                            message: format!(
+                                "型エラー: {} の長さは取得できません",
+                                type_name(&value)
+                            ),
+                        });
+                    }
+                };
+                self.stack.push(Value::Int(length));
+            }
+            OpCode::Index => {
+                let index = self.pop(line)?;
+                let collection = self.pop(line)?;
+                let result = self.eval_index(collection, index, line)?;
+                self.stack.push(result);
+            }
+            OpCode::ListPush => {
+                let value = self.pop(line)?;
+                let list = self.stack.last_mut().ok_or_else(|| TsumugiError::Runtime {
+                    line,
+                    message: "内部エラー: スタックが空です".to_string(),
+                })?;
+                if let Value::List(v) = list {
+                    v.push(value);
+                } else {
+                    return Err(TsumugiError::Runtime {
+                        line,
+                        message: "内部エラー: ListPush の対象がリストではありません".to_string(),
+                    });
+                }
+            }
+            OpCode::CallBuiltin(ref name, arg_count) => {
+                let mut args = Vec::with_capacity(arg_count);
+                for _ in 0..arg_count {
+                    args.push(self.pop(line)?);
+                }
+                args.reverse();
+                let result = self.exec_builtin(name, args, line)?;
+                self.stack.push(result);
+            }
+            OpCode::ReturnValue | OpCode::Return => {
+                // これらは run() / call_fn_value で処理済み、ここに来ない
+                unreachable!()
             }
         }
         Ok(())
@@ -408,6 +376,507 @@ impl Vm {
                     collection, index
                 ),
             }),
+        }
+    }
+
+    // --- 組み込み関数 ---
+
+    fn exec_builtin(
+        &mut self,
+        name: &str,
+        args: Vec<Value>,
+        line: usize,
+    ) -> Result<Value, TsumugiError> {
+        match name {
+            "len" => {
+                self.check_arity(name, &args, 1, line)?;
+                match &args[0] {
+                    Value::List(v) => Ok(Value::Int(v.len() as i64)),
+                    Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
+                    Value::Dict(m) => Ok(Value::Int(m.len() as i64)),
+                    _ => Err(self.type_error(line, "len は List/Str/Dict に対してのみ使えます")),
+                }
+            }
+            "push" => {
+                self.check_arity(name, &args, 2, line)?;
+                let mut list = args[0].clone();
+                if let Value::List(ref mut v) = list {
+                    v.push(args[1].clone());
+                    // push はスタック上のオリジナルを変更する必要がある
+                    // ただし値キャプチャ方式なのでここでは新しいリストを返す
+                    Ok(list)
+                } else {
+                    Err(self.type_error(line, "push はリストに対してのみ使えます"))
+                }
+            }
+            "pop" => {
+                self.check_arity(name, &args, 1, line)?;
+                let mut list = args[0].clone();
+                if let Value::List(ref mut v) = list {
+                    if v.is_empty() {
+                        Err(TsumugiError::Runtime {
+                            line,
+                            message: "pop: 空のリストからは取り出せません".to_string(),
+                        })
+                    } else {
+                        Ok(v.pop().unwrap())
+                    }
+                } else {
+                    Err(self.type_error(line, "pop はリストに対してのみ使えます"))
+                }
+            }
+            "keys" => {
+                self.check_arity(name, &args, 1, line)?;
+                if let Value::Dict(map) = &args[0] {
+                    let keys: Vec<Value> = map.keys().map(|k| Value::Str(k.clone())).collect();
+                    Ok(Value::List(keys))
+                } else {
+                    Err(self.type_error(line, "keys は辞書に対してのみ使えます"))
+                }
+            }
+            "values" => {
+                self.check_arity(name, &args, 1, line)?;
+                if let Value::Dict(map) = &args[0] {
+                    let vals: Vec<Value> = map.values().cloned().collect();
+                    Ok(Value::List(vals))
+                } else {
+                    Err(self.type_error(line, "values は辞書に対してのみ使えます"))
+                }
+            }
+            "has_key" => {
+                self.check_arity(name, &args, 2, line)?;
+                if let (Value::Dict(map), Value::Str(key)) = (&args[0], &args[1]) {
+                    Ok(Value::Bool(map.contains_key(key)))
+                } else {
+                    Err(self.type_error(line, "has_key(dict, str) の形式で使います"))
+                }
+            }
+            "type" => {
+                self.check_arity(name, &args, 1, line)?;
+                let t = match &args[0] {
+                    Value::Int(_) => "int",
+                    Value::Float(_) => "float",
+                    Value::Str(_) => "str",
+                    Value::Bool(_) => "bool",
+                    Value::Null => "null",
+                    Value::List(_) => "list",
+                    Value::Dict(_) => "dict",
+                    Value::Fn { .. } | Value::VmFn { .. } => "fn",
+                };
+                Ok(Value::Str(t.to_string()))
+            }
+            "slice" => {
+                self.check_arity(name, &args, 3, line)?;
+                let (Value::Int(start), Value::Int(end)) = (&args[1], &args[2]) else {
+                    return Err(self.type_error(line, "slice の開始・終了は整数で指定します"));
+                };
+                let start = *start as usize;
+                let end = *end as usize;
+                match &args[0] {
+                    Value::List(v) => {
+                        let s = start.min(v.len());
+                        let e = end.min(v.len());
+                        Ok(Value::List(v[s..e].to_vec()))
+                    }
+                    Value::Str(s) => {
+                        let chars: Vec<char> = s.chars().collect();
+                        let st = start.min(chars.len());
+                        let en = end.min(chars.len());
+                        Ok(Value::Str(chars[st..en].iter().collect()))
+                    }
+                    _ => Err(self.type_error(line, "slice は List/Str に対してのみ使えます")),
+                }
+            }
+            "contains" => {
+                self.check_arity(name, &args, 2, line)?;
+                match &args[0] {
+                    Value::List(v) => Ok(Value::Bool(v.contains(&args[1]))),
+                    Value::Str(s) => {
+                        if let Value::Str(sub) = &args[1] {
+                            Ok(Value::Bool(s.contains(sub.as_str())))
+                        } else {
+                            Ok(Value::Bool(false))
+                        }
+                    }
+                    Value::Dict(map) => {
+                        if let Value::Str(key) = &args[1] {
+                            Ok(Value::Bool(map.contains_key(key)))
+                        } else {
+                            Ok(Value::Bool(false))
+                        }
+                    }
+                    _ => {
+                        Err(self.type_error(line, "contains は List/Str/Dict に対してのみ使えます"))
+                    }
+                }
+            }
+            "split" => {
+                self.check_arity(name, &args, 2, line)?;
+                if let (Value::Str(s), Value::Str(sep)) = (&args[0], &args[1]) {
+                    let parts: Vec<Value> = s
+                        .split(sep.as_str())
+                        .map(|p| Value::Str(p.to_string()))
+                        .collect();
+                    Ok(Value::List(parts))
+                } else {
+                    Err(self.type_error(line, "split(str, str) の形式で使います"))
+                }
+            }
+            "join" => {
+                self.check_arity(name, &args, 2, line)?;
+                if let (Value::List(list), Value::Str(sep)) = (&args[0], &args[1]) {
+                    let parts: Vec<String> = list.iter().map(|v| v.to_string()).collect();
+                    Ok(Value::Str(parts.join(sep)))
+                } else {
+                    Err(self.type_error(line, "join(list, str) の形式で使います"))
+                }
+            }
+            "to_int" => {
+                self.check_arity(name, &args, 1, line)?;
+                match &args[0] {
+                    Value::Int(n) => Ok(Value::Int(*n)),
+                    Value::Float(f) => Ok(Value::Int(*f as i64)),
+                    Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
+                    Value::Str(s) => {
+                        s.parse::<i64>()
+                            .map(Value::Int)
+                            .map_err(|_| TsumugiError::Runtime {
+                                line,
+                                message: format!("to_int: \"{}\" は整数に変換できません", s),
+                            })
+                    }
+                    _ => Err(self.type_error(line, "to_int: 変換できない型です")),
+                }
+            }
+            "to_str" => {
+                self.check_arity(name, &args, 1, line)?;
+                Ok(Value::Str(args[0].to_string()))
+            }
+            "to_float" => {
+                self.check_arity(name, &args, 1, line)?;
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Float(*f)),
+                    Value::Int(n) => Ok(Value::Float(*n as f64)),
+                    Value::Str(s) => {
+                        s.parse::<f64>()
+                            .map(Value::Float)
+                            .map_err(|_| TsumugiError::Runtime {
+                                line,
+                                message: format!(
+                                    "to_float: \"{}\" は浮動小数点に変換できません",
+                                    s
+                                ),
+                            })
+                    }
+                    _ => Err(self.type_error(line, "to_float: 変換できない型です")),
+                }
+            }
+            "range" => {
+                self.check_arity(name, &args, 2, line)?;
+                if let (Value::Int(start), Value::Int(end)) = (&args[0], &args[1]) {
+                    let list: Vec<Value> = (*start..*end).map(Value::Int).collect();
+                    Ok(Value::List(list))
+                } else {
+                    Err(self.type_error(line, "range(int, int) の形式で使います"))
+                }
+            }
+            "map" => {
+                self.check_arity(name, &args, 2, line)?;
+                if let Value::List(list) = &args[0] {
+                    let func = args[1].clone();
+                    let mut result = Vec::new();
+                    for item in list {
+                        result.push(self.call_fn_value(func.clone(), vec![item.clone()], line)?);
+                    }
+                    Ok(Value::List(result))
+                } else {
+                    Err(self.type_error(line, "map(list, fn) の形式で使います"))
+                }
+            }
+            "filter" => {
+                self.check_arity(name, &args, 2, line)?;
+                if let Value::List(list) = &args[0] {
+                    let func = args[1].clone();
+                    let mut result = Vec::new();
+                    for item in list {
+                        let cond = self.call_fn_value(func.clone(), vec![item.clone()], line)?;
+                        if cond.is_truthy() {
+                            result.push(item.clone());
+                        }
+                    }
+                    Ok(Value::List(result))
+                } else {
+                    Err(self.type_error(line, "filter(list, fn) の形式で使います"))
+                }
+            }
+            "each" => {
+                self.check_arity(name, &args, 2, line)?;
+                if let Value::List(list) = &args[0] {
+                    let func = args[1].clone();
+                    for item in list {
+                        self.call_fn_value(func.clone(), vec![item.clone()], line)?;
+                    }
+                    Ok(Value::Null)
+                } else {
+                    Err(self.type_error(line, "each(list, fn) の形式で使います"))
+                }
+            }
+            "sort" => {
+                self.check_arity(name, &args, 1, line)?;
+                if let Value::List(list) = &args[0] {
+                    let mut sorted = list.clone();
+                    sorted.sort_by_key(|a| a.to_string());
+                    Ok(Value::List(sorted))
+                } else {
+                    Err(self.type_error(line, "sort はリストに対してのみ使えます"))
+                }
+            }
+            "reverse" => {
+                self.check_arity(name, &args, 1, line)?;
+                match &args[0] {
+                    Value::List(list) => {
+                        let mut rev = list.clone();
+                        rev.reverse();
+                        Ok(Value::List(rev))
+                    }
+                    Value::Str(s) => Ok(Value::Str(s.chars().rev().collect())),
+                    _ => Err(self.type_error(line, "reverse は List/Str に対してのみ使えます")),
+                }
+            }
+            "trim" => {
+                self.check_arity(name, &args, 1, line)?;
+                if let Value::Str(s) = &args[0] {
+                    Ok(Value::Str(s.trim().to_string()))
+                } else {
+                    Err(self.type_error(line, "trim は文字列に対してのみ使えます"))
+                }
+            }
+            "upper" => {
+                self.check_arity(name, &args, 1, line)?;
+                if let Value::Str(s) = &args[0] {
+                    Ok(Value::Str(s.to_uppercase()))
+                } else {
+                    Err(self.type_error(line, "upper は文字列に対してのみ使えます"))
+                }
+            }
+            "lower" => {
+                self.check_arity(name, &args, 1, line)?;
+                if let Value::Str(s) = &args[0] {
+                    Ok(Value::Str(s.to_lowercase()))
+                } else {
+                    Err(self.type_error(line, "lower は文字列に対してのみ使えます"))
+                }
+            }
+            "starts_with" => {
+                self.check_arity(name, &args, 2, line)?;
+                if let (Value::Str(s), Value::Str(prefix)) = (&args[0], &args[1]) {
+                    Ok(Value::Bool(s.starts_with(prefix.as_str())))
+                } else {
+                    Err(self.type_error(line, "starts_with(str, str) の形式で使います"))
+                }
+            }
+            "ends_with" => {
+                self.check_arity(name, &args, 2, line)?;
+                if let (Value::Str(s), Value::Str(suffix)) = (&args[0], &args[1]) {
+                    Ok(Value::Bool(s.ends_with(suffix.as_str())))
+                } else {
+                    Err(self.type_error(line, "ends_with(str, str) の形式で使います"))
+                }
+            }
+            "replace" => {
+                self.check_arity(name, &args, 3, line)?;
+                if let (Value::Str(s), Value::Str(old), Value::Str(new)) =
+                    (&args[0], &args[1], &args[2])
+                {
+                    Ok(Value::Str(s.replace(old.as_str(), new.as_str())))
+                } else {
+                    Err(self.type_error(line, "replace(str, str, str) の形式で使います"))
+                }
+            }
+            "abs" => {
+                self.check_arity(name, &args, 1, line)?;
+                match &args[0] {
+                    Value::Int(n) => Ok(Value::Int(n.abs())),
+                    Value::Float(f) => Ok(Value::Float(f.abs())),
+                    _ => Err(self.type_error(line, "abs は数値に対してのみ使えます")),
+                }
+            }
+            "min" => {
+                self.check_arity(name, &args, 2, line)?;
+                match (&args[0], &args[1]) {
+                    (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.min(b))),
+                    (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.min(*b))),
+                    _ => Err(self.type_error(line, "min は同じ数値型に対してのみ使えます")),
+                }
+            }
+            "max" => {
+                self.check_arity(name, &args, 2, line)?;
+                match (&args[0], &args[1]) {
+                    (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.max(b))),
+                    (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.max(*b))),
+                    _ => Err(self.type_error(line, "max は同じ数値型に対してのみ使えます")),
+                }
+            }
+            "floor" => {
+                self.check_arity(name, &args, 1, line)?;
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Int(f.floor() as i64)),
+                    Value::Int(n) => Ok(Value::Int(*n)),
+                    _ => Err(self.type_error(line, "floor は数値に対してのみ使えます")),
+                }
+            }
+            "ceil" => {
+                self.check_arity(name, &args, 1, line)?;
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Int(f.ceil() as i64)),
+                    Value::Int(n) => Ok(Value::Int(*n)),
+                    _ => Err(self.type_error(line, "ceil は数値に対してのみ使えます")),
+                }
+            }
+            "round" => {
+                self.check_arity(name, &args, 1, line)?;
+                match &args[0] {
+                    Value::Float(f) => Ok(Value::Int(f.round() as i64)),
+                    Value::Int(n) => Ok(Value::Int(*n)),
+                    _ => Err(self.type_error(line, "round は数値に対してのみ使えます")),
+                }
+            }
+            "input" => {
+                self.check_arity(name, &args, 0, line)?;
+                let mut buf = String::new();
+                match std::io::stdin().read_line(&mut buf) {
+                    Ok(0) => Ok(Value::Null),
+                    Ok(_) => Ok(Value::Str(buf.trim_end_matches('\n').to_string())),
+                    Err(_) => Ok(Value::Null),
+                }
+            }
+            "exit" => {
+                let code = if args.is_empty() {
+                    0
+                } else if let Value::Int(n) = &args[0] {
+                    *n as i32
+                } else {
+                    0
+                };
+                std::process::exit(code);
+            }
+            _ => Err(TsumugiError::Runtime {
+                line,
+                message: format!("未定義の組み込み関数: {}", name),
+            }),
+        }
+    }
+
+    /// 関数値を呼び出すヘルパー（map/filter/each 用）
+    fn call_fn_value(
+        &mut self,
+        func: Value,
+        args: Vec<Value>,
+        line: usize,
+    ) -> Result<Value, TsumugiError> {
+        if let Value::VmFn {
+            arity,
+            chunk,
+            upvalues,
+            ..
+        } = func
+        {
+            if args.len() != arity {
+                return Err(TsumugiError::Runtime {
+                    line,
+                    message: format!(
+                        "引数の数が合いません: {}個必要ですが{}個渡されました",
+                        arity,
+                        args.len()
+                    ),
+                });
+            }
+            // 関数自身をスタックに積む（slot 0）
+            let base = self.stack.len();
+            self.stack.push(Value::Null); // slot 0 placeholder
+            for arg in args {
+                self.stack.push(arg);
+            }
+            let target_depth = self.frames.len();
+            self.frames.push(CallFrame {
+                chunk,
+                ip: 0,
+                base,
+                upvalues,
+            });
+            // メインループと同じ構造で実行（ReturnValue でフレームが target_depth に戻ったら終了）
+            loop {
+                let frame = self.frames.last().unwrap();
+                if frame.ip >= frame.chunk.code.len() {
+                    // フレームの命令が尽きた = 暗黙 null return
+                    let f = self.frames.pop().unwrap();
+                    self.stack.truncate(f.base);
+                    if self.frames.len() <= target_depth {
+                        return Ok(Value::Null);
+                    }
+                    self.stack.push(Value::Null);
+                    continue;
+                }
+
+                let instruction = frame.chunk.code[frame.ip].clone();
+                let instr_line = frame.chunk.lines[frame.ip];
+                self.frames.last_mut().unwrap().ip += 1;
+
+                match &instruction {
+                    OpCode::ReturnValue => {
+                        let return_value = self.pop(instr_line)?;
+                        let f = self.frames.pop().unwrap();
+                        self.stack.truncate(f.base);
+                        if self.frames.len() <= target_depth {
+                            return Ok(return_value);
+                        }
+                        self.stack.push(return_value);
+                    }
+                    OpCode::Return => {
+                        // トップレベル Return = 通常は起きないがガード
+                        let f = self.frames.pop().unwrap();
+                        self.stack.truncate(f.base);
+                        return Ok(Value::Null);
+                    }
+                    _ => {
+                        self.dispatch(instruction, instr_line)?;
+                    }
+                }
+            }
+        } else {
+            Err(TsumugiError::Runtime {
+                line,
+                message: "関数ではない値を呼び出そうとしました".to_string(),
+            })
+        }
+    }
+
+    fn check_arity(
+        &self,
+        name: &str,
+        args: &[Value],
+        expected: usize,
+        line: usize,
+    ) -> Result<(), TsumugiError> {
+        if args.len() != expected {
+            Err(TsumugiError::Runtime {
+                line,
+                message: format!(
+                    "{}: 引数の数が合いません: {}個必要ですが{}個渡されました",
+                    name,
+                    expected,
+                    args.len()
+                ),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn type_error(&self, line: usize, msg: &str) -> TsumugiError {
+        TsumugiError::Runtime {
+            line,
+            message: msg.to_string(),
         }
     }
 
