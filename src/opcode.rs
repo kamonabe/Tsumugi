@@ -47,6 +47,14 @@ pub enum OpCode {
     /// 後方ジャンプ（ループ先頭に戻る: ip を指定位置に設定）
     Loop(usize),
 
+    // --- 関数呼び出し ---
+    /// 関数を呼び出す。operand: 引数の数
+    /// スタック: [fn, arg0, arg1, ...] → 関数を実行
+    Call(usize),
+
+    /// 関数から値を返す（スタックトップが戻り値）
+    ReturnValue,
+
     // --- 組み込み関数呼び出し ---
     /// print: 引数の数を operand で指定
     Print(usize),

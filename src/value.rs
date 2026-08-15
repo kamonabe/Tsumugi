@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 use crate::ast::Stmt;
+use crate::chunk::Chunk;
 
 /// Tsumugi の実行時の値
 #[derive(Debug, Clone, PartialEq)]
@@ -13,12 +14,18 @@ pub enum Value {
     Null,
     List(Vec<Value>),
     Dict(BTreeMap<String, Value>),
-    /// 関数値（ユーザー定義関数を値として扱う）
+    /// 関数値（ツリーウォーク用: ユーザー定義関数を値として扱う）
     Fn {
         name: String,
         params: Vec<String>,
         body: Vec<Stmt>,
         captured: HashMap<String, Value>,
+    },
+    /// VM用関数値（コンパイル済みバイトコード）
+    VmFn {
+        name: String,
+        arity: usize,
+        chunk: Chunk,
     },
 }
 
@@ -60,6 +67,9 @@ impl std::fmt::Display for Value {
             }
             Value::Fn { name, params, .. } => {
                 write!(f, "<fn {}({})>", name, params.join(", "))
+            }
+            Value::VmFn { name, arity, .. } => {
+                write!(f, "<fn {}({} args)>", name, arity)
             }
         }
     }

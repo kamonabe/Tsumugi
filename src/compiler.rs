@@ -106,6 +106,18 @@ impl Compiler {
             Stmt::Continue { line } => {
                 self.compile_continue(*line)?;
             }
+            Stmt::FnDef {
+                name,
+                params,
+                body,
+                line,
+            } => {
+                self.compile_fn_def(name, params, body, *line)?;
+            }
+            Stmt::Return { value, line } => {
+                self.compile_expr(value, *line)?;
+                self.chunk.emit(OpCode::ReturnValue, *line);
+            }
             _ => {
                 let line = stmt.line();
                 return Err(TsumugiError::Runtime {
@@ -425,6 +437,7 @@ impl Compiler {
                 }
             }
             Expr::Call { callee, args } => {
+                // print は専用命令で処理
                 if let Expr::Ident(name) = callee.as_ref()
                     && name == "print"
                 {
@@ -436,10 +449,13 @@ impl Compiler {
                     self.chunk.emit_constant(Value::Null, line);
                     return Ok(());
                 }
-                return Err(TsumugiError::Runtime {
-                    line,
-                    message: "VM未対応: print以外の関数呼び出し".to_string(),
-                });
+                // 汎用関数呼び出し: callee を評価 → 引数を評価 → Call
+                self.compile_expr(callee, line)?;
+                let arg_count = args.len();
+                for arg in args {
+                    self.compile_expr(arg, line)?;
+                }
+                self.chunk.emit(OpCode::Call(arg_count), line);
             }
             Expr::List(elements) => {
                 self.chunk.emit_constant(Value::List(Vec::new()), line);
@@ -481,6 +497,50 @@ impl Compiler {
     }
 
     // --- ローカル変数管理 ---
+
+    /// 関数定義のコンパイル
+    fn compile_fn_def(
+        &mut self,
+        name: &str,
+        params: &[String],
+        body: &[Stmt],
+        line: usize,
+    ) -> Result<(), TsumugiError> {
+        // 関数本体を別の Compiler でコンパイル
+        let mut fn_compiler = Compiler::new();
+
+        // 再帰呼び出し用に関数自身の名前を slot 0 として登録
+        fn_compiler.add_local(name.to_string());
+
+        // パラメータをローカル変数として登録（slot 1, 2, 3, ...）
+        for param in params {
+            fn_compiler.add_local(param.clone());
+        }
+
+        // 本体をコンパイル
+        for stmt in body {
+            fn_compiler.compile_stmt(stmt)?;
+        }
+
+        // 明示的な return がない場合のフォールバック: null を返す
+        fn_compiler.chunk.emit_constant(Value::Null, line);
+        fn_compiler.chunk.emit(OpCode::ReturnValue, line);
+
+        let fn_chunk = fn_compiler.chunk;
+
+        // VmFn 値を定数テーブルに追加してロード
+        let fn_value = Value::VmFn {
+            name: name.to_string(),
+            arity: params.len(),
+            chunk: fn_chunk,
+        };
+        self.chunk.emit_constant(fn_value, line);
+
+        // 関数名をローカル変数として登録
+        self.add_local(name.to_string());
+
+        Ok(())
+    }
 
     fn add_local(&mut self, name: String) {
         self.locals.push(Local {

@@ -411,6 +411,7 @@ impl Evaluator {
                     Value::List(_) => "list",
                     Value::Dict(_) => "dict",
                     Value::Fn { .. } => "fn",
+                    Value::VmFn { .. } => "fn",
                 };
                 Ok(Some(Value::Str(type_name.to_string())))
             }

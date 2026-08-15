@@ -4,7 +4,7 @@ use crate::opcode::OpCode;
 use crate::value::Value;
 
 /// コンパイル結果を保持する構造体
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
     /// 命令列
     pub code: Vec<OpCode>,

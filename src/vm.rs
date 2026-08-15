@@ -5,13 +5,21 @@ use crate::error::TsumugiError;
 use crate::opcode::OpCode;
 use crate::value::Value;
 
+/// コールフレーム: 関数呼び出しの状態を保存する
+#[derive(Debug)]
+struct CallFrame {
+    /// この関数の Chunk
+    chunk: Chunk,
+    /// 命令ポインタ（この関数内の次に実行する命令のインデックス）
+    ip: usize,
+    /// スタック上のベース位置（この関数のローカル変数 slot 0 に対応）
+    base: usize,
+}
+
 /// スタックベースの仮想マシン
 pub struct Vm {
-    /// 実行中のチャンク
-    chunk: Chunk,
-
-    /// 命令ポインタ（次に実行する命令のインデックス）
-    ip: usize,
+    /// コールフレームスタック
+    frames: Vec<CallFrame>,
 
     /// 値スタック
     stack: Vec<Value>,
@@ -19,9 +27,13 @@ pub struct Vm {
 
 impl Vm {
     pub fn new(chunk: Chunk) -> Self {
-        Vm {
+        let frame = CallFrame {
             chunk,
             ip: 0,
+            base: 0,
+        };
+        Vm {
+            frames: vec![frame],
             stack: Vec::with_capacity(256),
         }
     }
@@ -29,17 +41,19 @@ impl Vm {
     /// チャンクを実行する
     pub fn run(&mut self) -> Result<(), TsumugiError> {
         loop {
-            if self.ip >= self.chunk.code.len() {
+            let frame = self.frames.last().unwrap();
+            if frame.ip >= frame.chunk.code.len() {
                 break;
             }
 
-            let instruction = self.chunk.code[self.ip].clone();
-            let line = self.chunk.lines[self.ip];
-            self.ip += 1;
+            let instruction = frame.chunk.code[frame.ip].clone();
+            let line = frame.chunk.lines[frame.ip];
+            // ip を進める（frames の可変参照）
+            self.frames.last_mut().unwrap().ip += 1;
 
             match instruction {
                 OpCode::LoadConst(idx) => {
-                    let value = self.chunk.constants[idx].clone();
+                    let value = self.frames.last().unwrap().chunk.constants[idx].clone();
                     self.stack.push(value);
                 }
 
@@ -142,12 +156,13 @@ impl Vm {
                 }
 
                 OpCode::GetLocal(slot) => {
-                    let value = self.stack[slot].clone();
+                    let base = self.frames.last().unwrap().base;
+                    let value = self.stack[base + slot].clone();
                     self.stack.push(value);
                 }
 
                 OpCode::SetLocal(slot) => {
-                    // スタックトップの値でスロットを上書き（値はスタックに残す）
+                    let base = self.frames.last().unwrap().base;
                     let value =
                         self.stack
                             .last()
@@ -156,7 +171,7 @@ impl Vm {
                                 line,
                                 message: "内部エラー: スタックが空です".to_string(),
                             })?;
-                    self.stack[slot] = value;
+                    self.stack[base + slot] = value;
                 }
 
                 OpCode::Print(arg_count) => {
@@ -181,18 +196,18 @@ impl Vm {
                 }
 
                 OpCode::Jump(target) => {
-                    self.ip = target;
+                    self.frames.last_mut().unwrap().ip = target;
                 }
 
                 OpCode::JumpIfFalse(target) => {
                     let value = self.pop(line)?;
                     if !value.is_truthy() {
-                        self.ip = target;
+                        self.frames.last_mut().unwrap().ip = target;
                     }
                 }
 
                 OpCode::Loop(target) => {
-                    self.ip = target;
+                    self.frames.last_mut().unwrap().ip = target;
                 }
 
                 OpCode::Len => {
@@ -237,6 +252,57 @@ impl Vm {
                                 .to_string(),
                         });
                     }
+                }
+
+                OpCode::Call(arg_count) => {
+                    // スタック: [..., fn_value, arg0, arg1, ...]
+                    let fn_pos = self.stack.len() - 1 - arg_count;
+                    let fn_value = self.stack[fn_pos].clone();
+
+                    if let Value::VmFn { arity, chunk, .. } = fn_value {
+                        if arg_count != arity {
+                            return Err(TsumugiError::Runtime {
+                                line,
+                                message: format!(
+                                    "引数の数が合いません: {}個必要ですが{}個渡されました",
+                                    arity, arg_count
+                                ),
+                            });
+                        }
+                        // コールフレームを push
+                        // base = fn_pos（fn_value 自体が slot 0 = 自己参照用）
+                        // 引数は slot 1, 2, ... に対応
+                        let base = fn_pos;
+
+                        self.frames.push(CallFrame { chunk, ip: 0, base });
+                    } else {
+                        return Err(TsumugiError::Runtime {
+                            line,
+                            message: format!(
+                                "関数ではない値を呼び出そうとしました: {:?}",
+                                fn_value
+                            ),
+                        });
+                    }
+                }
+
+                OpCode::ReturnValue => {
+                    // 戻り値をスタックトップから取得
+                    let return_value = self.pop(line)?;
+
+                    // 現在のフレームを pop
+                    let frame = self.frames.pop().unwrap();
+
+                    // フレームのローカル変数をスタックからクリーンアップ
+                    self.stack.truncate(frame.base);
+
+                    // トップレベルからの ReturnValue なら終了
+                    if self.frames.is_empty() {
+                        return Ok(());
+                    }
+
+                    // 戻り値をスタックに積む
+                    self.stack.push(return_value);
                 }
 
                 OpCode::Return => {
@@ -494,6 +560,7 @@ fn type_name(value: &Value) -> &'static str {
         Value::List(_) => "List",
         Value::Dict(_) => "Dict",
         Value::Fn { .. } => "Fn",
+        Value::VmFn { .. } => "Fn",
     }
 }
 
@@ -674,5 +741,44 @@ mod tests {
             run_vm("for i in [1, 2]\n    for j in [10, 20]\n        print(i, j)\n    end\nend")
                 .is_ok()
         );
+    }
+
+    // --- Phase 4: 関数 ---
+
+    #[test]
+    fn vm_fn_basic() {
+        assert!(run_vm("fn add(a, b)\n    return a + b\nend\nprint(add(3, 4))").is_ok());
+    }
+
+    #[test]
+    fn vm_fn_no_return() {
+        assert!(run_vm("fn greet()\n    print(\"hello\")\nend\ngreet()").is_ok());
+    }
+
+    #[test]
+    fn vm_fn_recursive() {
+        assert!(
+            run_vm("fn fib(n)\n    if n <= 1\n        return n\n    end\n    return fib(n - 1) + fib(n - 2)\nend\nprint(fib(10))").is_ok()
+        );
+    }
+
+    #[test]
+    fn vm_fn_multiple_calls() {
+        assert!(
+            run_vm("fn double(x)\n    return x * 2\nend\nprint(double(3))\nprint(double(5))")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn vm_fn_wrong_arity() {
+        let result = run_vm("fn add(a, b)\n    return a + b\nend\nadd(1)");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn vm_fn_call_non_function() {
+        let result = run_vm("let x = 42\nx()");
+        assert!(result.is_err());
     }
 }
