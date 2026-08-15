@@ -30,6 +30,7 @@
 - [x] 高階関数（map / filter / each）
 - [x] バイトコード VM: Phase 1（OpCode + Chunk + Compiler + VM + 算術 + Print）
 - [x] バイトコード VM: Phase 2（変数 — let / 再代入 / GetLocal / SetLocal）
+- [x] バイトコード VM: Phase 3（制御フロー — if/elif/else / while / for / break / continue / and / or）
 
 ## 設計方針: 組み込み関数の境界線
 
@@ -83,7 +84,7 @@
 |---|---|---|
 | 0+1 | OpCode + Chunk + Compiler + VM + 定数 + 算術 + Print | ✅ 完了 |
 | 2 | 変数（let / 再代入 / 参照） | ✅ 完了 |
-| 3 | 比較 + 条件ジャンプ（if / while / for） + break/continue | 未着手 |
+| 3 | 比較 + 条件ジャンプ（if / while / for） + break/continue | ✅ 完了 |
 | 4 | 関数定義・呼び出し（コールフレーム） | 未着手 |
 | 5 | クロージャ（upvalue） | 未着手 |
 | 6 | 組み込み関数（len, push, pop 等） | 未着手 |

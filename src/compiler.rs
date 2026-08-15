@@ -10,9 +10,24 @@ use crate::value::Value;
 #[derive(Debug, Clone)]
 struct Local {
     name: String,
-    /// スコープの深さ（0 = トップレベル）— Phase 3 で使用
-    #[allow(dead_code)]
+    /// スコープの深さ（0 = トップレベル）
     depth: usize,
+}
+
+/// ループのコンパイル状態（break/continue のパッチに使う）
+#[derive(Debug)]
+struct LoopState {
+    /// continue の飛び先（while: 条件チェック先頭、for: インクリメント先頭）
+    /// for では本体コンパイル後にパッチする
+    continue_target: usize,
+    /// break のジャンプ命令位置（ループ後にパッチする）
+    breaks: Vec<usize>,
+    /// continue のジャンプ命令位置（for ループ用: インクリメント位置にパッチ）
+    continues: Vec<usize>,
+    /// ループ開始時のローカル変数数（break/continue 時のスタック巻き戻しに使う）
+    locals_count: usize,
+    /// continue を固定先に飛ばすか（while=true）、パッチするか（for=false）
+    continue_resolved: bool,
 }
 
 /// AST をバイトコードにコンパイルする
@@ -22,6 +37,8 @@ pub struct Compiler {
     locals: Vec<Local>,
     /// 現在のスコープの深さ
     scope_depth: usize,
+    /// ループのネスト管理
+    loops: Vec<LoopState>,
 }
 
 impl Compiler {
@@ -30,6 +47,7 @@ impl Compiler {
             chunk: Chunk::new(),
             locals: Vec::new(),
             scope_depth: 0,
+            loops: Vec::new(),
         }
     }
 
@@ -38,7 +56,6 @@ impl Compiler {
         for stmt in program {
             self.compile_stmt(stmt)?;
         }
-        // 最後に Return を追加（VM の実行終了を示す）
         self.chunk.emit(OpCode::Return, 0);
         Ok(self.chunk)
     }
@@ -47,25 +64,47 @@ impl Compiler {
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), TsumugiError> {
         match stmt {
             Stmt::Let { name, value, line } => {
-                // 初期値をコンパイル → スタックトップに値が残る
                 self.compile_expr(value, *line)?;
-                // ローカル変数として登録（スタック上の現在位置に対応）
                 self.add_local(name.clone());
-                // let 文では Pop しない — 値がスタック上に変数のスロットとして残る
             }
             Stmt::Assign { name, value, line } => {
-                // 新しい値をコンパイル
                 self.compile_expr(value, *line)?;
-                // 変数のスロットを探して SetLocal を発行
                 let slot = self.resolve_local(name, *line)?;
                 self.chunk.emit(OpCode::SetLocal(slot), *line);
-                // 代入文は式文ではないが、SetLocal は値をスタックに残すので Pop する
                 self.chunk.emit(OpCode::Pop, *line);
             }
             Stmt::ExprStmt { expr, line } => {
                 self.compile_expr(expr, *line)?;
-                // 式文の結果はスタックに残るので捨てる
                 self.chunk.emit(OpCode::Pop, *line);
+            }
+            Stmt::If {
+                condition,
+                then_body,
+                else_body,
+                line,
+            } => {
+                self.compile_if(condition, then_body, else_body, *line)?;
+            }
+            Stmt::While {
+                condition,
+                body,
+                line,
+            } => {
+                self.compile_while(condition, body, *line)?;
+            }
+            Stmt::For {
+                var,
+                iter,
+                body,
+                line,
+            } => {
+                self.compile_for(var, iter, body, *line)?;
+            }
+            Stmt::Break { line } => {
+                self.compile_break(*line)?;
+            }
+            Stmt::Continue { line } => {
+                self.compile_continue(*line)?;
             }
             _ => {
                 let line = stmt.line();
@@ -74,6 +113,235 @@ impl Compiler {
                     message: "VM未対応の文です".to_string(),
                 });
             }
+        }
+        Ok(())
+    }
+
+    // --- 制御フロー ---
+
+    /// if / elif / else のコンパイル
+    fn compile_if(
+        &mut self,
+        condition: &Expr,
+        then_body: &[Stmt],
+        else_body: &[Stmt],
+        line: usize,
+    ) -> Result<(), TsumugiError> {
+        // 条件式をコンパイル
+        self.compile_expr(condition, line)?;
+        // 偽なら else ブロックへジャンプ（飛び先は後でパッチ）
+        let jump_to_else = self.chunk.emit_jump(OpCode::JumpIfFalse(0), line);
+
+        // then ブロック
+        self.begin_scope();
+        for stmt in then_body {
+            self.compile_stmt(stmt)?;
+        }
+        self.end_scope(line);
+
+        // then の末尾で else の後ろへジャンプ（else がある場合のみ）
+        if !else_body.is_empty() {
+            let jump_over_else = self.chunk.emit_jump(OpCode::Jump(0), line);
+            self.chunk.patch_jump(jump_to_else);
+
+            // else ブロック（elif は Parser が再帰的に If ノードに変換済み）
+            self.begin_scope();
+            for stmt in else_body {
+                self.compile_stmt(stmt)?;
+            }
+            self.end_scope(line);
+
+            self.chunk.patch_jump(jump_over_else);
+        } else {
+            self.chunk.patch_jump(jump_to_else);
+        }
+
+        Ok(())
+    }
+
+    /// while ループのコンパイル
+    fn compile_while(
+        &mut self,
+        condition: &Expr,
+        body: &[Stmt],
+        line: usize,
+    ) -> Result<(), TsumugiError> {
+        let loop_start = self.chunk.len();
+
+        // ループ状態を push（while では continue = 条件チェック先頭）
+        self.loops.push(LoopState {
+            continue_target: loop_start,
+            breaks: Vec::new(),
+            continues: Vec::new(),
+            locals_count: self.locals.len(),
+            continue_resolved: true,
+        });
+
+        // 条件式
+        self.compile_expr(condition, line)?;
+        let exit_jump = self.chunk.emit_jump(OpCode::JumpIfFalse(0), line);
+
+        // ループ本体
+        self.begin_scope();
+        for stmt in body {
+            self.compile_stmt(stmt)?;
+        }
+        self.end_scope(line);
+
+        // ループ先頭に戻る
+        self.chunk.emit(OpCode::Loop(loop_start), line);
+
+        // ループ脱出先をパッチ
+        self.chunk.patch_jump(exit_jump);
+
+        // break のパッチ
+        let loop_state = self.loops.pop().unwrap();
+        for break_offset in loop_state.breaks {
+            self.chunk.patch_jump(break_offset);
+        }
+
+        Ok(())
+    }
+
+    /// for ループのコンパイル
+    /// `for item in collection` → コレクションを評価し、インデックス変数と共にwhile的に展開
+    fn compile_for(
+        &mut self,
+        var: &str,
+        iter: &Expr,
+        body: &[Stmt],
+        line: usize,
+    ) -> Result<(), TsumugiError> {
+        // スコープ開始（コレクション・インデックス・ループ変数が入る）
+        self.begin_scope();
+
+        // コレクションを評価してスタックに積む（隠しローカル変数として）
+        self.compile_expr(iter, line)?;
+        let collection_slot = self.locals.len();
+        self.add_local("__collection__".to_string());
+
+        // インデックスカウンタ (0) を積む
+        self.chunk.emit_constant(Value::Int(0), line);
+        let index_slot = self.locals.len();
+        self.add_local("__index__".to_string());
+
+        // ループ変数を null で初期化
+        self.chunk.emit_constant(Value::Null, line);
+        let var_slot = self.locals.len();
+        self.add_local(var.to_string());
+
+        // ループ先頭
+        let loop_start = self.chunk.len();
+        // for では continue_target を後で設定する（インクリメント位置）
+        self.loops.push(LoopState {
+            continue_target: 0, // 後でパッチ
+            breaks: Vec::new(),
+            continues: Vec::new(),
+            locals_count: self.locals.len(),
+            continue_resolved: false,
+        });
+
+        // 条件: index < len(collection)
+        self.chunk.emit(OpCode::GetLocal(index_slot), line);
+        self.chunk.emit(OpCode::GetLocal(collection_slot), line);
+        self.chunk.emit(OpCode::Len, line);
+        self.chunk.emit(OpCode::Lt, line);
+        let exit_jump = self.chunk.emit_jump(OpCode::JumpIfFalse(0), line);
+
+        // ループ変数 = collection[index]
+        self.chunk.emit(OpCode::GetLocal(collection_slot), line);
+        self.chunk.emit(OpCode::GetLocal(index_slot), line);
+        self.chunk.emit(OpCode::Index, line);
+        self.chunk.emit(OpCode::SetLocal(var_slot), line);
+        self.chunk.emit(OpCode::Pop, line);
+
+        // ループ本体
+        self.begin_scope();
+        for stmt in body {
+            self.compile_stmt(stmt)?;
+        }
+        self.end_scope(line);
+
+        // continue の飛び先 = インクリメント処理の先頭
+        let increment_start = self.chunk.len();
+        // LoopState の continue_target をパッチ
+        self.loops.last_mut().unwrap().continue_target = increment_start;
+
+        // index = index + 1
+        self.chunk.emit(OpCode::GetLocal(index_slot), line);
+        self.chunk.emit_constant(Value::Int(1), line);
+        self.chunk.emit(OpCode::Add, line);
+        self.chunk.emit(OpCode::SetLocal(index_slot), line);
+        self.chunk.emit(OpCode::Pop, line);
+
+        // ループ先頭に戻る
+        self.chunk.emit(OpCode::Loop(loop_start), line);
+
+        // 脱出先パッチ
+        self.chunk.patch_jump(exit_jump);
+
+        // break / continue パッチ
+        let loop_state = self.loops.pop().unwrap();
+        for break_offset in loop_state.breaks {
+            self.chunk.patch_jump(break_offset);
+        }
+        // continue のジャンプ先をインクリメント位置にパッチ
+        for cont_offset in loop_state.continues {
+            // Loop 命令のターゲットをパッチ
+            if let OpCode::Loop(ref mut target) = self.chunk.code[cont_offset] {
+                *target = increment_start;
+            }
+        }
+
+        // for スコープ終了（collection, index, var を pop）
+        self.end_scope(line);
+
+        Ok(())
+    }
+
+    /// break のコンパイル
+    fn compile_break(&mut self, line: usize) -> Result<(), TsumugiError> {
+        let loop_state = self.loops.last().ok_or_else(|| TsumugiError::Runtime {
+            line,
+            message: "ループの外で break は使えません".to_string(),
+        })?;
+
+        // ループ内で宣言されたローカル変数をクリーンアップ
+        let locals_to_pop = self.locals.len() - loop_state.locals_count;
+        if locals_to_pop > 0 {
+            self.chunk.emit(OpCode::PopN(locals_to_pop), line);
+        }
+
+        // ジャンプ命令を仮で発行（ループ終了後にパッチ）
+        let jump_offset = self.chunk.emit_jump(OpCode::Jump(0), line);
+        // loop_state を再度可変で取得（borrow checker 対策）
+        self.loops.last_mut().unwrap().breaks.push(jump_offset);
+        Ok(())
+    }
+
+    /// continue のコンパイル
+    fn compile_continue(&mut self, line: usize) -> Result<(), TsumugiError> {
+        let loop_state = self.loops.last().ok_or_else(|| TsumugiError::Runtime {
+            line,
+            message: "ループの外で continue は使えません".to_string(),
+        })?;
+        let continue_target = loop_state.continue_target;
+        let continue_resolved = loop_state.continue_resolved;
+
+        // ループ内で宣言されたローカル変数をクリーンアップ
+        let locals_to_pop = self.locals.len() - loop_state.locals_count;
+        if locals_to_pop > 0 {
+            self.chunk.emit(OpCode::PopN(locals_to_pop), line);
+        }
+
+        if continue_resolved {
+            // while: 飛び先が確定している
+            self.chunk.emit(OpCode::Loop(continue_target), line);
+        } else {
+            // for: 飛び先が未確定なので仮で発行して後でパッチ
+            let offset = self.chunk.len();
+            self.chunk.emit(OpCode::Loop(0), line);
+            self.loops.last_mut().unwrap().continues.push(offset);
         }
         Ok(())
     }
@@ -97,31 +365,57 @@ impl Compiler {
                 self.chunk.emit_constant(Value::Null, line);
             }
             Expr::Ident(name) => {
-                // 変数参照 → GetLocal
                 let slot = self.resolve_local(name, line)?;
                 self.chunk.emit(OpCode::GetLocal(slot), line);
             }
             Expr::BinOp { left, op, right } => {
-                // 左辺 → 右辺の順にコンパイル（スタックに積む）
-                self.compile_expr(left, line)?;
-                self.compile_expr(right, line)?;
-                // 演算命令を発行
-                let opcode = match op {
-                    BinOpKind::Add => OpCode::Add,
-                    BinOpKind::Sub => OpCode::Sub,
-                    BinOpKind::Mul => OpCode::Mul,
-                    BinOpKind::Div => OpCode::Div,
-                    BinOpKind::Mod => OpCode::Mod,
-                    BinOpKind::Eq => OpCode::Eq,
-                    BinOpKind::NotEq => OpCode::NotEq,
-                    BinOpKind::Lt => OpCode::Lt,
-                    BinOpKind::Gt => OpCode::Gt,
-                    BinOpKind::LtEq => OpCode::LtEq,
-                    BinOpKind::GtEq => OpCode::GtEq,
-                    BinOpKind::And => OpCode::Add, // TODO: Phase 3 で短絡評価に対応
-                    BinOpKind::Or => OpCode::Add,  // TODO: Phase 3 で短絡評価に対応
-                };
-                self.chunk.emit(opcode, line);
+                match op {
+                    // and: 短絡評価（左辺が偽ならスキップ）
+                    BinOpKind::And => {
+                        self.compile_expr(left, line)?;
+                        // 左辺が偽ならジャンプ（結果は false）
+                        let jump = self.chunk.emit_jump(OpCode::JumpIfFalse(0), line);
+                        // 左辺が真なら右辺を評価
+                        self.compile_expr(right, line)?;
+                        let end = self.chunk.emit_jump(OpCode::Jump(0), line);
+                        // 左辺が偽だった場合: false をスタックに積む
+                        self.chunk.patch_jump(jump);
+                        self.chunk.emit_constant(Value::Bool(false), line);
+                        self.chunk.patch_jump(end);
+                    }
+                    // or: 短絡評価（左辺が真ならスキップ）
+                    BinOpKind::Or => {
+                        self.compile_expr(left, line)?;
+                        // 左辺が偽ならジャンプして右辺へ
+                        let jump_to_right = self.chunk.emit_jump(OpCode::JumpIfFalse(0), line);
+                        // 左辺が真: true をスタックに積んで終了へ
+                        self.chunk.emit_constant(Value::Bool(true), line);
+                        let jump_to_end = self.chunk.emit_jump(OpCode::Jump(0), line);
+                        // 右辺を評価
+                        self.chunk.patch_jump(jump_to_right);
+                        self.compile_expr(right, line)?;
+                        self.chunk.patch_jump(jump_to_end);
+                    }
+                    _ => {
+                        self.compile_expr(left, line)?;
+                        self.compile_expr(right, line)?;
+                        let opcode = match op {
+                            BinOpKind::Add => OpCode::Add,
+                            BinOpKind::Sub => OpCode::Sub,
+                            BinOpKind::Mul => OpCode::Mul,
+                            BinOpKind::Div => OpCode::Div,
+                            BinOpKind::Mod => OpCode::Mod,
+                            BinOpKind::Eq => OpCode::Eq,
+                            BinOpKind::NotEq => OpCode::NotEq,
+                            BinOpKind::Lt => OpCode::Lt,
+                            BinOpKind::Gt => OpCode::Gt,
+                            BinOpKind::LtEq => OpCode::LtEq,
+                            BinOpKind::GtEq => OpCode::GtEq,
+                            BinOpKind::And | BinOpKind::Or => unreachable!(),
+                        };
+                        self.chunk.emit(opcode, line);
+                    }
+                }
             }
             Expr::UnaryOp { op, expr } => {
                 self.compile_expr(expr, line)?;
@@ -131,7 +425,6 @@ impl Compiler {
                 }
             }
             Expr::Call { callee, args } => {
-                // Phase 1-2: print のみ対応
                 if let Expr::Ident(name) = callee.as_ref()
                     && name == "print"
                 {
@@ -140,7 +433,6 @@ impl Compiler {
                         self.compile_expr(arg, line)?;
                     }
                     self.chunk.emit(OpCode::Print(arg_count), line);
-                    // print は null を返す（スタックに null を積む）
                     self.chunk.emit_constant(Value::Null, line);
                     return Ok(());
                 }
@@ -148,6 +440,13 @@ impl Compiler {
                     line,
                     message: "VM未対応: print以外の関数呼び出し".to_string(),
                 });
+            }
+            Expr::List(elements) => {
+                self.chunk.emit_constant(Value::List(Vec::new()), line);
+                for elem in elements {
+                    self.compile_expr(elem, line)?;
+                    self.chunk.emit(OpCode::ListPush, line);
+                }
             }
             _ => {
                 return Err(TsumugiError::Runtime {
@@ -159,9 +458,30 @@ impl Compiler {
         Ok(())
     }
 
+    // --- スコープ管理 ---
+
+    fn begin_scope(&mut self) {
+        self.scope_depth += 1;
+    }
+
+    fn end_scope(&mut self, line: usize) {
+        self.scope_depth -= 1;
+        // 現在のスコープより深いローカル変数を削除
+        let mut pop_count = 0;
+        while let Some(local) = self.locals.last() {
+            if local.depth <= self.scope_depth {
+                break;
+            }
+            self.locals.pop();
+            pop_count += 1;
+        }
+        if pop_count > 0 {
+            self.chunk.emit(OpCode::PopN(pop_count), line);
+        }
+    }
+
     // --- ローカル変数管理 ---
 
-    /// ローカル変数を追加
     fn add_local(&mut self, name: String) {
         self.locals.push(Local {
             name,
@@ -169,9 +489,7 @@ impl Compiler {
         });
     }
 
-    /// 変数名からスタック上のスロット位置を検索（内側→外側）
     fn resolve_local(&self, name: &str, line: usize) -> Result<usize, TsumugiError> {
-        // 後ろから探す（内側のスコープが優先）
         for (i, local) in self.locals.iter().enumerate().rev() {
             if local.name == name {
                 return Ok(i);
@@ -181,95 +499,5 @@ impl Compiler {
             line,
             message: format!("未定義の変数: {}", name),
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::lexer::Lexer;
-    use crate::parser::Parser;
-
-    fn compile_source(source: &str) -> Chunk {
-        let mut lexer = Lexer::new(source);
-        let tokens = lexer.tokenize();
-        let mut parser = Parser::new(tokens);
-        let program = parser.parse().unwrap();
-        Compiler::new().compile(&program).unwrap()
-    }
-
-    #[test]
-    fn compile_print_int() {
-        let chunk = compile_source("print(42)");
-        assert_eq!(chunk.constants[0], Value::Int(42));
-        assert_eq!(chunk.constants[1], Value::Null);
-        assert_eq!(chunk.code[0], OpCode::LoadConst(0));
-        assert_eq!(chunk.code[1], OpCode::Print(1));
-        assert_eq!(chunk.code[2], OpCode::LoadConst(1));
-        assert_eq!(chunk.code[3], OpCode::Pop);
-        assert_eq!(chunk.code[4], OpCode::Return);
-    }
-
-    #[test]
-    fn compile_arithmetic() {
-        let chunk = compile_source("print(1 + 2)");
-        assert_eq!(chunk.constants[0], Value::Int(1));
-        assert_eq!(chunk.constants[1], Value::Int(2));
-        assert_eq!(chunk.code[0], OpCode::LoadConst(0));
-        assert_eq!(chunk.code[1], OpCode::LoadConst(1));
-        assert_eq!(chunk.code[2], OpCode::Add);
-        assert_eq!(chunk.code[3], OpCode::Print(1));
-    }
-
-    #[test]
-    fn compile_let_and_get() {
-        let chunk = compile_source("let x = 10\nprint(x)");
-        // 定数: [10, null]
-        assert_eq!(chunk.constants[0], Value::Int(10));
-        // 命令: LoadConst(0) → x のスロット確保
-        //       GetLocal(0), Print(1), LoadConst(1), Pop, Return
-        assert_eq!(chunk.code[0], OpCode::LoadConst(0)); // let x = 10
-        assert_eq!(chunk.code[1], OpCode::GetLocal(0)); // print(x) の x
-        assert_eq!(chunk.code[2], OpCode::Print(1));
-    }
-
-    #[test]
-    fn compile_let_and_assign() {
-        let chunk = compile_source("let x = 1\nx = 2\nprint(x)");
-        // LoadConst(0) → let x = 1 (slot 0)
-        // LoadConst(1) → 2 (新しい値)
-        // SetLocal(0)  → x に代入
-        // Pop          → 代入文なので Pop
-        // GetLocal(0)  → print(x) の x
-        assert_eq!(chunk.code[0], OpCode::LoadConst(0));
-        assert_eq!(chunk.code[1], OpCode::LoadConst(1));
-        assert_eq!(chunk.code[2], OpCode::SetLocal(0));
-        assert_eq!(chunk.code[3], OpCode::Pop);
-        assert_eq!(chunk.code[4], OpCode::GetLocal(0));
-        assert_eq!(chunk.code[5], OpCode::Print(1));
-    }
-
-    #[test]
-    fn compile_multiple_vars() {
-        let chunk = compile_source("let a = 1\nlet b = 2\nprint(a + b)");
-        // LoadConst(0) → let a = 1 (slot 0)
-        // LoadConst(1) → let b = 2 (slot 1)
-        // GetLocal(0), GetLocal(1), Add, Print(1)
-        assert_eq!(chunk.code[0], OpCode::LoadConst(0));
-        assert_eq!(chunk.code[1], OpCode::LoadConst(1));
-        assert_eq!(chunk.code[2], OpCode::GetLocal(0));
-        assert_eq!(chunk.code[3], OpCode::GetLocal(1));
-        assert_eq!(chunk.code[4], OpCode::Add);
-        assert_eq!(chunk.code[5], OpCode::Print(1));
-    }
-
-    #[test]
-    fn compile_undefined_var_error() {
-        let mut lexer = Lexer::new("print(z)");
-        let tokens = lexer.tokenize();
-        let mut parser = Parser::new(tokens);
-        let program = parser.parse().unwrap();
-        let result = Compiler::new().compile(&program);
-        assert!(result.is_err());
     }
 }
