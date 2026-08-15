@@ -229,6 +229,7 @@ impl Vm {
                 let fn_pos = self.stack.len() - 1 - arg_count;
                 let fn_value = self.stack[fn_pos].clone();
                 if let Value::VmFn {
+                    name,
                     arity,
                     chunk,
                     upvalues,
@@ -239,8 +240,8 @@ impl Vm {
                         return Err(TsumugiError::Runtime {
                             line,
                             message: format!(
-                                "引数の数が合いません: {}個必要ですが{}個渡されました",
-                                arity, arg_count
+                                "関数 {} は引数{}個ですが、{}個渡されました",
+                                name, arity, arg_count
                             ),
                         });
                     }
@@ -463,7 +464,7 @@ impl Vm {
             }
             _ => Err(TsumugiError::Runtime {
                 line,
-                message: "インデックス代入はリストまたは辞書に対してのみ使えます".to_string(),
+                message: "辞書のキーは文字列である必要があります".to_string(),
             }),
         }
     }
