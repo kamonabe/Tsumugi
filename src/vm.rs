@@ -14,6 +14,8 @@ struct CallFrame {
     ip: usize,
     /// スタック上のベース位置（この関数のローカル変数 slot 0 に対応）
     base: usize,
+    /// この関数がキャプチャした値（クロージャ用）
+    upvalues: Vec<Value>,
 }
 
 /// スタックベースの仮想マシン
@@ -31,6 +33,7 @@ impl Vm {
             chunk,
             ip: 0,
             base: 0,
+            upvalues: Vec::new(),
         };
         Vm {
             frames: vec![frame],
@@ -254,12 +257,53 @@ impl Vm {
                     }
                 }
 
+                OpCode::GetUpvalue(index) => {
+                    let value = self.frames.last().unwrap().upvalues[index].clone();
+                    self.stack.push(value);
+                }
+
+                OpCode::MakeClosure(upvalue_count) => {
+                    // スタック: [..., VmFn, upval0, upval1, ...]
+                    // upvalue を取り出す
+                    let mut upvalues = Vec::with_capacity(upvalue_count);
+                    for _ in 0..upvalue_count {
+                        upvalues.push(self.pop(line)?);
+                    }
+                    upvalues.reverse();
+
+                    // VmFn を取り出して upvalues を設定
+                    let fn_value = self.pop(line)?;
+                    if let Value::VmFn {
+                        name, arity, chunk, ..
+                    } = fn_value
+                    {
+                        self.stack.push(Value::VmFn {
+                            name,
+                            arity,
+                            chunk,
+                            upvalues,
+                        });
+                    } else {
+                        return Err(TsumugiError::Runtime {
+                            line,
+                            message: "内部エラー: MakeClosure の対象が VmFn ではありません"
+                                .to_string(),
+                        });
+                    }
+                }
+
                 OpCode::Call(arg_count) => {
                     // スタック: [..., fn_value, arg0, arg1, ...]
                     let fn_pos = self.stack.len() - 1 - arg_count;
                     let fn_value = self.stack[fn_pos].clone();
 
-                    if let Value::VmFn { arity, chunk, .. } = fn_value {
+                    if let Value::VmFn {
+                        arity,
+                        chunk,
+                        upvalues,
+                        ..
+                    } = fn_value
+                    {
                         if arg_count != arity {
                             return Err(TsumugiError::Runtime {
                                 line,
@@ -269,12 +313,13 @@ impl Vm {
                                 ),
                             });
                         }
-                        // コールフレームを push
-                        // base = fn_pos（fn_value 自体が slot 0 = 自己参照用）
-                        // 引数は slot 1, 2, ... に対応
                         let base = fn_pos;
-
-                        self.frames.push(CallFrame { chunk, ip: 0, base });
+                        self.frames.push(CallFrame {
+                            chunk,
+                            ip: 0,
+                            base,
+                            upvalues,
+                        });
                     } else {
                         return Err(TsumugiError::Runtime {
                             line,
@@ -780,5 +825,42 @@ mod tests {
     fn vm_fn_call_non_function() {
         let result = run_vm("let x = 42\nx()");
         assert!(result.is_err());
+    }
+
+    // --- Phase 5: クロージャ ---
+
+    #[test]
+    fn vm_closure_make_adder() {
+        assert!(run_vm(
+            "fn make_adder(n)\n    return fn(x) return x + n end\nend\nlet add5 = make_adder(5)\nprint(add5(3))"
+        ).is_ok());
+    }
+
+    #[test]
+    fn vm_closure_value_capture() {
+        // 値キャプチャ: 定義後に元の変数を変更してもクロージャには影響しない
+        assert!(
+            run_vm(
+                "let base = 10\nlet adder = fn(x) return x + base end\nbase = 999\nprint(adder(1))"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn vm_lambda_inline() {
+        assert!(
+            run_vm(
+                "fn apply(func, val)\n    return func(val)\nend\nprint(apply(fn(x) x * x end, 6))"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn vm_closure_multiple_calls() {
+        assert!(run_vm(
+            "fn make_adder(n)\n    return fn(x) return x + n end\nend\nlet add3 = make_adder(3)\nlet add7 = make_adder(7)\nprint(add3(1))\nprint(add7(1))"
+        ).is_ok());
     }
 }

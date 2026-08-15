@@ -26,6 +26,8 @@ pub enum Value {
         name: String,
         arity: usize,
         chunk: Chunk,
+        /// クロージャがキャプチャした値（値キャプチャ方式）
+        upvalues: Vec<Value>,
     },
 }
 

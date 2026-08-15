@@ -30,6 +30,16 @@ struct LoopState {
     continue_resolved: bool,
 }
 
+/// upvalue の情報（外側のどの変数をキャプチャするか）
+#[derive(Debug, Clone)]
+struct Upvalue {
+    /// 外側のコンパイラでのスロット位置
+    slot: usize,
+    /// 変数名（デバッグ用）
+    #[allow(dead_code)]
+    name: String,
+}
+
 /// AST をバイトコードにコンパイルする
 pub struct Compiler {
     chunk: Chunk,
@@ -39,6 +49,10 @@ pub struct Compiler {
     scope_depth: usize,
     /// ループのネスト管理
     loops: Vec<LoopState>,
+    /// この関数がキャプチャする upvalue のリスト
+    upvalues: Vec<Upvalue>,
+    /// 親コンパイラのローカル変数（クロージャ用）
+    enclosing_locals: Option<Vec<Local>>,
 }
 
 impl Compiler {
@@ -48,6 +62,20 @@ impl Compiler {
             locals: Vec::new(),
             scope_depth: 0,
             loops: Vec::new(),
+            upvalues: Vec::new(),
+            enclosing_locals: None,
+        }
+    }
+
+    /// 子コンパイラを作成（親のローカル変数を参照可能に）
+    fn new_enclosed(enclosing_locals: Vec<Local>) -> Self {
+        Compiler {
+            chunk: Chunk::new(),
+            locals: Vec::new(),
+            scope_depth: 0,
+            loops: Vec::new(),
+            upvalues: Vec::new(),
+            enclosing_locals: Some(enclosing_locals),
         }
     }
 
@@ -377,8 +405,18 @@ impl Compiler {
                 self.chunk.emit_constant(Value::Null, line);
             }
             Expr::Ident(name) => {
-                let slot = self.resolve_local(name, line)?;
-                self.chunk.emit(OpCode::GetLocal(slot), line);
+                // ローカル変数を検索
+                if let Ok(slot) = self.resolve_local(name, line) {
+                    self.chunk.emit(OpCode::GetLocal(slot), line);
+                } else if let Some(upvalue_idx) = self.resolve_upvalue(name) {
+                    // upvalue（外側のスコープの変数）
+                    self.chunk.emit(OpCode::GetUpvalue(upvalue_idx), line);
+                } else {
+                    return Err(TsumugiError::Runtime {
+                        line,
+                        message: format!("未定義の変数: {}", name),
+                    });
+                }
             }
             Expr::BinOp { left, op, right } => {
                 match op {
@@ -464,6 +502,9 @@ impl Compiler {
                     self.chunk.emit(OpCode::ListPush, line);
                 }
             }
+            Expr::Lambda { params, body } => {
+                self.compile_lambda(params, body, line)?;
+            }
             _ => {
                 return Err(TsumugiError::Runtime {
                     line,
@@ -506,8 +547,8 @@ impl Compiler {
         body: &[Stmt],
         line: usize,
     ) -> Result<(), TsumugiError> {
-        // 関数本体を別の Compiler でコンパイル
-        let mut fn_compiler = Compiler::new();
+        // 関数本体を別の Compiler でコンパイル（親のlocalsを渡す）
+        let mut fn_compiler = Compiler::new_enclosed(self.locals.clone());
 
         // 再帰呼び出し用に関数自身の名前を slot 0 として登録
         fn_compiler.add_local(name.to_string());
@@ -527,17 +568,73 @@ impl Compiler {
         fn_compiler.chunk.emit(OpCode::ReturnValue, line);
 
         let fn_chunk = fn_compiler.chunk;
+        let upvalues = fn_compiler.upvalues;
 
         // VmFn 値を定数テーブルに追加してロード
         let fn_value = Value::VmFn {
             name: name.to_string(),
             arity: params.len(),
             chunk: fn_chunk,
+            upvalues: Vec::new(), // MakeClosure で埋める or upvalueなしならそのまま
         };
         self.chunk.emit_constant(fn_value, line);
 
+        if upvalues.is_empty() {
+            // upvalue なし: そのまま関数値として使う
+        } else {
+            // upvalue あり: 外側の変数値をスタックに積んで MakeClosure
+            for uv in &upvalues {
+                self.chunk.emit(OpCode::GetLocal(uv.slot), line);
+            }
+            self.chunk.emit(OpCode::MakeClosure(upvalues.len()), line);
+        }
+
         // 関数名をローカル変数として登録
         self.add_local(name.to_string());
+
+        Ok(())
+    }
+
+    /// ラムダ（無名関数）のコンパイル
+    fn compile_lambda(
+        &mut self,
+        params: &[String],
+        body: &[Stmt],
+        line: usize,
+    ) -> Result<(), TsumugiError> {
+        let mut fn_compiler = Compiler::new_enclosed(self.locals.clone());
+
+        // ラムダ自身は slot 0（無名なので "__lambda__"）
+        fn_compiler.add_local("__lambda__".to_string());
+
+        for param in params {
+            fn_compiler.add_local(param.clone());
+        }
+
+        for stmt in body {
+            fn_compiler.compile_stmt(stmt)?;
+        }
+
+        fn_compiler.chunk.emit_constant(Value::Null, line);
+        fn_compiler.chunk.emit(OpCode::ReturnValue, line);
+
+        let fn_chunk = fn_compiler.chunk;
+        let upvalues = fn_compiler.upvalues;
+
+        let fn_value = Value::VmFn {
+            name: "<lambda>".to_string(),
+            arity: params.len(),
+            chunk: fn_chunk,
+            upvalues: Vec::new(),
+        };
+        self.chunk.emit_constant(fn_value, line);
+
+        if !upvalues.is_empty() {
+            for uv in &upvalues {
+                self.chunk.emit(OpCode::GetLocal(uv.slot), line);
+            }
+            self.chunk.emit(OpCode::MakeClosure(upvalues.len()), line);
+        }
 
         Ok(())
     }
@@ -559,5 +656,30 @@ impl Compiler {
             line,
             message: format!("未定義の変数: {}", name),
         })
+    }
+
+    /// 外側のスコープから変数を探し、upvalue として登録する
+    /// 見つかった場合は upvalue のインデックスを返す
+    fn resolve_upvalue(&mut self, name: &str) -> Option<usize> {
+        let enclosing = self.enclosing_locals.as_ref()?;
+        // 親のローカル変数を検索
+        for (i, local) in enclosing.iter().enumerate().rev() {
+            if local.name == name {
+                // 既に同じスロットの upvalue があるか確認
+                for (ui, uv) in self.upvalues.iter().enumerate() {
+                    if uv.slot == i {
+                        return Some(ui);
+                    }
+                }
+                // 新しい upvalue を登録
+                let index = self.upvalues.len();
+                self.upvalues.push(Upvalue {
+                    slot: i,
+                    name: name.to_string(),
+                });
+                return Some(index);
+            }
+        }
+        None
     }
 }
