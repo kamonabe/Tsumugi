@@ -55,6 +55,13 @@ pub enum OpCode {
     /// 関数から値を返す（スタックトップが戻り値）
     ReturnValue,
 
+    /// upvalue（クロージャがキャプチャした値）をスタックに積む
+    GetUpvalue(usize),
+
+    /// クロージャを作る: スタックの [VmFn, upval0, upval1, ...] → クロージャ値
+    /// operand: upvalue の数
+    MakeClosure(usize),
+
     // --- 組み込み関数呼び出し ---
     /// print: 引数の数を operand で指定
     Print(usize),
