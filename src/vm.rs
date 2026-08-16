@@ -18,6 +18,17 @@ struct CallFrame {
     upvalues: Vec<Value>,
 }
 
+/// デフォルトのステップ上限（100万）
+const DEFAULT_MAX_STEPS: u64 = 1_000_000;
+
+/// 環境変数からステップ上限を読み取る
+fn vm_resolve_max_steps() -> u64 {
+    std::env::var("TSUMUGI_MAX_STEPS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX_STEPS)
+}
+
 /// スタックベースの仮想マシン
 pub struct Vm {
     /// コールフレームスタック
@@ -25,6 +36,12 @@ pub struct Vm {
 
     /// 値スタック
     stack: Vec<Value>,
+
+    /// 実行ステップカウンタ（ループ反復 + 関数呼び出し）
+    steps: u64,
+
+    /// ステップ上限
+    max_steps: u64,
 }
 
 impl Vm {
@@ -38,6 +55,8 @@ impl Vm {
         Vm {
             frames: vec![frame],
             stack: Vec::with_capacity(256),
+            steps: 0,
+            max_steps: vm_resolve_max_steps(),
         }
     }
 
@@ -73,6 +92,19 @@ impl Vm {
             if let Err(e) = result {
                 return Err(self.attach_trace(e));
             }
+        }
+        Ok(())
+    }
+
+    /// ステップカウンタを進め、上限チェックする
+    fn count_step(&mut self, line: usize) -> Result<(), TsumugiError> {
+        self.steps += 1;
+        if self.steps > self.max_steps {
+            return Err(TsumugiError::Runtime {
+                line,
+                message: format!("ステップ上限に達しました (上限: {})", self.max_steps),
+                trace: Vec::new(),
+            });
         }
         Ok(())
     }
@@ -227,6 +259,7 @@ impl Vm {
                 }
             }
             OpCode::Loop(target) => {
+                self.count_step(line)?;
                 self.frames.last_mut().unwrap().ip = target;
             }
             OpCode::GetUpvalue(index) => {
@@ -264,6 +297,7 @@ impl Vm {
                 }
             }
             OpCode::Call(arg_count) => {
+                self.count_step(line)?;
                 let fn_pos = self.stack.len() - 1 - arg_count;
                 let fn_value = self.stack[fn_pos].clone();
                 if let Value::VmFn {
