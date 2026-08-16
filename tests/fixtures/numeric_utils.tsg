@@ -1,0 +1,25 @@
+# floor / ceil / round
+print(floor(3.7))
+print(floor(3.2))
+print(floor(-1.5))
+print(ceil(3.2))
+print(ceil(3.7))
+print(ceil(-1.5))
+print(round(3.5))
+print(round(3.4))
+print(round(-1.5))
+
+# floor / ceil / round with int (pass-through)
+print(floor(5))
+print(ceil(5))
+print(round(5))
+
+# abs with float
+print(abs(-3.14))
+print(abs(2.71))
+
+# min / max with mixed int/float
+print(min(3, 2.5))
+print(min(2.5, 3))
+print(max(3, 2.5))
+print(max(2.5, 3))

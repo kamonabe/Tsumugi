@@ -809,7 +809,9 @@ impl Vm {
                 match (&args[0], &args[1]) {
                     (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.min(b))),
                     (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.min(*b))),
-                    _ => Err(self.type_error(line, "min は同じ数値型に対してのみ使えます")),
+                    (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).min(*b))),
+                    (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.min(*b as f64))),
+                    _ => Err(self.type_error(line, "min は数値に対してのみ使えます")),
                 }
             }
             "max" => {
@@ -817,7 +819,9 @@ impl Vm {
                 match (&args[0], &args[1]) {
                     (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.max(b))),
                     (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.max(*b))),
-                    _ => Err(self.type_error(line, "max は同じ数値型に対してのみ使えます")),
+                    (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).max(*b))),
+                    (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.max(*b as f64))),
+                    _ => Err(self.type_error(line, "max は数値に対してのみ使えます")),
                 }
             }
             "floor" => {
@@ -891,15 +895,23 @@ impl Vm {
             }
             "write_file" => {
                 self.check_arity(name, &args, 2, line)?;
-                if let (Value::Str(path), Value::Str(content)) = (&args[0], &args[1]) {
-                    Ok(Value::Bool(std::fs::write(path, content).is_ok()))
+                if let Value::Str(path) = &args[0] {
+                    let content = match &args[1] {
+                        Value::Str(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    Ok(Value::Bool(std::fs::write(path, &content).is_ok()))
                 } else {
-                    Err(self.type_error(line, "write_file(str, str) の形式で使います"))
+                    Err(self.type_error(line, "write_file(str, content) の形式で使います"))
                 }
             }
             "append_file" => {
                 self.check_arity(name, &args, 2, line)?;
-                if let (Value::Str(path), Value::Str(content)) = (&args[0], &args[1]) {
+                if let Value::Str(path) = &args[0] {
+                    let content = match &args[1] {
+                        Value::Str(s) => s.clone(),
+                        other => other.to_string(),
+                    };
                     use std::fs::OpenOptions;
                     use std::io::Write;
                     let result = OpenOptions::new()
@@ -909,7 +921,7 @@ impl Vm {
                         .and_then(|mut f| f.write_all(content.as_bytes()));
                     Ok(Value::Bool(result.is_ok()))
                 } else {
-                    Err(self.type_error(line, "append_file(str, str) の形式で使います"))
+                    Err(self.type_error(line, "append_file(str, content) の形式で使います"))
                 }
             }
             "env" => {
@@ -976,7 +988,13 @@ impl Vm {
             "remove" => {
                 self.check_arity(name, &args, 1, line)?;
                 if let Value::Str(path) = &args[0] {
-                    Ok(Value::Bool(std::fs::remove_file(path).is_ok()))
+                    let p = std::path::Path::new(path);
+                    let result = if p.is_dir() {
+                        std::fs::remove_dir(path)
+                    } else {
+                        std::fs::remove_file(path)
+                    };
+                    Ok(Value::Bool(result.is_ok()))
                 } else {
                     Err(self.type_error(line, "remove(str) の形式で使います"))
                 }

@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-08-15
+最終更新: 2026-08-16
 
 ## 実装済み
 
@@ -34,6 +34,7 @@
 - [x] バイトコード VM: Phase 4（関数 — FnDef / Call / ReturnValue / 再帰対応）
 - [x] バイトコード VM: Phase 5（クロージャ — upvalue / MakeClosure / Lambda）
 - [x] バイトコード VM: Phase 6（組み込み関数 — 33個対応）
+- [x] バイトコード VM: Phase 7（互換性修正 — min/max Int×Float混合、remove ファイル/ディレクトリ判定、write_file/append_file 型変換）
 
 ## 設計方針: 組み込み関数の境界線
 
@@ -91,6 +92,7 @@
 | 4 | 関数定義・呼び出し（コールフレーム） | ✅ 完了 |
 | 5 | クロージャ（upvalue） | ✅ 完了 |
 | 6 | 組み込み関数（len, push, pop 等） | ✅ 完了 |
+| 7 | VM互換性修正 — min/max混合型・remove・write_file | ✅ 完了 |
 
 ## 次の候補（言語機能）
 
