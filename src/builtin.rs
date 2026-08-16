@@ -1124,6 +1124,7 @@ impl Evaluator {
                         .into());
                     }
                 };
+                crate::sandbox::check_path(&path, line)?;
                 Ok(Some(match fs::read_to_string(&path) {
                     Ok(content) => Value::Str(content),
                     Err(_) => Value::Null,
@@ -1148,6 +1149,7 @@ impl Evaluator {
                         .into());
                     }
                 };
+                crate::sandbox::check_path(&path, line)?;
                 Ok(Some(match fs::read_to_string(&path) {
                     Ok(content) => {
                         let lines: Vec<Value> =
@@ -1180,6 +1182,7 @@ impl Evaluator {
                     Value::Str(s) => s,
                     other => other.to_string(),
                 };
+                crate::sandbox::check_path(&path, line)?;
                 Ok(Some(Value::Bool(fs::write(&path, &content).is_ok())))
             }
             "append_file" => {
@@ -1205,6 +1208,7 @@ impl Evaluator {
                     Value::Str(s) => s,
                     other => other.to_string(),
                 };
+                crate::sandbox::check_path(&path, line)?;
                 use std::fs::OpenOptions;
                 use std::io::Write;
                 let result = OpenOptions::new()
@@ -1250,6 +1254,7 @@ impl Evaluator {
                         .into());
                     }
                 };
+                crate::sandbox::check_path(&path, line)?;
                 Ok(Some(Value::Bool(Path::new(&path).exists())))
             }
             "path_join" => {
@@ -1291,6 +1296,7 @@ impl Evaluator {
                         .into());
                     }
                 };
+                crate::sandbox::check_path(&path, line)?;
                 Ok(Some(Value::Bool(fs::create_dir_all(&path).is_ok())))
             }
             "remove" => {
@@ -1312,6 +1318,7 @@ impl Evaluator {
                         .into());
                     }
                 };
+                crate::sandbox::check_path(&path, line)?;
                 let p = Path::new(&path);
                 let result = if p.is_dir() {
                     fs::remove_dir(&path)
@@ -1339,6 +1346,7 @@ impl Evaluator {
                         .into());
                     }
                 };
+                crate::sandbox::check_path(&path, line)?;
                 Ok(Some(Value::Bool(fs::remove_dir_all(&path).is_ok())))
             }
             "rename" => {
@@ -1370,6 +1378,8 @@ impl Evaluator {
                         .into());
                     }
                 };
+                crate::sandbox::check_path(&from, line)?;
+                crate::sandbox::check_path(&to, line)?;
                 Ok(Some(Value::Bool(fs::rename(&from, &to).is_ok())))
             }
             "list_dir" => {
@@ -1391,6 +1401,7 @@ impl Evaluator {
                         .into());
                     }
                 };
+                crate::sandbox::check_path(&path, line)?;
                 Ok(Some(match fs::read_dir(&path) {
                     Ok(entries) => {
                         let mut names: Vec<Value> = Vec::new();
@@ -1424,6 +1435,7 @@ impl Evaluator {
                         .into());
                     }
                 };
+                crate::sandbox::check_path(&path, line)?;
                 Ok(Some(match fs::metadata(&path) {
                     Ok(meta) => Value::Int(meta.len() as i64),
                     Err(_) => Value::Null,
@@ -1448,6 +1460,7 @@ impl Evaluator {
                         .into());
                     }
                 };
+                crate::sandbox::check_path(&path, line)?;
                 Ok(Some(Value::Bool(Path::new(&path).is_file())))
             }
             "is_dir" => {
@@ -1469,6 +1482,7 @@ impl Evaluator {
                         .into());
                     }
                 };
+                crate::sandbox::check_path(&path, line)?;
                 Ok(Some(Value::Bool(Path::new(&path).is_dir())))
             }
             _ => Ok(None),

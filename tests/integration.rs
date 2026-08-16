@@ -445,6 +445,47 @@ fn vm_error_step_limit() {
     assert!(!output.status.success());
 }
 
+#[test]
+fn error_sandbox() {
+    let dir = fixtures_dir();
+    let script = dir.join("error_sandbox.tsg");
+
+    let output = Command::new(tsumugi_bin())
+        .arg(script.to_str().unwrap())
+        .env("TSUMUGI_SANDBOX", "/tmp")
+        .output()
+        .expect("tsumugi バイナリの実行に失敗");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("サンドボックス違反"),
+        "サンドボックスエラーが出ません: {}",
+        stderr
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn vm_error_sandbox() {
+    let dir = fixtures_dir();
+    let script = dir.join("error_sandbox.tsg");
+
+    let output = Command::new(tsumugi_bin())
+        .arg("--vm")
+        .arg(script.to_str().unwrap())
+        .env("TSUMUGI_SANDBOX", "/tmp")
+        .output()
+        .expect("tsumugi バイナリの実行に失敗");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("サンドボックス違反"),
+        "[VM] サンドボックスエラーが出ません: {}",
+        stderr
+    );
+    assert!(!output.status.success());
+}
+
 // =============================================================
 // エラー系テスト（VM）
 // =============================================================

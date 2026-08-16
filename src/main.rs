@@ -7,6 +7,7 @@ mod eval;
 mod lexer;
 mod opcode;
 mod parser;
+mod sandbox;
 mod token;
 mod value;
 mod vm;

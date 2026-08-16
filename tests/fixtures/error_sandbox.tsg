@@ -1,0 +1,3 @@
+# サンドボックス有効時に許可範囲外のパスにアクセス
+let content = read_file("/etc/hostname")
+print(content)
