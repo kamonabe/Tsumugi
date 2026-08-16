@@ -46,17 +46,32 @@ impl Evaluator {
                 for (param, val) in params.iter().zip(arg_values) {
                     self.env.set(param, val);
                 }
+
+                use crate::error::TraceFrame;
+                self.call_stack.push(TraceFrame {
+                    name: name.clone(),
+                    line,
+                });
+
                 let mut result = Value::Null;
                 for stmt in body {
-                    match self.exec_stmt(stmt)? {
-                        super::EvalResult::Return(v) => {
+                    match self.exec_stmt(stmt) {
+                        Ok(super::EvalResult::Return(v)) => {
                             result = v;
                             break;
                         }
-                        super::EvalResult::Break | super::EvalResult::Continue => break,
-                        super::EvalResult::Val => {}
+                        Ok(super::EvalResult::Break | super::EvalResult::Continue) => break,
+                        Ok(super::EvalResult::Val) => {}
+                        Err(e) => {
+                            let mut trace = self.call_stack.clone();
+                            trace.reverse();
+                            self.call_stack.pop();
+                            self.env.pop_scope();
+                            return Err(e.with_trace(trace));
+                        }
                     }
                 }
+                self.call_stack.pop();
                 self.env.pop_scope();
                 Ok(result)
             }

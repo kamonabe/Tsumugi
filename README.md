@@ -89,10 +89,11 @@ print(apply(fn(x) x * x end, 6))  # 36
 - REPL（複数行入力対応）
 - ファイル実行
 - 行番号付きエラーメッセージ（パースエラー・ランタイムエラー両方）
+- スタックトレース（関数呼び出し経路の表示）
 
 ## エラーメッセージ
 
-エラー発生時に行番号が表示される。
+エラー発生時に行番号が表示される。関数内のエラーにはスタックトレースが付加される。
 
 ```
 $ cat error.tsg
@@ -101,6 +102,26 @@ let y = x + 1
 
 $ tsumugi error.tsg
 2行目: 型エラー: Str("hello") Add Int(1) は計算できません
+```
+
+スタックトレース例:
+
+```
+$ cat trace.tsg
+fn divide(a, b)
+    return a / b
+end
+
+fn calc(x)
+    return divide(x, 0)
+end
+
+calc(10)
+
+$ tsumugi trace.tsg
+2行目: ゼロ除算
+  in divide() (6行目)
+  in calc() (9行目)
 ```
 
 ## テスト
