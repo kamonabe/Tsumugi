@@ -108,6 +108,7 @@ impl Compiler {
                     .map_err(|_| TsumugiError::Runtime {
                         line: *line,
                         message: format!("未定義の変数に代入: {}", name),
+                        trace: Vec::new(),
                     })?;
                 self.chunk.emit(OpCode::SetLocal(slot), *line);
                 self.chunk.emit(OpCode::Pop, *line);
@@ -132,6 +133,7 @@ impl Compiler {
                     return Err(TsumugiError::Runtime {
                         line: *line,
                         message: "VM未対応: ネストされたインデックス代入".to_string(),
+                        trace: Vec::new(),
                     });
                 }
             }
@@ -369,6 +371,7 @@ impl Compiler {
         let loop_state = self.loops.last().ok_or_else(|| TsumugiError::Runtime {
             line,
             message: "break はループの中でのみ使用できます".to_string(),
+            trace: Vec::new(),
         })?;
 
         // ループ内で宣言されたローカル変数をクリーンアップ
@@ -389,6 +392,7 @@ impl Compiler {
         let loop_state = self.loops.last().ok_or_else(|| TsumugiError::Runtime {
             line,
             message: "continue はループの中でのみ使用できます".to_string(),
+            trace: Vec::new(),
         })?;
         let continue_target = loop_state.continue_target;
         let continue_resolved = loop_state.continue_resolved;
@@ -440,6 +444,7 @@ impl Compiler {
                     return Err(TsumugiError::Runtime {
                         line,
                         message: format!("未定義の変数: {}", name),
+                        trace: Vec::new(),
                     });
                 }
             }
@@ -557,6 +562,7 @@ impl Compiler {
                         return Err(TsumugiError::Runtime {
                             line,
                             message: format!("未定義の関数: {}", name),
+                            trace: Vec::new(),
                         });
                     }
                 }
@@ -629,6 +635,7 @@ impl Compiler {
     ) -> Result<(), TsumugiError> {
         // 関数本体を別の Compiler でコンパイル（親のlocalsを渡す）
         let mut fn_compiler = Compiler::new_enclosed(self.locals.clone());
+        fn_compiler.chunk.name = name.to_string();
 
         // 再帰呼び出し用に関数自身の名前を slot 0 として登録
         fn_compiler.add_local(name.to_string());
@@ -684,6 +691,7 @@ impl Compiler {
         line: usize,
     ) -> Result<(), TsumugiError> {
         let mut fn_compiler = Compiler::new_enclosed(self.locals.clone());
+        fn_compiler.chunk.name = "<lambda>".to_string();
 
         // ラムダ自身は slot 0（無名なので "__lambda__"）
         fn_compiler.add_local("__lambda__".to_string());
@@ -750,6 +758,7 @@ impl Compiler {
         Err(TsumugiError::Runtime {
             line,
             message: format!("未定義の変数: {}", name),
+            trace: Vec::new(),
         })
     }
 

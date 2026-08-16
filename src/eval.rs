@@ -3,7 +3,7 @@ mod builtin;
 
 use crate::ast::*;
 use crate::env::{Env, Function};
-use crate::error::TsumugiError;
+use crate::error::{TraceFrame, TsumugiError};
 use crate::value::Value;
 
 use std::collections::BTreeMap;
@@ -18,11 +18,16 @@ enum EvalResult {
 /// AST を評価して実行する
 pub struct Evaluator {
     pub(crate) env: Env,
+    /// 関数呼び出しのスタック（スタックトレース用）
+    call_stack: Vec<TraceFrame>,
 }
 
 impl Evaluator {
     pub fn new() -> Self {
-        Self { env: Env::new() }
+        Self {
+            env: Env::new(),
+            call_stack: Vec::new(),
+        }
     }
 
     /// プログラム全体を実行
@@ -327,7 +332,7 @@ impl Evaluator {
                 // 無名関数: 定義時のスコープをキャプチャして Value::Fn を生成
                 let captured = self.env.snapshot();
                 Ok(Value::Fn {
-                    name: "<anonymous>".to_string(),
+                    name: "<lambda>".to_string(),
                     params: params.clone(),
                     body: body.clone(),
                     captured,
@@ -576,30 +581,46 @@ impl Evaluator {
             self.env.set(param, val);
         }
 
+        // コールスタックに記録
+        self.call_stack.push(TraceFrame {
+            name: func_name.clone(),
+            line,
+        });
+
         // 関数本体を実行
         let mut result = Value::Null;
         for stmt in &body {
-            match self.exec_stmt(stmt)? {
-                EvalResult::Return(v) => {
+            match self.exec_stmt(stmt) {
+                Ok(EvalResult::Return(v)) => {
                     result = v;
                     break;
                 }
-                EvalResult::Break => {
+                Ok(EvalResult::Break) => {
+                    self.call_stack.pop();
                     self.env.pop_scope();
                     return Err(
                         format!("{}行目: break はループの中でのみ使用できます", line).into(),
                     );
                 }
-                EvalResult::Continue => {
+                Ok(EvalResult::Continue) => {
+                    self.call_stack.pop();
                     self.env.pop_scope();
                     return Err(
                         format!("{}行目: continue はループの中でのみ使用できます", line).into(),
                     );
                 }
-                EvalResult::Val => {}
+                Ok(EvalResult::Val) => {}
+                Err(e) => {
+                    let mut trace = self.call_stack.clone();
+                    trace.reverse();
+                    self.call_stack.pop();
+                    self.env.pop_scope();
+                    return Err(e.with_trace(trace));
+                }
             }
         }
 
+        self.call_stack.pop();
         self.env.pop_scope();
         Ok(result)
     }

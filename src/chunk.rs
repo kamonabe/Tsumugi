@@ -6,6 +6,9 @@ use crate::value::Value;
 /// コンパイル結果を保持する構造体
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
+    /// この Chunk に対応する関数名（トップレベルなら "<main>"）
+    pub name: String,
+
     /// 命令列
     pub code: Vec<OpCode>,
 
@@ -19,6 +22,7 @@ pub struct Chunk {
 impl Chunk {
     pub fn new() -> Self {
         Chunk {
+            name: "<main>".to_string(),
             code: Vec::new(),
             constants: Vec::new(),
             lines: Vec::new(),

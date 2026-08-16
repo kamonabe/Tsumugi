@@ -399,6 +399,11 @@ fn error_unknown_char() {
     run_error_test("error_unknown_char");
 }
 
+#[test]
+fn error_stack_trace() {
+    run_error_test("error_stack_trace");
+}
+
 // =============================================================
 // エラー系テスト（VM）
 // =============================================================
@@ -491,4 +496,9 @@ fn vm_error_dict_key_type() {
 #[test]
 fn vm_error_unknown_char() {
     run_error_test_vm("error_unknown_char");
+}
+
+#[test]
+fn vm_error_stack_trace() {
+    run_error_test_vm("error_stack_trace");
 }

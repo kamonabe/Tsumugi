@@ -53,7 +53,7 @@ impl Vm {
             let line = frame.chunk.lines[frame.ip];
             self.frames.last_mut().unwrap().ip += 1;
 
-            match &instruction {
+            let result = match &instruction {
                 OpCode::ReturnValue => {
                     let return_value = self.pop(line)?;
                     let frame = self.frames.pop().unwrap();
@@ -62,16 +62,51 @@ impl Vm {
                         return Ok(());
                     }
                     self.stack.push(return_value);
+                    Ok(())
                 }
                 OpCode::Return => {
                     return Ok(());
                 }
-                _ => {
-                    self.dispatch(instruction, line)?;
-                }
+                _ => self.dispatch(instruction, line),
+            };
+
+            if let Err(e) = result {
+                return Err(self.attach_trace(e));
             }
         }
         Ok(())
+    }
+
+    /// エラーにスタックトレース情報を付加する
+    fn attach_trace(&self, error: TsumugiError) -> TsumugiError {
+        use crate::error::TraceFrame;
+
+        if self.frames.len() <= 1 {
+            return error;
+        }
+
+        let mut trace = Vec::new();
+        // frames: [<main>, calc, divide] のとき、エラーは divide で発生
+        // 表示:
+        //   "in divide() (6行目)"  ← divide が呼ばれた行（calc内のCall命令の行）
+        //   "in calc() (9行目)"    ← calc が呼ばれた行（<main>内のCall命令の行）
+        //
+        // frames[i+1] の関数名と、frames[i] の ip-1 の行番号を組み合わせる
+        for i in (0..self.frames.len() - 1).rev() {
+            let caller = &self.frames[i];
+            let callee = &self.frames[i + 1];
+            let call_line = if caller.ip > 0 {
+                caller.chunk.lines[caller.ip - 1]
+            } else {
+                1
+            };
+            trace.push(TraceFrame {
+                name: callee.chunk.name.clone(),
+                line: call_line,
+            });
+        }
+
+        error.with_trace(trace)
     }
 
     /// 命令をディスパッチ（ReturnValue / Return 以外）
@@ -158,6 +193,7 @@ impl Vm {
                         return Err(TsumugiError::Runtime {
                             line,
                             message: format!("型エラー: -{} は計算できません", type_name(&other)),
+                            trace: Vec::new(),
                         });
                     }
                 };
@@ -177,6 +213,7 @@ impl Vm {
                     .ok_or_else(|| TsumugiError::Runtime {
                         line,
                         message: "内部エラー: スタックが空です".to_string(),
+                        trace: Vec::new(),
                     })?;
                 self.stack[base + slot] = value;
             }
@@ -222,6 +259,7 @@ impl Vm {
                     return Err(TsumugiError::Runtime {
                         line,
                         message: "内部エラー: MakeClosure の対象が VmFn ではありません".to_string(),
+                        trace: Vec::new(),
                     });
                 }
             }
@@ -243,6 +281,7 @@ impl Vm {
                                 "関数 {} は引数{}個ですが、{}個渡されました",
                                 name, arity, arg_count
                             ),
+                            trace: Vec::new(),
                         });
                     }
                     let base = fn_pos;
@@ -256,6 +295,7 @@ impl Vm {
                     return Err(TsumugiError::Runtime {
                         line,
                         message: format!("関数ではない値を呼び出そうとしました: {:?}", fn_value),
+                        trace: Vec::new(),
                     });
                 }
             }
@@ -289,6 +329,7 @@ impl Vm {
                                 "型エラー: {} の長さは取得できません",
                                 type_name(&value)
                             ),
+                            trace: Vec::new(),
                         });
                     }
                 };
@@ -305,6 +346,7 @@ impl Vm {
                 let list = self.stack.last_mut().ok_or_else(|| TsumugiError::Runtime {
                     line,
                     message: "内部エラー: スタックが空です".to_string(),
+                    trace: Vec::new(),
                 })?;
                 if let Value::List(v) = list {
                     v.push(value);
@@ -312,6 +354,7 @@ impl Vm {
                     return Err(TsumugiError::Runtime {
                         line,
                         message: "内部エラー: ListPush の対象がリストではありません".to_string(),
+                        trace: Vec::new(),
                     });
                 }
             }
@@ -321,6 +364,7 @@ impl Vm {
                 let dict = self.stack.last_mut().ok_or_else(|| TsumugiError::Runtime {
                     line,
                     message: "内部エラー: スタックが空です".to_string(),
+                    trace: Vec::new(),
                 })?;
                 if let Value::Dict(map) = dict {
                     if let Value::Str(k) = key {
@@ -329,12 +373,14 @@ impl Vm {
                         return Err(TsumugiError::Runtime {
                             line,
                             message: "辞書のキーは文字列である必要があります".to_string(),
+                            trace: Vec::new(),
                         });
                     }
                 } else {
                     return Err(TsumugiError::Runtime {
                         line,
                         message: "内部エラー: DictInsert の対象が辞書ではありません".to_string(),
+                        trace: Vec::new(),
                     });
                 }
             }
@@ -359,6 +405,7 @@ impl Vm {
                         return Err(TsumugiError::Runtime {
                             line,
                             message: format!("型エラー: {:?} はイテレートできません", value),
+                            trace: Vec::new(),
                         });
                     }
                 };
@@ -386,6 +433,7 @@ impl Vm {
         self.stack.pop().ok_or_else(|| TsumugiError::Runtime {
             line,
             message: "内部エラー: スタックが空です".to_string(),
+            trace: Vec::new(),
         })
     }
 
@@ -406,6 +454,7 @@ impl Vm {
                 list.get(idx).cloned().ok_or_else(|| TsumugiError::Runtime {
                     line,
                     message: format!("インデックス範囲外: {} (長さ: {})", i, list.len()),
+                    trace: Vec::new(),
                 })
             }
             (Value::Str(s), Value::Int(i)) => {
@@ -421,6 +470,7 @@ impl Vm {
                     .ok_or_else(|| TsumugiError::Runtime {
                         line,
                         message: format!("インデックス範囲外: {} (長さ: {})", i, chars.len()),
+                        trace: Vec::new(),
                     })
             }
             (Value::Dict(map), Value::Str(key)) => Ok(map.get(key).cloned().unwrap_or(Value::Null)),
@@ -430,6 +480,7 @@ impl Vm {
                     "型エラー: {:?} に対して {:?} でインデックスアクセスできません",
                     collection, index
                 ),
+                trace: Vec::new(),
             }),
         }
     }
@@ -453,6 +504,7 @@ impl Vm {
                     return Err(TsumugiError::Runtime {
                         line,
                         message: format!("インデックス範囲外: {} (長さ: {})", i, list.len()),
+                        trace: Vec::new(),
                     });
                 }
                 list[idx] = value;
@@ -465,6 +517,7 @@ impl Vm {
             _ => Err(TsumugiError::Runtime {
                 line,
                 message: "辞書のキーは文字列である必要があります".to_string(),
+                trace: Vec::new(),
             }),
         }
     }
@@ -507,6 +560,7 @@ impl Vm {
                         Err(TsumugiError::Runtime {
                             line,
                             message: "pop: 空のリストからは取り出せません".to_string(),
+                            trace: Vec::new(),
                         })
                     } else {
                         Ok(v.pop().unwrap())
@@ -646,6 +700,7 @@ impl Vm {
                             .map_err(|_| TsumugiError::Runtime {
                                 line,
                                 message: format!("to_int: \"{}\" は整数に変換できません", s),
+                                trace: Vec::new(),
                             })
                     }
                     _ => Err(self.type_error(line, "to_int: 変換できない型です")),
@@ -669,6 +724,7 @@ impl Vm {
                                     "to_float: \"{}\" は浮動小数点に変換できません",
                                     s
                                 ),
+                                trace: Vec::new(),
                             })
                     }
                     _ => Err(self.type_error(line, "to_float: 変換できない型です")),
@@ -1063,6 +1119,7 @@ impl Vm {
             _ => Err(TsumugiError::Runtime {
                 line,
                 message: format!("未定義の組み込み関数: {}", name),
+                trace: Vec::new(),
             }),
         }
     }
@@ -1089,6 +1146,7 @@ impl Vm {
                         arity,
                         args.len()
                     ),
+                    trace: Vec::new(),
                 });
             }
             // 関数自身をスタックに積む（slot 0）
@@ -1147,6 +1205,7 @@ impl Vm {
             Err(TsumugiError::Runtime {
                 line,
                 message: "関数ではない値を呼び出そうとしました".to_string(),
+                trace: Vec::new(),
             })
         }
     }
@@ -1167,6 +1226,7 @@ impl Vm {
                     expected,
                     args.len()
                 ),
+                trace: Vec::new(),
             })
         } else {
             Ok(())
@@ -1177,6 +1237,7 @@ impl Vm {
         TsumugiError::Runtime {
             line,
             message: msg.to_string(),
+            trace: Vec::new(),
         }
     }
 
@@ -1192,6 +1253,7 @@ impl Vm {
             _ => Err(TsumugiError::Runtime {
                 line,
                 message: format!("型エラー: {:?} Add {:?} は計算できません", left, right),
+                trace: Vec::new(),
             }),
         }
     }
@@ -1205,6 +1267,7 @@ impl Vm {
             _ => Err(TsumugiError::Runtime {
                 line,
                 message: format!("型エラー: {:?} Sub {:?} は計算できません", left, right),
+                trace: Vec::new(),
             }),
         }
     }
@@ -1218,6 +1281,7 @@ impl Vm {
             _ => Err(TsumugiError::Runtime {
                 line,
                 message: format!("型エラー: {:?} Mul {:?} は計算できません", left, right),
+                trace: Vec::new(),
             }),
         }
     }
@@ -1227,6 +1291,7 @@ impl Vm {
             (Value::Int(_), Value::Int(0)) => Err(TsumugiError::Runtime {
                 line,
                 message: "ゼロ除算".to_string(),
+                trace: Vec::new(),
             }),
             (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a / b)),
             (Value::Float(a), Value::Float(b)) => {
@@ -1234,6 +1299,7 @@ impl Vm {
                     return Err(TsumugiError::Runtime {
                         line,
                         message: "ゼロ除算".to_string(),
+                        trace: Vec::new(),
                     });
                 }
                 Ok(Value::Float(a / b))
@@ -1243,6 +1309,7 @@ impl Vm {
                     return Err(TsumugiError::Runtime {
                         line,
                         message: "ゼロ除算".to_string(),
+                        trace: Vec::new(),
                     });
                 }
                 Ok(Value::Float(*a as f64 / b))
@@ -1252,6 +1319,7 @@ impl Vm {
                     return Err(TsumugiError::Runtime {
                         line,
                         message: "ゼロ除算".to_string(),
+                        trace: Vec::new(),
                     });
                 }
                 Ok(Value::Float(a / *b as f64))
@@ -1259,6 +1327,7 @@ impl Vm {
             _ => Err(TsumugiError::Runtime {
                 line,
                 message: format!("型エラー: {:?} Div {:?} は計算できません", left, right),
+                trace: Vec::new(),
             }),
         }
     }
@@ -1268,6 +1337,7 @@ impl Vm {
             (Value::Int(_), Value::Int(0)) => Err(TsumugiError::Runtime {
                 line,
                 message: "ゼロ除算".to_string(),
+                trace: Vec::new(),
             }),
             (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a % b)),
             (Value::Float(a), Value::Float(b)) => {
@@ -1275,6 +1345,7 @@ impl Vm {
                     return Err(TsumugiError::Runtime {
                         line,
                         message: "ゼロ除算".to_string(),
+                        trace: Vec::new(),
                     });
                 }
                 Ok(Value::Float(a % b))
@@ -1284,6 +1355,7 @@ impl Vm {
                     return Err(TsumugiError::Runtime {
                         line,
                         message: "ゼロ除算".to_string(),
+                        trace: Vec::new(),
                     });
                 }
                 Ok(Value::Float(*a as f64 % b))
@@ -1293,6 +1365,7 @@ impl Vm {
                     return Err(TsumugiError::Runtime {
                         line,
                         message: "ゼロ除算".to_string(),
+                        trace: Vec::new(),
                     });
                 }
                 Ok(Value::Float(a % *b as f64))
@@ -1300,6 +1373,7 @@ impl Vm {
             _ => Err(TsumugiError::Runtime {
                 line,
                 message: format!("型エラー: {:?} Mod {:?} は計算できません", left, right),
+                trace: Vec::new(),
             }),
         }
     }
@@ -1316,6 +1390,7 @@ impl Vm {
             _ => Err(TsumugiError::Runtime {
                 line,
                 message: format!("型エラー: {:?} と {:?} は比較できません", left, right),
+                trace: Vec::new(),
             }),
         }
     }
@@ -1330,6 +1405,7 @@ impl Vm {
             _ => Err(TsumugiError::Runtime {
                 line,
                 message: format!("型エラー: {:?} と {:?} は比較できません", left, right),
+                trace: Vec::new(),
             }),
         }
     }
@@ -1344,6 +1420,7 @@ impl Vm {
             _ => Err(TsumugiError::Runtime {
                 line,
                 message: format!("型エラー: {:?} と {:?} は比較できません", left, right),
+                trace: Vec::new(),
             }),
         }
     }
@@ -1358,6 +1435,7 @@ impl Vm {
             _ => Err(TsumugiError::Runtime {
                 line,
                 message: format!("型エラー: {:?} と {:?} は比較できません", left, right),
+                trace: Vec::new(),
             }),
         }
     }

@@ -35,6 +35,7 @@
 - [x] バイトコード VM: Phase 5（クロージャ — upvalue / MakeClosure / Lambda）
 - [x] バイトコード VM: Phase 6（組み込み関数 — 33個対応）
 - [x] バイトコード VM: Phase 7（互換性修正 — min/max Int×Float混合、remove ファイル/ディレクトリ判定、write_file/append_file 型変換）
+- [x] スタックトレース（関数呼び出し経路のエラー表示、ツリーウォーク版/VM版両対応）
 
 ## 設計方針: 組み込み関数の境界線
 
