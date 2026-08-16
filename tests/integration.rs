@@ -404,6 +404,47 @@ fn error_stack_trace() {
     run_error_test("error_stack_trace");
 }
 
+#[test]
+fn error_step_limit() {
+    let dir = fixtures_dir();
+    let script = dir.join("error_step_limit.tsg");
+
+    let output = Command::new(tsumugi_bin())
+        .arg(script.to_str().unwrap())
+        .env("TSUMUGI_MAX_STEPS", "100")
+        .output()
+        .expect("tsumugi バイナリの実行に失敗");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ステップ上限に達しました"),
+        "ステップ予算エラーが出ません: {}",
+        stderr
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn vm_error_step_limit() {
+    let dir = fixtures_dir();
+    let script = dir.join("error_step_limit.tsg");
+
+    let output = Command::new(tsumugi_bin())
+        .arg("--vm")
+        .arg(script.to_str().unwrap())
+        .env("TSUMUGI_MAX_STEPS", "100")
+        .output()
+        .expect("tsumugi バイナリの実行に失敗");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ステップ上限に達しました"),
+        "[VM] ステップ予算エラーが出ません: {}",
+        stderr
+    );
+    assert!(!output.status.success());
+}
+
 // =============================================================
 // エラー系テスト（VM）
 // =============================================================

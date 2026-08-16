@@ -15,11 +15,26 @@ enum EvalResult {
     Continue,
 }
 
+/// デフォルトのステップ上限（100万）
+const DEFAULT_MAX_STEPS: u64 = 1_000_000;
+
+/// 環境変数からステップ上限を読み取る
+fn resolve_max_steps() -> u64 {
+    std::env::var("TSUMUGI_MAX_STEPS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX_STEPS)
+}
+
 /// AST を評価して実行する
 pub struct Evaluator {
     pub(crate) env: Env,
     /// 関数呼び出しのスタック（スタックトレース用）
     call_stack: Vec<TraceFrame>,
+    /// 実行ステップカウンタ（ループ反復 + 関数呼び出し）
+    steps: u64,
+    /// ステップ上限
+    max_steps: u64,
 }
 
 impl Evaluator {
@@ -27,7 +42,28 @@ impl Evaluator {
         Self {
             env: Env::new(),
             call_stack: Vec::new(),
+            steps: 0,
+            max_steps: resolve_max_steps(),
         }
+    }
+
+    /// ステップカウンタを進め、上限チェックする
+    fn count_step(&mut self, line: usize) -> Result<(), TsumugiError> {
+        self.steps += 1;
+        if self.steps > self.max_steps {
+            let mut err = TsumugiError::Runtime {
+                line,
+                message: format!("ステップ上限に達しました (上限: {})", self.max_steps),
+                trace: Vec::new(),
+            };
+            if !self.call_stack.is_empty() {
+                let mut trace = self.call_stack.clone();
+                trace.reverse();
+                err = err.with_trace(trace);
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// プログラム全体を実行
@@ -196,6 +232,7 @@ impl Evaluator {
                     if should_break {
                         break;
                     }
+                    self.count_step(*line)?;
                 }
                 Ok(EvalResult::Val)
             }
@@ -237,6 +274,7 @@ impl Evaluator {
                     if should_break {
                         break;
                     }
+                    self.count_step(*line)?;
                 }
                 Ok(EvalResult::Val)
             }
@@ -503,6 +541,9 @@ impl Evaluator {
         {
             return Ok(value);
         }
+
+        // ユーザー定義関数の呼び出し: ステップカウント
+        self.count_step(line)?;
 
         // callee を評価して関数値を取得
         // 識別子の場合: 変数 → 関数テーブルの順で検索
