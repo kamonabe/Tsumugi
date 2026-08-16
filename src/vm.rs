@@ -960,6 +960,7 @@ impl Vm {
             "read_file" => {
                 self.check_arity(name, &args, 1, line)?;
                 if let Value::Str(path) = &args[0] {
+                    crate::sandbox::check_path(path, line)?;
                     match std::fs::read_to_string(path) {
                         Ok(content) => Ok(Value::Str(content)),
                         Err(_) => Ok(Value::Null),
@@ -971,6 +972,7 @@ impl Vm {
             "read_lines" => {
                 self.check_arity(name, &args, 1, line)?;
                 if let Value::Str(path) = &args[0] {
+                    crate::sandbox::check_path(path, line)?;
                     match std::fs::read_to_string(path) {
                         Ok(content) => {
                             let lines: Vec<Value> =
@@ -986,6 +988,7 @@ impl Vm {
             "write_file" => {
                 self.check_arity(name, &args, 2, line)?;
                 if let Value::Str(path) = &args[0] {
+                    crate::sandbox::check_path(path, line)?;
                     let content = match &args[1] {
                         Value::Str(s) => s.clone(),
                         other => other.to_string(),
@@ -998,6 +1001,7 @@ impl Vm {
             "append_file" => {
                 self.check_arity(name, &args, 2, line)?;
                 if let Value::Str(path) = &args[0] {
+                    crate::sandbox::check_path(path, line)?;
                     let content = match &args[1] {
                         Value::Str(s) => s.clone(),
                         other => other.to_string(),
@@ -1053,6 +1057,7 @@ impl Vm {
             "path_exists" => {
                 self.check_arity(name, &args, 1, line)?;
                 if let Value::Str(path) = &args[0] {
+                    crate::sandbox::check_path(path, line)?;
                     Ok(Value::Bool(std::path::Path::new(path).exists()))
                 } else {
                     Err(self.type_error(line, "path_exists(str) の形式で使います"))
@@ -1070,6 +1075,7 @@ impl Vm {
             "mkdir" => {
                 self.check_arity(name, &args, 1, line)?;
                 if let Value::Str(path) = &args[0] {
+                    crate::sandbox::check_path(path, line)?;
                     Ok(Value::Bool(std::fs::create_dir_all(path).is_ok()))
                 } else {
                     Err(self.type_error(line, "mkdir(str) の形式で使います"))
@@ -1078,6 +1084,7 @@ impl Vm {
             "remove" => {
                 self.check_arity(name, &args, 1, line)?;
                 if let Value::Str(path) = &args[0] {
+                    crate::sandbox::check_path(path, line)?;
                     let p = std::path::Path::new(path);
                     let result = if p.is_dir() {
                         std::fs::remove_dir(path)
@@ -1092,6 +1099,7 @@ impl Vm {
             "remove_dir" => {
                 self.check_arity(name, &args, 1, line)?;
                 if let Value::Str(path) = &args[0] {
+                    crate::sandbox::check_path(path, line)?;
                     Ok(Value::Bool(std::fs::remove_dir_all(path).is_ok()))
                 } else {
                     Err(self.type_error(line, "remove_dir(str) の形式で使います"))
@@ -1100,6 +1108,8 @@ impl Vm {
             "rename" => {
                 self.check_arity(name, &args, 2, line)?;
                 if let (Value::Str(from), Value::Str(to)) = (&args[0], &args[1]) {
+                    crate::sandbox::check_path(from, line)?;
+                    crate::sandbox::check_path(to, line)?;
                     Ok(Value::Bool(std::fs::rename(from, to).is_ok()))
                 } else {
                     Err(self.type_error(line, "rename(str, str) の形式で使います"))
@@ -1108,6 +1118,7 @@ impl Vm {
             "list_dir" => {
                 self.check_arity(name, &args, 1, line)?;
                 if let Value::Str(path) = &args[0] {
+                    crate::sandbox::check_path(path, line)?;
                     match std::fs::read_dir(path) {
                         Ok(entries) => {
                             let mut names: Vec<Value> = entries
@@ -1126,6 +1137,7 @@ impl Vm {
             "file_size" => {
                 self.check_arity(name, &args, 1, line)?;
                 if let Value::Str(path) = &args[0] {
+                    crate::sandbox::check_path(path, line)?;
                     match std::fs::metadata(path) {
                         Ok(meta) => Ok(Value::Int(meta.len() as i64)),
                         Err(_) => Ok(Value::Null),
@@ -1137,6 +1149,7 @@ impl Vm {
             "is_file" => {
                 self.check_arity(name, &args, 1, line)?;
                 if let Value::Str(path) = &args[0] {
+                    crate::sandbox::check_path(path, line)?;
                     Ok(Value::Bool(std::path::Path::new(path).is_file()))
                 } else {
                     Err(self.type_error(line, "is_file(str) の形式で使います"))
@@ -1145,6 +1158,7 @@ impl Vm {
             "is_dir" => {
                 self.check_arity(name, &args, 1, line)?;
                 if let Value::Str(path) = &args[0] {
+                    crate::sandbox::check_path(path, line)?;
                     Ok(Value::Bool(std::path::Path::new(path).is_dir()))
                 } else {
                     Err(self.type_error(line, "is_dir(str) の形式で使います"))
