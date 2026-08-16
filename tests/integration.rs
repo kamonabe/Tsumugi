@@ -198,6 +198,16 @@ fn golden_higher_order() {
     run_golden_test("higher_order");
 }
 
+#[test]
+fn golden_numeric_utils() {
+    run_golden_test("numeric_utils");
+}
+
+#[test]
+fn golden_dict_utils() {
+    run_golden_test("dict_utils");
+}
+
 // =============================================================
 // 正常系ゴールデンテスト（VM）
 // =============================================================
@@ -285,6 +295,16 @@ fn vm_golden_closure() {
 #[test]
 fn vm_golden_higher_order() {
     run_golden_test_vm("higher_order");
+}
+
+#[test]
+fn vm_golden_numeric_utils() {
+    run_golden_test_vm("numeric_utils");
+}
+
+#[test]
+fn vm_golden_dict_utils() {
+    run_golden_test_vm("dict_utils");
 }
 
 // =============================================================

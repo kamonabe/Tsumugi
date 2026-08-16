@@ -1,0 +1,17 @@
+# has_key
+let config = {"host": "localhost", "port": 8080, "debug": null}
+print(has_key(config, "host"))
+print(has_key(config, "missing"))
+print(has_key(config, "debug"))
+
+# values
+let d = {"a": 1, "b": 2, "c": 3}
+print(values(d))
+
+# keys (already tested elsewhere, but verify ordering)
+print(keys(d))
+
+# keys / values on empty dict
+let empty = {}
+print(keys(empty))
+print(values(empty))
