@@ -1,4 +1,5 @@
 mod ast;
+mod builtin_core;
 mod chunk;
 mod compiler;
 mod env;
