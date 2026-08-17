@@ -24,7 +24,9 @@ pub fn check_arity(
             line,
             message: format!(
                 "{}: 引数の数が合いません: {}個必要ですが{}個渡されました",
-                name, expected, args.len()
+                name,
+                expected,
+                args.len()
             ),
             trace: Vec::new(),
         })
@@ -51,7 +53,10 @@ pub fn builtin_len(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
         Value::List(v) => Ok(Value::Int(v.len() as i64)),
         Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
         Value::Dict(m) => Ok(Value::Int(m.len() as i64)),
-        _ => Err(type_error(line, "len は List/Str/Dict に対してのみ使えます")),
+        _ => Err(type_error(
+            line,
+            "len は List/Str/Dict に対してのみ使えます",
+        )),
     }
 }
 
@@ -182,7 +187,10 @@ pub fn builtin_contains(args: &[Value], line: usize) -> Result<Value, TsumugiErr
                 Ok(Value::Bool(false))
             }
         }
-        _ => Err(type_error(line, "contains は List/Str/Dict に対してのみ使えます")),
+        _ => Err(type_error(
+            line,
+            "contains は List/Str/Dict に対してのみ使えます",
+        )),
     }
 }
 
@@ -227,7 +235,10 @@ pub fn builtin_range(args: &[Value], line: usize) -> Result<Value, TsumugiError>
 pub fn builtin_split(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("split", args, 2, line)?;
     if let (Value::Str(s), Value::Str(sep)) = (&args[0], &args[1]) {
-        let parts: Vec<Value> = s.split(sep.as_str()).map(|p| Value::Str(p.to_string())).collect();
+        let parts: Vec<Value> = s
+            .split(sep.as_str())
+            .map(|p| Value::Str(p.to_string()))
+            .collect();
         Ok(Value::List(parts))
     } else {
         Err(type_error(line, "split(str, str) の形式で使います"))

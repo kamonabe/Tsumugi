@@ -101,17 +101,13 @@ impl Evaluator {
 
             // --- 共通モジュールに委譲可能なビルトイン ---
             // 引数を評価してから builtin_core::dispatch に委譲
-            "len" | "keys" | "values" | "has_key" | "type" | "slice"
-            | "contains" | "sort" | "reverse" | "range"
-            | "split" | "join" | "trim" | "starts_with" | "ends_with" | "replace"
-            | "upper" | "lower"
-            | "to_int" | "to_str" | "to_float" | "abs" | "min" | "max"
-            | "floor" | "ceil" | "round"
-            | "now" | "format_time"
-            | "env"
-            | "read_file" | "read_lines" | "write_file" | "append_file"
-            | "path_exists" | "path_join" | "mkdir" | "remove" | "remove_dir"
-            | "rename" | "list_dir" | "file_size" | "is_file" | "is_dir" => {
+            "len" | "keys" | "values" | "has_key" | "type" | "slice" | "contains" | "sort"
+            | "reverse" | "range" | "split" | "join" | "trim" | "starts_with" | "ends_with"
+            | "replace" | "upper" | "lower" | "to_int" | "to_str" | "to_float" | "abs" | "min"
+            | "max" | "floor" | "ceil" | "round" | "now" | "format_time" | "env" | "read_file"
+            | "read_lines" | "write_file" | "append_file" | "path_exists" | "path_join"
+            | "mkdir" | "remove" | "remove_dir" | "rename" | "list_dir" | "file_size"
+            | "is_file" | "is_dir" => {
                 let mut evaluated = Vec::with_capacity(args.len());
                 for arg in args {
                     evaluated.push(self.eval_expr(arg, line)?);
@@ -377,4 +373,3 @@ impl Evaluator {
         }
     }
 }
-
