@@ -45,14 +45,18 @@ fn run_golden_test_mode(name: &str, use_vm: bool) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mode = if use_vm { "VM" } else { "tree-walk" };
 
+    // Windows の CRLF を LF に正規化して比較
+    let actual = stdout.replace("\r\n", "\n");
+    let expect = expected.replace("\r\n", "\n");
+
     assert_eq!(
-        stdout.trim_end(),
-        expected.trim_end(),
+        actual.trim_end(),
+        expect.trim_end(),
         "ゴールデンテスト失敗 [{}]: {}\n--- 実際の出力 ---\n{}\n--- 期待出力 ---\n{}",
         mode,
         name,
-        stdout,
-        expected
+        actual,
+        expect
     );
 }
 
@@ -83,7 +87,7 @@ fn run_error_test_mode(name: &str, use_vm: bool) {
 
     let output = cmd.output().expect("tsumugi バイナリの実行に失敗");
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
     let mode = if use_vm { "VM" } else { "tree-walk" };
 
     for line in expected_err.lines() {
