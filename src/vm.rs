@@ -1,5 +1,7 @@
 //! 仮想マシン: バイトコード（Chunk）を実行するスタックマシン
 
+use std::rc::Rc;
+
 use crate::chunk::Chunk;
 use crate::error::TsumugiError;
 use crate::opcode::OpCode;
@@ -8,8 +10,8 @@ use crate::value::Value;
 /// コールフレーム: 関数呼び出しの状態を保存する
 #[derive(Debug)]
 struct CallFrame {
-    /// この関数の Chunk
-    chunk: Chunk,
+    /// この関数の Chunk（Rc で共有）
+    chunk: Rc<Chunk>,
     /// 命令ポインタ（この関数内の次に実行する命令のインデックス）
     ip: usize,
     /// スタック上のベース位置（この関数のローカル変数 slot 0 に対応）
@@ -47,7 +49,7 @@ pub struct Vm {
 impl Vm {
     pub fn new(chunk: Chunk) -> Self {
         let frame = CallFrame {
-            chunk,
+            chunk: Rc::new(chunk),
             ip: 0,
             base: 0,
             upvalues: Vec::new(),
@@ -285,7 +287,7 @@ impl Vm {
                         name,
                         arity,
                         params,
-                        chunk,
+                        chunk, // Rc::clone は自動（Value の Clone 実装経由）
                         upvalues,
                     });
                 } else {
@@ -320,7 +322,7 @@ impl Vm {
                     }
                     let base = fn_pos;
                     self.frames.push(CallFrame {
-                        chunk,
+                        chunk, // Rc<Chunk> — ポインタコピーのみ
                         ip: 0,
                         base,
                         upvalues,
@@ -564,382 +566,15 @@ impl Vm {
         args: Vec<Value>,
         line: usize,
     ) -> Result<Value, TsumugiError> {
+        // まず共通モジュールで処理を試みる
+        if let Some(result) = crate::builtin_core::dispatch(name, &args, line)? {
+            return Ok(result);
+        }
+
+        // コンテキスト依存のビルトイン（VM固有の実装が必要なもの）
         match name {
-            "len" => {
-                self.check_arity(name, &args, 1, line)?;
-                match &args[0] {
-                    Value::List(v) => Ok(Value::Int(v.len() as i64)),
-                    Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
-                    Value::Dict(m) => Ok(Value::Int(m.len() as i64)),
-                    _ => Err(self.type_error(line, "len は List/Str/Dict に対してのみ使えます")),
-                }
-            }
-            "push" => {
-                self.check_arity(name, &args, 2, line)?;
-                let mut list = args[0].clone();
-                if let Value::List(ref mut v) = list {
-                    v.push(args[1].clone());
-                    // push はスタック上のオリジナルを変更する必要がある
-                    // ただし値キャプチャ方式なのでここでは新しいリストを返す
-                    Ok(list)
-                } else {
-                    Err(self.type_error(line, "push はリストに対してのみ使えます"))
-                }
-            }
-            "pop" => {
-                self.check_arity(name, &args, 1, line)?;
-                let mut list = args[0].clone();
-                if let Value::List(ref mut v) = list {
-                    if v.is_empty() {
-                        Err(TsumugiError::Runtime {
-                            line,
-                            message: "pop: 空のリストからは取り出せません".to_string(),
-                            trace: Vec::new(),
-                        })
-                    } else {
-                        Ok(v.pop().unwrap())
-                    }
-                } else {
-                    Err(self.type_error(line, "pop はリストに対してのみ使えます"))
-                }
-            }
-            "__pop_update" => {
-                // pop した後のリスト（末尾を1つ削除）を返す
-                self.check_arity(name, &args, 1, line)?;
-                let mut list = args[0].clone();
-                if let Value::List(ref mut v) = list {
-                    if !v.is_empty() {
-                        v.pop();
-                    }
-                    Ok(list)
-                } else {
-                    Ok(args[0].clone())
-                }
-            }
-            "keys" => {
-                self.check_arity(name, &args, 1, line)?;
-                if let Value::Dict(map) = &args[0] {
-                    let keys: Vec<Value> = map.keys().map(|k| Value::Str(k.clone())).collect();
-                    Ok(Value::List(keys))
-                } else {
-                    Err(self.type_error(line, "keys は辞書に対してのみ使えます"))
-                }
-            }
-            "values" => {
-                self.check_arity(name, &args, 1, line)?;
-                if let Value::Dict(map) = &args[0] {
-                    let vals: Vec<Value> = map.values().cloned().collect();
-                    Ok(Value::List(vals))
-                } else {
-                    Err(self.type_error(line, "values は辞書に対してのみ使えます"))
-                }
-            }
-            "has_key" => {
-                self.check_arity(name, &args, 2, line)?;
-                if let (Value::Dict(map), Value::Str(key)) = (&args[0], &args[1]) {
-                    Ok(Value::Bool(map.contains_key(key)))
-                } else {
-                    Err(self.type_error(line, "has_key(dict, str) の形式で使います"))
-                }
-            }
-            "type" => {
-                self.check_arity(name, &args, 1, line)?;
-                let t = match &args[0] {
-                    Value::Int(_) => "int",
-                    Value::Float(_) => "float",
-                    Value::Str(_) => "str",
-                    Value::Bool(_) => "bool",
-                    Value::Null => "null",
-                    Value::List(_) => "list",
-                    Value::Dict(_) => "dict",
-                    Value::Fn { .. } | Value::VmFn { .. } => "fn",
-                };
-                Ok(Value::Str(t.to_string()))
-            }
-            "slice" => {
-                self.check_arity(name, &args, 3, line)?;
-                let (Value::Int(start), Value::Int(end)) = (&args[1], &args[2]) else {
-                    return Err(self.type_error(line, "slice の開始・終了は整数で指定します"));
-                };
-                let start = *start as usize;
-                let end = *end as usize;
-                match &args[0] {
-                    Value::List(v) => {
-                        let s = start.min(v.len());
-                        let e = end.min(v.len());
-                        Ok(Value::List(v[s..e].to_vec()))
-                    }
-                    Value::Str(s) => {
-                        let chars: Vec<char> = s.chars().collect();
-                        let st = start.min(chars.len());
-                        let en = end.min(chars.len());
-                        Ok(Value::Str(chars[st..en].iter().collect()))
-                    }
-                    _ => Err(self.type_error(line, "slice は List/Str に対してのみ使えます")),
-                }
-            }
-            "contains" => {
-                self.check_arity(name, &args, 2, line)?;
-                match &args[0] {
-                    Value::List(v) => Ok(Value::Bool(v.contains(&args[1]))),
-                    Value::Str(s) => {
-                        if let Value::Str(sub) = &args[1] {
-                            Ok(Value::Bool(s.contains(sub.as_str())))
-                        } else {
-                            Ok(Value::Bool(false))
-                        }
-                    }
-                    Value::Dict(map) => {
-                        if let Value::Str(key) = &args[1] {
-                            Ok(Value::Bool(map.contains_key(key)))
-                        } else {
-                            Ok(Value::Bool(false))
-                        }
-                    }
-                    _ => {
-                        Err(self.type_error(line, "contains は List/Str/Dict に対してのみ使えます"))
-                    }
-                }
-            }
-            "split" => {
-                self.check_arity(name, &args, 2, line)?;
-                if let (Value::Str(s), Value::Str(sep)) = (&args[0], &args[1]) {
-                    let parts: Vec<Value> = s
-                        .split(sep.as_str())
-                        .map(|p| Value::Str(p.to_string()))
-                        .collect();
-                    Ok(Value::List(parts))
-                } else {
-                    Err(self.type_error(line, "split(str, str) の形式で使います"))
-                }
-            }
-            "join" => {
-                self.check_arity(name, &args, 2, line)?;
-                if let (Value::List(list), Value::Str(sep)) = (&args[0], &args[1]) {
-                    let parts: Vec<String> = list.iter().map(|v| v.to_string()).collect();
-                    Ok(Value::Str(parts.join(sep)))
-                } else {
-                    Err(self.type_error(line, "join(list, str) の形式で使います"))
-                }
-            }
-            "to_int" => {
-                self.check_arity(name, &args, 1, line)?;
-                match &args[0] {
-                    Value::Int(n) => Ok(Value::Int(*n)),
-                    Value::Float(f) => Ok(Value::Int(*f as i64)),
-                    Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
-                    Value::Str(s) => {
-                        s.parse::<i64>()
-                            .map(Value::Int)
-                            .map_err(|_| TsumugiError::Runtime {
-                                line,
-                                message: format!("to_int: \"{}\" は整数に変換できません", s),
-                                trace: Vec::new(),
-                            })
-                    }
-                    _ => Err(self.type_error(line, "to_int: 変換できない型です")),
-                }
-            }
-            "to_str" => {
-                self.check_arity(name, &args, 1, line)?;
-                Ok(Value::Str(args[0].to_string()))
-            }
-            "to_float" => {
-                self.check_arity(name, &args, 1, line)?;
-                match &args[0] {
-                    Value::Float(f) => Ok(Value::Float(*f)),
-                    Value::Int(n) => Ok(Value::Float(*n as f64)),
-                    Value::Str(s) => {
-                        s.parse::<f64>()
-                            .map(Value::Float)
-                            .map_err(|_| TsumugiError::Runtime {
-                                line,
-                                message: format!(
-                                    "to_float: \"{}\" は浮動小数点に変換できません",
-                                    s
-                                ),
-                                trace: Vec::new(),
-                            })
-                    }
-                    _ => Err(self.type_error(line, "to_float: 変換できない型です")),
-                }
-            }
-            "range" => {
-                self.check_arity(name, &args, 2, line)?;
-                if let (Value::Int(start), Value::Int(end)) = (&args[0], &args[1]) {
-                    let list: Vec<Value> = (*start..*end).map(Value::Int).collect();
-                    Ok(Value::List(list))
-                } else {
-                    Err(self.type_error(line, "range(int, int) の形式で使います"))
-                }
-            }
-            "map" => {
-                self.check_arity(name, &args, 2, line)?;
-                if let Value::List(list) = &args[0] {
-                    let func = args[1].clone();
-                    let mut result = Vec::new();
-                    for item in list {
-                        result.push(self.call_fn_value(func.clone(), vec![item.clone()], line)?);
-                    }
-                    Ok(Value::List(result))
-                } else {
-                    Err(self.type_error(line, "map(list, fn) の形式で使います"))
-                }
-            }
-            "filter" => {
-                self.check_arity(name, &args, 2, line)?;
-                if let Value::List(list) = &args[0] {
-                    let func = args[1].clone();
-                    let mut result = Vec::new();
-                    for item in list {
-                        let cond = self.call_fn_value(func.clone(), vec![item.clone()], line)?;
-                        if cond.is_truthy() {
-                            result.push(item.clone());
-                        }
-                    }
-                    Ok(Value::List(result))
-                } else {
-                    Err(self.type_error(line, "filter(list, fn) の形式で使います"))
-                }
-            }
-            "each" => {
-                self.check_arity(name, &args, 2, line)?;
-                if let Value::List(list) = &args[0] {
-                    let func = args[1].clone();
-                    for item in list {
-                        self.call_fn_value(func.clone(), vec![item.clone()], line)?;
-                    }
-                    Ok(Value::Null)
-                } else {
-                    Err(self.type_error(line, "each(list, fn) の形式で使います"))
-                }
-            }
-            "sort" => {
-                self.check_arity(name, &args, 1, line)?;
-                if let Value::List(list) = &args[0] {
-                    let mut sorted = list.clone();
-                    sorted.sort_by_key(|a| a.to_string());
-                    Ok(Value::List(sorted))
-                } else {
-                    Err(self.type_error(line, "sort はリストに対してのみ使えます"))
-                }
-            }
-            "reverse" => {
-                self.check_arity(name, &args, 1, line)?;
-                match &args[0] {
-                    Value::List(list) => {
-                        let mut rev = list.clone();
-                        rev.reverse();
-                        Ok(Value::List(rev))
-                    }
-                    Value::Str(s) => Ok(Value::Str(s.chars().rev().collect())),
-                    _ => Err(self.type_error(line, "reverse は List/Str に対してのみ使えます")),
-                }
-            }
-            "trim" => {
-                self.check_arity(name, &args, 1, line)?;
-                if let Value::Str(s) = &args[0] {
-                    Ok(Value::Str(s.trim().to_string()))
-                } else {
-                    Err(self.type_error(line, "trim は文字列に対してのみ使えます"))
-                }
-            }
-            "upper" => {
-                self.check_arity(name, &args, 1, line)?;
-                if let Value::Str(s) = &args[0] {
-                    Ok(Value::Str(s.to_uppercase()))
-                } else {
-                    Err(self.type_error(line, "upper は文字列に対してのみ使えます"))
-                }
-            }
-            "lower" => {
-                self.check_arity(name, &args, 1, line)?;
-                if let Value::Str(s) = &args[0] {
-                    Ok(Value::Str(s.to_lowercase()))
-                } else {
-                    Err(self.type_error(line, "lower は文字列に対してのみ使えます"))
-                }
-            }
-            "starts_with" => {
-                self.check_arity(name, &args, 2, line)?;
-                if let (Value::Str(s), Value::Str(prefix)) = (&args[0], &args[1]) {
-                    Ok(Value::Bool(s.starts_with(prefix.as_str())))
-                } else {
-                    Err(self.type_error(line, "starts_with(str, str) の形式で使います"))
-                }
-            }
-            "ends_with" => {
-                self.check_arity(name, &args, 2, line)?;
-                if let (Value::Str(s), Value::Str(suffix)) = (&args[0], &args[1]) {
-                    Ok(Value::Bool(s.ends_with(suffix.as_str())))
-                } else {
-                    Err(self.type_error(line, "ends_with(str, str) の形式で使います"))
-                }
-            }
-            "replace" => {
-                self.check_arity(name, &args, 3, line)?;
-                if let (Value::Str(s), Value::Str(old), Value::Str(new)) =
-                    (&args[0], &args[1], &args[2])
-                {
-                    Ok(Value::Str(s.replace(old.as_str(), new.as_str())))
-                } else {
-                    Err(self.type_error(line, "replace(str, str, str) の形式で使います"))
-                }
-            }
-            "abs" => {
-                self.check_arity(name, &args, 1, line)?;
-                match &args[0] {
-                    Value::Int(n) => Ok(Value::Int(n.abs())),
-                    Value::Float(f) => Ok(Value::Float(f.abs())),
-                    _ => Err(self.type_error(line, "abs は数値に対してのみ使えます")),
-                }
-            }
-            "min" => {
-                self.check_arity(name, &args, 2, line)?;
-                match (&args[0], &args[1]) {
-                    (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.min(b))),
-                    (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.min(*b))),
-                    (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).min(*b))),
-                    (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.min(*b as f64))),
-                    _ => Err(self.type_error(line, "min は数値に対してのみ使えます")),
-                }
-            }
-            "max" => {
-                self.check_arity(name, &args, 2, line)?;
-                match (&args[0], &args[1]) {
-                    (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.max(b))),
-                    (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.max(*b))),
-                    (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).max(*b))),
-                    (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.max(*b as f64))),
-                    _ => Err(self.type_error(line, "max は数値に対してのみ使えます")),
-                }
-            }
-            "floor" => {
-                self.check_arity(name, &args, 1, line)?;
-                match &args[0] {
-                    Value::Float(f) => Ok(Value::Int(f.floor() as i64)),
-                    Value::Int(n) => Ok(Value::Int(*n)),
-                    _ => Err(self.type_error(line, "floor は数値に対してのみ使えます")),
-                }
-            }
-            "ceil" => {
-                self.check_arity(name, &args, 1, line)?;
-                match &args[0] {
-                    Value::Float(f) => Ok(Value::Int(f.ceil() as i64)),
-                    Value::Int(n) => Ok(Value::Int(*n)),
-                    _ => Err(self.type_error(line, "ceil は数値に対してのみ使えます")),
-                }
-            }
-            "round" => {
-                self.check_arity(name, &args, 1, line)?;
-                match &args[0] {
-                    Value::Float(f) => Ok(Value::Int(f.round() as i64)),
-                    Value::Int(n) => Ok(Value::Int(*n)),
-                    _ => Err(self.type_error(line, "round は数値に対してのみ使えます")),
-                }
-            }
             "input" => {
-                self.check_arity(name, &args, 0, line)?;
+                crate::builtin_core::check_arity(name, &args, 0, line)?;
                 let mut buf = String::new();
                 match std::io::stdin().read_line(&mut buf) {
                     Ok(0) => Ok(Value::Null),
@@ -957,78 +592,6 @@ impl Vm {
                 };
                 std::process::exit(code);
             }
-            "read_file" => {
-                self.check_arity(name, &args, 1, line)?;
-                if let Value::Str(path) = &args[0] {
-                    crate::sandbox::check_path(path, line)?;
-                    match std::fs::read_to_string(path) {
-                        Ok(content) => Ok(Value::Str(content)),
-                        Err(_) => Ok(Value::Null),
-                    }
-                } else {
-                    Err(self.type_error(line, "read_file(str) の形式で使います"))
-                }
-            }
-            "read_lines" => {
-                self.check_arity(name, &args, 1, line)?;
-                if let Value::Str(path) = &args[0] {
-                    crate::sandbox::check_path(path, line)?;
-                    match std::fs::read_to_string(path) {
-                        Ok(content) => {
-                            let lines: Vec<Value> =
-                                content.lines().map(|l| Value::Str(l.to_string())).collect();
-                            Ok(Value::List(lines))
-                        }
-                        Err(_) => Ok(Value::Null),
-                    }
-                } else {
-                    Err(self.type_error(line, "read_lines(str) の形式で使います"))
-                }
-            }
-            "write_file" => {
-                self.check_arity(name, &args, 2, line)?;
-                if let Value::Str(path) = &args[0] {
-                    crate::sandbox::check_path(path, line)?;
-                    let content = match &args[1] {
-                        Value::Str(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    Ok(Value::Bool(std::fs::write(path, &content).is_ok()))
-                } else {
-                    Err(self.type_error(line, "write_file(str, content) の形式で使います"))
-                }
-            }
-            "append_file" => {
-                self.check_arity(name, &args, 2, line)?;
-                if let Value::Str(path) = &args[0] {
-                    crate::sandbox::check_path(path, line)?;
-                    let content = match &args[1] {
-                        Value::Str(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    use std::fs::OpenOptions;
-                    use std::io::Write;
-                    let result = OpenOptions::new()
-                        .append(true)
-                        .create(true)
-                        .open(path)
-                        .and_then(|mut f| f.write_all(content.as_bytes()));
-                    Ok(Value::Bool(result.is_ok()))
-                } else {
-                    Err(self.type_error(line, "append_file(str, content) の形式で使います"))
-                }
-            }
-            "env" => {
-                self.check_arity(name, &args, 1, line)?;
-                if let Value::Str(key) = &args[0] {
-                    match std::env::var(key) {
-                        Ok(val) => Ok(Value::Str(val)),
-                        Err(_) => Ok(Value::Null),
-                    }
-                } else {
-                    Err(self.type_error(line, "env(str) の形式で使います"))
-                }
-            }
             "args" => {
                 let argv: Vec<Value> = std::env::args()
                     .skip(1)
@@ -1038,130 +601,54 @@ impl Vm {
                     .collect();
                 Ok(Value::List(argv))
             }
-            "now" => {
-                use std::time::{SystemTime, UNIX_EPOCH};
-                let secs = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-                Ok(Value::Int(secs))
-            }
-            "format_time" => {
-                self.check_arity(name, &args, 2, line)?;
-                if let (Value::Int(ts), Value::Str(fmt)) = (&args[0], &args[1]) {
-                    Ok(Value::Str(format_unix_timestamp(*ts, fmt)))
-                } else {
-                    Err(self.type_error(line, "format_time(int, str) の形式で使います"))
-                }
-            }
-            "path_exists" => {
-                self.check_arity(name, &args, 1, line)?;
-                if let Value::Str(path) = &args[0] {
-                    crate::sandbox::check_path(path, line)?;
-                    Ok(Value::Bool(std::path::Path::new(path).exists()))
-                } else {
-                    Err(self.type_error(line, "path_exists(str) の形式で使います"))
-                }
-            }
-            "path_join" => {
-                let mut path = std::path::PathBuf::new();
-                for arg in &args {
-                    if let Value::Str(s) = arg {
-                        path.push(s);
+            "map" => {
+                crate::builtin_core::check_arity(name, &args, 2, line)?;
+                if let Value::List(list) = &args[0] {
+                    let func = args[1].clone();
+                    let mut result = Vec::new();
+                    for item in list {
+                        result.push(self.call_fn_value(func.clone(), vec![item.clone()], line)?);
                     }
-                }
-                Ok(Value::Str(path.to_string_lossy().to_string()))
-            }
-            "mkdir" => {
-                self.check_arity(name, &args, 1, line)?;
-                if let Value::Str(path) = &args[0] {
-                    crate::sandbox::check_path(path, line)?;
-                    Ok(Value::Bool(std::fs::create_dir_all(path).is_ok()))
+                    Ok(Value::List(result))
                 } else {
-                    Err(self.type_error(line, "mkdir(str) の形式で使います"))
+                    Err(crate::builtin_core::type_error(
+                        line,
+                        "map(list, fn) の形式で使います",
+                    ))
                 }
             }
-            "remove" => {
-                self.check_arity(name, &args, 1, line)?;
-                if let Value::Str(path) = &args[0] {
-                    crate::sandbox::check_path(path, line)?;
-                    let p = std::path::Path::new(path);
-                    let result = if p.is_dir() {
-                        std::fs::remove_dir(path)
-                    } else {
-                        std::fs::remove_file(path)
-                    };
-                    Ok(Value::Bool(result.is_ok()))
-                } else {
-                    Err(self.type_error(line, "remove(str) の形式で使います"))
-                }
-            }
-            "remove_dir" => {
-                self.check_arity(name, &args, 1, line)?;
-                if let Value::Str(path) = &args[0] {
-                    crate::sandbox::check_path(path, line)?;
-                    Ok(Value::Bool(std::fs::remove_dir_all(path).is_ok()))
-                } else {
-                    Err(self.type_error(line, "remove_dir(str) の形式で使います"))
-                }
-            }
-            "rename" => {
-                self.check_arity(name, &args, 2, line)?;
-                if let (Value::Str(from), Value::Str(to)) = (&args[0], &args[1]) {
-                    crate::sandbox::check_path(from, line)?;
-                    crate::sandbox::check_path(to, line)?;
-                    Ok(Value::Bool(std::fs::rename(from, to).is_ok()))
-                } else {
-                    Err(self.type_error(line, "rename(str, str) の形式で使います"))
-                }
-            }
-            "list_dir" => {
-                self.check_arity(name, &args, 1, line)?;
-                if let Value::Str(path) = &args[0] {
-                    crate::sandbox::check_path(path, line)?;
-                    match std::fs::read_dir(path) {
-                        Ok(entries) => {
-                            let mut names: Vec<Value> = entries
-                                .filter_map(|e| e.ok())
-                                .map(|e| Value::Str(e.file_name().to_string_lossy().to_string()))
-                                .collect();
-                            names.sort_by_key(|v| v.to_string());
-                            Ok(Value::List(names))
+            "filter" => {
+                crate::builtin_core::check_arity(name, &args, 2, line)?;
+                if let Value::List(list) = &args[0] {
+                    let func = args[1].clone();
+                    let mut result = Vec::new();
+                    for item in list {
+                        let cond = self.call_fn_value(func.clone(), vec![item.clone()], line)?;
+                        if cond.is_truthy() {
+                            result.push(item.clone());
                         }
-                        Err(_) => Ok(Value::Null),
                     }
+                    Ok(Value::List(result))
                 } else {
-                    Err(self.type_error(line, "list_dir(str) の形式で使います"))
+                    Err(crate::builtin_core::type_error(
+                        line,
+                        "filter(list, fn) の形式で使います",
+                    ))
                 }
             }
-            "file_size" => {
-                self.check_arity(name, &args, 1, line)?;
-                if let Value::Str(path) = &args[0] {
-                    crate::sandbox::check_path(path, line)?;
-                    match std::fs::metadata(path) {
-                        Ok(meta) => Ok(Value::Int(meta.len() as i64)),
-                        Err(_) => Ok(Value::Null),
+            "each" => {
+                crate::builtin_core::check_arity(name, &args, 2, line)?;
+                if let Value::List(list) = &args[0] {
+                    let func = args[1].clone();
+                    for item in list {
+                        self.call_fn_value(func.clone(), vec![item.clone()], line)?;
                     }
+                    Ok(Value::Null)
                 } else {
-                    Err(self.type_error(line, "file_size(str) の形式で使います"))
-                }
-            }
-            "is_file" => {
-                self.check_arity(name, &args, 1, line)?;
-                if let Value::Str(path) = &args[0] {
-                    crate::sandbox::check_path(path, line)?;
-                    Ok(Value::Bool(std::path::Path::new(path).is_file()))
-                } else {
-                    Err(self.type_error(line, "is_file(str) の形式で使います"))
-                }
-            }
-            "is_dir" => {
-                self.check_arity(name, &args, 1, line)?;
-                if let Value::Str(path) = &args[0] {
-                    crate::sandbox::check_path(path, line)?;
-                    Ok(Value::Bool(std::path::Path::new(path).is_dir()))
-                } else {
-                    Err(self.type_error(line, "is_dir(str) の形式で使います"))
+                    Err(crate::builtin_core::type_error(
+                        line,
+                        "each(list, fn) の形式で使います",
+                    ))
                 }
             }
             _ => Err(TsumugiError::Runtime {
@@ -1205,7 +692,7 @@ impl Vm {
             }
             let target_depth = self.frames.len();
             self.frames.push(CallFrame {
-                chunk,
+                chunk, // Rc<Chunk> — ポインタコピーのみ
                 ip: 0,
                 base,
                 upvalues,
@@ -1255,37 +742,6 @@ impl Vm {
                 message: "関数ではない値を呼び出そうとしました".to_string(),
                 trace: Vec::new(),
             })
-        }
-    }
-
-    fn check_arity(
-        &self,
-        name: &str,
-        args: &[Value],
-        expected: usize,
-        line: usize,
-    ) -> Result<(), TsumugiError> {
-        if args.len() != expected {
-            Err(TsumugiError::Runtime {
-                line,
-                message: format!(
-                    "{}: 引数の数が合いません: {}個必要ですが{}個渡されました",
-                    name,
-                    expected,
-                    args.len()
-                ),
-                trace: Vec::new(),
-            })
-        } else {
-            Ok(())
-        }
-    }
-
-    fn type_error(&self, line: usize, msg: &str) -> TsumugiError {
-        TsumugiError::Runtime {
-            line,
-            message: msg.to_string(),
-            trace: Vec::new(),
         }
     }
 
@@ -1502,53 +958,6 @@ fn type_name(value: &Value) -> &'static str {
         Value::Fn { .. } => "Fn",
         Value::VmFn { .. } => "Fn",
     }
-}
-
-/// UNIX タイムスタンプをフォーマットするヘルパー（簡易実装）
-fn format_unix_timestamp(timestamp: i64, format: &str) -> String {
-    let secs_per_day: i64 = 86400;
-    let mut days = timestamp / secs_per_day;
-    let day_secs = (timestamp % secs_per_day) as u32;
-    let hours = day_secs / 3600;
-    let minutes = (day_secs % 3600) / 60;
-    let seconds = day_secs % 60;
-
-    // 1970-01-01 からの日数 → 年月日
-    let mut year: i64 = 1970;
-    loop {
-        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-        if days < days_in_year {
-            break;
-        }
-        days -= days_in_year;
-        year += 1;
-    }
-    let month_days = if is_leap_year(year) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    let mut month: u32 = 1;
-    for md in month_days {
-        if days < md {
-            break;
-        }
-        days -= md;
-        month += 1;
-    }
-    let day = days + 1;
-
-    format
-        .replace("%Y", &format!("{:04}", year))
-        .replace("%m", &format!("{:02}", month))
-        .replace("%d", &format!("{:02}", day))
-        .replace("%H", &format!("{:02}", hours))
-        .replace("%M", &format!("{:02}", minutes))
-        .replace("%S", &format!("{:02}", seconds))
-}
-
-fn is_leap_year(year: i64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
 #[cfg(test)]

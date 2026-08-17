@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::ast::Stmt;
 use crate::chunk::Chunk;
@@ -22,11 +23,12 @@ pub enum Value {
         captured: HashMap<String, Value>,
     },
     /// VM用関数値（コンパイル済みバイトコード）
+    /// Rc<Chunk> により関数呼び出し・クロージャ生成時のディープコピーを回避
     VmFn {
         name: String,
         arity: usize,
         params: Vec<String>,
-        chunk: Chunk,
+        chunk: Rc<Chunk>,
         /// クロージャがキャプチャした値（値キャプチャ方式）
         upvalues: Vec<Value>,
     },

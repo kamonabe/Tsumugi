@@ -189,6 +189,7 @@ test = result
 - `return` 文は EvalResult::Return で早期脱出を表現
 - ランタイムエラー（型エラー、未定義変数、ゼロ除算等）に `Stmt.line` を付与
 - 組み込み関数の実装は `builtin.rs` に分離（eval.rs は制御フロー・式評価に専念）
+- `builtin.rs` はコンテキスト依存のビルトイン（push/pop/map/filter/each/print/input/exit/args）を処理し、それ以外は `builtin_core.rs` に委譲
 
 ### 環境 (env.rs)
 
@@ -446,6 +447,7 @@ let f = fn(x) x * 2 end
 | `src/chunk.rs` | Chunk — 命令列（`Vec<OpCode>`）+ 定数テーブル（`Vec<Value>`）+ 行番号 |
 | `src/compiler.rs` | Compiler — AST を走査して Chunk を生成する |
 | `src/vm.rs` | Vm — Chunk をスタックマシンとして実行する |
+| `src/builtin_core.rs` | 組み込み関数の共通ロジック — VM/ツリーウォーク両方から呼ばれる |
 
 ### スタックマシンの動作原理
 
@@ -476,6 +478,42 @@ let f = fn(x) x * 2 end
 | 5 | クロージャ（upvalue） | ✅ 完了 |
 | 6 | 組み込み関数（53個） | ✅ 完了 |
 | 7 | 互換性修正（min/max混合型・remove・write_file） | ✅ 完了 |
+
+### Rc\<Chunk\> による関数値の共有
+
+`Value::VmFn` の `chunk` フィールドは `Rc<Chunk>` で保持する。
+
+```rust
+VmFn {
+    name: String,
+    arity: usize,
+    params: Vec<String>,
+    chunk: Rc<Chunk>,     // ← ポインタコピーで共有
+    upvalues: Vec<Value>,
+}
+```
+
+採用理由:
+- `Value` は `Clone` を要求される（スタック操作・クロージャ生成で頻繁にコピーが走る）
+- `Chunk` は命令列（`Vec<OpCode>`）+ 定数テーブル（`Vec<Value>`）を持つため、ディープコピーはコストが高い
+- `Rc<Chunk>` にすることで、`Value::clone()` 時はポインタコピー（参照カウント+1）だけで済む
+- 関数の `Chunk` は immutable（実行中に書き換わらない）のため `Rc` で十分。`RefCell` は不要
+
+### 組み込み関数の共通化（builtin_core.rs）
+
+ツリーウォーク評価器（`builtin.rs`）と VM（`vm.rs`）で重複していた組み込み関数ロジックを `builtin_core.rs` に集約した。
+
+```
+builtin_core.rs
+├── dispatch(name, &[Value], line) → Result<Option<Value>>
+├── builtin_len, builtin_push, ...（~45個の純粋関数）
+└── format_unix_timestamp, is_leap_year（ヘルパー）
+```
+
+設計方針:
+- **引数は評価済み `&[Value]`** — 引数の評価方法がエンジンで異なるため（ツリーウォーク: `&[Expr]` を `eval_expr` で評価、VM: スタックから pop 済み）、共通モジュールは評価済みの値だけ受け取る
+- **エンジン固有のビルトインは各モジュールに残す** — `push`/`pop`（ツリーウォークは変数を直接変更）、`map`/`filter`/`each`（クロージャ呼び出しがエンジン依存）、`print`/`input`/`exit`/`args`（I/O・プロセス操作）
+- **新規ビルトイン追加は `builtin_core.rs` + dispatch テーブルへの登録のみ** — 両エンジンに自動的に反映される
 
 ### 設計判断
 

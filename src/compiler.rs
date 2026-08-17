@@ -1,13 +1,14 @@
 //! コンパイラ: AST → バイトコード（Chunk）に変換
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
 use crate::ast::{BinOpKind, Expr, Program, Stmt, UnaryOpKind};
 use crate::chunk::Chunk;
 use crate::error::TsumugiError;
 use crate::opcode::OpCode;
 use crate::value::Value;
-
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 
 /// ローカル変数の情報
 #[derive(Debug, Clone)]
@@ -739,7 +740,7 @@ impl Compiler {
             name: name.to_string(),
             arity: params.len(),
             params: params.to_vec(),
-            chunk: fn_chunk,
+            chunk: Rc::new(fn_chunk),
             upvalues: Vec::new(),
         };
         self.chunk.emit_constant(fn_value, line);
@@ -791,7 +792,7 @@ impl Compiler {
             name: "<lambda>".to_string(),
             arity: params.len(),
             params: params.to_vec(),
-            chunk: fn_chunk,
+            chunk: Rc::new(fn_chunk),
             upvalues: Vec::new(),
         };
         self.chunk.emit_constant(fn_value, line);
