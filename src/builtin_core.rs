@@ -13,7 +13,12 @@ use crate::value::Value;
 // ユーティリティ
 // =============================================================================
 
-pub fn check_arity(name: &str, args: &[Value], expected: usize, line: usize) -> Result<(), TsumugiError> {
+pub fn check_arity(
+    name: &str,
+    args: &[Value],
+    expected: usize,
+    line: usize,
+) -> Result<(), TsumugiError> {
     if args.len() != expected {
         Err(TsumugiError::Runtime {
             line,
@@ -435,7 +440,8 @@ pub fn builtin_read_lines(args: &[Value], line: usize) -> Result<Value, TsumugiE
         crate::sandbox::check_path(path, line)?;
         match std::fs::read_to_string(path) {
             Ok(content) => {
-                let lines: Vec<Value> = content.lines().map(|l| Value::Str(l.to_string())).collect();
+                let lines: Vec<Value> =
+                    content.lines().map(|l| Value::Str(l.to_string())).collect();
                 Ok(Value::List(lines))
             }
             Err(_) => Ok(Value::Null),
@@ -455,7 +461,10 @@ pub fn builtin_write_file(args: &[Value], line: usize) -> Result<Value, TsumugiE
         };
         Ok(Value::Bool(std::fs::write(path, &content).is_ok()))
     } else {
-        Err(type_error(line, "write_file(str, content) の形式で使います"))
+        Err(type_error(
+            line,
+            "write_file(str, content) の形式で使います",
+        ))
     }
 }
 
@@ -476,7 +485,10 @@ pub fn builtin_append_file(args: &[Value], line: usize) -> Result<Value, Tsumugi
             .and_then(|mut f| f.write_all(content.as_bytes()));
         Ok(Value::Bool(result.is_ok()))
     } else {
-        Err(type_error(line, "append_file(str, content) の形式で使います"))
+        Err(type_error(
+            line,
+            "append_file(str, content) の形式で使います",
+        ))
     }
 }
 

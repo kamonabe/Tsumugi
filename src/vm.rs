@@ -611,7 +611,10 @@ impl Vm {
                     }
                     Ok(Value::List(result))
                 } else {
-                    Err(crate::builtin_core::type_error(line, "map(list, fn) の形式で使います"))
+                    Err(crate::builtin_core::type_error(
+                        line,
+                        "map(list, fn) の形式で使います",
+                    ))
                 }
             }
             "filter" => {
@@ -627,7 +630,10 @@ impl Vm {
                     }
                     Ok(Value::List(result))
                 } else {
-                    Err(crate::builtin_core::type_error(line, "filter(list, fn) の形式で使います"))
+                    Err(crate::builtin_core::type_error(
+                        line,
+                        "filter(list, fn) の形式で使います",
+                    ))
                 }
             }
             "each" => {
@@ -639,7 +645,10 @@ impl Vm {
                     }
                     Ok(Value::Null)
                 } else {
-                    Err(crate::builtin_core::type_error(line, "each(list, fn) の形式で使います"))
+                    Err(crate::builtin_core::type_error(
+                        line,
+                        "each(list, fn) の形式で使います",
+                    ))
                 }
             }
             _ => Err(TsumugiError::Runtime {
