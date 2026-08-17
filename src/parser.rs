@@ -39,6 +39,7 @@ impl Parser {
             Token::Fn => self.parse_fn_def(),
             Token::Break => self.parse_break(),
             Token::Continue => self.parse_continue(),
+            Token::Import => self.parse_import(),
             Token::Ident(_) => {
                 // 識別子 + '=' なら再代入文
                 // 識別子 + '[' ... ']' + '=' ならインデックス代入文
@@ -290,6 +291,26 @@ impl Parser {
         self.advance(); // consume 'continue'
         self.expect_newline_or_eof()?;
         Ok(Stmt::Continue { line })
+    }
+
+    /// import "path"
+    fn parse_import(&mut self) -> Result<Stmt, TsumugiError> {
+        let line = self.current_line();
+        self.advance(); // consume 'import'
+
+        let spanned = self.advance_spanned();
+        let path = match spanned.token {
+            Token::Str(s) => s,
+            _ => {
+                return Err(TsumugiError::parse(
+                    line,
+                    "import の後に文字列パスが必要です",
+                ));
+            }
+        };
+
+        self.expect_newline_or_eof()?;
+        Ok(Stmt::Import { path, line })
     }
 
     /// fn name(params) \n body end
@@ -1052,5 +1073,30 @@ mod tests {
         let result = parse("let x = 10\n@@@");
         // '@' is unknown — lexer skips it, but the resulting parse should error with line info
         assert!(result.is_err() || result.is_ok()); // relaxed: just confirm no panic
+    }
+
+    #[test]
+    fn parse_import() {
+        let program = parse("import \"math.tsg\"").unwrap();
+        assert_eq!(program.len(), 1);
+        match &program[0] {
+            Stmt::Import { path, line } => {
+                assert_eq!(path, "math.tsg");
+                assert_eq!(*line, 1);
+            }
+            other => panic!("expected Import, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_import_error_no_string() {
+        let result = parse("import 123");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message().contains("文字列パス"),
+            "error should mention string path: {}",
+            err
+        );
     }
 }

@@ -215,6 +215,7 @@ impl Lexer {
             "false" => Token::False,
             "null" => Token::Null,
             "print" => Token::Print,
+            "import" => Token::Import,
             _ => Token::Ident(s),
         }
     }
@@ -353,7 +354,7 @@ mod tests {
     #[test]
     fn keywords() {
         let tokens = tokens_only(
-            "if else elif while for in break continue fn end return let and or not true false null print",
+            "if else elif while for in break continue fn end return let and or not true false null print import",
         );
         assert_eq!(
             tokens,
@@ -377,6 +378,7 @@ mod tests {
                 Token::False,
                 Token::Null,
                 Token::Print,
+                Token::Import,
                 Token::Eof,
             ]
         );

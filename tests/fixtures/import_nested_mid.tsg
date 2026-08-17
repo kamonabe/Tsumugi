@@ -1,0 +1,6 @@
+# ネスト import: このファイルがさらに別ファイルを import する
+import "import_nested_base.tsg"
+
+fn cube(x)
+    return x * square(x)
+end

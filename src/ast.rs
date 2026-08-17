@@ -68,6 +68,9 @@ pub enum Stmt {
     /// continue
     Continue { line: usize },
 
+    /// import "path"
+    Import { path: String, line: usize },
+
     /// 式文（print(x) や add(1,2) など、式だけの行）
     #[allow(clippy::enum_variant_names)]
     ExprStmt { expr: Expr, line: usize },
@@ -88,6 +91,7 @@ impl Stmt {
             Stmt::FnDef { line, .. } => *line,
             Stmt::Break { line } => *line,
             Stmt::Continue { line } => *line,
+            Stmt::Import { line, .. } => *line,
             Stmt::ExprStmt { line, .. } => *line,
         }
     }

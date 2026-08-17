@@ -66,6 +66,10 @@ fn apply(func, val)
     return func(val)
 end
 print(apply(fn(x) x * x end, 6))  # 36
+
+# モジュール import
+import "math.tsg"
+print(square(5))    # 25
 ```
 
 ## 対応機能
@@ -85,6 +89,7 @@ print(apply(fn(x) x * x end, 6))  # 36
 - while ループ
 - for ループ (`for item in collection ... end`)
 - break / continue
+- モジュール / import (`import "path.tsg"`)
 - 組み込み関数 53個（文字列操作、リスト操作、高階関数、ファイルI/O、パス操作、環境変数、日時など）
 - REPL（複数行入力対応）
 - ファイル実行

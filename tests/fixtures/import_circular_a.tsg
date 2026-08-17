@@ -1,0 +1,6 @@
+# 循環 import テスト: A → B → A（スキップされる）
+import "import_circular_b.tsg"
+
+fn from_a()
+    return "A"
+end

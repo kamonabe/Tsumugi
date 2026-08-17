@@ -27,6 +27,7 @@ pub enum Token {
     Or,
     Not,
     Print,
+    Import,
 
     // 演算子
     Plus,    // +

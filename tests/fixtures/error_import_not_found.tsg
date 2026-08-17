@@ -1,0 +1,2 @@
+import "nonexistent_file.tsg"
+print("should not reach here")

@@ -7,6 +7,8 @@ use crate::error::{TraceFrame, TsumugiError};
 use crate::value::Value;
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 /// 評価器の戻り値（通常の値 or return / break / continue による制御フロー）
 enum EvalResult {
     Val,
@@ -35,6 +37,10 @@ pub struct Evaluator {
     steps: u64,
     /// ステップ上限
     max_steps: u64,
+    /// 現在のスクリプトの基準ディレクトリ（import のパス解決に使用）
+    base_dir: PathBuf,
+    /// import 済みファイルの正規パス集合（循環 import 防止）
+    imported: HashSet<PathBuf>,
 }
 
 impl Evaluator {
@@ -44,6 +50,19 @@ impl Evaluator {
             call_stack: Vec::new(),
             steps: 0,
             max_steps: resolve_max_steps(),
+            base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            imported: HashSet::new(),
+        }
+    }
+
+    /// 基準ディレクトリを設定する（ファイル実行時に呼ばれる）
+    pub fn set_base_dir(&mut self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            self.base_dir = parent.to_path_buf();
+        }
+        // 実行されたファイル自体も imported に追加（自分自身の import を防ぐ）
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            self.imported.insert(canonical);
         }
     }
 
@@ -89,6 +108,57 @@ impl Evaluator {
             }
         }
         Ok(())
+    }
+
+    /// import 文を実行する
+    fn exec_import(&mut self, path: &str, line: usize) -> Result<(), TsumugiError> {
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+
+        // パス解決: base_dir からの相対パス
+        let resolved = self.base_dir.join(path);
+        let canonical = std::fs::canonicalize(&resolved).map_err(|e| TsumugiError::Runtime {
+            line,
+            message: format!("import 失敗: ファイルが見つかりません: {} ({})", path, e),
+            trace: Vec::new(),
+        })?;
+
+        // 循環 import チェック
+        if self.imported.contains(&canonical) {
+            // 既に import 済み → スキップ（エラーにしない）
+            return Ok(());
+        }
+        self.imported.insert(canonical.clone());
+
+        // ファイル読み込み
+        let source = std::fs::read_to_string(&canonical).map_err(|e| TsumugiError::Runtime {
+            line,
+            message: format!("import 失敗: ファイルを読み込めません: {} ({})", path, e),
+            trace: Vec::new(),
+        })?;
+
+        // base_dir を一時的に import 先のディレクトリに切り替え（ネスト import 対応）
+        let prev_base_dir = self.base_dir.clone();
+        if let Some(parent) = canonical.parent() {
+            self.base_dir = parent.to_path_buf();
+        }
+
+        // パース & 実行
+        let mut lexer = Lexer::new(&source);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().map_err(|e| TsumugiError::Runtime {
+            line,
+            message: format!("import 失敗 ({}): {}", path, e),
+            trace: Vec::new(),
+        })?;
+
+        let result = self.run(&program);
+
+        // base_dir を復元
+        self.base_dir = prev_base_dir;
+
+        result
     }
 
     /// 文を実行
@@ -303,6 +373,11 @@ impl Evaluator {
             Stmt::Break { .. } => Ok(EvalResult::Break),
 
             Stmt::Continue { .. } => Ok(EvalResult::Continue),
+
+            Stmt::Import { path, line } => {
+                self.exec_import(path, *line)?;
+                Ok(EvalResult::Val)
+            }
 
             Stmt::ExprStmt { expr, line } => {
                 self.eval_expr(expr, *line)?;
