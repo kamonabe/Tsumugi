@@ -1,0 +1,5 @@
+# 循環 import テスト: エラーにならず正常動作する
+import "import_circular_a.tsg"
+
+print(from_a())
+print(from_b())

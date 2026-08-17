@@ -584,3 +584,51 @@ fn vm_error_unknown_char() {
 fn vm_error_stack_trace() {
     run_error_test_vm("error_stack_trace");
 }
+
+// =============================================================
+// import テスト（ツリーウォーク）
+// =============================================================
+
+#[test]
+fn golden_import_basic() {
+    run_golden_test("import_basic");
+}
+
+#[test]
+fn golden_import_nested() {
+    run_golden_test("import_nested");
+}
+
+#[test]
+fn golden_import_circular() {
+    run_golden_test("import_circular");
+}
+
+#[test]
+fn error_import_not_found() {
+    run_error_test("error_import_not_found");
+}
+
+// =============================================================
+// import テスト（VM）
+// =============================================================
+
+#[test]
+fn vm_golden_import_basic() {
+    run_golden_test_vm("import_basic");
+}
+
+#[test]
+fn vm_golden_import_nested() {
+    run_golden_test_vm("import_nested");
+}
+
+#[test]
+fn vm_golden_import_circular() {
+    run_golden_test_vm("import_circular");
+}
+
+#[test]
+fn vm_error_import_not_found() {
+    run_error_test_vm("error_import_not_found");
+}

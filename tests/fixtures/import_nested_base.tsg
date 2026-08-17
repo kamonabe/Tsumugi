@@ -1,0 +1,4 @@
+# ネスト import 用の基底ライブラリ
+fn square(x)
+    return x * x
+end

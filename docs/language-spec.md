@@ -369,6 +369,51 @@ print(evens)  # [2, 4]
 each(nums, fn(x) print(x) end)
 ```
 
+## モジュール / import
+
+別のファイルに定義された関数や変数を読み込むことができる。
+
+```
+import "path/to/module.tsg"
+```
+
+### 基本的な使い方
+
+```
+# math.tsg
+fn square(x)
+    return x * x
+end
+
+fn cube(x)
+    return x * x * x
+end
+```
+
+```
+# main.tsg
+import "math.tsg"
+
+print(square(5))   # 25
+print(cube(3))     # 27
+```
+
+### パス解決
+
+- パスは現在実行中のスクリプトからの相対パスで解決される
+- ネストした import（A が B を import し、B が C を import する）にも対応
+
+### 循環 import
+
+- 同じファイルが複数回 import された場合、2回目以降はスキップされる（エラーにはならない）
+- これにより循環 import が安全に処理される
+
+### 制約
+
+- import はトップレベルの文として記述する（関数やループの中では使えない — 構文上は可能だが非推奨）
+- import されたファイル内の `let` 宣言・`fn` 定義がすべて現在のスコープに展開される（名前空間は分離されない）
+- REPL での import は現在の作業ディレクトリからの相対パスで解決される
+
 ## 組み込み関数
 
 | 関数 | 説明 |

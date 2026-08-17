@@ -1,0 +1,10 @@
+# import テスト用ライブラリ
+fn add(a, b)
+    return a + b
+end
+
+fn greet(name)
+    return "hello, " + name
+end
+
+let LIB_VERSION = 1

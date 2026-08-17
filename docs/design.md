@@ -1,6 +1,6 @@
 # Tsumugi — 設計ドキュメント
 
-最終更新: 2026-08-16
+最終更新: 2026-08-17
 
 ## 目的
 
@@ -243,7 +243,7 @@ GitHub Actions (`.github/workflows/ci.yml`) で push / PR 時に自動実行:
 program        = stmt*
 stmt           = let_stmt | assign_stmt | index_assign | return_stmt
                | if_stmt | while_stmt | for_stmt | break_stmt | continue_stmt
-               | fn_def | expr_stmt
+               | fn_def | import_stmt | expr_stmt
 let_stmt       = "let" IDENT "=" expr NEWLINE
 assign_stmt    = IDENT "=" expr NEWLINE
 index_assign   = postfix "[" expr "]" "=" expr NEWLINE
@@ -253,6 +253,7 @@ while_stmt     = "while" expr NEWLINE block "end" NEWLINE
 for_stmt       = "for" IDENT "in" expr NEWLINE block "end" NEWLINE
 break_stmt     = "break" NEWLINE
 continue_stmt  = "continue" NEWLINE
+import_stmt    = "import" STRING NEWLINE
 fn_def         = "fn" IDENT "(" params? ")" NEWLINE block "end" NEWLINE
 expr_stmt      = expr NEWLINE
 block          = stmt*
@@ -279,9 +280,7 @@ args           = expr ("," expr)*
 
 | 優先度 | 項目 |
 |---|---|
-| 進行中 | バイトコード VM 化（Phase 1 完了） |
 | 低 | 参照キャプチャ（カウンターパターン対応） |
-| 低 | モジュール / import |
 | 低 | クラス（継承なし・合成で拡張） |
 
 ## クロージャ・無名関数の設計判断
@@ -341,6 +340,52 @@ let f = fn(x) x * 2 end
 - キャプチャした変数への再代入は元のスコープに反映されない
 - カウンターパターン（状態を保持するクロージャ）は未サポート
 - 関数テーブル（`Env::functions`）がまだ残っている。将来的に廃止して全て環境内の変数として管理する案がある
+
+## モジュール / import の設計
+
+### 概要
+
+`import "path.tsg"` 構文で別ファイルの関数・変数を現在のスコープに取り込む。
+ツリーウォーク版・VM版の両方で動作する。
+
+### 設計判断
+
+#### フラットなインジェクション方式を採用
+
+検討した選択肢:
+1. **フラットインジェクション（全展開）** — 採用。import 先のファイルを実行し、定義された名前をすべて現在のスコープに注入する
+2. **名前空間分離（`module.func()` 形式）** — 不採用。ドット演算子のパース追加が必要で、クラスの前準備として後回し
+3. **選択的 import（`import { add, sub } from "math.tsg"`）** — 不採用。入門レベルでは過剰
+
+フラットインジェクションを選んだ理由:
+- 実装が素直（import 先を評価/コンパイルして現在の環境に追加するだけ）
+- 名前衝突は「後から定義した方が勝つ」で解決（Python と同じ）
+- 将来名前空間が欲しくなったら、クラス実装時にドット演算子を追加すれば自然に対応できる
+
+#### パス解決: 実行中スクリプトからの相対パス
+
+- import を書いたファイルの親ディレクトリを基準に解決する
+- `std::fs::canonicalize()` で正規化し、循環 import 検出に使う
+- REPL では `cwd` を基準にする
+
+#### 循環 import: サイレントスキップ
+
+- 正規化パスの `HashSet` で管理
+- 2回目以降の import は何もせずスキップ（エラーにしない）
+- これにより A→B→A のような循環参照が安全に処理される
+- Python の挙動に近い（部分的に実行済みのモジュールオブジェクトを返す）
+
+#### VM版: コンパイル時にインライン展開
+
+- VM ではファイルを読み込んでパースし、得られた AST を現在の `Compiler` でそのままコンパイルする
+- ランタイムの新しい OpCode は不要（コンパイル時に解決される）
+- ネスト import 対応のため、コンパイル中に `base_dir` を一時切り替えする
+
+### 制約・トレードオフ
+
+- 名前空間が分離されないため、大規模なプロジェクトでは名前衝突のリスクがある
+- ファイルのトップレベルで副作用のあるコード（print 等）がある場合、import 時に実行される
+- 将来的に名前空間分離が必要になったら、クラス + ドット演算子の実装と合わせて対応する
 
 ## 参考資料
 

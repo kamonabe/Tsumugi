@@ -64,7 +64,10 @@ fn run_file(path: &str) {
         }
     };
 
-    if let Err(e) = execute(&source, &mut Evaluator::new()) {
+    let mut evaluator = Evaluator::new();
+    evaluator.set_base_dir(std::path::Path::new(path));
+
+    if let Err(e) = execute(&source, &mut evaluator) {
         eprintln!("{}", e);
         std::process::exit(1);
     }
@@ -153,7 +156,7 @@ fn run_file_vm(path: &str) {
         }
     };
 
-    if let Err(e) = execute_vm(&source) {
+    if let Err(e) = execute_vm_with_path(&source, path) {
         eprintln!("{}", e);
         std::process::exit(1);
     }
@@ -202,6 +205,21 @@ fn execute_vm(source: &str) -> Result<(), error::TsumugiError> {
     let program = parser.parse()?;
 
     let chunk = Compiler::new().compile(&program)?;
+    let mut vm = Vm::new(chunk);
+    vm.run()
+}
+
+/// VMモードの実行関数（ファイルパス付き）
+fn execute_vm_with_path(source: &str, path: &str) -> Result<(), error::TsumugiError> {
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize();
+
+    let mut parser = Parser::new(tokens);
+    let program = parser.parse()?;
+
+    let mut compiler = Compiler::new();
+    compiler.set_base_dir(std::path::Path::new(path));
+    let chunk = compiler.compile(&program)?;
     let mut vm = Vm::new(chunk);
     vm.run()
 }

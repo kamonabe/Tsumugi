@@ -1,0 +1,7 @@
+# import デモ: 別ファイルの関数を利用する
+import "math.tsg"
+
+print("square(5) = " + to_str(square(5)))
+print("cube(3) = " + to_str(cube(3)))
+print("power(2, 10) = " + to_str(power(2, 10)))
+print("factorial(6) = " + to_str(factorial(6)))
