@@ -1,0 +1,4 @@
+# テストフィクスチャは常に LF で checkout する（Windows での CRLF 変換を防止）
+tests/fixtures/*.expected text eol=lf
+tests/fixtures/*.expected_err text eol=lf
+tests/fixtures/*.tsg text eol=lf

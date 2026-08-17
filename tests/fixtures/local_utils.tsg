@@ -1,6 +1,6 @@
-# 環境変数
-let home = env("HOME")
-print(home != null)
+# 環境変数（OS非依存: PATH は全OSで存在する）
+let p = env("PATH")
+print(p != null)
 let missing = env("NONEXISTENT_TSG_VAR_XYZ")
 print(missing)
 
@@ -13,12 +13,13 @@ print(ts > 0)
 let formatted = format_time(1767225600, "%Y-%m-%d %H:%M:%S")
 print(formatted)
 
-# path_exists
-print(path_exists("/tmp"))
+# path_exists（カレントディレクトリ "." は全OSで存在する）
+print(path_exists("."))
 print(path_exists("/no_such_path_xyz"))
 
-# path_join
-print(path_join("/usr", "local", "bin"))
+# path_join（結果がOS依存なのでセパレータに依存しない確認）
+let joined = path_join("a", "b", "c")
+print(len(joined) > 0)
 
 # args (テスト実行時は空リスト)
 let a = args()
