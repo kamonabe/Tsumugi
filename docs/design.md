@@ -1,6 +1,6 @@
 # Tsumugi — 設計ドキュメント
 
-最終更新: 2026-08-17
+最終更新: 2026-08-18
 
 ## 目的
 
@@ -38,7 +38,7 @@
 ### 実行方式: ツリーウォークインタプリタ
 
 - AST を再帰的にたどって直接実行する最もシンプルな方式
-- バイトコード VM は将来の発展形として残す
+- バイトコード VM も実装済み（`--vm` フラグで切り替え）
 
 ### 関数の戻り値: 明示的 return
 
@@ -131,7 +131,11 @@ end
 test = result
 ```
 
-将来的にクロージャ/高階関数を実装した際に `filter()` を追加すれば、より簡潔に書けるようになる。
+高階関数 `filter()` を使えば、より簡潔に書ける:
+
+```
+let result = filter(test, fn(item) item != "kani" end)
+```
 
 ### 組み込み関数の拡充
 
@@ -238,13 +242,13 @@ GitHub Actions (`.github/workflows/ci.yml`) で push / PR 時に自動実行:
 2. `cargo clippy -- -D warnings` — 静的解析
 3. `cargo test` — 全テスト実行
 
-## 文法仕様 (v0.2)
+## 文法仕様 (v0.3)
 
 ```
 program        = stmt*
 stmt           = let_stmt | assign_stmt | index_assign | return_stmt
                | if_stmt | while_stmt | for_stmt | break_stmt | continue_stmt
-               | fn_def | import_stmt | expr_stmt
+               | fn_def | import_stmt | try_catch_stmt | expr_stmt
 let_stmt       = "let" IDENT "=" expr NEWLINE
 assign_stmt    = IDENT "=" expr NEWLINE
 index_assign   = postfix "[" expr "]" "=" expr NEWLINE
@@ -255,6 +259,7 @@ for_stmt       = "for" IDENT "in" expr NEWLINE block "end" NEWLINE
 break_stmt     = "break" NEWLINE
 continue_stmt  = "continue" NEWLINE
 import_stmt    = "import" STRING NEWLINE
+try_catch_stmt = "try" NEWLINE block "catch" IDENT NEWLINE block "end" NEWLINE
 fn_def         = "fn" IDENT "(" params? ")" NEWLINE block "end" NEWLINE
 expr_stmt      = expr NEWLINE
 block          = stmt*
@@ -533,4 +538,4 @@ builtin_core.rs
 
 - Phase 1 では汎用的な関数呼び出し機構がまだない
 - print は出力の確認に必須なので、最小構成で動かすために専用命令とした
-- Phase 4 で関数呼び出しを実装した後、組み込み関数テーブル方式に移行する予定
+- Phase 4 で関数呼び出しを実装した後、`CallBuiltin` OpCode + `builtin_core.rs` 方式に移行した

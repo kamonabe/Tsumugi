@@ -28,6 +28,8 @@ pub enum Token {
     Not,
     Print,
     Import,
+    Try,
+    Catch,
 
     // 演算子
     Plus,    // +

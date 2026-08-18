@@ -636,3 +636,17 @@ fn vm_golden_import_circular() {
 fn vm_error_import_not_found() {
     run_error_test_vm("error_import_not_found");
 }
+
+// =============================================================
+// try/catch テスト
+// =============================================================
+
+#[test]
+fn golden_try_catch() {
+    run_golden_test("try_catch");
+}
+
+#[test]
+fn vm_golden_try_catch() {
+    run_golden_test_vm("try_catch");
+}

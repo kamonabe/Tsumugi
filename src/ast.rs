@@ -71,6 +71,14 @@ pub enum Stmt {
     /// import "path"
     Import { path: String, line: usize },
 
+    /// try ... catch var ... end
+    TryCatch {
+        try_body: Vec<Stmt>,
+        var: String,
+        catch_body: Vec<Stmt>,
+        line: usize,
+    },
+
     /// 式文（print(x) や add(1,2) など、式だけの行）
     #[allow(clippy::enum_variant_names)]
     ExprStmt { expr: Expr, line: usize },
@@ -92,6 +100,7 @@ impl Stmt {
             Stmt::Break { line } => *line,
             Stmt::Continue { line } => *line,
             Stmt::Import { line, .. } => *line,
+            Stmt::TryCatch { line, .. } => *line,
             Stmt::ExprStmt { line, .. } => *line,
         }
     }

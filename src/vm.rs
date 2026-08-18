@@ -31,6 +31,17 @@ fn vm_resolve_max_steps() -> u64 {
         .unwrap_or(DEFAULT_MAX_STEPS)
 }
 
+/// 例外ハンドラ: try/catch のスタック状態を保持
+#[derive(Debug)]
+struct TryHandler {
+    /// catch ブロックの先頭命令アドレス
+    catch_ip: usize,
+    /// try 開始時のスタック深さ（エラー時にスタックを巻き戻す）
+    stack_depth: usize,
+    /// try 開始時のフレーム深さ
+    frame_depth: usize,
+}
+
 /// スタックベースの仮想マシン
 pub struct Vm {
     /// コールフレームスタック
@@ -44,6 +55,9 @@ pub struct Vm {
 
     /// ステップ上限
     max_steps: u64,
+
+    /// 例外ハンドラスタック（try/catch）
+    try_handlers: Vec<TryHandler>,
 }
 
 impl Vm {
@@ -59,6 +73,7 @@ impl Vm {
             stack: Vec::with_capacity(256),
             steps: 0,
             max_steps: vm_resolve_max_steps(),
+            try_handlers: Vec::new(),
         }
     }
 
@@ -88,11 +103,36 @@ impl Vm {
                 OpCode::Return => {
                     return Ok(());
                 }
+                OpCode::SetupTry(catch_ip) => {
+                    let catch_ip = *catch_ip;
+                    self.try_handlers.push(TryHandler {
+                        catch_ip,
+                        stack_depth: self.stack.len(),
+                        frame_depth: self.frames.len(),
+                    });
+                    Ok(())
+                }
+                OpCode::TeardownTry => {
+                    self.try_handlers.pop();
+                    Ok(())
+                }
                 _ => self.dispatch(instruction, line),
             };
 
             if let Err(e) = result {
-                return Err(self.attach_trace(e));
+                if let Some(handler) = self.try_handlers.pop() {
+                    // フレームを巻き戻す
+                    self.frames.truncate(handler.frame_depth);
+                    // スタックを巻き戻す
+                    self.stack.truncate(handler.stack_depth);
+                    // エラーメッセージをスタックに積む
+                    let error_msg = e.message().to_string();
+                    self.stack.push(Value::Str(error_msg));
+                    // catch ブロックへジャンプ
+                    self.frames.last_mut().unwrap().ip = handler.catch_ip;
+                } else {
+                    return Err(self.attach_trace(e));
+                }
             }
         }
         Ok(())
@@ -458,6 +498,10 @@ impl Vm {
             }
             OpCode::ReturnValue | OpCode::Return => {
                 // これらは run() / call_fn_value で処理済み、ここに来ない
+                unreachable!()
+            }
+            OpCode::SetupTry(_) | OpCode::TeardownTry => {
+                // これらは run() で処理済み、ここに来ない
                 unreachable!()
             }
         }
