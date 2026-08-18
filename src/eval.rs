@@ -379,11 +379,47 @@ impl Evaluator {
                 Ok(EvalResult::Val)
             }
 
+            Stmt::TryCatch {
+                try_body,
+                var,
+                catch_body,
+                line: _,
+            } => {
+                // try本体を実行し、エラーが発生したらcatchブロックへ
+                let try_result = self.exec_block(try_body);
+                match try_result {
+                    Ok(result) => Ok(result),
+                    Err(e) => {
+                        // エラーメッセージを変数にバインドしてcatchブロックを実行
+                        let error_msg = e.message().to_string();
+                        self.env.set(var, Value::Str(error_msg));
+                        for s in catch_body {
+                            match self.exec_stmt(s)? {
+                                EvalResult::Val => {}
+                                other => return Ok(other),
+                            }
+                        }
+                        Ok(EvalResult::Val)
+                    }
+                }
+            }
+
             Stmt::ExprStmt { expr, line } => {
                 self.eval_expr(expr, *line)?;
                 Ok(EvalResult::Val)
             }
         }
+    }
+
+    /// ブロック（文のリスト）を実行する（try/catch用）
+    fn exec_block(&mut self, stmts: &[Stmt]) -> Result<EvalResult, TsumugiError> {
+        for s in stmts {
+            match self.exec_stmt(s)? {
+                EvalResult::Val => {}
+                other => return Ok(other),
+            }
+        }
+        Ok(EvalResult::Val)
     }
 
     /// 式を評価して値を返す（line は文の行番号をエラー表示に使う）

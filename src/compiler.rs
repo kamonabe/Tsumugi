@@ -207,6 +207,14 @@ impl Compiler {
             Stmt::Import { path, line } => {
                 self.compile_import(path, *line)?;
             }
+            Stmt::TryCatch {
+                try_body,
+                var,
+                catch_body,
+                line,
+            } => {
+                self.compile_try_catch(try_body, var, catch_body, *line)?;
+            }
         }
         Ok(())
     }
@@ -262,6 +270,50 @@ impl Compiler {
 
         // base_dir を復元
         self.base_dir = prev_base_dir;
+
+        Ok(())
+    }
+
+    /// try / catch のコンパイル
+    fn compile_try_catch(
+        &mut self,
+        try_body: &[Stmt],
+        var: &str,
+        catch_body: &[Stmt],
+        line: usize,
+    ) -> Result<(), TsumugiError> {
+        // SetupTry: catch ブロックの先頭アドレスを後でパッチ
+        let setup_offset = self.chunk.len();
+        self.chunk.emit(OpCode::SetupTry(0), line);
+
+        // try ブロック
+        self.begin_scope();
+        for stmt in try_body {
+            self.compile_stmt(stmt)?;
+        }
+        self.end_scope(line);
+
+        // try 正常完了: ハンドラを解除して catch をスキップ
+        self.chunk.emit(OpCode::TeardownTry, line);
+        let jump_over_catch = self.chunk.emit_jump(OpCode::Jump(0), line);
+
+        // catch ブロックの先頭アドレスをパッチ
+        let catch_start = self.chunk.len();
+        if let OpCode::SetupTry(ref mut addr) = self.chunk.code[setup_offset] {
+            *addr = catch_start;
+        }
+
+        // catch ブロック: エラーメッセージがスタックトップに積まれた状態で開始
+        self.begin_scope();
+        // エラーメッセージをローカル変数として登録
+        self.add_local(var.to_string());
+        for stmt in catch_body {
+            self.compile_stmt(stmt)?;
+        }
+        self.end_scope(line);
+
+        // catch 後への合流点
+        self.chunk.patch_jump(jump_over_catch);
 
         Ok(())
     }

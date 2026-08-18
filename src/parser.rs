@@ -40,6 +40,7 @@ impl Parser {
             Token::Break => self.parse_break(),
             Token::Continue => self.parse_continue(),
             Token::Import => self.parse_import(),
+            Token::Try => self.parse_try_catch(),
             Token::Ident(_) => {
                 // 識別子 + '=' なら再代入文
                 // 識別子 + '[' ... ']' + '=' ならインデックス代入文
@@ -311,6 +312,44 @@ impl Parser {
 
         self.expect_newline_or_eof()?;
         Ok(Stmt::Import { path, line })
+    }
+
+    /// try \n body catch var \n body end
+    fn parse_try_catch(&mut self) -> Result<Stmt, TsumugiError> {
+        let line = self.current_line();
+        self.advance(); // consume 'try'
+        self.expect_newline()?;
+        self.skip_newlines();
+
+        let try_body = self.parse_block(&[Token::Catch])?;
+
+        self.expect(Token::Catch)?;
+
+        let spanned = self.advance_spanned();
+        let var = match spanned.token {
+            Token::Ident(s) => s,
+            other => {
+                return Err(TsumugiError::parse(
+                    spanned.line,
+                    format!("catch の後に変数名が必要です。got: {:?}", other),
+                ));
+            }
+        };
+
+        self.expect_newline()?;
+        self.skip_newlines();
+
+        let catch_body = self.parse_block(&[Token::End])?;
+
+        self.expect(Token::End)?;
+        self.expect_newline_or_eof()?;
+
+        Ok(Stmt::TryCatch {
+            try_body,
+            var,
+            catch_body,
+            line,
+        })
     }
 
     /// fn name(params) \n body end

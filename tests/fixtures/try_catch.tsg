@@ -1,0 +1,56 @@
+# try/catch 基本テスト
+
+# ゼロ除算のキャッチ
+try
+    let x = 10 / 0
+catch e
+    print("1: " + e)
+end
+
+# 関数内のエラーをキャッチ
+fn divide(a, b)
+    return a / b
+end
+
+try
+    let result = divide(10, 0)
+catch e
+    print("2: " + e)
+end
+
+# エラーがない場合はcatchをスキップ
+try
+    let x = 42
+    print("3: 正常: " + to_str(x))
+catch e
+    print("ここには来ない")
+end
+
+# ネストしたtry/catch
+try
+    try
+        let y = 1 / 0
+    catch inner
+        print("4: 内側: " + inner)
+    end
+    print("5: 外側は続行")
+catch outer
+    print("ここには来ない")
+end
+
+# 型エラーのキャッチ
+try
+    let z = "hello" + 1
+catch e
+    print("6: " + e)
+end
+
+# インデックス範囲外のキャッチ
+try
+    let xs = [1, 2, 3]
+    print(xs[10])
+catch e
+    print("7: " + e)
+end
+
+print("8: プログラム正常終了")

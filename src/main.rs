@@ -135,7 +135,7 @@ fn is_incomplete(input: &str) -> bool {
     let mut depth: i32 = 0;
     for spanned in &tokens {
         match &spanned.token {
-            Token::If | Token::Fn | Token::While | Token::For => depth += 1,
+            Token::If | Token::Fn | Token::While | Token::For | Token::Try => depth += 1,
             Token::End => depth -= 1,
             _ => {}
         }

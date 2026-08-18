@@ -98,4 +98,11 @@ pub enum OpCode {
 
     /// プログラム終了
     Return,
+
+    /// 例外ハンドラを設定する: 失敗時に指定アドレスへジャンプ
+    /// operand: catch ブロックの先頭アドレス
+    SetupTry(usize),
+
+    /// 例外ハンドラを解除する（try ブロック正常完了時）
+    TeardownTry,
 }

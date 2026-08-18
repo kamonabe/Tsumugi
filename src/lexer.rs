@@ -216,6 +216,8 @@ impl Lexer {
             "null" => Token::Null,
             "print" => Token::Print,
             "import" => Token::Import,
+            "try" => Token::Try,
+            "catch" => Token::Catch,
             _ => Token::Ident(s),
         }
     }
