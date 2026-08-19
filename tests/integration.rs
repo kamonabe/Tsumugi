@@ -650,3 +650,17 @@ fn golden_try_catch() {
 fn vm_golden_try_catch() {
     run_golden_test_vm("try_catch");
 }
+
+// =============================================================
+// 整数オーバーフロー テスト
+// =============================================================
+
+#[test]
+fn error_integer_overflow() {
+    run_error_test("error_integer_overflow");
+}
+
+#[test]
+fn vm_error_integer_overflow() {
+    run_error_test_vm("error_integer_overflow");
+}

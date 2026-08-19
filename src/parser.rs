@@ -702,6 +702,14 @@ impl Parser {
             Token::LBracket => self.parse_list_literal(),
             Token::LBrace => self.parse_dict_literal(),
             Token::Fn => self.parse_anonymous_fn(),
+            Token::Error(_) => {
+                let s = self.advance_spanned();
+                if let Token::Error(msg) = s.token {
+                    Err(TsumugiError::parse(s.line, msg))
+                } else {
+                    unreachable!()
+                }
+            }
             other => Err(TsumugiError::parse(
                 spanned.line,
                 format!("予期しないトークン: {:?}", other),

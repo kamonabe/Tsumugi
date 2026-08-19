@@ -133,9 +133,19 @@ impl Lexer {
         }
 
         if is_float {
-            Token::Float(s.parse().unwrap())
+            match s.parse::<f64>() {
+                Ok(n) => Token::Float(n),
+                Err(_) => Token::Error(format!("浮動小数点リテラルが不正です: {}", s)),
+            }
         } else {
-            Token::Int(s.parse().unwrap())
+            match s.parse::<i64>() {
+                Ok(n) => Token::Int(n),
+                Err(_) => Token::Error(format!(
+                    "整数リテラルが範囲外です (最大: {}): {}",
+                    i64::MAX,
+                    s
+                )),
+            }
         }
     }
 
@@ -400,5 +410,35 @@ mod tests {
                 Token::Eof
             ]
         );
+    }
+
+    #[test]
+    fn integer_overflow_returns_error_token() {
+        let tokens = tokens_only("99999999999999999999");
+        assert_eq!(tokens.len(), 2); // Error + Eof
+        match &tokens[0] {
+            Token::Error(msg) => {
+                assert!(msg.contains("整数リテラルが範囲外です"));
+                assert!(msg.contains("99999999999999999999"));
+            }
+            other => panic!("期待: Token::Error, 実際: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn i64_max_is_valid() {
+        let tokens = tokens_only("9223372036854775807");
+        assert_eq!(tokens, vec![Token::Int(i64::MAX), Token::Eof]);
+    }
+
+    #[test]
+    fn i64_max_plus_one_is_error() {
+        let tokens = tokens_only("9223372036854775808");
+        match &tokens[0] {
+            Token::Error(msg) => {
+                assert!(msg.contains("整数リテラルが範囲外です"));
+            }
+            other => panic!("期待: Token::Error, 実際: {:?}", other),
+        }
     }
 }
