@@ -664,3 +664,27 @@ fn error_integer_overflow() {
 fn vm_error_integer_overflow() {
     run_error_test_vm("error_integer_overflow");
 }
+
+// =============================================================
+// 未閉じ文字列テスト
+// =============================================================
+
+#[test]
+fn error_unclosed_string() {
+    run_error_test("error_unclosed_string");
+}
+
+#[test]
+fn vm_error_unclosed_string() {
+    run_error_test_vm("error_unclosed_string");
+}
+
+#[test]
+fn error_unclosed_string_eof() {
+    run_error_test("error_unclosed_string_eof");
+}
+
+#[test]
+fn vm_error_unclosed_string_eof() {
+    run_error_test_vm("error_unclosed_string_eof");
+}

@@ -153,12 +153,14 @@ impl Lexer {
     fn read_string(&mut self) -> Token {
         self.advance(); // 開き "
         let mut s = String::new();
+        let mut closed = false;
 
         loop {
             match self.peek() {
-                None | Some('\n') => break, // 未閉じ→そのまま返す
+                None | Some('\n') => break, // 未閉じ
                 Some('"') => {
                     self.advance(); // 閉じ "
+                    closed = true;
                     break;
                 }
                 Some('\\') => {
@@ -190,7 +192,11 @@ impl Lexer {
             }
         }
 
-        Token::Str(s)
+        if closed {
+            Token::Str(s)
+        } else {
+            Token::Error("文字列リテラルが閉じられていません".into())
+        }
     }
 
     /// 識別子 or キーワード
@@ -338,6 +344,32 @@ mod tests {
     fn string_with_escapes() {
         let tokens = tokens_only(r#""hello\nworld""#);
         assert_eq!(tokens, vec![Token::Str("hello\nworld".into()), Token::Eof]);
+    }
+
+    #[test]
+    fn unclosed_string_newline() {
+        let tokens = tokens_only("\"hello\nworld");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Error("文字列リテラルが閉じられていません".into()),
+                Token::Newline,
+                Token::Ident("world".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn unclosed_string_eof() {
+        let tokens = tokens_only("\"hello");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Error("文字列リテラルが閉じられていません".into()),
+                Token::Eof
+            ]
+        );
     }
 
     #[test]
