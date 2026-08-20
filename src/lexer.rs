@@ -365,7 +365,10 @@ mod tests {
         let tokens = tokens_only("\"hello");
         assert_eq!(
             tokens,
-            vec![Token::Error("文字列リテラルが閉じられていません".into()), Token::Eof]
+            vec![
+                Token::Error("文字列リテラルが閉じられていません".into()),
+                Token::Eof
+            ]
         );
     }
 
