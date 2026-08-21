@@ -590,6 +590,14 @@ impl Evaluator {
             (Value::Int(l), BinOpKind::LtEq, Value::Int(r)) => Ok(Value::Bool(l <= r)),
             (Value::Int(l), BinOpKind::GtEq, Value::Int(r)) => Ok(Value::Bool(l >= r)),
 
+            // 比較演算（浮動小数点）
+            (Value::Float(l), BinOpKind::Eq, Value::Float(r)) => Ok(Value::Bool(l == r)),
+            (Value::Float(l), BinOpKind::NotEq, Value::Float(r)) => Ok(Value::Bool(l != r)),
+            (Value::Float(l), BinOpKind::Lt, Value::Float(r)) => Ok(Value::Bool(l < r)),
+            (Value::Float(l), BinOpKind::Gt, Value::Float(r)) => Ok(Value::Bool(l > r)),
+            (Value::Float(l), BinOpKind::LtEq, Value::Float(r)) => Ok(Value::Bool(l <= r)),
+            (Value::Float(l), BinOpKind::GtEq, Value::Float(r)) => Ok(Value::Bool(l >= r)),
+
             // 比較演算（文字列）
             (Value::Str(l), BinOpKind::Eq, Value::Str(r)) => Ok(Value::Bool(l == r)),
             (Value::Str(l), BinOpKind::NotEq, Value::Str(r)) => Ok(Value::Bool(l != r)),

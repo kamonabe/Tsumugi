@@ -485,6 +485,7 @@ let f = fn(x) x * 2 end
 | 5 | クロージャ（upvalue） | ✅ 完了 |
 | 6 | 組み込み関数（53個） | ✅ 完了 |
 | 7 | 互換性修正（min/max混合型・remove・write_file） | ✅ 完了 |
+| 8 | 浮動小数点 IEEE 754 統一（VM ゼロ除算→inf/NaN、ツリーウォーク Float 比較追加） | ✅ 完了 |
 
 ### Rc\<Chunk\> による関数値の共有
 

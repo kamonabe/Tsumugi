@@ -43,6 +43,7 @@
 - [x] `From<String>` 廃止（全エラー生成箇所を `TsumugiError::runtime()` に統一、文字列再パース除去）
 - [x] import のサンドボックス対応（`TSUMUGI_SANDBOX` 設定時に import 先パスも検証、ツリーウォーク版/VM版両対応）
 - [x] 環境変数アクセス制御（`TSUMUGI_ENV_ALLOW` で env() の読み取り可能キーを許可リスト制限）
+- [x] 浮動小数点 IEEE 754 統一（VM の Float ゼロ除算を inf/NaN に修正、ツリーウォークに Float 比較 arm 追加、両エンジン完全一致）
 
 ## 設計方針: 組み込み関数の境界線
 
@@ -101,6 +102,7 @@
 | 5 | クロージャ（upvalue） | ✅ 完了 |
 | 6 | 組み込み関数（len, push, pop 等） | ✅ 完了 |
 | 7 | VM互換性修正 — min/max混合型・remove・write_file | ✅ 完了 |
+| 8 | 浮動小数点 IEEE 754 統一 — VMゼロ除算→inf/NaN、Float比較arm追加 | ✅ 完了 |
 
 ## 次の候補（言語機能）
 

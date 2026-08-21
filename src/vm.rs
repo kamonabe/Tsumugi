@@ -842,36 +842,9 @@ impl Vm {
                 trace: Vec::new(),
             }),
             (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a / b)),
-            (Value::Float(a), Value::Float(b)) => {
-                if *b == 0.0 {
-                    return Err(TsumugiError::Runtime {
-                        line,
-                        message: "ゼロ除算".to_string(),
-                        trace: Vec::new(),
-                    });
-                }
-                Ok(Value::Float(a / b))
-            }
-            (Value::Int(a), Value::Float(b)) => {
-                if *b == 0.0 {
-                    return Err(TsumugiError::Runtime {
-                        line,
-                        message: "ゼロ除算".to_string(),
-                        trace: Vec::new(),
-                    });
-                }
-                Ok(Value::Float(*a as f64 / b))
-            }
-            (Value::Float(a), Value::Int(b)) => {
-                if *b == 0 {
-                    return Err(TsumugiError::Runtime {
-                        line,
-                        message: "ゼロ除算".to_string(),
-                        trace: Vec::new(),
-                    });
-                }
-                Ok(Value::Float(a / *b as f64))
-            }
+            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a / b)),
+            (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 / b)),
+            (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a / *b as f64)),
             _ => Err(TsumugiError::Runtime {
                 line,
                 message: format!("型エラー: {:?} Div {:?} は計算できません", left, right),
@@ -888,36 +861,9 @@ impl Vm {
                 trace: Vec::new(),
             }),
             (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a % b)),
-            (Value::Float(a), Value::Float(b)) => {
-                if *b == 0.0 {
-                    return Err(TsumugiError::Runtime {
-                        line,
-                        message: "ゼロ除算".to_string(),
-                        trace: Vec::new(),
-                    });
-                }
-                Ok(Value::Float(a % b))
-            }
-            (Value::Int(a), Value::Float(b)) => {
-                if *b == 0.0 {
-                    return Err(TsumugiError::Runtime {
-                        line,
-                        message: "ゼロ除算".to_string(),
-                        trace: Vec::new(),
-                    });
-                }
-                Ok(Value::Float(*a as f64 % b))
-            }
-            (Value::Float(a), Value::Int(b)) => {
-                if *b == 0 {
-                    return Err(TsumugiError::Runtime {
-                        line,
-                        message: "ゼロ除算".to_string(),
-                        trace: Vec::new(),
-                    });
-                }
-                Ok(Value::Float(a % *b as f64))
-            }
+            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a % b)),
+            (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 % b)),
+            (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a % *b as f64)),
             _ => Err(TsumugiError::Runtime {
                 line,
                 message: format!("型エラー: {:?} Mod {:?} は計算できません", left, right),
