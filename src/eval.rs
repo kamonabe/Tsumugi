@@ -121,6 +121,9 @@ impl Evaluator {
             trace: Vec::new(),
         })?;
 
+        // サンドボックスチェック: import 先が許可範囲内か検証
+        crate::sandbox::check_path(canonical.to_str().unwrap_or(""), line)?;
+
         // 循環 import チェック
         if self.imported.contains(&canonical) {
             // 既に import 済み → スキップ（エラーにしない）

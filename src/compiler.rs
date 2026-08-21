@@ -234,6 +234,9 @@ impl Compiler {
             trace: Vec::new(),
         })?;
 
+        // サンドボックスチェック: import 先が許可範囲内か検証
+        crate::sandbox::check_path(canonical.to_str().unwrap_or(""), line)?;
+
         // 循環 import チェック（既に import 済みならスキップ）
         if self.imported.contains(&canonical) {
             return Ok(());

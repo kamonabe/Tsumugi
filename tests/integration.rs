@@ -490,6 +490,74 @@ fn vm_error_sandbox() {
     assert!(!output.status.success());
 }
 
+#[test]
+fn error_sandbox_import() {
+    let dir = fixtures_dir();
+    let script = dir.join("error_sandbox_import.tsg");
+
+    let output = Command::new(tsumugi_bin())
+        .arg(script.to_str().unwrap())
+        .env("TSUMUGI_SANDBOX", "/tmp")
+        .output()
+        .expect("tsumugi バイナリの実行に失敗");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("サンドボックス違反"),
+        "import のサンドボックスエラーが出ません: {}",
+        stderr
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn vm_error_sandbox_import() {
+    let dir = fixtures_dir();
+    let script = dir.join("error_sandbox_import.tsg");
+
+    let output = Command::new(tsumugi_bin())
+        .arg("--vm")
+        .arg(script.to_str().unwrap())
+        .env("TSUMUGI_SANDBOX", "/tmp")
+        .output()
+        .expect("tsumugi バイナリの実行に失敗");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("サンドボックス違反"),
+        "[VM] import のサンドボックスエラーが出ません: {}",
+        stderr
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn env_allow_list() {
+    let dir = fixtures_dir();
+    let script = dir.join("env_allow.tsg");
+
+    // TSUMUGI_ENV_ALLOW で HOME のみ許可、SECRET_DB_PASS はブロック
+    let output = Command::new(tsumugi_bin())
+        .arg(script.to_str().unwrap())
+        .env("TSUMUGI_ENV_ALLOW", "HOME,TSUMUGI_*")
+        .env("SECRET_DB_PASS", "hunter2")
+        .output()
+        .expect("tsumugi バイナリの実行に失敗");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(
+        stdout.contains("home_ok: true"),
+        "HOME should be accessible: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("secret_blocked: true"),
+        "SECRET_DB_PASS should be blocked: {}",
+        stdout
+    );
+    assert!(output.status.success());
+}
+
 // =============================================================
 // エラー系テスト（VM）
 // =============================================================

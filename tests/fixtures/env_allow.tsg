@@ -1,0 +1,10 @@
+# TSUMUGI_ENV_ALLOW テスト
+# テスト実行時に TSUMUGI_ENV_ALLOW="HOME,TSUMUGI_*" が設定される想定
+
+# HOME は許可リストに含まれるのでアクセス可能
+let home = env("HOME")
+print("home_ok: " + to_str(home != null))
+
+# SECRET_DB_PASS は許可リストに含まれないので null が返る
+let secret = env("SECRET_DB_PASS")
+print("secret_blocked: " + to_str(secret == null))
