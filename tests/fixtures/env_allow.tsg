@@ -1,9 +1,10 @@
 # TSUMUGI_ENV_ALLOW テスト
-# テスト実行時に TSUMUGI_ENV_ALLOW="HOME,TSUMUGI_*" が設定される想定
+# テスト実行時に TSUMUGI_ENV_ALLOW="TSG_TEST_ALLOWED,TSUMUGI_*" が設定される想定
+# TSG_TEST_ALLOWED="visible_value" と SECRET_DB_PASS="hunter2" も設定される
 
-# HOME は許可リストに含まれるのでアクセス可能
-let home = env("HOME")
-print("home_ok: " + to_str(home != null))
+# TSG_TEST_ALLOWED は許可リストに含まれるのでアクセス可能
+let allowed = env("TSG_TEST_ALLOWED")
+print("allowed_ok: " + to_str(allowed != null))
 
 # SECRET_DB_PASS は許可リストに含まれないので null が返る
 let secret = env("SECRET_DB_PASS")

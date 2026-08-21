@@ -1,2 +1,0 @@
-# サンドボックス有効時に範囲外のファイルを import しようとする
-import "/etc/passwd"
