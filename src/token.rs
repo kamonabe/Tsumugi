@@ -1,3 +1,12 @@
+/// f-string の各パートを表す型
+#[derive(Debug, Clone, PartialEq)]
+pub enum FStrPart {
+    /// リテラル部分（{} の外側のテキスト）
+    Literal(String),
+    /// 式部分（{} の内側のトークン列）
+    Expr(Vec<Spanned>),
+}
+
 /// Tsumugi のトークン型
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -5,6 +14,8 @@ pub enum Token {
     Int(i64),
     Float(f64),
     Str(String),
+    /// f-string: f"hello, {expr}"
+    FStr(Vec<FStrPart>),
     True,
     False,
     Null,

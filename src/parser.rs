@@ -1,6 +1,6 @@
 use crate::ast::*;
 use crate::error::TsumugiError;
-use crate::token::{Spanned, Token};
+use crate::token::{FStrPart, Spanned, Token};
 
 /// トークン列をASTに変換するパーサー
 pub struct Parser {
@@ -662,6 +662,14 @@ impl Parser {
                     unreachable!()
                 }
             }
+            Token::FStr(_) => {
+                let s = self.advance_spanned();
+                if let Token::FStr(parts) = s.token {
+                    self.parse_fstr(parts, s.line)
+                } else {
+                    unreachable!()
+                }
+            }
             Token::True => {
                 self.advance();
                 Ok(Expr::Bool(true))
@@ -801,6 +809,35 @@ impl Parser {
                 body: vec![Stmt::Return { value: expr, line }],
             })
         }
+    }
+
+    /// f-string のトークンパーツを AST に変換する
+    fn parse_fstr(&mut self, parts: Vec<FStrPart>, line: usize) -> Result<Expr, TsumugiError> {
+        let mut ast_parts: Vec<FStrExprPart> = Vec::new();
+
+        for part in parts {
+            match part {
+                FStrPart::Literal(s) => {
+                    ast_parts.push(FStrExprPart::Literal(s));
+                }
+                FStrPart::Expr(tokens) => {
+                    // サブパーサーで式トークン列をパースする
+                    // Eof トークンを末尾に追加（パーサーが終端を認識するため）
+                    let mut expr_tokens = tokens;
+                    let eof_line = expr_tokens.last().map_or(line, |t| t.line);
+                    expr_tokens.push(Spanned::new(Token::Eof, eof_line));
+
+                    let mut sub_parser = Parser::new(expr_tokens);
+                    let expr = sub_parser.parse_expr().map_err(|e| {
+                        // サブパーサーのエラーに f-string のコンテキストを付加
+                        TsumugiError::parse(line, format!("f-string内の式のパースに失敗: {}", e))
+                    })?;
+                    ast_parts.push(FStrExprPart::Expr(Box::new(expr)));
+                }
+            }
+        }
+
+        Ok(Expr::FStr(ast_parts))
     }
 
     // --- ユーティリティ ---

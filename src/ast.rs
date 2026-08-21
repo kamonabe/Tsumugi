@@ -154,6 +154,19 @@ pub enum Expr {
 
     /// インデックスアクセス: expr[expr]
     Index { object: Box<Expr>, index: Box<Expr> },
+
+    /// f-string: f"hello, {expr}"
+    /// 各パートはリテラル文字列か式
+    FStr(Vec<FStrExprPart>),
+}
+
+/// f-string の AST パート
+#[derive(Debug, Clone, PartialEq)]
+pub enum FStrExprPart {
+    /// リテラル部分
+    Literal(String),
+    /// 式部分（評価して文字列化する）
+    Expr(Box<Expr>),
 }
 
 /// 二項演算子の種類
