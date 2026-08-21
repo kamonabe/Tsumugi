@@ -21,8 +21,7 @@ enum EvalResult {
 const DEFAULT_MAX_STEPS: u64 = 1_000_000;
 
 /// コールフレーム深度の上限（スタックオーバーフロー防止）
-/// Windowsのデフォルトスタック(1MB)でも安全に動作する値
-const MAX_CALL_DEPTH: usize = 64;
+const MAX_CALL_DEPTH: usize = 128;
 
 /// 環境変数からステップ上限を読み取る
 fn resolve_max_steps() -> u64 {

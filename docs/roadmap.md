@@ -44,7 +44,7 @@
 - [x] import のサンドボックス対応（`TSUMUGI_SANDBOX` 設定時に import 先パスも検証、ツリーウォーク版/VM版両対応）
 - [x] 環境変数アクセス制御（`TSUMUGI_ENV_ALLOW` で env() の読み取り可能キーを許可リスト制限）
 - [x] 浮動小数点 IEEE 754 統一（VM の Float ゼロ除算を inf/NaN に修正、ツリーウォークに Float 比較 arm 追加、両エンジン完全一致）
-- [x] セキュリティ強化（コールフレーム深度制限 MAX_CALL_DEPTH=64、map/filter/each ステップカウント修正、TSUMUGI_* 環境変数ブロック）
+- [x] セキュリティ強化（コールフレーム深度制限 MAX_CALL_DEPTH=128、map/filter/each ステップカウント修正、TSUMUGI_* 環境変数ブロック）
 
 ## 設計方針: 組み込み関数の境界線
 
