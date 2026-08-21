@@ -1,12 +1,10 @@
-# 浮動小数点の特殊値テスト（ツリーウォーク版）
+# 浮動小数点の特殊値テスト
 #
-# 既知の挙動:
+# 挙動（ツリーウォーク・VM共通、IEEE 754準拠）:
 # - 1.0 / 0.0 → inf（Rust の f64 挙動に準拠）
 # - 0.0 / 0.0 → NaN
-# - inf の比較は型エラーになる（Float 同士の == が未対応パターンにフォールスルー）
-#
-# VM版では Float(x) / Float(0.0) がゼロ除算エラーになるため、
-# このテストはツリーウォーク版のみで実行する。
+# - inf == inf → true
+# - NaN == NaN → false（IEEE 754仕様）
 
 # 正常な浮動小数点演算
 print(1.5 + 2.5)
@@ -25,18 +23,20 @@ print(nan)
 print(inf + 1.0)
 print(inf * 2.0)
 
-# inf の比較は型エラーになる → try/catch で確認
-try
-    let result = inf == inf
-catch e
-    print("inf比較エラー: " + e)
-end
+# Float 比較（IEEE 754準拠）
+print(1.5 == 1.5)
+print(1.5 != 2.0)
+print(1.0 < 2.0)
+print(2.0 > 1.0)
+print(1.0 <= 1.0)
+print(2.0 >= 1.0)
 
-# NaN の比較も型エラー
-try
-    let result = nan == nan
-catch e
-    print("nan比較エラー: " + e)
-end
+# inf の比較
+print(inf == inf)
+print(inf > 1000000.0)
+
+# NaN の比較（IEEE 754: NaN は何と比較しても false）
+print(nan == nan)
+print(nan != nan)
 
 print("完了")

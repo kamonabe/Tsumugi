@@ -5,6 +5,14 @@ inf
 NaN
 inf
 inf
-inf比較エラー: 型エラー: Float(inf) Eq Float(inf) は計算できません
-nan比較エラー: 型エラー: Float(NaN) Eq Float(NaN) は計算できません
+true
+true
+true
+true
+true
+true
+true
+true
+false
+true
 完了
