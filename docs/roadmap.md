@@ -41,6 +41,8 @@
 - [x] モジュール / import（ファイル分割、循環import検出、ネストimport対応、ツリーウォーク版/VM版両対応）
 - [x] エラー処理 / try/catch（ランタイムエラーの捕捉、ネスト対応、ツリーウォーク版/VM版両対応）
 - [x] `From<String>` 廃止（全エラー生成箇所を `TsumugiError::runtime()` に統一、文字列再パース除去）
+- [x] import のサンドボックス対応（`TSUMUGI_SANDBOX` 設定時に import 先パスも検証、ツリーウォーク版/VM版両対応）
+- [x] 環境変数アクセス制御（`TSUMUGI_ENV_ALLOW` で env() の読み取り可能キーを許可リスト制限）
 
 ## 設計方針: 組み込み関数の境界線
 
