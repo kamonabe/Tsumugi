@@ -490,6 +490,113 @@ fn vm_error_sandbox() {
     assert!(!output.status.success());
 }
 
+#[test]
+fn error_sandbox_import() {
+    // サンドボックス外の実在ファイルを用意してテスト
+    let temp_dir = std::env::temp_dir();
+    let outside_file = temp_dir.join("tsg_sandbox_import_test.tsg");
+    std::fs::write(&outside_file, "print(\"leaked\")").unwrap();
+
+    // スクリプト本体を一時ディレクトリに作成（import先はプロジェクトディレクトリ外）
+    let script = temp_dir.join("tsg_sandbox_import_main.tsg");
+    std::fs::write(
+        &script,
+        format!(
+            "import \"{}\"",
+            outside_file.to_str().unwrap().replace('\\', "/")
+        ),
+    )
+    .unwrap();
+
+    // サンドボックスを fixtures ディレクトリに設定 → 一時ディレクトリの import 先はブロック
+    let sandbox_path = fixtures_dir().to_str().unwrap().to_string();
+
+    let output = Command::new(tsumugi_bin())
+        .arg(script.to_str().unwrap())
+        .env("TSUMUGI_SANDBOX", &sandbox_path)
+        .output()
+        .expect("tsumugi バイナリの実行に失敗");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("サンドボックス違反"),
+        "import のサンドボックスエラーが出ません: {}",
+        stderr
+    );
+    assert!(!output.status.success());
+
+    // cleanup
+    std::fs::remove_file(&outside_file).ok();
+    std::fs::remove_file(&script).ok();
+}
+
+#[test]
+fn vm_error_sandbox_import() {
+    // サンドボックス外の実在ファイルを用意してテスト
+    let temp_dir = std::env::temp_dir();
+    let outside_file = temp_dir.join("tsg_sandbox_import_test_vm.tsg");
+    std::fs::write(&outside_file, "print(\"leaked\")").unwrap();
+
+    let script = temp_dir.join("tsg_sandbox_import_main_vm.tsg");
+    std::fs::write(
+        &script,
+        format!(
+            "import \"{}\"",
+            outside_file.to_str().unwrap().replace('\\', "/")
+        ),
+    )
+    .unwrap();
+
+    let sandbox_path = fixtures_dir().to_str().unwrap().to_string();
+
+    let output = Command::new(tsumugi_bin())
+        .arg("--vm")
+        .arg(script.to_str().unwrap())
+        .env("TSUMUGI_SANDBOX", &sandbox_path)
+        .output()
+        .expect("tsumugi バイナリの実行に失敗");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("サンドボックス違反"),
+        "[VM] import のサンドボックスエラーが出ません: {}",
+        stderr
+    );
+    assert!(!output.status.success());
+
+    // cleanup
+    std::fs::remove_file(&outside_file).ok();
+    std::fs::remove_file(&script).ok();
+}
+
+#[test]
+fn env_allow_list() {
+    let dir = fixtures_dir();
+    let script = dir.join("env_allow.tsg");
+
+    // テスト側で制御可能な環境変数を設定して検証
+    let output = Command::new(tsumugi_bin())
+        .arg(script.to_str().unwrap())
+        .env("TSUMUGI_ENV_ALLOW", "TSG_TEST_ALLOWED,TSUMUGI_*")
+        .env("TSG_TEST_ALLOWED", "visible_value")
+        .env("SECRET_DB_PASS", "hunter2")
+        .output()
+        .expect("tsumugi バイナリの実行に失敗");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(
+        stdout.contains("allowed_ok: true"),
+        "TSG_TEST_ALLOWED should be accessible: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("secret_blocked: true"),
+        "SECRET_DB_PASS should be blocked: {}",
+        stdout
+    );
+    assert!(output.status.success());
+}
+
 // =============================================================
 // エラー系テスト（VM）
 // =============================================================

@@ -513,9 +513,51 @@ pub fn builtin_append_file(args: &[Value], line: usize) -> Result<Value, Tsumugi
 // 環境系
 // =============================================================================
 
+/// 環境変数アクセス許可リスト（`TSUMUGI_ENV_ALLOW` で制御）
+/// 未設定 → 全キー許可、設定 → リスト内のキーのみ許可
+static ENV_ALLOW: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+
+fn env_allowed_keys() -> &'static Option<Vec<String>> {
+    ENV_ALLOW.get_or_init(|| {
+        let val = std::env::var("TSUMUGI_ENV_ALLOW").ok()?;
+        if val.is_empty() {
+            return None;
+        }
+        let keys: Vec<String> = val
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        Some(keys)
+    })
+}
+
+fn is_env_key_allowed(key: &str) -> bool {
+    let Some(allowed) = env_allowed_keys() else {
+        // 許可リスト未設定 → 全キー許可
+        return true;
+    };
+    for pattern in allowed {
+        if pattern.ends_with('*') {
+            // プレフィックスマッチ（例: "TSUMUGI_*"）
+            let prefix = &pattern[..pattern.len() - 1];
+            if key.starts_with(prefix) {
+                return true;
+            }
+        } else if pattern == key {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn builtin_env(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("env", args, 1, line)?;
     if let Value::Str(key) = &args[0] {
+        if !is_env_key_allowed(key) {
+            // 許可リスト外のキーへのアクセスは null を返す（エラーにはしない）
+            return Ok(Value::Null);
+        }
         match std::env::var(key) {
             Ok(val) => Ok(Value::Str(val)),
             Err(_) => Ok(Value::Null),
