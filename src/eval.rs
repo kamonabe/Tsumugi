@@ -20,6 +20,9 @@ enum EvalResult {
 /// デフォルトのステップ上限（100万）
 const DEFAULT_MAX_STEPS: u64 = 1_000_000;
 
+/// コールフレーム深度の上限（スタックオーバーフロー防止）
+const MAX_CALL_DEPTH: usize = 128;
+
 /// 環境変数からステップ上限を読み取る
 fn resolve_max_steps() -> u64 {
     std::env::var("TSUMUGI_MAX_STEPS")
@@ -657,8 +660,17 @@ impl Evaluator {
             return Ok(value);
         }
 
-        // ユーザー定義関数の呼び出し: ステップカウント
+        // ユーザー定義関数の呼び出し: ステップカウント + 深度チェック
         self.count_step(line)?;
+        if self.call_stack.len() >= MAX_CALL_DEPTH {
+            return Err(TsumugiError::runtime(
+                line,
+                format!(
+                    "スタックオーバーフロー: 再帰が深すぎます (上限: {})",
+                    MAX_CALL_DEPTH
+                ),
+            ));
+        }
 
         // callee を評価して関数値を取得
         // 識別子の場合: 変数 → 関数テーブルの順で検索

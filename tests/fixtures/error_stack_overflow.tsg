@@ -1,0 +1,6 @@
+# 無限再帰（コールフレーム深度制限で停止することを期待）
+fn recurse()
+    recurse()
+end
+
+recurse()

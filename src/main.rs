@@ -25,6 +25,20 @@ use token::Token;
 use vm::Vm;
 
 fn main() {
+    // ツリーウォーク版の再帰がスタックを多く消費するため、
+    // メインスレッド(Windows: 1MB)では不足する場合がある。
+    // 十分なスタックサイズのスレッドで実行する。
+    let builder = std::thread::Builder::new()
+        .name("tsumugi-main".to_string())
+        .stack_size(8 * 1024 * 1024); // 8MB
+    let handler = builder.spawn(run).unwrap();
+    if handler.join().is_err() {
+        // パニック時（スタックオーバーフロー等）はそのまま異常終了
+        std::process::exit(1);
+    }
+}
+
+fn run() {
     let args: Vec<String> = std_env::args().collect();
 
     // --vm フラグの検出
