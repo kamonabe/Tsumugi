@@ -21,7 +21,7 @@ enum EvalResult {
 const DEFAULT_MAX_STEPS: u64 = 1_000_000;
 
 /// コールフレーム深度の上限（スタックオーバーフロー防止）
-const MAX_CALL_DEPTH: usize = 256;
+const MAX_CALL_DEPTH: usize = 128;
 
 /// 環境変数からステップ上限を読み取る
 fn resolve_max_steps() -> u64 {
@@ -665,7 +665,10 @@ impl Evaluator {
         if self.call_stack.len() >= MAX_CALL_DEPTH {
             return Err(TsumugiError::runtime(
                 line,
-                format!("スタックオーバーフロー: 再帰が深すぎます (上限: {})", MAX_CALL_DEPTH),
+                format!(
+                    "スタックオーバーフロー: 再帰が深すぎます (上限: {})",
+                    MAX_CALL_DEPTH
+                ),
             ));
         }
 

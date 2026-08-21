@@ -24,7 +24,7 @@ struct CallFrame {
 const DEFAULT_MAX_STEPS: u64 = 1_000_000;
 
 /// コールフレーム深度の上限（スタックオーバーフロー防止）
-const MAX_CALL_DEPTH: usize = 256;
+const MAX_CALL_DEPTH: usize = 128;
 
 /// 環境変数からステップ上限を読み取る
 fn vm_resolve_max_steps() -> u64 {
@@ -346,7 +346,10 @@ impl Vm {
                 if self.frames.len() >= MAX_CALL_DEPTH {
                     return Err(TsumugiError::Runtime {
                         line,
-                        message: format!("スタックオーバーフロー: 再帰が深すぎます (上限: {})", MAX_CALL_DEPTH),
+                        message: format!(
+                            "スタックオーバーフロー: 再帰が深すぎます (上限: {})",
+                            MAX_CALL_DEPTH
+                        ),
                         trace: Vec::new(),
                     });
                 }
