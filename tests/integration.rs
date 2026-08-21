@@ -449,6 +449,20 @@ fn vm_error_step_limit() {
     assert!(!output.status.success());
 }
 
+// =============================================================
+// スタックオーバーフロー（コールフレーム深度制限）テスト
+// =============================================================
+
+#[test]
+fn error_stack_overflow() {
+    run_error_test("error_stack_overflow");
+}
+
+#[test]
+fn vm_error_stack_overflow() {
+    run_error_test_vm("error_stack_overflow");
+}
+
 #[test]
 fn error_sandbox() {
     let dir = fixtures_dir();

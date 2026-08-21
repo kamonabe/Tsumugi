@@ -23,6 +23,9 @@ struct CallFrame {
 /// デフォルトのステップ上限（100万）
 const DEFAULT_MAX_STEPS: u64 = 1_000_000;
 
+/// コールフレーム深度の上限（スタックオーバーフロー防止）
+const MAX_CALL_DEPTH: usize = 256;
+
 /// 環境変数からステップ上限を読み取る
 fn vm_resolve_max_steps() -> u64 {
     std::env::var("TSUMUGI_MAX_STEPS")
@@ -340,6 +343,13 @@ impl Vm {
             }
             OpCode::Call(arg_count) => {
                 self.count_step(line)?;
+                if self.frames.len() >= MAX_CALL_DEPTH {
+                    return Err(TsumugiError::Runtime {
+                        line,
+                        message: format!("スタックオーバーフロー: 再帰が深すぎます (上限: {})", MAX_CALL_DEPTH),
+                        trace: Vec::new(),
+                    });
+                }
                 let fn_pos = self.stack.len() - 1 - arg_count;
                 let fn_value = self.stack[fn_pos].clone();
                 if let Value::VmFn {
@@ -710,6 +720,7 @@ impl Vm {
         args: Vec<Value>,
         line: usize,
     ) -> Result<Value, TsumugiError> {
+        self.count_step(line)?;
         if let Value::VmFn {
             arity,
             chunk,

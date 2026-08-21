@@ -554,6 +554,10 @@ fn is_env_key_allowed(key: &str) -> bool {
 pub fn builtin_env(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("env", args, 1, line)?;
     if let Value::Str(key) = &args[0] {
+        // ランタイム制御用の環境変数はスクリプトからアクセス不可
+        if key.starts_with("TSUMUGI_") {
+            return Ok(Value::Null);
+        }
         if !is_env_key_allowed(key) {
             // 許可リスト外のキーへのアクセスは null を返す（エラーにはしない）
             return Ok(Value::Null);
