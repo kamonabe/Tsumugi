@@ -254,7 +254,8 @@ impl Lexer {
                     }
                     // 単独の '}' はエラー
                     return Token::Error(
-                        "f-string: 対応しない '}' があります（'}}' でエスケープしてください）".into(),
+                        "f-string: 対応しない '}' があります（'}}' でエスケープしてください）"
+                            .into(),
                     );
                 }
                 Some('\\') => {
@@ -330,8 +331,9 @@ impl Lexer {
                     loop {
                         match self.peek() {
                             None | Some('\n') => {
-                                return Err("f-string: 式中の文字列リテラルが閉じられていません"
-                                    .into());
+                                return Err(
+                                    "f-string: 式中の文字列リテラルが閉じられていません".into()
+                                );
                             }
                             Some('\\') => {
                                 expr_chars.push('\\');

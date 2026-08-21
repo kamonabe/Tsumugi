@@ -812,11 +812,7 @@ impl Parser {
     }
 
     /// f-string のトークンパーツを AST に変換する
-    fn parse_fstr(
-        &mut self,
-        parts: Vec<FStrPart>,
-        line: usize,
-    ) -> Result<Expr, TsumugiError> {
+    fn parse_fstr(&mut self, parts: Vec<FStrPart>, line: usize) -> Result<Expr, TsumugiError> {
         let mut ast_parts: Vec<FStrExprPart> = Vec::new();
 
         for part in parts {
@@ -834,10 +830,7 @@ impl Parser {
                     let mut sub_parser = Parser::new(expr_tokens);
                     let expr = sub_parser.parse_expr().map_err(|e| {
                         // サブパーサーのエラーに f-string のコンテキストを付加
-                        TsumugiError::parse(
-                            line,
-                            format!("f-string内の式のパースに失敗: {}", e),
-                        )
+                        TsumugiError::parse(line, format!("f-string内の式のパースに失敗: {}", e))
                     })?;
                     ast_parts.push(FStrExprPart::Expr(Box::new(expr)));
                 }
