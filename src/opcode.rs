@@ -105,4 +105,8 @@ pub enum OpCode {
 
     /// 例外ハンドラを解除する（try ブロック正常完了時）
     TeardownTry,
+
+    /// f-string 連結: スタックから N 個の値を pop して文字列として連結
+    /// operand: パーツ数
+    FStrConcat(usize),
 }

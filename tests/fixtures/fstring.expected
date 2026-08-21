@@ -1,0 +1,15 @@
+hello, world
+2 + 3 = 5
+10 + 20 = 30
+count is 42
+no interpolation here
+startend
+len = 5
+use {braces} like this
+flag: true, null: null
+items: [1, 2, 3]
+dict: {"a": 1, "b": 2}
+is big: true
+123
+line1
+line2

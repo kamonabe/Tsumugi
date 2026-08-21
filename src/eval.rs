@@ -493,6 +493,20 @@ impl Evaluator {
                 let idx = self.eval_expr(index, line)?;
                 self.eval_index(&obj, &idx, line)
             }
+
+            Expr::FStr(parts) => {
+                let mut result = String::new();
+                for part in parts {
+                    match part {
+                        FStrExprPart::Literal(s) => result.push_str(s),
+                        FStrExprPart::Expr(expr) => {
+                            let val = self.eval_expr(expr, line)?;
+                            result.push_str(&val.to_string());
+                        }
+                    }
+                }
+                Ok(Value::Str(result))
+            }
         }
     }
 

@@ -1,0 +1,50 @@
+# f-string 基本テスト
+
+# 変数の埋め込み
+let name = "world"
+print(f"hello, {name}")
+
+# 式の埋め込み
+print(f"2 + 3 = {2 + 3}")
+
+# 複数の式
+let x = 10
+let y = 20
+print(f"{x} + {y} = {x + y}")
+
+# 型変換（数値が自動的に文字列化される）
+let count = 42
+print(f"count is {count}")
+
+# リテラルのみ（式なし）
+print(f"no interpolation here")
+
+# 空文字列
+let empty = ""
+print(f"start{empty}end")
+
+# ネストした関数呼び出し
+print(f"len = {len("hello")}")
+
+# ブレースのエスケープ
+print(f"use {{braces}} like this")
+
+# bool と null
+let flag = true
+print(f"flag: {flag}, null: {null}")
+
+# リストと辞書の埋め込み
+let items = [1, 2, 3]
+print(f"items: {items}")
+
+let d = {"a": 1, "b": 2}
+print(f"dict: {d}")
+
+# 式中の比較
+print(f"is big: {x > 5}")
+
+# 連続する式
+print(f"{1}{2}{3}")
+
+# エスケープシーケンス
+print(f"line1\nline2")

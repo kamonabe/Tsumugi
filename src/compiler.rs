@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use crate::ast::{BinOpKind, Expr, Program, Stmt, UnaryOpKind};
+use crate::ast::{BinOpKind, Expr, FStrExprPart, Program, Stmt, UnaryOpKind};
 use crate::chunk::Chunk;
 use crate::error::TsumugiError;
 use crate::opcode::OpCode;
@@ -729,6 +729,20 @@ impl Compiler {
             }
             Expr::Lambda { params, body } => {
                 self.compile_lambda(params, body, line)?;
+            }
+            Expr::FStr(parts) => {
+                let part_count = parts.len();
+                for part in parts {
+                    match part {
+                        FStrExprPart::Literal(s) => {
+                            self.chunk.emit_constant(Value::Str(s.clone()), line);
+                        }
+                        FStrExprPart::Expr(expr) => {
+                            self.compile_expr(expr, line)?;
+                        }
+                    }
+                }
+                self.chunk.emit(OpCode::FStrConcat(part_count), line);
             }
         }
         Ok(())

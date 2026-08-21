@@ -30,6 +30,10 @@ cargo run
 let name = "tsumugi"
 print("hello, " + name)
 
+# f-string（文字列補間）
+let version = 1
+print(f"running {name} v{version}")
+
 fn add(a, b)
     return a + b
 end
@@ -75,6 +79,7 @@ print(square(5))    # 25
 ## 対応機能
 
 - 整数・浮動小数点・文字列・真偽値・null
+- f-string（文字列補間: `f"hello, {expr}"`）
 - リスト (`[1, 2, 3]`) と辞書 (`{"key": value}`)
 - 変数束縛 (`let`) と再代入 (`x = expr`)
 - インデックスアクセス (`xs[0]`, `d["key"]`) と代入 (`xs[0] = val`)

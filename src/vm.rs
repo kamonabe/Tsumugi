@@ -509,6 +509,16 @@ impl Vm {
                 let result = self.exec_builtin(name, args, line)?;
                 self.stack.push(result);
             }
+            OpCode::FStrConcat(count) => {
+                // スタックから count 個の値を取り出して文字列に連結
+                let start = self.stack.len() - count;
+                let parts: Vec<Value> = self.stack.drain(start..).collect();
+                let mut result = String::new();
+                for val in parts {
+                    result.push_str(&val.to_string());
+                }
+                self.stack.push(Value::Str(result));
+            }
             OpCode::ReturnValue | OpCode::Return => {
                 // これらは run() / call_fn_value で処理済み、ここに来ない
                 unreachable!()
