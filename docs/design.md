@@ -1,6 +1,6 @@
 # Tsumugi — 設計ドキュメント
 
-最終更新: 2026-08-19
+最終更新: 2026-08-21
 
 ## 目的
 
@@ -210,7 +210,8 @@ let result = filter(test, fn(item) item != "kani" end)
 - `TsumugiError` enum でパースエラー（`Parse`）とランタイムエラー（`Runtime`）を構造的に区別
 - 各バリアントに `line: usize` と `message: String` を保持
 - `Display` 実装で「N行目: メッセージ」形式の出力を生成（従来と同じ形式を維持）
-- `From<String>` を実装し、既存の `format!("{}行目: ...")` パターンからの段階的移行を可能にしている
+- 全箇所で `TsumugiError::runtime(line, msg)` / `TsumugiError::parse(line, msg)` コンストラクタを使用
+- `From<String>` は廃止済み — 文字列の再パースに頼らず、行番号を構造として保持する方式に統一
 
 ## テスト設計
 

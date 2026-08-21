@@ -91,18 +91,16 @@ impl Evaluator {
             match self.exec_stmt(stmt)? {
                 EvalResult::Return(_) => break,
                 EvalResult::Break => {
-                    return Err(format!(
-                        "{}行目: break はループの中でのみ使用できます",
-                        stmt.line()
-                    )
-                    .into());
+                    return Err(TsumugiError::runtime(
+                        stmt.line(),
+                        "break はループの中でのみ使用できます",
+                    ));
                 }
                 EvalResult::Continue => {
-                    return Err(format!(
-                        "{}行目: continue はループの中でのみ使用できます",
-                        stmt.line()
-                    )
-                    .into());
+                    return Err(TsumugiError::runtime(
+                        stmt.line(),
+                        "continue はループの中でのみ使用できます",
+                    ));
                 }
                 EvalResult::Val => {}
             }
@@ -173,7 +171,10 @@ impl Evaluator {
             Stmt::Assign { name, value, line } => {
                 let val = self.eval_expr(value, *line)?;
                 if self.env.update(name, val).is_err() {
-                    return Err(format!("{}行目: 未定義の変数に代入: {}", line, name).into());
+                    return Err(TsumugiError::runtime(
+                        *line,
+                        format!("未定義の変数に代入: {}", name),
+                    ));
                 }
                 Ok(EvalResult::Val)
             }
@@ -191,16 +192,15 @@ impl Evaluator {
                 let var_name = match object {
                     Expr::Ident(name) => name.clone(),
                     _ => {
-                        return Err(format!(
-                            "{}行目: インデックス代入の対象は変数である必要があります",
-                            line
-                        )
-                        .into());
+                        return Err(TsumugiError::runtime(
+                            *line,
+                            "インデックス代入の対象は変数である必要があります",
+                        ));
                     }
                 };
 
                 let target = self.env.get_mut(&var_name).ok_or_else(|| {
-                    TsumugiError::from(format!("{}行目: 未定義の変数: {}", line, var_name))
+                    TsumugiError::runtime(*line, format!("未定義の変数: {}", var_name))
                 })?;
 
                 match target {
@@ -208,21 +208,19 @@ impl Evaluator {
                         let i = match &idx {
                             Value::Int(n) => *n,
                             _ => {
-                                return Err(format!(
-                                    "{}行目: リストのインデックスは整数である必要があります",
-                                    line
-                                )
-                                .into());
+                                return Err(TsumugiError::runtime(
+                                    *line,
+                                    "リストのインデックスは整数である必要があります",
+                                ));
                             }
                         };
                         let len = list.len() as i64;
                         let actual_idx = if i < 0 { len + i } else { i };
                         if actual_idx < 0 || actual_idx >= len {
-                            return Err(format!(
-                                "{}行目: インデックス範囲外: {} (長さ: {})",
-                                line, i, len
-                            )
-                            .into());
+                            return Err(TsumugiError::runtime(
+                                *line,
+                                format!("インデックス範囲外: {} (長さ: {})", i, len),
+                            ));
                         }
                         list[actual_idx as usize] = val;
                     }
@@ -230,21 +228,19 @@ impl Evaluator {
                         let key = match &idx {
                             Value::Str(s) => s.clone(),
                             _ => {
-                                return Err(format!(
-                                    "{}行目: 辞書のキーは文字列である必要があります",
-                                    line
-                                )
-                                .into());
+                                return Err(TsumugiError::runtime(
+                                    *line,
+                                    "辞書のキーは文字列である必要があります",
+                                ));
                             }
                         };
                         map.insert(key, val);
                     }
                     _ => {
-                        return Err(format!(
-                            "{}行目: インデックス代入はリストまたは辞書にのみ使用できます",
-                            line
-                        )
-                        .into());
+                        return Err(TsumugiError::runtime(
+                            *line,
+                            "インデックス代入はリストまたは辞書にのみ使用できます",
+                        ));
                     }
                 }
 
@@ -319,11 +315,10 @@ impl Evaluator {
                     Value::Dict(map) => map.keys().map(|k| Value::Str(k.clone())).collect(),
                     Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
                     _ => {
-                        return Err(format!(
-                            "{}行目: for で反復できません: {:?}",
-                            line, collection
-                        )
-                        .into());
+                        return Err(TsumugiError::runtime(
+                            *line,
+                            format!("for で反復できません: {:?}", collection),
+                        ));
                     }
                 };
 
@@ -445,11 +440,10 @@ impl Evaluator {
                     let key = match self.eval_expr(key_expr, line)? {
                         Value::Str(s) => s,
                         other => {
-                            return Err(format!(
-                                "{}行目: 辞書のキーは文字列である必要があります。got: {:?}",
-                                line, other
-                            )
-                            .into());
+                            return Err(TsumugiError::runtime(
+                                line,
+                                format!("辞書のキーは文字列である必要があります。got: {:?}", other),
+                            ));
                         }
                     };
                     let val = self.eval_expr(val_expr, line)?;
@@ -458,11 +452,11 @@ impl Evaluator {
                 Ok(Value::Dict(map))
             }
 
-            Expr::Ident(name) => {
-                self.env.get(name).cloned().ok_or_else(|| {
-                    TsumugiError::from(format!("{}行目: 未定義の変数: {}", line, name))
-                })
-            }
+            Expr::Ident(name) => self
+                .env
+                .get(name)
+                .cloned()
+                .ok_or_else(|| TsumugiError::runtime(line, format!("未定義の変数: {}", name))),
 
             Expr::BinOp { left, op, right } => {
                 let l = self.eval_expr(left, line)?;
@@ -508,9 +502,10 @@ impl Evaluator {
                 let len = list.len() as i64;
                 let actual = if *i < 0 { len + *i } else { *i };
                 if actual < 0 || actual >= len {
-                    return Err(
-                        format!("{}行目: インデックス範囲外: {} (長さ: {})", line, i, len).into(),
-                    );
+                    return Err(TsumugiError::runtime(
+                        line,
+                        format!("インデックス範囲外: {} (長さ: {})", i, len),
+                    ));
                 }
                 Ok(list[actual as usize].clone())
             }
@@ -519,18 +514,18 @@ impl Evaluator {
                 let len = s.chars().count() as i64;
                 let actual = if *i < 0 { len + *i } else { *i };
                 if actual < 0 || actual >= len {
-                    return Err(
-                        format!("{}行目: インデックス範囲外: {} (長さ: {})", line, i, len).into(),
-                    );
+                    return Err(TsumugiError::runtime(
+                        line,
+                        format!("インデックス範囲外: {} (長さ: {})", i, len),
+                    ));
                 }
                 let ch = s.chars().nth(actual as usize).unwrap();
                 Ok(Value::Str(ch.to_string()))
             }
-            _ => Err(format!(
-                "{}行目: インデックスアクセスできません: {:?}[{:?}]",
-                line, object, index
-            )
-            .into()),
+            _ => Err(TsumugiError::runtime(
+                line,
+                format!("インデックスアクセスできません: {:?}[{:?}]", object, index),
+            )),
         }
     }
 
@@ -549,14 +544,14 @@ impl Evaluator {
             (Value::Int(l), BinOpKind::Mul, Value::Int(r)) => Ok(Value::Int(l * r)),
             (Value::Int(l), BinOpKind::Div, Value::Int(r)) => {
                 if *r == 0 {
-                    Err(format!("{}行目: ゼロ除算", line).into())
+                    Err(TsumugiError::runtime(line, "ゼロ除算"))
                 } else {
                     Ok(Value::Int(l / r))
                 }
             }
             (Value::Int(l), BinOpKind::Mod, Value::Int(r)) => {
                 if *r == 0 {
-                    Err(format!("{}行目: ゼロ除算", line).into())
+                    Err(TsumugiError::runtime(line, "ゼロ除算"))
                 } else {
                     Ok(Value::Int(l % r))
                 }
@@ -612,11 +607,10 @@ impl Evaluator {
             (l, BinOpKind::And, r) => Ok(Value::Bool(l.is_truthy() && r.is_truthy())),
             (l, BinOpKind::Or, r) => Ok(Value::Bool(l.is_truthy() || r.is_truthy())),
 
-            _ => Err(format!(
-                "{}行目: 型エラー: {:?} {:?} {:?} は計算できません",
-                line, left, op, right
-            )
-            .into()),
+            _ => Err(TsumugiError::runtime(
+                line,
+                format!("型エラー: {:?} {:?} {:?} は計算できません", left, op, right),
+            )),
         }
     }
 
@@ -631,11 +625,10 @@ impl Evaluator {
             (UnaryOpKind::Neg, Value::Int(n)) => Ok(Value::Int(-n)),
             (UnaryOpKind::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
             (UnaryOpKind::Not, v) => Ok(Value::Bool(!v.is_truthy())),
-            _ => Err(format!(
-                "{}行目: 型エラー: {:?} {:?} は計算できません",
-                line, op, val
-            )
-            .into()),
+            _ => Err(TsumugiError::runtime(
+                line,
+                format!("型エラー: {:?} {:?} は計算できません", op, val),
+            )),
         }
     }
 
@@ -669,11 +662,10 @@ impl Evaluator {
                         captured,
                     } => (fn_name, params, body, captured),
                     _ => {
-                        return Err(format!(
-                            "{}行目: 関数ではない値を呼び出そうとしました: {}",
-                            line, val
-                        )
-                        .into());
+                        return Err(TsumugiError::runtime(
+                            line,
+                            format!("関数ではない値を呼び出そうとしました: {}", val),
+                        ));
                     }
                 }
             } else if let Some(func) = self.env.functions.get(name).cloned() {
@@ -685,7 +677,10 @@ impl Evaluator {
                     std::collections::HashMap::new(),
                 )
             } else {
-                return Err(format!("{}行目: 未定義の関数: {}", line, name).into());
+                return Err(TsumugiError::runtime(
+                    line,
+                    format!("未定義の関数: {}", name),
+                ));
             }
         } else {
             // 識別子以外（式の評価結果を呼び出す）
@@ -698,24 +693,24 @@ impl Evaluator {
                     captured,
                 } => (name, params, body, captured),
                 _ => {
-                    return Err(format!(
-                        "{}行目: 関数ではない値を呼び出そうとしました: {}",
-                        line, func_value
-                    )
-                    .into());
+                    return Err(TsumugiError::runtime(
+                        line,
+                        format!("関数ではない値を呼び出そうとしました: {}", func_value),
+                    ));
                 }
             }
         };
 
         if args.len() != params.len() {
-            return Err(format!(
-                "{}行目: 関数 {} は引数{}個ですが、{}個渡されました",
+            return Err(TsumugiError::runtime(
                 line,
-                func_name,
-                params.len(),
-                args.len()
-            )
-            .into());
+                format!(
+                    "関数 {} は引数{}個ですが、{}個渡されました",
+                    func_name,
+                    params.len(),
+                    args.len()
+                ),
+            ));
         }
 
         // 引数を評価
@@ -750,16 +745,18 @@ impl Evaluator {
                 Ok(EvalResult::Break) => {
                     self.call_stack.pop();
                     self.env.pop_scope();
-                    return Err(
-                        format!("{}行目: break はループの中でのみ使用できます", line).into(),
-                    );
+                    return Err(TsumugiError::runtime(
+                        line,
+                        "break はループの中でのみ使用できます",
+                    ));
                 }
                 Ok(EvalResult::Continue) => {
                     self.call_stack.pop();
                     self.env.pop_scope();
-                    return Err(
-                        format!("{}行目: continue はループの中でのみ使用できます", line).into(),
-                    );
+                    return Err(TsumugiError::runtime(
+                        line,
+                        "continue はループの中でのみ使用できます",
+                    ));
                 }
                 Ok(EvalResult::Val) => {}
                 Err(e) => {

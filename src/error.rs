@@ -39,7 +39,6 @@ impl TsumugiError {
     }
 
     /// ランタイムエラーを生成する
-    #[allow(dead_code)]
     pub fn runtime(line: usize, message: impl Into<String>) -> Self {
         Self::Runtime {
             line,
@@ -103,26 +102,3 @@ impl fmt::Display for TsumugiError {
 }
 
 impl std::error::Error for TsumugiError {}
-
-/// 「N行目: メッセージ」形式の文字列から TsumugiError::Runtime に変換する。
-/// パターンに一致しない場合は行番号0のランタイムエラーとする。
-impl From<String> for TsumugiError {
-    fn from(s: String) -> Self {
-        // "N行目: message" パターンを解析
-        if let Some(idx) = s.find("行目: ")
-            && let Ok(line) = s[..idx].parse::<usize>()
-        {
-            let message = s[idx + "行目: ".len()..].to_string();
-            return Self::Runtime {
-                line,
-                message,
-                trace: Vec::new(),
-            };
-        }
-        Self::Runtime {
-            line: 0,
-            message: s,
-            trace: Vec::new(),
-        }
-    }
-}

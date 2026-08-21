@@ -28,14 +28,15 @@ impl Evaluator {
                 captured,
             } => {
                 if arg_values.len() != params.len() {
-                    return Err(format!(
-                        "{}行目: 関数 {} は引数{}個ですが、{}個渡されました",
+                    return Err(TsumugiError::runtime(
                         line,
-                        name,
-                        params.len(),
-                        arg_values.len()
-                    )
-                    .into());
+                        format!(
+                            "関数 {} は引数{}個ですが、{}個渡されました",
+                            name,
+                            params.len(),
+                            arg_values.len()
+                        ),
+                    ));
                 }
                 self.env.push_scope();
                 for (k, v) in captured {
@@ -73,11 +74,10 @@ impl Evaluator {
                 self.env.pop_scope();
                 Ok(result)
             }
-            _ => Err(format!(
-                "{}行目: 関数ではない値を呼び出そうとしました: {}",
-                line, func
-            )
-            .into()),
+            _ => Err(TsumugiError::runtime(
+                line,
+                format!("関数ではない値を呼び出そうとしました: {}", func),
+            )),
         }
     }
 
@@ -141,12 +141,10 @@ impl Evaluator {
             }
             "input" => {
                 if !args.is_empty() {
-                    return Err(format!(
-                        "{}行目: input() は引数0個ですが、{}個渡されました",
+                    return Err(TsumugiError::runtime(
                         line,
-                        args.len()
-                    )
-                    .into());
+                        format!("input() は引数0個ですが、{}個渡されました", args.len()),
+                    ));
                 }
                 let stdin = io::stdin();
                 let mut line_buf = String::new();
@@ -166,24 +164,20 @@ impl Evaluator {
             }
             "args" => {
                 if !args.is_empty() {
-                    return Err(format!(
-                        "{}行目: args() は引数0個ですが、{}個渡されました",
+                    return Err(TsumugiError::runtime(
                         line,
-                        args.len()
-                    )
-                    .into());
+                        format!("args() は引数0個ですが、{}個渡されました", args.len()),
+                    ));
                 }
                 let argv: Vec<Value> = std::env::args().skip(2).map(Value::Str).collect();
                 Ok(Some(Value::List(argv)))
             }
             "exit" => {
                 if args.len() > 1 {
-                    return Err(format!(
-                        "{}行目: exit() は引数0〜1個ですが、{}個渡されました",
+                    return Err(TsumugiError::runtime(
                         line,
-                        args.len()
-                    )
-                    .into());
+                        format!("exit() は引数0〜1個ですが、{}個渡されました", args.len()),
+                    ));
                 }
                 let code = if args.is_empty() {
                     0
@@ -191,11 +185,10 @@ impl Evaluator {
                     match self.eval_expr(&args[0], line)? {
                         Value::Int(n) => n as i32,
                         _ => {
-                            return Err(format!(
-                                "{}行目: exit() の引数は整数である必要があります",
-                                line
-                            )
-                            .into());
+                            return Err(TsumugiError::runtime(
+                                line,
+                                "exit() の引数は整数である必要があります",
+                            ));
                         }
                     }
                 };
@@ -218,93 +211,87 @@ impl Evaluator {
         match name {
             "push" => {
                 if args.len() != 2 {
-                    return Err(format!(
-                        "{}行目: push() は引数2個ですが、{}個渡されました",
+                    return Err(TsumugiError::runtime(
                         line,
-                        args.len()
-                    )
-                    .into());
+                        format!("push() は引数2個ですが、{}個渡されました", args.len()),
+                    ));
                 }
                 let var_name = match &args[0] {
                     Expr::Ident(name) => name.clone(),
                     _ => {
-                        return Err(format!(
-                            "{}行目: push() の第1引数はリスト変数である必要があります",
-                            line
-                        )
-                        .into());
+                        return Err(TsumugiError::runtime(
+                            line,
+                            "push() の第1引数はリスト変数である必要があります",
+                        ));
                     }
                 };
                 let val = self.eval_expr(&args[1], line)?;
-                let target = self
-                    .env
-                    .get_mut(&var_name)
-                    .ok_or_else(|| format!("{}行目: 未定義の変数: {}", line, var_name))?;
+                let target = self.env.get_mut(&var_name).ok_or_else(|| {
+                    TsumugiError::runtime(line, format!("未定義の変数: {}", var_name))
+                })?;
                 match target {
                     Value::List(list) => {
                         list.push(val);
                     }
                     _ => {
-                        return Err(
-                            format!("{}行目: push() はリストにのみ使用できます", line).into()
-                        );
+                        return Err(TsumugiError::runtime(
+                            line,
+                            "push() はリストにのみ使用できます",
+                        ));
                     }
                 }
                 Ok(Some(Value::Null))
             }
             "pop" => {
                 if args.len() != 1 {
-                    return Err(format!(
-                        "{}行目: pop() は引数1個ですが、{}個渡されました",
+                    return Err(TsumugiError::runtime(
                         line,
-                        args.len()
-                    )
-                    .into());
+                        format!("pop() は引数1個ですが、{}個渡されました", args.len()),
+                    ));
                 }
                 let var_name = match &args[0] {
                     Expr::Ident(name) => name.clone(),
                     _ => {
-                        return Err(format!(
-                            "{}行目: pop() の引数はリスト変数である必要があります",
-                            line
-                        )
-                        .into());
+                        return Err(TsumugiError::runtime(
+                            line,
+                            "pop() の引数はリスト変数である必要があります",
+                        ));
                     }
                 };
-                let target = self
-                    .env
-                    .get_mut(&var_name)
-                    .ok_or_else(|| format!("{}行目: 未定義の変数: {}", line, var_name))?;
+                let target = self.env.get_mut(&var_name).ok_or_else(|| {
+                    TsumugiError::runtime(line, format!("未定義の変数: {}", var_name))
+                })?;
                 match target {
                     Value::List(list) => {
                         if list.is_empty() {
-                            return Err(
-                                format!("{}行目: 空のリストから pop できません", line).into()
-                            );
+                            return Err(TsumugiError::runtime(
+                                line,
+                                "空のリストから pop できません",
+                            ));
                         }
                         let val = list.pop().unwrap();
                         Ok(Some(val))
                     }
-                    _ => Err(format!("{}行目: pop() はリストにのみ使用できます", line).into()),
+                    _ => Err(TsumugiError::runtime(
+                        line,
+                        "pop() はリストにのみ使用できます",
+                    )),
                 }
             }
             "map" => {
                 if args.len() != 2 {
-                    return Err(format!(
-                        "{}行目: map() は引数2個ですが、{}個渡されました",
+                    return Err(TsumugiError::runtime(
                         line,
-                        args.len()
-                    )
-                    .into());
+                        format!("map() は引数2個ですが、{}個渡されました", args.len()),
+                    ));
                 }
                 let list = match self.eval_expr(&args[0], line)? {
                     Value::List(v) => v,
                     _ => {
-                        return Err(format!(
-                            "{}行目: map() の第1引数はリストである必要があります",
-                            line
-                        )
-                        .into());
+                        return Err(TsumugiError::runtime(
+                            line,
+                            "map() の第1引数はリストである必要があります",
+                        ));
                     }
                 };
                 let func = self.eval_expr(&args[1], line)?;
@@ -317,21 +304,18 @@ impl Evaluator {
             }
             "filter" => {
                 if args.len() != 2 {
-                    return Err(format!(
-                        "{}行目: filter() は引数2個ですが、{}個渡されました",
+                    return Err(TsumugiError::runtime(
                         line,
-                        args.len()
-                    )
-                    .into());
+                        format!("filter() は引数2個ですが、{}個渡されました", args.len()),
+                    ));
                 }
                 let list = match self.eval_expr(&args[0], line)? {
                     Value::List(v) => v,
                     _ => {
-                        return Err(format!(
-                            "{}行目: filter() の第1引数はリストである必要があります",
-                            line
-                        )
-                        .into());
+                        return Err(TsumugiError::runtime(
+                            line,
+                            "filter() の第1引数はリストである必要があります",
+                        ));
                     }
                 };
                 let func = self.eval_expr(&args[1], line)?;
@@ -346,21 +330,18 @@ impl Evaluator {
             }
             "each" => {
                 if args.len() != 2 {
-                    return Err(format!(
-                        "{}行目: each() は引数2個ですが、{}個渡されました",
+                    return Err(TsumugiError::runtime(
                         line,
-                        args.len()
-                    )
-                    .into());
+                        format!("each() は引数2個ですが、{}個渡されました", args.len()),
+                    ));
                 }
                 let list = match self.eval_expr(&args[0], line)? {
                     Value::List(v) => v,
                     _ => {
-                        return Err(format!(
-                            "{}行目: each() の第1引数はリストである必要があります",
-                            line
-                        )
-                        .into());
+                        return Err(TsumugiError::runtime(
+                            line,
+                            "each() の第1引数はリストである必要があります",
+                        ));
                     }
                 };
                 let func = self.eval_expr(&args[1], line)?;
