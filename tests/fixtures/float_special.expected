@@ -1,0 +1,10 @@
+4
+3.3333333333333335
+7
+inf
+NaN
+inf
+inf
+inf比較エラー: 型エラー: Float(inf) Eq Float(inf) は計算できません
+nan比較エラー: 型エラー: Float(NaN) Eq Float(NaN) は計算できません
+完了

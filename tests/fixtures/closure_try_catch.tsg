@@ -1,0 +1,86 @@
+# クロージャ × try/catch 複合テスト
+#
+# クロージャ内で発生したエラーが try/catch で正しくキャッチされること、
+# キャッチ後もクロージャの状態が壊れないことを検証する。
+
+# 1. クロージャ内のゼロ除算をキャッチ
+fn make_divider(n)
+    return fn(x) return n / x end
+end
+
+let div10 = make_divider(10)
+try
+    let result = div10(0)
+catch e
+    print("1: " + e)
+end
+
+# キャッチ後もクロージャは正常に使える
+print("2: " + to_str(div10(2)))
+
+# 2. クロージャが別のクロージャを呼び、その中でエラー発生
+fn make_chain(a, b)
+    let inner = fn(x) return a / x end
+    return fn(x) return inner(x) + b end
+end
+
+let chain = make_chain(10, 5)
+try
+    chain(0)
+catch e
+    print("3: " + e)
+end
+print("4: " + to_str(chain(2)))
+
+# 3. ループ内でクロージャ + try/catch
+fn make_validator(limit)
+    return fn(x)
+        if x > limit
+            # 範囲外の値でインデックスエラーを発生させる
+            let xs = [1, 2, 3]
+            return xs[x]
+        end
+        return x
+    end
+end
+
+let validate = make_validator(2)
+let results = []
+for i in [0, 1, 5, 2, 10]
+    try
+        push(results, validate(i))
+    catch e
+        push(results, "err")
+    end
+end
+print("5: " + to_str(results))
+
+# 4. ネストした try/catch とクロージャ
+fn make_safe_op(op)
+    return fn(a, b)
+        try
+            return op(a, b)
+        catch e
+            return "error: " + e
+        end
+    end
+end
+
+let safe_div = make_safe_op(fn(a, b) return a / b end)
+print("6: " + to_str(safe_div(10, 2)))
+print("7: " + safe_div(10, 0))
+
+# 5. map + try/catch: クロージャ内のエラーがmapを壊さないか
+let items = [2, 0, 4]
+let processed = []
+for item in items
+    try
+        let f = fn(x) return 100 / x end
+        push(processed, f(item))
+    catch e
+        push(processed, -1)
+    end
+end
+print("8: " + to_str(processed))
+
+print("9: 完了")
