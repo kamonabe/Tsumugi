@@ -6,25 +6,71 @@ use crate::token::{FStrPart, Spanned, Token};
 pub struct Parser {
     tokens: Vec<Spanned>,
     pos: usize,
+    errors: Vec<TsumugiError>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Spanned>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            errors: Vec::new(),
+        }
     }
 
     /// プログラム全体をパースする
-    pub fn parse(&mut self) -> Result<Program, TsumugiError> {
+    ///
+    /// エラー回復により複数のパースエラーをまとめて報告する。
+    /// エラーが1つ以上ある場合は Err(Vec<TsumugiError>) を返す。
+    pub fn parse(&mut self) -> Result<Program, Vec<TsumugiError>> {
         let mut stmts = Vec::new();
         self.skip_newlines();
 
         while !self.is_at_end() {
-            let stmt = self.parse_stmt()?;
-            stmts.push(stmt);
+            match self.parse_stmt() {
+                Ok(stmt) => stmts.push(stmt),
+                Err(e) => {
+                    self.errors.push(e);
+                    self.synchronize();
+                }
+            }
             self.skip_newlines();
         }
 
-        Ok(stmts)
+        if self.errors.is_empty() {
+            Ok(stmts)
+        } else {
+            Err(std::mem::take(&mut self.errors))
+        }
+    }
+
+    /// エラー回復: 次の文の境界までトークンを読み飛ばす
+    ///
+    /// 改行・EOF・文の先頭になりうるキーワードをリカバリポイントとする。
+    fn synchronize(&mut self) {
+        loop {
+            match self.peek_token() {
+                Token::Eof => break,
+                Token::Newline => {
+                    self.advance();
+                    break;
+                }
+                // 次の文の先頭になりうるキーワード
+                Token::Let
+                | Token::Fn
+                | Token::If
+                | Token::While
+                | Token::For
+                | Token::Return
+                | Token::Import
+                | Token::Try
+                | Token::Break
+                | Token::Continue => break,
+                _ => {
+                    self.advance();
+                }
+            }
+        }
     }
 
     // --- 文のパース ---
@@ -938,7 +984,7 @@ mod tests {
     use super::*;
     use crate::lexer::Lexer;
 
-    fn parse(input: &str) -> Result<Program, TsumugiError> {
+    fn parse(input: &str) -> Result<Program, Vec<TsumugiError>> {
         let tokens = Lexer::new(input).tokenize();
         Parser::new(tokens).parse()
     }
@@ -1010,8 +1056,25 @@ mod tests {
     fn error_has_line_number() {
         let result = parse("let x = 10\nlet = oops");
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.line(), 2, "error should be on line 2: {}", err);
+        let errors = result.unwrap_err();
+        assert!(!errors.is_empty());
+        assert_eq!(
+            errors[0].line(),
+            2,
+            "error should be on line 2: {}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn parse_multi_error_recovery() {
+        // 複数のエラーがまとめて報告されることを確認
+        let result = parse("let = oops\nlet y = 1\nlet = bad");
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 2, "should report 2 errors: {:?}", errors);
+        assert_eq!(errors[0].line(), 1);
+        assert_eq!(errors[1].line(), 3);
     }
 
     #[test]
@@ -1176,11 +1239,11 @@ mod tests {
     fn parse_import_error_no_string() {
         let result = parse("import 123");
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let errors = result.unwrap_err();
         assert!(
-            err.message().contains("文字列パス"),
+            errors[0].message().contains("文字列パス"),
             "error should mention string path: {}",
-            err
+            errors[0]
         );
     }
 }

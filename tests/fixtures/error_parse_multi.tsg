@@ -1,0 +1,5 @@
+let x = 10
+let = oops
+let y = 20
+let = bad
+print(y)

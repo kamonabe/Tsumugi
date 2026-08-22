@@ -82,8 +82,10 @@ fn run_file(path: &str) {
     let mut evaluator = Evaluator::new();
     evaluator.set_base_dir(std::path::Path::new(path));
 
-    if let Err(e) = execute(&source, &mut evaluator) {
-        eprintln!("{}", e);
+    if let Err(errors) = execute(&source, &mut evaluator) {
+        for e in &errors {
+            eprintln!("{}", e);
+        }
         std::process::exit(1);
     }
 }
@@ -120,8 +122,10 @@ fn run_repl() {
         }
 
         // 実行
-        if let Err(e) = execute(&input, &mut evaluator) {
-            eprintln!("  エラー: {}", e);
+        if let Err(errors) = execute(&input, &mut evaluator) {
+            for e in &errors {
+                eprintln!("  エラー: {}", e);
+            }
         }
 
         input.clear();
@@ -129,14 +133,14 @@ fn run_repl() {
 }
 
 /// ソースを実行する共通関数
-fn execute(source: &str, evaluator: &mut Evaluator) -> Result<(), error::TsumugiError> {
+fn execute(source: &str, evaluator: &mut Evaluator) -> Result<(), Vec<error::TsumugiError>> {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize();
 
     let mut parser = Parser::new(tokens);
     let program = parser.parse()?;
 
-    evaluator.run(&program)?;
+    evaluator.run(&program).map_err(|e| vec![e])?;
     Ok(())
 }
 
@@ -171,8 +175,10 @@ fn run_file_vm(path: &str) {
         }
     };
 
-    if let Err(e) = execute_vm_with_path(&source, path) {
-        eprintln!("{}", e);
+    if let Err(errors) = execute_vm_with_path(&source, path) {
+        for e in &errors {
+            eprintln!("{}", e);
+        }
         std::process::exit(1);
     }
 }
@@ -203,8 +209,10 @@ fn run_repl_vm() {
             continue;
         }
 
-        if let Err(e) = execute_vm(&input) {
-            eprintln!("  エラー: {}", e);
+        if let Err(errors) = execute_vm(&input) {
+            for e in &errors {
+                eprintln!("  エラー: {}", e);
+            }
         }
 
         input.clear();
@@ -212,20 +220,20 @@ fn run_repl_vm() {
 }
 
 /// VMモードの実行関数
-fn execute_vm(source: &str) -> Result<(), error::TsumugiError> {
+fn execute_vm(source: &str) -> Result<(), Vec<error::TsumugiError>> {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize();
 
     let mut parser = Parser::new(tokens);
     let program = parser.parse()?;
 
-    let chunk = Compiler::new().compile(&program)?;
+    let chunk = Compiler::new().compile(&program).map_err(|e| vec![e])?;
     let mut vm = Vm::new(chunk);
-    vm.run()
+    vm.run().map_err(|e| vec![e])
 }
 
 /// VMモードの実行関数（ファイルパス付き）
-fn execute_vm_with_path(source: &str, path: &str) -> Result<(), error::TsumugiError> {
+fn execute_vm_with_path(source: &str, path: &str) -> Result<(), Vec<error::TsumugiError>> {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize();
 
@@ -234,7 +242,7 @@ fn execute_vm_with_path(source: &str, path: &str) -> Result<(), error::TsumugiEr
 
     let mut compiler = Compiler::new();
     compiler.set_base_dir(std::path::Path::new(path));
-    let chunk = compiler.compile(&program)?;
+    let chunk = compiler.compile(&program).map_err(|e| vec![e])?;
     let mut vm = Vm::new(chunk);
-    vm.run()
+    vm.run().map_err(|e| vec![e])
 }

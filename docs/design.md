@@ -1,6 +1,6 @@
 # Tsumugi — 設計ドキュメント
 
-最終更新: 2026-08-21
+最終更新: 2026-08-22
 
 ## 目的
 
@@ -185,6 +185,10 @@ let result = filter(test, fn(item) item != "kani" end)
 - 演算子の優先順位（低→高）: or → and → 比較 → 加減 → 乗除 → 単項 → 関数呼び出し
 - ブロックは終端トークン（`end`, `else`）を目印に解析
 - エラー発生時に `Spanned.line` を参照して「N行目: ...」メッセージを生成
+- エラー回復: 1つ目のエラーで停止せず、複数のパースエラーをまとめて報告する
+  - `parse()` の戻り型は `Result<Program, Vec<TsumugiError>>`
+  - 文のパースに失敗したら `synchronize()` で次の文境界までスキップし、パースを継続する
+  - リカバリポイント: 改行 / EOF / 文の先頭キーワード（`let`, `fn`, `if`, `while`, `for`, `return`, `import`, `try`, `break`, `continue`）
 
 ### 評価器 (eval.rs)
 

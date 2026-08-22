@@ -345,6 +345,11 @@ fn error_parse() {
 }
 
 #[test]
+fn error_parse_multi() {
+    run_error_test("error_parse_multi");
+}
+
+#[test]
 fn error_type() {
     let dir = fixtures_dir();
     let script = dir.join("error_type.tsg");
@@ -643,6 +648,11 @@ fn vm_error_parse() {
         stderr
     );
     assert!(!output.status.success());
+}
+
+#[test]
+fn vm_error_parse_multi() {
+    run_error_test_vm("error_parse_multi");
 }
 
 #[test]

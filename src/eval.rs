@@ -151,9 +151,17 @@ impl Evaluator {
         let mut lexer = Lexer::new(&source);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(tokens);
-        let program = parser.parse().map_err(|e| TsumugiError::Runtime {
+        let program = parser.parse().map_err(|errors| TsumugiError::Runtime {
             line,
-            message: format!("import 失敗 ({}): {}", path, e),
+            message: format!(
+                "import 失敗 ({}): {}",
+                path,
+                errors
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
             trace: Vec::new(),
         })?;
 
@@ -820,7 +828,9 @@ mod tests {
 
     fn run_program(input: &str) -> Result<(), TsumugiError> {
         let tokens = Lexer::new(input).tokenize();
-        let program = Parser::new(tokens).parse()?;
+        let program = Parser::new(tokens)
+            .parse()
+            .map_err(|errors| errors.into_iter().next().unwrap())?;
         let mut eval = Evaluator::new();
         eval.run(&program)
     }

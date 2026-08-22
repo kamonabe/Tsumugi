@@ -987,7 +987,9 @@ mod tests {
         let mut lexer = Lexer::new(source);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(tokens);
-        let program = parser.parse()?;
+        let program = parser
+            .parse()
+            .map_err(|errors| errors.into_iter().next().unwrap())?;
         let chunk = Compiler::new().compile(&program)?;
         let mut vm = Vm::new(chunk);
         vm.run()
