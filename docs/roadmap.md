@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-08-22
+最終更新: 2026-08-23
 
 ## 実装済み
 
@@ -236,7 +236,7 @@ Tsumugi にはファイルI/O やサンドボックス機能が既に実装さ�
 
 | 項目 | 詳細 | 状態 |
 |---|---|---|
-| `OpCode::CallBuiltin` の String 除去 | 関数名を定数テーブルに移し `CallBuiltin(usize, usize)` にする | 未着手 |
+| `OpCode::CallBuiltin` の String 除去 | 関数名を定数テーブルに移し `CallBuiltin(usize, usize)` にする | ✅ 完了 |
 | `dispatch` の match 分割 | 算術・比較・制御フローをメソッドに分けて可読性向上 | 未着手 |
 
 ### レキサー / パーサーの堅牢性

@@ -669,8 +669,10 @@ impl Compiler {
                             for arg in args {
                                 self.compile_expr(arg, line)?;
                             }
+                            let name_idx =
+                                self.chunk.add_constant(Value::Str(name.clone()));
                             self.chunk
-                                .emit(OpCode::CallBuiltin(name.clone(), arg_count), line);
+                                .emit(OpCode::CallBuiltin(name_idx, arg_count), line);
                             if name == "push" {
                                 self.chunk.emit(OpCode::SetLocal(slot), line);
                                 self.chunk.emit(OpCode::Pop, line);
@@ -678,8 +680,11 @@ impl Compiler {
                             }
                             if name == "pop" {
                                 self.chunk.emit(OpCode::GetLocal(slot), line);
+                                let pop_update_idx = self
+                                    .chunk
+                                    .add_constant(Value::Str("__pop_update".to_string()));
                                 self.chunk
-                                    .emit(OpCode::CallBuiltin("__pop_update".to_string(), 1), line);
+                                    .emit(OpCode::CallBuiltin(pop_update_idx, 1), line);
                                 self.chunk.emit(OpCode::SetLocal(slot), line);
                                 self.chunk.emit(OpCode::Pop, line);
                             }
@@ -689,8 +694,10 @@ impl Compiler {
                         for arg in args {
                             self.compile_expr(arg, line)?;
                         }
+                        let name_idx =
+                            self.chunk.add_constant(Value::Str(name.clone()));
                         self.chunk
-                            .emit(OpCode::CallBuiltin(name.clone(), arg_count), line);
+                            .emit(OpCode::CallBuiltin(name_idx, arg_count), line);
                         return Ok(());
                     }
                 }

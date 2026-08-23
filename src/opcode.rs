@@ -93,8 +93,8 @@ pub enum OpCode {
     ToIterList,
 
     /// 組み込み関数呼び出し
-    /// operand: (関数名, 引数の数)
-    CallBuiltin(String, usize),
+    /// operand: (定数テーブル上の関数名インデックス, 引数の数)
+    CallBuiltin(usize, usize),
 
     /// プログラム終了
     Return,
