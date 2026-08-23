@@ -500,13 +500,24 @@ impl Vm {
                 };
                 self.stack.push(list);
             }
-            OpCode::CallBuiltin(ref name, arg_count) => {
+            OpCode::CallBuiltin(name_idx, arg_count) => {
+                let name = match &self.frames.last().unwrap().chunk.constants[name_idx] {
+                    Value::Str(s) => s.clone(),
+                    _ => {
+                        return Err(TsumugiError::Runtime {
+                            line,
+                            message: "内部エラー: CallBuiltin の関数名が文字列ではありません"
+                                .to_string(),
+                            trace: Vec::new(),
+                        });
+                    }
+                };
                 let mut args = Vec::with_capacity(arg_count);
                 for _ in 0..arg_count {
                     args.push(self.pop(line)?);
                 }
                 args.reverse();
-                let result = self.exec_builtin(name, args, line)?;
+                let result = self.exec_builtin(&name, args, line)?;
                 self.stack.push(result);
             }
             OpCode::FStrConcat(count) => {
