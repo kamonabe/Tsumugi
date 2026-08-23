@@ -669,8 +669,7 @@ impl Compiler {
                             for arg in args {
                                 self.compile_expr(arg, line)?;
                             }
-                            let name_idx =
-                                self.chunk.add_constant(Value::Str(name.clone()));
+                            let name_idx = self.chunk.add_constant(Value::Str(name.clone()));
                             self.chunk
                                 .emit(OpCode::CallBuiltin(name_idx, arg_count), line);
                             if name == "push" {
@@ -694,8 +693,7 @@ impl Compiler {
                         for arg in args {
                             self.compile_expr(arg, line)?;
                         }
-                        let name_idx =
-                            self.chunk.add_constant(Value::Str(name.clone()));
+                        let name_idx = self.chunk.add_constant(Value::Str(name.clone()));
                         self.chunk
                             .emit(OpCode::CallBuiltin(name_idx, arg_count), line);
                         return Ok(());
