@@ -1,29 +1,18 @@
 use std::collections::HashMap;
 
-use crate::ast::Stmt;
 use crate::value::Value;
 
-/// 関数定義を保持する構造体
-#[derive(Debug, Clone)]
-pub struct Function {
-    pub params: Vec<String>,
-    pub body: Vec<Stmt>,
-}
-
-/// 変数と関数のスコープを管理する環境
+/// 変数のスコープを管理する環境
 #[derive(Debug, Clone)]
 pub struct Env {
     /// スコープのスタック（末尾が現在のスコープ）
     scopes: Vec<HashMap<String, Value>>,
-    /// 関数定義（グローバル）
-    pub functions: HashMap<String, Function>,
 }
 
 impl Env {
     pub fn new() -> Self {
         Self {
             scopes: vec![HashMap::new()], // グローバルスコープ
-            functions: HashMap::new(),
         }
     }
 
