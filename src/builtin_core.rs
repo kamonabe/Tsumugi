@@ -46,6 +46,11 @@ fn check_collection_size(size: usize, line: usize) -> Result<(), TsumugiError> {
     Ok(())
 }
 
+/// コレクションサイズチェック（外部モジュールから利用可能）
+pub fn check_collection_size_public(size: usize, line: usize) -> Result<(), TsumugiError> {
+    check_collection_size(size, line)
+}
+
 // =============================================================================
 // ユーティリティ
 // =============================================================================
