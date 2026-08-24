@@ -2,7 +2,7 @@
 mod builtin;
 
 use crate::ast::*;
-use crate::env::{Env, Function};
+use crate::env::Env;
 use crate::error::{TraceFrame, TsumugiError};
 use crate::value::Value;
 
@@ -361,12 +361,7 @@ impl Evaluator {
             Stmt::FnDef {
                 name, params, body, ..
             } => {
-                let func = Function {
-                    params: params.clone(),
-                    body: body.clone(),
-                };
-                self.env.functions.insert(name.clone(), func);
-                // 関数を値としても環境にセット（let f = add のように参照可能にする）
+                // 関数を値として環境にセット（let f = add のように参照可能）
                 self.env.set(
                     name,
                     Value::Fn {
@@ -713,14 +708,6 @@ impl Evaluator {
                         ));
                     }
                 }
-            } else if let Some(func) = self.env.functions.get(name).cloned() {
-                // 関数テーブルから検索
-                (
-                    name.clone(),
-                    func.params,
-                    func.body,
-                    std::collections::HashMap::new(),
-                )
             } else {
                 return Err(TsumugiError::runtime(
                     line,
