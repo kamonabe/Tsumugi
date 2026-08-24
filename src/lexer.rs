@@ -448,8 +448,7 @@ impl Lexer {
                     Token::NotEq
                 } else {
                     // '!' 単体は Tsumugi では使わない（not を使う）
-                    // 不明な文字として再帰 — line は呼び出し元で記録済み
-                    self.next_token().token
+                    Token::Unknown('!')
                 }
             }
             '<' => {
