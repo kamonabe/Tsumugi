@@ -2,11 +2,16 @@ use crate::ast::*;
 use crate::error::TsumugiError;
 use crate::token::{FStrPart, Spanned, Token};
 
+/// 式のネスト深度上限（パーサーの再帰スタックオーバーフロー防止）
+const MAX_PARSE_DEPTH: usize = 256;
+
 /// トークン列をASTに変換するパーサー
 pub struct Parser {
     tokens: Vec<Spanned>,
     pos: usize,
     errors: Vec<TsumugiError>,
+    /// 式パースの再帰深度（スタックオーバーフロー防止）
+    depth: usize,
 }
 
 impl Parser {
@@ -15,6 +20,7 @@ impl Parser {
             tokens,
             pos: 0,
             errors: Vec::new(),
+            depth: 0,
         }
     }
 
@@ -502,7 +508,17 @@ impl Parser {
     //   関数呼び出し・リテラル・括弧
 
     fn parse_expr(&mut self) -> Result<Expr, TsumugiError> {
-        self.parse_or()
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return Err(TsumugiError::parse(
+                self.current_line(),
+                format!("式のネストが深すぎます (上限: {})", MAX_PARSE_DEPTH),
+            ));
+        }
+        let result = self.parse_or();
+        self.depth -= 1;
+        result
     }
 
     /// or
