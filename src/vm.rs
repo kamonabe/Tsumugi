@@ -82,10 +82,32 @@ impl Vm {
 
     /// チャンクを実行する
     pub fn run(&mut self) -> Result<(), TsumugiError> {
+        self.run_frames(0)?;
+        Ok(())
+    }
+
+    /// フレーム実行ループ（共通エンジン）
+    ///
+    /// `stop_depth` より深いフレームを実行し、`ReturnValue` で `stop_depth` まで
+    /// 戻ったら戻り値を返す。トップレベル（`stop_depth == 0`）で命令が尽きた場合は
+    /// `Value::Null` を返す。
+    ///
+    /// try/catch ハンドラもこのループ内で処理するため、map/filter/each 経由で
+    /// 呼ばれた関数内の try/catch も正しく動作する。
+    fn run_frames(&mut self, stop_depth: usize) -> Result<Value, TsumugiError> {
         loop {
             let frame = self.frames.last().unwrap();
             if frame.ip >= frame.chunk.code.len() {
-                break;
+                // フレームの命令が尽きた = 暗黙 null return
+                if self.frames.len() <= stop_depth + 1 {
+                    // トップレベルまたは stop_depth に戻った
+                    break;
+                }
+                // ネストされた関数が暗黙 null return で終わった場合
+                let f = self.frames.pop().unwrap();
+                self.stack.truncate(f.base);
+                self.stack.push(Value::Null);
+                continue;
             }
 
             let instruction = frame.chunk.code[frame.ip].clone();
@@ -97,14 +119,21 @@ impl Vm {
                     let return_value = self.pop(line)?;
                     let frame = self.frames.pop().unwrap();
                     self.stack.truncate(frame.base);
-                    if self.frames.is_empty() {
-                        return Ok(());
+                    if self.frames.len() <= stop_depth {
+                        return Ok(return_value);
                     }
                     self.stack.push(return_value);
                     Ok(())
                 }
                 OpCode::Return => {
-                    return Ok(());
+                    if self.frames.len() <= stop_depth + 1 {
+                        return Ok(Value::Null);
+                    }
+                    // ネストされたフレーム内の Return（通常は起きないがガード）
+                    let f = self.frames.pop().unwrap();
+                    self.stack.truncate(f.base);
+                    self.stack.push(Value::Null);
+                    Ok(())
                 }
                 OpCode::SetupTry(catch_ip) => {
                     let catch_ip = *catch_ip;
@@ -124,21 +153,29 @@ impl Vm {
 
             if let Err(e) = result {
                 if let Some(handler) = self.try_handlers.pop() {
-                    // フレームを巻き戻す
-                    self.frames.truncate(handler.frame_depth);
-                    // スタックを巻き戻す
-                    self.stack.truncate(handler.stack_depth);
-                    // エラーメッセージをスタックに積む
-                    let error_msg = e.message().to_string();
-                    self.stack.push(Value::Str(error_msg));
-                    // catch ブロックへジャンプ
-                    self.frames.last_mut().unwrap().ip = handler.catch_ip;
+                    // try ハンドラが stop_depth より深い場合のみ処理する
+                    // (stop_depth 以下のハンドラは呼び出し元の管轄)
+                    if handler.frame_depth > stop_depth {
+                        // フレームを巻き戻す
+                        self.frames.truncate(handler.frame_depth);
+                        // スタックを巻き戻す
+                        self.stack.truncate(handler.stack_depth);
+                        // エラーメッセージをスタックに積む
+                        let error_msg = e.message().to_string();
+                        self.stack.push(Value::Str(error_msg));
+                        // catch ブロックへジャンプ
+                        self.frames.last_mut().unwrap().ip = handler.catch_ip;
+                    } else {
+                        // このハンドラは呼び出し元のもの → 戻してからエラーを伝播
+                        self.try_handlers.push(handler);
+                        return Err(self.attach_trace(e));
+                    }
                 } else {
                     return Err(self.attach_trace(e));
                 }
             }
         }
-        Ok(())
+        Ok(Value::Null)
     }
 
     /// ステップカウンタを進め、上限チェックする
@@ -771,50 +808,13 @@ impl Vm {
             }
             let target_depth = self.frames.len();
             self.frames.push(CallFrame {
-                chunk, // Rc<Chunk> — ポインタコピーのみ
+                chunk,
                 ip: 0,
                 base,
                 upvalues,
             });
-            // メインループと同じ構造で実行（ReturnValue でフレームが target_depth に戻ったら終了）
-            loop {
-                let frame = self.frames.last().unwrap();
-                if frame.ip >= frame.chunk.code.len() {
-                    // フレームの命令が尽きた = 暗黙 null return
-                    let f = self.frames.pop().unwrap();
-                    self.stack.truncate(f.base);
-                    if self.frames.len() <= target_depth {
-                        return Ok(Value::Null);
-                    }
-                    self.stack.push(Value::Null);
-                    continue;
-                }
-
-                let instruction = frame.chunk.code[frame.ip].clone();
-                let instr_line = frame.chunk.lines[frame.ip];
-                self.frames.last_mut().unwrap().ip += 1;
-
-                match &instruction {
-                    OpCode::ReturnValue => {
-                        let return_value = self.pop(instr_line)?;
-                        let f = self.frames.pop().unwrap();
-                        self.stack.truncate(f.base);
-                        if self.frames.len() <= target_depth {
-                            return Ok(return_value);
-                        }
-                        self.stack.push(return_value);
-                    }
-                    OpCode::Return => {
-                        // トップレベル Return = 通常は起きないがガード
-                        let f = self.frames.pop().unwrap();
-                        self.stack.truncate(f.base);
-                        return Ok(Value::Null);
-                    }
-                    _ => {
-                        self.dispatch(instruction, instr_line)?;
-                    }
-                }
-            }
+            // run_frames で実行し、target_depth まで戻ったら値を返す
+            self.run_frames(target_depth)
         } else {
             Err(TsumugiError::Runtime {
                 line,

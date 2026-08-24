@@ -238,6 +238,7 @@ Tsumugi にはファイルI/O やサンドボックス機能が既に実装さ�
 |---|---|---|
 | `OpCode::CallBuiltin` の String 除去 | 関数名を定数テーブルに移し `CallBuiltin(usize, usize)` にする | ✅ 完了 |
 | `dispatch` の match 分割 | 算術・比較・制御フローをメソッドに分けて可読性向上 | 未着手 |
+| `call_fn_value` ループ統一 | `run_frames(stop_depth)` を抽出し run() と共有、try/catch 対応を統一 | ✅ 完了 |
 
 ### レキサー / パーサーの堅牢性
 
