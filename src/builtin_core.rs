@@ -142,6 +142,7 @@ pub fn builtin_type(args: &[Value], line: usize) -> Result<Value, TsumugiError> 
         Value::List(_) => "list",
         Value::Dict(_) => "dict",
         Value::Fn { .. } | Value::VmFn { .. } => "fn",
+        Value::Error { .. } => "error",
     };
     Ok(Value::Str(t.to_string()))
 }

@@ -875,3 +875,17 @@ fn error_unclosed_string_eof() {
 fn vm_error_unclosed_string_eof() {
     run_error_test_vm("error_unclosed_string_eof");
 }
+
+// =============================================================
+// 構造化エラーテスト
+// =============================================================
+
+#[test]
+fn golden_error_structured() {
+    run_golden_test("error_structured");
+}
+
+#[test]
+fn vm_golden_error_structured() {
+    run_golden_test_vm("error_structured");
+}

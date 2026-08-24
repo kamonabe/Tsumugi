@@ -32,6 +32,14 @@ pub enum Value {
         /// クロージャがキャプチャした値（値キャプチャ方式）
         upvalues: Vec<Value>,
     },
+    /// 構造化エラー値（try/catch で捕捉したエラー）
+    /// Display では message を返すため、既存の文字列結合と互換性がある。
+    /// インデックスアクセスで "type" / "message" / "line" を取得可能。
+    Error {
+        error_type: String,
+        message: String,
+        line: usize,
+    },
 }
 
 impl Value {
@@ -46,6 +54,8 @@ impl Value {
             Value::List(v) => !v.is_empty(),
             Value::Dict(m) => !m.is_empty(),
             Value::Fn { .. } => true,
+            Value::VmFn { .. } => true,
+            Value::Error { .. } => true,
             _ => true,
         }
     }
@@ -75,6 +85,9 @@ impl std::fmt::Display for Value {
             }
             Value::VmFn { name, params, .. } => {
                 write!(f, "<fn {}({})>", name, params.join(", "))
+            }
+            Value::Error { message, .. } => {
+                write!(f, "{}", message)
             }
         }
     }

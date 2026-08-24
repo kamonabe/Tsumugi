@@ -160,9 +160,13 @@ impl Vm {
                         self.frames.truncate(handler.frame_depth);
                         // スタックを巻き戻す
                         self.stack.truncate(handler.stack_depth);
-                        // エラーメッセージをスタックに積む
-                        let error_msg = e.message().to_string();
-                        self.stack.push(Value::Str(error_msg));
+                        // 構造化エラーをスタックに積む
+                        let error_value = Value::Error {
+                            error_type: e.error_type().to_string(),
+                            message: e.message().to_string(),
+                            line: e.line(),
+                        };
+                        self.stack.push(error_value);
                         // catch ブロックへジャンプ
                         self.frames.last_mut().unwrap().ip = handler.catch_ip;
                     } else {
@@ -625,6 +629,19 @@ impl Vm {
                     })
             }
             (Value::Dict(map), Value::Str(key)) => Ok(map.get(key).cloned().unwrap_or(Value::Null)),
+            (
+                Value::Error {
+                    error_type,
+                    message,
+                    line: err_line,
+                },
+                Value::Str(key),
+            ) => match key.as_str() {
+                "type" => Ok(Value::Str(error_type.clone())),
+                "message" => Ok(Value::Str(message.clone())),
+                "line" => Ok(Value::Int(*err_line as i64)),
+                _ => Ok(Value::Null),
+            },
             _ => Err(TsumugiError::Runtime {
                 line,
                 message: format!(
@@ -833,6 +850,8 @@ impl Vm {
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + *b as f64)),
             (Value::Str(a), Value::Str(b)) => Ok(Value::Str(format!("{}{}", a, b))),
+            (Value::Str(a), Value::Error { .. }) => Ok(Value::Str(format!("{}{}", a, right))),
+            (Value::Error { .. }, Value::Str(b)) => Ok(Value::Str(format!("{}{}", left, b))),
             _ => Err(TsumugiError::Runtime {
                 line,
                 message: format!("型エラー: {:?} Add {:?} は計算できません", left, right),
@@ -982,6 +1001,7 @@ fn type_name(value: &Value) -> &'static str {
         Value::Dict(_) => "Dict",
         Value::Fn { .. } => "Fn",
         Value::VmFn { .. } => "Fn",
+        Value::Error { .. } => "Error",
     }
 }
 

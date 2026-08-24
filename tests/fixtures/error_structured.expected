@@ -1,0 +1,12 @@
+1: type=zero_division
+2: message=ゼロ除算
+3: type=type
+4: type=index
+5: type=argument
+6: line=40
+7: type_of=error
+8: unknown=null
+9: division_error
+10: 5
+11: type=argument
+12: done
