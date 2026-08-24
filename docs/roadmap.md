@@ -46,6 +46,7 @@
 - [x] 浮動小数点 IEEE 754 統一（VM の Float ゼロ除算を inf/NaN に修正、ツリーウォークに Float 比較 arm 追加、両エンジン完全一致）
 - [x] セキュリティ強化（コールフレーム深度制限 MAX_CALL_DEPTH=128、map/filter/each ステップカウント修正、TSUMUGI_* 環境変数ブロック）
 - [x] f-string（文字列補間）— `f"hello, {expr}"` 構文。レキサー/パーサー/評価器/VM全対応
+- [x] 構造化エラー — try/catch で `Value::Error` を返す。`e["type"]` / `e["message"]` / `e["line"]` でアクセス可能。既存の文字列結合との互換性を維持
 
 ## 設計方針: 組み込み関数の境界線
 

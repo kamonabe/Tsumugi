@@ -1,0 +1,85 @@
+# 構造化エラーのテスト
+# catch で受け取るエラー値が辞書的にアクセスできることを検証する
+
+# 1. エラーの type フィールド（ゼロ除算）
+try
+    let x = 10 / 0
+catch e
+    print("1: type=" + e["type"])
+    print("2: message=" + e["message"])
+end
+
+# 2. エラーの type フィールド（型エラー）
+try
+    let y = "hello" + 1
+catch e
+    print("3: type=" + e["type"])
+end
+
+# 3. エラーの type フィールド（インデックス範囲外）
+try
+    let xs = [1, 2, 3]
+    let z = xs[100]
+catch e
+    print("4: type=" + e["type"])
+end
+
+# 4. エラーの type フィールド（未定義関数呼び出し）
+fn dummy()
+    return 1
+end
+
+try
+    dummy(1, 2, 3)
+catch e
+    print("5: type=" + e["type"])
+end
+
+# 5. エラーの line フィールド
+try
+    let bad = 1 / 0
+catch e
+    print("6: line=" + to_str(e["line"]))
+end
+
+# 6. type() 組み込み関数で "error" が返る
+try
+    let w = 1 / 0
+catch e
+    print("7: type_of=" + type(e))
+end
+
+# 7. 存在しないキーへのアクセスは null
+try
+    let v = 1 / 0
+catch e
+    print("8: unknown=" + to_str(e["unknown"]))
+end
+
+# 8. エラーの type で分岐する実用パターン
+fn safe_divide(a, b)
+    try
+        return a / b
+    catch e
+        if e["type"] == "zero_division"
+            return "division_error"
+        end
+        return "other_error"
+    end
+end
+
+print("9: " + safe_divide(10, 0))
+print("10: " + to_str(safe_divide(10, 2)))
+
+# 9. 引数エラーの type
+fn add(a, b)
+    return a + b
+end
+
+try
+    add(1, 2, 3)
+catch e
+    print("11: type=" + e["type"])
+end
+
+print("12: done")

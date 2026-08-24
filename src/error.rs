@@ -80,6 +80,42 @@ impl TsumugiError {
             other => other,
         }
     }
+
+    /// エラーの種類を分類する（try/catch で Value::Error の type フィールドに使用）
+    pub fn error_type(&self) -> &'static str {
+        match self {
+            Self::Parse { .. } => "parse",
+            Self::Runtime { message, .. } => classify_runtime_error(message),
+        }
+    }
+}
+
+/// ランタイムエラーのメッセージからエラー種別を推定する
+fn classify_runtime_error(message: &str) -> &'static str {
+    if message.contains("ゼロ除算") {
+        "zero_division"
+    } else if message.contains("型エラー") {
+        "type"
+    } else if message.contains("インデックス範囲外") {
+        "index"
+    } else if message.contains("未定義の変数")
+        || message.contains("未定義の関数")
+        || message.contains("関数ではない値")
+    {
+        "name"
+    } else if message.contains("ステップ上限") {
+        "limit"
+    } else if message.contains("スタックオーバーフロー") {
+        "overflow"
+    } else if message.contains("サンドボックス") {
+        "sandbox"
+    } else if message.contains("import 失敗") {
+        "import"
+    } else if message.contains("引数") && message.contains("個") {
+        "argument"
+    } else {
+        "runtime"
+    }
 }
 
 impl fmt::Display for TsumugiError {

@@ -394,9 +394,13 @@ impl Evaluator {
                 match try_result {
                     Ok(result) => Ok(result),
                     Err(e) => {
-                        // エラーメッセージを変数にバインドしてcatchブロックを実行
-                        let error_msg = e.message().to_string();
-                        self.env.set(var, Value::Str(error_msg));
+                        // 構造化エラーを変数にバインドしてcatchブロックを実行
+                        let error_value = Value::Error {
+                            error_type: e.error_type().to_string(),
+                            message: e.message().to_string(),
+                            line: e.line(),
+                        };
+                        self.env.set(var, error_value);
                         for s in catch_body {
                             match self.exec_stmt(s)? {
                                 EvalResult::Val => {}
@@ -533,6 +537,19 @@ impl Evaluator {
                 Ok(list[actual as usize].clone())
             }
             (Value::Dict(map), Value::Str(key)) => Ok(map.get(key).cloned().unwrap_or(Value::Null)),
+            (
+                Value::Error {
+                    error_type,
+                    message,
+                    line: err_line,
+                },
+                Value::Str(key),
+            ) => match key.as_str() {
+                "type" => Ok(Value::Str(error_type.clone())),
+                "message" => Ok(Value::Str(message.clone())),
+                "line" => Ok(Value::Int(*err_line as i64)),
+                _ => Ok(Value::Null),
+            },
             (Value::Str(s), Value::Int(i)) => {
                 let len = s.chars().count() as i64;
                 let actual = if *i < 0 { len + *i } else { *i };
@@ -601,6 +618,13 @@ impl Evaluator {
 
             // 文字列結合
             (Value::Str(l), BinOpKind::Add, Value::Str(r)) => Ok(Value::Str(format!("{}{}", l, r))),
+            // 文字列 + Error（Error は Display で message を返す）
+            (Value::Str(l), BinOpKind::Add, r @ Value::Error { .. }) => {
+                Ok(Value::Str(format!("{}{}", l, r)))
+            }
+            (l @ Value::Error { .. }, BinOpKind::Add, Value::Str(r)) => {
+                Ok(Value::Str(format!("{}{}", l, r)))
+            }
 
             // 比較演算（整数）
             (Value::Int(l), BinOpKind::Eq, Value::Int(r)) => Ok(Value::Bool(l == r)),
