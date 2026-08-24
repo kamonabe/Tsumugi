@@ -305,7 +305,15 @@ impl Vm {
             OpCode::Negate => {
                 let value = self.pop(line)?;
                 let result = match value {
-                    Value::Int(n) => Value::Int(-n),
+                    Value::Int(n) => {
+                        n.checked_neg()
+                            .map(Value::Int)
+                            .ok_or_else(|| TsumugiError::Runtime {
+                                line,
+                                message: "整数オーバーフロー".to_string(),
+                                trace: Vec::new(),
+                            })?
+                    }
                     Value::Float(n) => Value::Float(-n),
                     other => {
                         return Err(TsumugiError::Runtime {
@@ -845,7 +853,15 @@ impl Vm {
 
     fn binary_add(&self, left: Value, right: Value, line: usize) -> Result<Value, TsumugiError> {
         match (&left, &right) {
-            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
+            (Value::Int(a), Value::Int(b)) => {
+                a.checked_add(*b)
+                    .map(Value::Int)
+                    .ok_or_else(|| TsumugiError::Runtime {
+                        line,
+                        message: "整数オーバーフロー".to_string(),
+                        trace: Vec::new(),
+                    })
+            }
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + *b as f64)),
@@ -862,7 +878,15 @@ impl Vm {
 
     fn binary_sub(&self, left: Value, right: Value, line: usize) -> Result<Value, TsumugiError> {
         match (&left, &right) {
-            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
+            (Value::Int(a), Value::Int(b)) => {
+                a.checked_sub(*b)
+                    .map(Value::Int)
+                    .ok_or_else(|| TsumugiError::Runtime {
+                        line,
+                        message: "整数オーバーフロー".to_string(),
+                        trace: Vec::new(),
+                    })
+            }
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 - b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a - *b as f64)),
@@ -876,7 +900,15 @@ impl Vm {
 
     fn binary_mul(&self, left: Value, right: Value, line: usize) -> Result<Value, TsumugiError> {
         match (&left, &right) {
-            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
+            (Value::Int(a), Value::Int(b)) => {
+                a.checked_mul(*b)
+                    .map(Value::Int)
+                    .ok_or_else(|| TsumugiError::Runtime {
+                        line,
+                        message: "整数オーバーフロー".to_string(),
+                        trace: Vec::new(),
+                    })
+            }
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 * b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a * *b as f64)),
@@ -895,7 +927,15 @@ impl Vm {
                 message: "ゼロ除算".to_string(),
                 trace: Vec::new(),
             }),
-            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a / b)),
+            (Value::Int(a), Value::Int(b)) => {
+                a.checked_div(*b)
+                    .map(Value::Int)
+                    .ok_or_else(|| TsumugiError::Runtime {
+                        line,
+                        message: "整数オーバーフロー".to_string(),
+                        trace: Vec::new(),
+                    })
+            }
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a / b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 / b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a / *b as f64)),
@@ -914,7 +954,15 @@ impl Vm {
                 message: "ゼロ除算".to_string(),
                 trace: Vec::new(),
             }),
-            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a % b)),
+            (Value::Int(a), Value::Int(b)) => {
+                a.checked_rem(*b)
+                    .map(Value::Int)
+                    .ok_or_else(|| TsumugiError::Runtime {
+                        line,
+                        message: "整数オーバーフロー".to_string(),
+                        trace: Vec::new(),
+                    })
+            }
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a % b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 % b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a % *b as f64)),
