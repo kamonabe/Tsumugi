@@ -71,6 +71,8 @@ pub fn check_path(path_str: &str, line: usize) -> Result<(), TsumugiError> {
 
 /// パスを絶対パスに正規化する。
 /// 存在しないパスでも動作するように canonicalize ではなく手動で処理する。
+/// 中間ディレクトリのシンボリックリンク迂回を防ぐため、
+/// 親ディレクトリが存在する場合はそこまで canonicalize する。
 fn normalize_path(path_str: &str) -> PathBuf {
     let p = Path::new(path_str);
     let absolute = if p.is_absolute() {
@@ -81,11 +83,22 @@ fn normalize_path(path_str: &str) -> PathBuf {
             .join(p)
     };
 
-    // canonicalize が成功すればそれを使う（シンボリックリンク解決 + .. 解決）
-    // 失敗する場合（パスが存在しない）は手動で .. を解決する
-    absolute
-        .canonicalize()
-        .unwrap_or_else(|_| resolve_dots(&absolute))
+    // 最終パス全体が canonicalize できればそれを使う（シンボリックリンク解決 + .. 解決）
+    if let Ok(resolved) = absolute.canonicalize() {
+        return resolved;
+    }
+
+    // 最終パスが存在しない場合: 親ディレクトリまで canonicalize を試行
+    // （中間シンボリックリンクを解決してプレフィックスチェックの迂回を防ぐ）
+    if let Some(parent) = absolute.parent()
+        && let Ok(resolved_parent) = parent.canonicalize()
+        && let Some(file_name) = absolute.file_name()
+    {
+        return resolved_parent.join(file_name);
+    }
+
+    // 親ディレクトリも存在しない場合は手動で .. を解決する
+    resolve_dots(&absolute)
 }
 
 /// パス中の `.` と `..` を手動で解決する（パスが存在しなくても動作する）

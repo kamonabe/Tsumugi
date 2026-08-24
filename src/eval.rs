@@ -579,21 +579,34 @@ impl Evaluator {
     ) -> Result<Value, TsumugiError> {
         match (left, op, right) {
             // 整数同士の算術
-            (Value::Int(l), BinOpKind::Add, Value::Int(r)) => Ok(Value::Int(l + r)),
-            (Value::Int(l), BinOpKind::Sub, Value::Int(r)) => Ok(Value::Int(l - r)),
-            (Value::Int(l), BinOpKind::Mul, Value::Int(r)) => Ok(Value::Int(l * r)),
+            (Value::Int(l), BinOpKind::Add, Value::Int(r)) => l
+                .checked_add(*r)
+                .map(Value::Int)
+                .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー")),
+            (Value::Int(l), BinOpKind::Sub, Value::Int(r)) => l
+                .checked_sub(*r)
+                .map(Value::Int)
+                .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー")),
+            (Value::Int(l), BinOpKind::Mul, Value::Int(r)) => l
+                .checked_mul(*r)
+                .map(Value::Int)
+                .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー")),
             (Value::Int(l), BinOpKind::Div, Value::Int(r)) => {
                 if *r == 0 {
                     Err(TsumugiError::runtime(line, "ゼロ除算"))
                 } else {
-                    Ok(Value::Int(l / r))
+                    l.checked_div(*r)
+                        .map(Value::Int)
+                        .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー"))
                 }
             }
             (Value::Int(l), BinOpKind::Mod, Value::Int(r)) => {
                 if *r == 0 {
                     Err(TsumugiError::runtime(line, "ゼロ除算"))
                 } else {
-                    Ok(Value::Int(l % r))
+                    l.checked_rem(*r)
+                        .map(Value::Int)
+                        .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー"))
                 }
             }
 
@@ -677,7 +690,10 @@ impl Evaluator {
         line: usize,
     ) -> Result<Value, TsumugiError> {
         match (op, val) {
-            (UnaryOpKind::Neg, Value::Int(n)) => Ok(Value::Int(-n)),
+            (UnaryOpKind::Neg, Value::Int(n)) => n
+                .checked_neg()
+                .map(Value::Int)
+                .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー")),
             (UnaryOpKind::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
             (UnaryOpKind::Not, v) => Ok(Value::Bool(!v.is_truthy())),
             _ => Err(TsumugiError::runtime(

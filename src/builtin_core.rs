@@ -9,6 +9,43 @@
 use crate::error::TsumugiError;
 use crate::value::Value;
 
+use std::sync::OnceLock;
+
+// =============================================================================
+// コレクションサイズ上限（メモリ DoS 対策）
+// =============================================================================
+
+/// デフォルトのコレクション要素数上限（100万）
+const DEFAULT_MAX_COLLECTION_SIZE: usize = 1_000_000;
+
+/// 環境変数からコレクションサイズ上限を読み取る（プロセス起動時に一度だけ解決）
+static MAX_COLLECTION_SIZE: OnceLock<usize> = OnceLock::new();
+
+fn max_collection_size() -> usize {
+    *MAX_COLLECTION_SIZE.get_or_init(|| {
+        std::env::var("TSUMUGI_MAX_COLLECTION_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_MAX_COLLECTION_SIZE)
+    })
+}
+
+/// コレクションサイズが上限を超えていないかチェックする
+fn check_collection_size(size: usize, line: usize) -> Result<(), TsumugiError> {
+    let limit = max_collection_size();
+    if size > limit {
+        return Err(TsumugiError::Runtime {
+            line,
+            message: format!(
+                "コレクションサイズ上限超過: {} 要素 (上限: {})",
+                size, limit
+            ),
+            trace: Vec::new(),
+        });
+    }
+    Ok(())
+}
+
 // =============================================================================
 // ユーティリティ
 // =============================================================================
@@ -222,6 +259,12 @@ pub fn builtin_reverse(args: &[Value], line: usize) -> Result<Value, TsumugiErro
 pub fn builtin_range(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("range", args, 2, line)?;
     if let (Value::Int(start), Value::Int(end)) = (&args[0], &args[1]) {
+        let size = if *end > *start {
+            (*end - *start) as usize
+        } else {
+            0
+        };
+        check_collection_size(size, line)?;
         let list: Vec<Value> = (*start..*end).map(Value::Int).collect();
         Ok(Value::List(list))
     } else {
@@ -240,6 +283,7 @@ pub fn builtin_split(args: &[Value], line: usize) -> Result<Value, TsumugiError>
             .split(sep.as_str())
             .map(|p| Value::Str(p.to_string()))
             .collect();
+        check_collection_size(parts.len(), line)?;
         Ok(Value::List(parts))
     } else {
         Err(type_error(line, "split(str, str) の形式で使います"))
@@ -460,6 +504,7 @@ pub fn builtin_read_lines(args: &[Value], line: usize) -> Result<Value, TsumugiE
             Ok(content) => {
                 let lines: Vec<Value> =
                     content.lines().map(|l| Value::Str(l.to_string())).collect();
+                check_collection_size(lines.len(), line)?;
                 Ok(Value::List(lines))
             }
             Err(_) => Ok(Value::Null),
