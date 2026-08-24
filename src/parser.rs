@@ -82,6 +82,21 @@ impl Parser {
     // --- 文のパース ---
 
     fn parse_stmt(&mut self) -> Result<Stmt, TsumugiError> {
+        // ブロックを持つ文のネストも深度制限の対象
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return Err(TsumugiError::parse(
+                self.current_line(),
+                format!("ネストが深すぎます (上限: {})", MAX_PARSE_DEPTH),
+            ));
+        }
+        let result = self.parse_stmt_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_stmt_inner(&mut self) -> Result<Stmt, TsumugiError> {
         match self.peek_token() {
             Token::Let => self.parse_let(),
             Token::Return => self.parse_return(),

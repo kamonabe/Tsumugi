@@ -444,6 +444,7 @@ impl Evaluator {
                 for item in items {
                     values.push(self.eval_expr(item, line)?);
                 }
+                crate::builtin_core::check_collection_size_public(values.len(), line)?;
                 Ok(Value::List(values))
             }
 
