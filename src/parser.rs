@@ -764,6 +764,13 @@ impl Parser {
                     unreachable!()
                 }
             }
+            Token::Unknown(c) => {
+                self.advance();
+                Err(TsumugiError::parse(
+                    spanned.line,
+                    format!("想定外の文字: '{}'", c),
+                ))
+            }
             other => Err(TsumugiError::parse(
                 spanned.line,
                 format!("予期しないトークン: {:?}", other),
