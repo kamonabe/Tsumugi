@@ -34,14 +34,14 @@ fn max_collection_size() -> usize {
 fn check_collection_size(size: usize, line: usize) -> Result<(), TsumugiError> {
     let limit = max_collection_size();
     if size > limit {
-        return Err(TsumugiError::Runtime {
+        return Err(TsumugiError::runtime_with_kind(
             line,
-            message: format!(
+            crate::error::ErrorKind::CollectionLimit,
+            format!(
                 "コレクションサイズ上限超過: {} 要素 (上限: {})",
                 size, limit
             ),
-            trace: Vec::new(),
-        });
+        ));
     }
     Ok(())
 }
@@ -62,27 +62,23 @@ pub fn check_arity(
     line: usize,
 ) -> Result<(), TsumugiError> {
     if args.len() != expected {
-        Err(TsumugiError::Runtime {
+        Err(TsumugiError::runtime_with_kind(
             line,
-            message: format!(
+            crate::error::ErrorKind::Argument,
+            format!(
                 "{}: 引数の数が合いません: {}個必要ですが{}個渡されました",
                 name,
                 expected,
                 args.len()
             ),
-            trace: Vec::new(),
-        })
+        ))
     } else {
         Ok(())
     }
 }
 
 pub fn type_error(line: usize, msg: &str) -> TsumugiError {
-    TsumugiError::Runtime {
-        line,
-        message: msg.to_string(),
-        trace: Vec::new(),
-    }
+    TsumugiError::runtime_with_kind(line, crate::error::ErrorKind::BuiltinType, msg)
 }
 
 // =============================================================================
@@ -118,11 +114,11 @@ pub fn builtin_pop(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     let mut list = args[0].clone();
     if let Value::List(ref mut v) = list {
         if v.is_empty() {
-            Err(TsumugiError::Runtime {
+            Err(TsumugiError::runtime_with_kind(
                 line,
-                message: "pop: 空のリストからは取り出せません".to_string(),
-                trace: Vec::new(),
-            })
+                crate::error::ErrorKind::BuiltinType,
+                "pop: 空のリストからは取り出せません",
+            ))
         } else {
             Ok(v.pop().unwrap())
         }
@@ -369,14 +365,13 @@ pub fn builtin_to_int(args: &[Value], line: usize) -> Result<Value, TsumugiError
         Value::Int(n) => Ok(Value::Int(*n)),
         Value::Float(f) => Ok(Value::Int(*f as i64)),
         Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
-        Value::Str(s) => s
-            .parse::<i64>()
-            .map(Value::Int)
-            .map_err(|_| TsumugiError::Runtime {
+        Value::Str(s) => s.parse::<i64>().map(Value::Int).map_err(|_| {
+            TsumugiError::runtime_with_kind(
                 line,
-                message: format!("to_int: 変換失敗: \"{}\"", s),
-                trace: Vec::new(),
-            }),
+                crate::error::ErrorKind::Conversion,
+                format!("to_int: 変換失敗: \"{}\"", s),
+            )
+        }),
         _ => Err(type_error(line, "to_int: 変換できない型です")),
     }
 }
@@ -391,14 +386,13 @@ pub fn builtin_to_float(args: &[Value], line: usize) -> Result<Value, TsumugiErr
     match &args[0] {
         Value::Float(f) => Ok(Value::Float(*f)),
         Value::Int(n) => Ok(Value::Float(*n as f64)),
-        Value::Str(s) => s
-            .parse::<f64>()
-            .map(Value::Float)
-            .map_err(|_| TsumugiError::Runtime {
+        Value::Str(s) => s.parse::<f64>().map(Value::Float).map_err(|_| {
+            TsumugiError::runtime_with_kind(
                 line,
-                message: format!("to_float: 変換失敗: \"{}\"", s),
-                trace: Vec::new(),
-            }),
+                crate::error::ErrorKind::Conversion,
+                format!("to_float: 変換失敗: \"{}\"", s),
+            )
+        }),
         _ => Err(type_error(line, "to_float: 変換できない型です")),
     }
 }

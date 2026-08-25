@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-08-24
+最終更新: 2026-08-25
 
 ## 実装済み
 
@@ -273,7 +273,7 @@ Tsumugi にはファイルI/O やサンドボックス機能が既に実装さ�
 | メモリ DoS 対策（コレクションサイズ上限） | `range` / `split` / `read_lines` に上限ガード。`TSUMUGI_MAX_COLLECTION_SIZE` で変更可能 | ✅ 完了 |
 | ファジングテスト導入 | `cargo-fuzz` でレキサー/パーサー/評価器に無作為入力 | 未着手 |
 | VM の `unwrap()` 除去 | コンパイラバグ時にパニックではなく構造化エラーを返す | 未着手 |
-| エラー種別の enum 化 | `classify_runtime_error()` の `contains()` 判定を `ErrorKind` enum に移行 | 未着手 |
+| エラー種別の enum 化 | `classify_runtime_error()` の `contains()` 判定を `ErrorKind` enum に移行 | ✅ 完了 |
 
 ## 検討事項: HTTP アクセス機能
 
