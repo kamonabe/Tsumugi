@@ -430,6 +430,9 @@ print(c())  # 3
 > Tsumugi uses reference capture for closures. Closures share variable cells with their
 > defining scope via `Rc<RefCell<Value>>`. Mutations inside a closure are visible to
 > subsequent calls (counter pattern works).
+>
+> Function values are never equal to each other (`f == f` is always `false`).
+> Do not use `==` or `contains()` to compare functions.
 
 ### Error Handling Pattern
 

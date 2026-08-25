@@ -56,8 +56,8 @@ impl PartialEq for Value {
             (Value::Null, Value::Null) => true,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Dict(a), Value::Dict(b)) => a == b,
-            (Value::Fn { name: a, .. }, Value::Fn { name: b, .. }) => a == b,
-            (Value::VmFn { name: a, .. }, Value::VmFn { name: b, .. }) => a == b,
+            (Value::Fn { .. }, Value::Fn { .. }) => false,
+            (Value::VmFn { .. }, Value::VmFn { .. }) => false,
             (
                 Value::Error {
                     error_type: t1,
