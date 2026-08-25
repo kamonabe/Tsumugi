@@ -417,13 +417,16 @@ pub fn builtin_to_float(args: &[Value], line: usize) -> Result<Value, TsumugiErr
 pub fn builtin_abs(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("abs", args, 1, line)?;
     match &args[0] {
-        Value::Int(n) => n.checked_abs().map(|v| Ok(Value::Int(v))).unwrap_or_else(|| {
-            Err(TsumugiError::runtime_with_kind(
-                line,
-                crate::error::ErrorKind::IntOverflow,
-                "整数オーバーフロー: abs() の結果が表現できません",
-            ))
-        }),
+        Value::Int(n) => n
+            .checked_abs()
+            .map(|v| Ok(Value::Int(v)))
+            .unwrap_or_else(|| {
+                Err(TsumugiError::runtime_with_kind(
+                    line,
+                    crate::error::ErrorKind::IntOverflow,
+                    "整数オーバーフロー: abs() の結果が表現できません",
+                ))
+            }),
         Value::Float(f) => Ok(Value::Float(f.abs())),
         _ => Err(type_error(line, "abs は数値に対してのみ使えます")),
     }

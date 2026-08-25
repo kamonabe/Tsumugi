@@ -129,8 +129,7 @@ impl Vm {
                     self.stack.truncate(frame.base);
                     // return 時にこのフレーム内の try ハンドラを除去する
                     let current_depth = self.frames.len();
-                    self.try_handlers
-                        .retain(|h| h.frame_depth <= current_depth);
+                    self.try_handlers.retain(|h| h.frame_depth <= current_depth);
                     if current_depth <= stop_depth {
                         return Ok(return_value);
                     }
