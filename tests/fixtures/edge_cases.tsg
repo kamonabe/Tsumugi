@@ -1,0 +1,31 @@
+# エッジケーステスト（リグレッション防止）
+
+# --- 0回実行される for ---
+let sum = 0
+for x in []
+    let local = 999
+    sum = sum + x
+end
+print(sum)
+
+# 0回 for の後も正常に動作する
+let after = "ok"
+print(after)
+
+# --- 負の Unix 時刻 ---
+# 1969-12-31 23:59:59 (timestamp = -1)
+print(format_time(-1, "%Y-%m-%d %H:%M:%S"))
+
+# 1969-12-31 00:00:00 (timestamp = -86400)
+print(format_time(-86400, "%Y-%m-%d %H:%M:%S"))
+
+# 1900-01-01 (timestamp = -2208988800)
+print(format_time(-2208988800, "%Y-%m-%d"))
+
+# エポック自体
+print(format_time(0, "%Y-%m-%d %H:%M:%S"))
+
+# --- f-string 正常系 ---
+let name = "test"
+print(f"hello {name}")
+print(f"{1 + 2} items")

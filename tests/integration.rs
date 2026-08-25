@@ -996,3 +996,40 @@ fn golden_map_recursion_limit() {
 fn vm_golden_map_recursion_limit() {
     run_golden_test_vm("map_recursion_limit");
 }
+
+// =============================================================
+// リグレッションテスト: エッジケース（0回for, 負時刻, f-string正常系）
+// =============================================================
+
+#[test]
+fn golden_edge_cases() {
+    run_golden_test("edge_cases");
+}
+
+#[test]
+fn vm_golden_edge_cases() {
+    run_golden_test_vm("edge_cases");
+}
+
+// =============================================================
+// リグレッションテスト: f-string 余剰トークンエラー
+// =============================================================
+
+#[test]
+fn error_fstring_extra() {
+    run_error_test("error_fstring_extra");
+}
+
+#[test]
+fn vm_error_fstring_extra() {
+    run_error_test_vm("error_fstring_extra");
+}
+
+// =============================================================
+// リグレッションテスト: import 失敗後の復旧（tree-walk のみ）
+// =============================================================
+
+#[test]
+fn golden_import_recovery() {
+    run_golden_test("import_recovery");
+}
