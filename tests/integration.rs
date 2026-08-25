@@ -959,3 +959,31 @@ fn golden_and_or_scope() {
 fn vm_golden_and_or_scope() {
     run_golden_test_vm("and_or_scope");
 }
+
+// =============================================================
+// リグレッションテスト: 多段クロージャキャプチャ
+// =============================================================
+
+#[test]
+fn golden_deep_closure() {
+    run_golden_test("deep_closure");
+}
+
+#[test]
+fn vm_golden_deep_closure() {
+    run_golden_test_vm("deep_closure");
+}
+
+// =============================================================
+// リグレッションテスト: map/filter 経由の再帰制限
+// =============================================================
+
+#[test]
+fn golden_map_recursion_limit() {
+    run_golden_test("map_recursion_limit");
+}
+
+#[test]
+fn vm_golden_map_recursion_limit() {
+    run_golden_test_vm("map_recursion_limit");
+}

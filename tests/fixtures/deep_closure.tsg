@@ -1,0 +1,56 @@
+# 多段クロージャキャプチャのテスト
+
+# 3段ネスト: inner が outer の変数を直接キャプチャ
+fn outer()
+    let x = 10
+    let y = 20
+    fn middle()
+        fn inner()
+            return x + y
+        end
+        return inner()
+    end
+    return middle()
+end
+print(outer())
+
+# 中間関数も同じ変数を使うケース
+fn make_adder()
+    let base = 100
+    fn add(n)
+        let local_base = base + n
+        fn get()
+            return local_base
+        end
+        return get()
+    end
+    return add(5)
+end
+print(make_adder())
+
+# ラムダでの多段キャプチャ
+fn wrap()
+    let val = "captured"
+    let getter = fn()
+        let inner = fn() val end
+        return inner()
+    end
+    return getter()
+end
+print(wrap())
+
+# ミュータブルな多段キャプチャ（参照共有）
+fn counter()
+    let count = 0
+    fn increment()
+        fn do_it()
+            count = count + 1
+        end
+        do_it()
+    end
+    increment()
+    increment()
+    increment()
+    return count
+end
+print(counter())

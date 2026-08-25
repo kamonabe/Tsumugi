@@ -20,6 +20,18 @@ impl Evaluator {
         arg_values: Vec<Value>,
         line: usize,
     ) -> Result<Value, TsumugiError> {
+        // 再帰制限チェック（通常の関数呼び出しと同じガードを適用）
+        self.count_step(line)?;
+        if self.call_stack.len() >= super::MAX_CALL_DEPTH {
+            return Err(TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::StackOverflow,
+                format!(
+                    "スタックオーバーフロー: 再帰が深すぎます (上限: {})",
+                    super::MAX_CALL_DEPTH
+                ),
+            ));
+        }
         match func {
             Value::Fn {
                 name,

@@ -666,3 +666,38 @@ AST評価器とVM間で動作が異なっていた2つの仕様を統一。
 - 既存テスト `control_flow.tsg` を修正
 
 **判断理由:** ほぼすべての現代言語がブロックスコープ。VM のスタック膨張問題を根本解決。バグ防止。
+
+
+### 2026-08-25: 高優先残件修正（再帰制限・多段クロージャ・import復元）
+
+#### map/filter/each 再帰制限の追加
+
+**問題:** `call_fn_value()`（AST版・VM版）にコールスタック深度チェックがなく、コールバック内の再帰で Rust プロセスのスタックが溢れる可能性があった。
+
+**修正:**
+- AST版 (`builtin.rs`): `count_step()` + `MAX_CALL_DEPTH` チェックを `call_fn_value` 冒頭に追加
+- VM版 (`vm.rs`): `MAX_CALL_DEPTH` チェックを `call_fn_value` 冒頭に追加（`count_step` は既存）
+
+#### 多段クロージャキャプチャ
+
+**問題:** `resolve_upvalue` が直近親のローカル変数しか検索せず、3段以上のネスト（`outer → middle → inner`）で `inner` が `outer` の変数を直接キャプチャできなかった。
+
+**修正:**
+- `Upvalue` 構造体に `is_local: bool` フィールドを追加（`true` = 親ローカル、`false` = 親upvalue経由）
+- `Compiler` に `enclosing_upvalues` フィールドを追加し、祖先の変数チェーンを伝搬
+- `build_ancestor_vars()` で親の enclosing_locals + enclosing_upvalues を合成して子に渡す
+- `resolve_child_upvalues()` で子の `is_local=false` upvalue に対し、親が自動的に中間キャプチャを登録
+- VM の `MakeClosure` を `GetLocal`/`GetUpvalue` 両方に対応するよう拡張
+
+**設計判断:** Crafting Interpreters の「upvalue-of-upvalue」方式を採用。中間関数が変数を直接使わなくても、子孫のために自動キャプチャする。
+
+#### import 失敗時の base_dir 復元
+
+**問題:** `exec_import` で `base_dir` 変更後にパース失敗すると `?` で早期リターンし、`base_dir` が復元されなかった。`try/catch` でキャッチして続行すると以降の相対 import が壊れる。
+
+**修正:** `parser.parse().map_err(...)? ` を `match` に書き換え、エラー時に `self.base_dir = prev_base_dir` を復元してからエラーを返す。
+
+#### リグレッションテスト
+
+- `tests/fixtures/deep_closure.tsg` — 3段ネスト、ラムダ多段、ミュータブル多段キャプチャ
+- `tests/fixtures/map_recursion_limit.tsg` — map 経由再帰のスタックオーバーフロー検出

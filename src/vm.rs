@@ -432,50 +432,47 @@ impl Vm {
                 *cell.borrow_mut() = value;
             }
             OpCode::MakeClosure(upvalue_count) => {
-                // upvalue_count 個のスロットインデックスがスタックに積まれている（Value::Int として）
-                // → 実際にはコンパイラが GetLocal で値を積むのではなく、
-                //   ローカル変数のセルを共有する形にする
-                //
-                // 現在の実装: コンパイラはまだ GetLocal(slot) を emit している
-                // → 値がスタックに積まれているので、それを pop して
-                //   対応するローカルのセルを取得する（参照キャプチャ）
-                //
-                // 方式: スタックに積まれた値は無視し、直前の GetLocal 命令の
-                //       slot 番号から locals_cells を参照する。
-                //
-                // ただしこれはコンパイラの変更が必要になるため、代わりに
-                // MakeClosure の前に emit される GetLocal の slot を
-                // chunk.code から逆算して取得する。
-
-                // コンパイラは MakeClosure(N) の直前に N 個の GetLocal(slot) を emit する
-                // → ip - 1 = MakeClosure, ip - 2 = GetLocal(last_upvalue), ...
+                // upvalue_count 個の値がスタックに積まれている
+                // コンパイラは MakeClosure(N) の直前に N 個の GetLocal/GetUpvalue を emit する
+                // GetLocal → 親のローカル変数セルを共有
+                // GetUpvalue → 親の upvalue セルを共有（多段キャプチャ）
                 let frame = self.frames.last().unwrap();
-                let make_closure_ip = frame.ip - 1; // 現在の命令が MakeClosure
+                let make_closure_ip = frame.ip - 1;
 
-                let mut upvalue_slots = Vec::with_capacity(upvalue_count);
+                let mut upvalue_sources = Vec::with_capacity(upvalue_count);
                 for i in 0..upvalue_count {
                     let instr_ip = make_closure_ip - upvalue_count + i;
-                    if let OpCode::GetLocal(slot) = &frame.chunk.code[instr_ip] {
-                        upvalue_slots.push(*slot);
-                    } else {
-                        // フォールバック: スロット情報が取れない場合は値キャプチャ
-                        upvalue_slots.push(usize::MAX);
+                    match &frame.chunk.code[instr_ip] {
+                        OpCode::GetLocal(slot) => {
+                            upvalue_sources.push((true, *slot)); // is_local, slot
+                        }
+                        OpCode::GetUpvalue(index) => {
+                            upvalue_sources.push((false, *index)); // is_upvalue, index
+                        }
+                        _ => {
+                            upvalue_sources.push((true, usize::MAX)); // フォールバック
+                        }
                     }
                 }
 
-                // スタックから積まれた値を pop（これらは GetLocal で積まれたもの）
+                // スタックから積まれた値を pop
                 for _ in 0..upvalue_count {
                     self.pop(line)?;
                 }
 
                 // 各 upvalue についてセルを取得/作成
                 let mut upvalue_cells = Vec::with_capacity(upvalue_count);
-                for slot in upvalue_slots {
-                    if slot == usize::MAX {
-                        // フォールバック（通常は起きない）
-                        upvalue_cells.push(Rc::new(RefCell::new(Value::Null)));
+                for (is_local, slot) in upvalue_sources {
+                    if is_local {
+                        if slot == usize::MAX {
+                            upvalue_cells.push(Rc::new(RefCell::new(Value::Null)));
+                        } else {
+                            let cell = self.ensure_local_cell(slot);
+                            upvalue_cells.push(cell);
+                        }
                     } else {
-                        let cell = self.ensure_local_cell(slot);
+                        // 親の upvalue セルを直接共有（多段キャプチャ）
+                        let cell = self.frames.last().unwrap().upvalues[slot].clone();
                         upvalue_cells.push(cell);
                     }
                 }
@@ -902,6 +899,17 @@ impl Vm {
         line: usize,
     ) -> Result<Value, TsumugiError> {
         self.count_step(line)?;
+        // 再帰制限チェック（OpCode::Call と同じガードを適用）
+        if self.frames.len() >= MAX_CALL_DEPTH {
+            return Err(TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::StackOverflow,
+                format!(
+                    "スタックオーバーフロー: 再帰が深すぎます (上限: {})",
+                    MAX_CALL_DEPTH
+                ),
+            ));
+        }
         if let Value::VmFn {
             arity,
             chunk,

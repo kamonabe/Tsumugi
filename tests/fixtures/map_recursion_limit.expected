@@ -1,0 +1,4 @@
+map recursion caught: overflow
+[2, 4, 6]
+[2, 4]
+done
