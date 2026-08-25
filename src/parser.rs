@@ -916,6 +916,13 @@ impl Parser {
                         // サブパーサーのエラーに f-string のコンテキストを付加
                         TsumugiError::parse(line, format!("f-string内の式のパースに失敗: {}", e))
                     })?;
+                    // 式の後に余剰トークンがないか確認
+                    if !sub_parser.is_at_end() {
+                        return Err(TsumugiError::parse(
+                            line,
+                            "f-string内の式に余分なトークンがあります".to_string(),
+                        ));
+                    }
                     ast_parts.push(FStrExprPart::Expr(Box::new(expr)));
                 }
             }

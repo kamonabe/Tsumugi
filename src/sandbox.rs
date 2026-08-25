@@ -72,7 +72,7 @@ pub fn check_path(path_str: &str, line: usize) -> Result<(), TsumugiError> {
 /// パスを絶対パスに正規化する。
 /// 存在しないパスでも動作するように canonicalize ではなく手動で処理する。
 /// 中間ディレクトリのシンボリックリンク迂回を防ぐため、
-/// 親ディレクトリが存在する場合はそこまで canonicalize する。
+/// 存在する最も近い祖先ディレクトリまで遡って canonicalize する。
 fn normalize_path(path_str: &str) -> PathBuf {
     let p = Path::new(path_str);
     let absolute = if p.is_absolute() {
@@ -88,16 +88,27 @@ fn normalize_path(path_str: &str) -> PathBuf {
         return resolved;
     }
 
-    // 最終パスが存在しない場合: 親ディレクトリまで canonicalize を試行
-    // （中間シンボリックリンクを解決してプレフィックスチェックの迂回を防ぐ）
-    if let Some(parent) = absolute.parent()
-        && let Ok(resolved_parent) = parent.canonicalize()
-        && let Some(file_name) = absolute.file_name()
-    {
-        return resolved_parent.join(file_name);
+    // 存在する最も近い祖先まで遡って canonicalize し、残りを join する
+    // これにより中間のシンボリックリンクが解決される
+    let mut ancestor = absolute.as_path();
+    let mut tail_parts: Vec<&std::ffi::OsStr> = Vec::new();
+
+    while let Some(parent) = ancestor.parent() {
+        if let Some(file_name) = ancestor.file_name() {
+            tail_parts.push(file_name);
+        }
+        ancestor = parent;
+        if let Ok(resolved_ancestor) = ancestor.canonicalize() {
+            // 祖先を解決できた: 残りのパーツを join して返す
+            let mut result = resolved_ancestor;
+            for part in tail_parts.into_iter().rev() {
+                result = result.join(part);
+            }
+            return result;
+        }
     }
 
-    // 親ディレクトリも存在しない場合は手動で .. を解決する
+    // どの祖先も canonicalize できない場合は手動で .. を解決する
     resolve_dots(&absolute)
 }
 
