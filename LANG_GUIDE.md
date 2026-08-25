@@ -170,6 +170,31 @@ while condition do          # ERROR: no `do`
 for i in range(10):         # ERROR: no colon
 ```
 
+### Scoping
+
+- `while` and `for` loop bodies have **block scope**: variables declared with `let` inside a loop are local to that iteration and not visible outside
+- `if`/`elif`/`else` blocks do **not** create a new scope
+- Functions create their own scope
+- To modify an outer variable inside a loop, use assignment (`x = x + 1`), not `let`
+
+```tsg
+let total = 0
+for i in [1, 2, 3]
+    let temp = i * 2    # temp is local to this iteration
+    total = total + temp # modifying outer variable via assignment
+end
+# print(temp)  → ERROR: temp is not defined here
+print(total)   # 12
+```
+
+**WRONG:**
+```
+let count = 3
+while count > 0
+    let count = count - 1  # ERROR: creates a new local, outer count never changes → infinite loop
+end
+```
+
 ### Data Types
 
 | Type | Examples |
@@ -271,6 +296,19 @@ import "module" as m                # ERROR: no `as` aliasing
 - No `**` power operator; use a custom function or loop
 - No `//` integer division operator; `/` on integers gives integer division
 - No `+=`, `-=`, etc. compound assignment operators
+
+**`and`/`or` semantics (Python/JS-style):**
+- Short-circuit evaluation: right side is not evaluated if result is determined by left side
+- `and` returns the left value if falsy, otherwise the right value
+- `or` returns the left value if truthy, otherwise the right value
+- Useful idiom: `let x = value or default`
+
+```tsg
+print(true and 5)       # 5 (left truthy → returns right)
+print(false and 5)      # false (left falsy → returns left)
+print(null or "default") # default (left falsy → returns right)
+print("hi" or "bye")   # hi (left truthy → returns left)
+```
 
 **WRONG:**
 ```

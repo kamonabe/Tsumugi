@@ -44,6 +44,12 @@ pub enum OpCode {
     /// スタックトップが偽ならジャンプ（値をpop）
     JumpIfFalse(usize),
 
+    /// スタックトップが偽ならジャンプ（値をpopしない — and の短絡評価用）
+    JumpIfFalseKeep(usize),
+
+    /// スタックトップが真ならジャンプ（値をpopしない — or の短絡評価用）
+    JumpIfTrueKeep(usize),
+
     /// 後方ジャンプ（ループ先頭に戻る: ip を指定位置に設定）
     Loop(usize),
 

@@ -391,6 +391,30 @@ impl Vm {
                     self.frames.last_mut().unwrap().ip = target;
                 }
             }
+            OpCode::JumpIfFalseKeep(target) => {
+                let value = self.stack.last().ok_or_else(|| {
+                    TsumugiError::runtime_with_kind(
+                        line,
+                        crate::error::ErrorKind::Internal,
+                        "スタックが空です",
+                    )
+                })?;
+                if !value.is_truthy() {
+                    self.frames.last_mut().unwrap().ip = target;
+                }
+            }
+            OpCode::JumpIfTrueKeep(target) => {
+                let value = self.stack.last().ok_or_else(|| {
+                    TsumugiError::runtime_with_kind(
+                        line,
+                        crate::error::ErrorKind::Internal,
+                        "スタックが空です",
+                    )
+                })?;
+                if value.is_truthy() {
+                    self.frames.last_mut().unwrap().ip = target;
+                }
+            }
             OpCode::Loop(target) => {
                 self.count_step(line)?;
                 self.frames.last_mut().unwrap().ip = target;

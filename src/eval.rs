@@ -304,10 +304,14 @@ impl Evaluator {
                     if !cond.is_truthy() {
                         break;
                     }
+                    self.env.push_scope();
                     let mut should_break = false;
                     for s in body {
                         match self.exec_stmt(s)? {
-                            EvalResult::Return(v) => return Ok(EvalResult::Return(v)),
+                            EvalResult::Return(v) => {
+                                self.env.pop_scope();
+                                return Ok(EvalResult::Return(v));
+                            }
                             EvalResult::Break => {
                                 should_break = true;
                                 break;
@@ -316,6 +320,7 @@ impl Evaluator {
                             EvalResult::Val => {}
                         }
                     }
+                    self.env.pop_scope();
                     if should_break {
                         break;
                     }
@@ -344,11 +349,15 @@ impl Evaluator {
                 };
 
                 for item in items {
+                    self.env.push_scope();
                     self.env.set(var, item);
                     let mut should_break = false;
                     for s in body {
                         match self.exec_stmt(s)? {
-                            EvalResult::Return(v) => return Ok(EvalResult::Return(v)),
+                            EvalResult::Return(v) => {
+                                self.env.pop_scope();
+                                return Ok(EvalResult::Return(v));
+                            }
                             EvalResult::Break => {
                                 should_break = true;
                                 break;
@@ -357,6 +366,7 @@ impl Evaluator {
                             EvalResult::Val => {}
                         }
                     }
+                    self.env.pop_scope();
                     if should_break {
                         break;
                     }
@@ -481,9 +491,28 @@ impl Evaluator {
                 .ok_or_else(|| TsumugiError::runtime(line, format!("未定義の変数: {}", name))),
 
             Expr::BinOp { left, op, right } => {
-                let l = self.eval_expr(left, line)?;
-                let r = self.eval_expr(right, line)?;
-                self.eval_binop(&l, op, &r, line)
+                // and/or は短絡評価（右辺を常に評価しない）
+                match op {
+                    BinOpKind::And => {
+                        let l = self.eval_expr(left, line)?;
+                        if !l.is_truthy() {
+                            return Ok(l);
+                        }
+                        self.eval_expr(right, line)
+                    }
+                    BinOpKind::Or => {
+                        let l = self.eval_expr(left, line)?;
+                        if l.is_truthy() {
+                            return Ok(l);
+                        }
+                        self.eval_expr(right, line)
+                    }
+                    _ => {
+                        let l = self.eval_expr(left, line)?;
+                        let r = self.eval_expr(right, line)?;
+                        self.eval_binop(&l, op, &r, line)
+                    }
+                }
             }
 
             Expr::UnaryOp { op, expr } => {
@@ -680,9 +709,8 @@ impl Evaluator {
             (Value::Bool(l), BinOpKind::Eq, Value::Bool(r)) => Ok(Value::Bool(l == r)),
             (Value::Bool(l), BinOpKind::NotEq, Value::Bool(r)) => Ok(Value::Bool(l != r)),
 
-            // 論理演算
-            (l, BinOpKind::And, r) => Ok(Value::Bool(l.is_truthy() && r.is_truthy())),
-            (l, BinOpKind::Or, r) => Ok(Value::Bool(l.is_truthy() || r.is_truthy())),
+            // 論理演算は eval_expr 側で短絡評価するため、ここには到達しない
+            (_, BinOpKind::And, _) | (_, BinOpKind::Or, _) => unreachable!(),
 
             _ => Err(TsumugiError::runtime(
                 line,
@@ -929,7 +957,7 @@ mod tests {
     #[test]
     fn while_loop() {
         // Just confirm it doesn't panic or infinite loop
-        let src = "let i = 3\nwhile i > 0\n  let i = i - 1\nend";
+        let src = "let i = 3\nwhile i > 0\n  i = i - 1\nend";
         run_program(src).unwrap();
     }
 

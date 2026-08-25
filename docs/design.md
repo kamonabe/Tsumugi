@@ -627,3 +627,42 @@ VM版の `call_fn_value()`（map/filter/each のコールバック呼び出し�
 - `tests/fixtures/slice_edge.tsg` — 負数・逆転範囲・範囲外
 - `tests/fixtures/try_break_continue.tsg` — try 内 break/continue/return
 - `tests/fixtures/overflow_edge.tsg` — abs(i64::MIN)、range オーバーフロー
+
+
+### 2026-08-25: 仕様統一（and/or 意味論 + ループブロックスコープ）
+
+AST評価器とVM間で動作が異なっていた2つの仕様を統一。
+
+#### and/or の意味論統一
+
+**変更前:**
+- AST版: 両辺を常に評価、結果は常に `Bool`
+- VM版: 短絡評価、左辺が偽なら `false` / 真なら右辺の値をそのまま返す
+
+**変更後（両エンジン共通）:**
+- Python/JS風の短絡評価 + 値返し
+- `and`: 左辺が falsy なら左辺を返す。truthy なら右辺を評価して返す
+- `or`: 左辺が truthy なら左辺を返す。falsy なら右辺を評価して返す
+
+**実装:**
+- AST版: `eval_binop` から `And`/`Or` を除去し、`Expr::BinOp` 処理内で短絡評価
+- VM版: `JumpIfFalseKeep` / `JumpIfTrueKeep` 新オペコードを追加（値を pop せずにジャンプ判定）
+
+**判断理由:** 動的型付け言語として最も一般的な動作。`let x = config or default` イディオムが使える。
+
+#### ループブロックスコープ導入
+
+**変更前:**
+- AST版: while/for 本体にスコープなし。ループ内 `let` がループ外から参照可能
+- VM版: コメントで「ツリーウォーク版に合わせてスコープを開始しない」と明記
+
+**変更後（両エンジン共通）:**
+- while/for の本体は反復ごとに新しいブロックスコープを作成
+- ループ内で `let` した変数はそのイテレーション終了時に破棄される
+- 外側の変数を変更するには代入（`x = x + 1`）を使う
+
+**破壊的変更:**
+- `let x = x - 1` パターンでループカウンタを更新していたコードは `x = x - 1` に書き換えが必要
+- 既存テスト `control_flow.tsg` を修正
+
+**判断理由:** ほぼすべての現代言語がブロックスコープ。VM のスタック膨張問題を根本解決。バグ防止。

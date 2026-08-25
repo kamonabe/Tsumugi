@@ -415,10 +415,12 @@ impl Compiler {
         self.compile_expr(condition, line)?;
         let exit_jump = self.chunk.emit_jump(OpCode::JumpIfFalse(0), line);
 
-        // ループ本体（ツリーウォーク版に合わせてスコープを開始しない）
+        // ループ本体（ブロックスコープあり）
+        self.begin_scope();
         for stmt in body {
             self.compile_stmt(stmt)?;
         }
+        self.end_scope(line);
 
         // ループ先頭に戻る
         self.chunk.emit(OpCode::Loop(loop_start), line);
@@ -490,10 +492,12 @@ impl Compiler {
         self.chunk.emit(OpCode::SetLocal(var_slot), line);
         self.chunk.emit(OpCode::Pop, line);
 
-        // ループ本体（ツリーウォーク版に合わせてスコープを開始しない）
+        // ループ本体（ブロックスコープあり）
+        self.begin_scope();
         for stmt in body {
             self.compile_stmt(stmt)?;
         }
+        self.end_scope(line);
 
         // continue の飛び先 = インクリメント処理の先頭
         let increment_start = self.chunk.len();
@@ -632,31 +636,25 @@ impl Compiler {
             }
             Expr::BinOp { left, op, right } => {
                 match op {
-                    // and: 短絡評価（左辺が偽ならスキップ）
+                    // and: 短絡評価（左辺が偽なら左辺の値を返す）
                     BinOpKind::And => {
                         self.compile_expr(left, line)?;
-                        // 左辺が偽ならジャンプ（結果は false）
-                        let jump = self.chunk.emit_jump(OpCode::JumpIfFalse(0), line);
-                        // 左辺が真なら右辺を評価
+                        // 左辺が偽ならスタックに残したままジャンプ
+                        let jump = self.chunk.emit_jump(OpCode::JumpIfFalseKeep(0), line);
+                        // 左辺が真 → 左辺を捨てて右辺を評価
+                        self.chunk.emit(OpCode::Pop, line);
                         self.compile_expr(right, line)?;
-                        let end = self.chunk.emit_jump(OpCode::Jump(0), line);
-                        // 左辺が偽だった場合: false をスタックに積む
                         self.chunk.patch_jump(jump);
-                        self.chunk.emit_constant(Value::Bool(false), line);
-                        self.chunk.patch_jump(end);
                     }
-                    // or: 短絡評価（左辺が真ならスキップ）
+                    // or: 短絡評価（左辺が真なら左辺の値を返す）
                     BinOpKind::Or => {
                         self.compile_expr(left, line)?;
-                        // 左辺が偽ならジャンプして右辺へ
-                        let jump_to_right = self.chunk.emit_jump(OpCode::JumpIfFalse(0), line);
-                        // 左辺が真: true をスタックに積んで終了へ
-                        self.chunk.emit_constant(Value::Bool(true), line);
-                        let jump_to_end = self.chunk.emit_jump(OpCode::Jump(0), line);
-                        // 右辺を評価
-                        self.chunk.patch_jump(jump_to_right);
+                        // 左辺が真ならスタックに残したままジャンプ
+                        let jump = self.chunk.emit_jump(OpCode::JumpIfTrueKeep(0), line);
+                        // 左辺が偽 → 左辺を捨てて右辺を評価
+                        self.chunk.emit(OpCode::Pop, line);
                         self.compile_expr(right, line)?;
-                        self.chunk.patch_jump(jump_to_end);
+                        self.chunk.patch_jump(jump);
                     }
                     _ => {
                         self.compile_expr(left, line)?;
