@@ -58,6 +58,9 @@ pub enum OpCode {
     /// upvalue（クロージャがキャプチャした値）をスタックに積む
     GetUpvalue(usize),
 
+    /// upvalue（クロージャがキャプチャした変数）を更新する
+    SetUpvalue(usize),
+
     /// クロージャを作る: スタックの [VmFn, upval0, upval1, ...] → クロージャ値
     /// operand: upvalue の数
     MakeClosure(usize),

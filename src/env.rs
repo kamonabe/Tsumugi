@@ -1,12 +1,15 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
-use crate::value::Value;
+use crate::value::{SharedValue, Value};
 
 /// 変数のスコープを管理する環境
 #[derive(Debug, Clone)]
 pub struct Env {
     /// スコープのスタック（末尾が現在のスコープ）
-    scopes: Vec<HashMap<String, Value>>,
+    /// 各変数は Rc<RefCell<Value>> で保持し、クロージャと共有可能
+    scopes: Vec<HashMap<String, SharedValue>>,
 }
 
 impl Env {
@@ -26,54 +29,62 @@ impl Env {
         self.scopes.pop();
     }
 
-    /// 現在のスコープに変数を定義
+    /// 現在のスコープに変数を定義（新しい SharedValue セルを作成）
     pub fn set(&mut self, name: &str, value: Value) {
         if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name.to_string(), value);
+            scope.insert(name.to_string(), Rc::new(RefCell::new(value)));
+        }
+    }
+
+    /// 現在のスコープに既存の SharedValue セルを直接挿入（クロージャの参照共有用）
+    pub fn set_shared(&mut self, name: &str, cell: SharedValue) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name.to_string(), cell);
         }
     }
 
     /// 既存の変数を更新（内側→外側へ探索）。見つからなければ Err を返す
+    /// 同じ SharedValue セルの中身を書き換えるため、参照を共有しているクロージャにも反映される
     pub fn update(&mut self, name: &str, value: Value) -> Result<(), ()> {
         for scope in self.scopes.iter_mut().rev() {
-            if scope.contains_key(name) {
-                scope.insert(name.to_string(), value);
+            if let Some(cell) = scope.get(name) {
+                *cell.borrow_mut() = value;
                 return Ok(());
             }
         }
         Err(())
     }
 
-    /// 変数を検索（現在のスコープ → 外側へ）
-    pub fn get(&self, name: &str) -> Option<&Value> {
+    /// 変数の値をクローンして返す（現在のスコープ → 外側へ）
+    pub fn get(&self, name: &str) -> Option<Value> {
         for scope in self.scopes.iter().rev() {
-            if let Some(v) = scope.get(name) {
-                return Some(v);
+            if let Some(cell) = scope.get(name) {
+                return Some(cell.borrow().clone());
             }
         }
         None
     }
 
-    /// 変数を可変参照で検索（現在のスコープ → 外側へ）
-    pub fn get_mut(&mut self, name: &str) -> Option<&mut Value> {
-        for scope in self.scopes.iter_mut().rev() {
-            if let Some(v) = scope.get_mut(name) {
-                return Some(v);
+    /// 変数の SharedValue セルを取得（参照キャプチャ用）
+    pub fn get_cell(&self, name: &str) -> Option<SharedValue> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(cell) = scope.get(name) {
+                return Some(Rc::clone(cell));
             }
         }
         None
     }
 
-    /// 現在の全スコープをフラットな HashMap に統合して返す（クロージャ用）
+    /// 現在の全スコープの変数セルを取得する（クロージャ定義時のキャプチャ用）
     /// 内側のスコープが外側を上書きする
-    pub fn snapshot(&self) -> HashMap<String, Value> {
-        let mut flat = HashMap::new();
+    pub fn capture_all(&self) -> HashMap<String, SharedValue> {
+        let mut captured = HashMap::new();
         for scope in &self.scopes {
-            for (k, v) in scope {
-                flat.insert(k.clone(), v.clone());
+            for (k, cell) in scope {
+                captured.insert(k.clone(), Rc::clone(cell));
             }
         }
-        flat
+        captured
     }
 }
 
@@ -85,7 +96,7 @@ mod tests {
     fn set_and_get() {
         let mut env = Env::new();
         env.set("x", Value::Int(10));
-        assert_eq!(env.get("x"), Some(&Value::Int(10)));
+        assert_eq!(env.get("x"), Some(Value::Int(10)));
     }
 
     #[test]
@@ -101,10 +112,10 @@ mod tests {
 
         env.push_scope();
         env.set("x", Value::Int(2));
-        assert_eq!(env.get("x"), Some(&Value::Int(2)));
+        assert_eq!(env.get("x"), Some(Value::Int(2)));
 
         env.pop_scope();
-        assert_eq!(env.get("x"), Some(&Value::Int(1)));
+        assert_eq!(env.get("x"), Some(Value::Int(1)));
     }
 
     #[test]
@@ -113,7 +124,7 @@ mod tests {
         env.set("outer", Value::Str("visible".to_string()));
 
         env.push_scope();
-        assert_eq!(env.get("outer"), Some(&Value::Str("visible".to_string())));
+        assert_eq!(env.get("outer"), Some(Value::Str("visible".to_string())));
         env.pop_scope();
     }
 
@@ -122,7 +133,7 @@ mod tests {
         let mut env = Env::new();
         env.set("x", Value::Int(1));
         assert!(env.update("x", Value::Int(2)).is_ok());
-        assert_eq!(env.get("x"), Some(&Value::Int(2)));
+        assert_eq!(env.get("x"), Some(Value::Int(2)));
     }
 
     #[test]
@@ -139,6 +150,20 @@ mod tests {
         // 内側スコープから外側の変数を更新できる
         assert!(env.update("x", Value::Int(99)).is_ok());
         env.pop_scope();
-        assert_eq!(env.get("x"), Some(&Value::Int(99)));
+        assert_eq!(env.get("x"), Some(Value::Int(99)));
+    }
+
+    #[test]
+    fn shared_capture() {
+        // クロージャが変数セルを共有し、外側からの更新が反映される
+        let mut env = Env::new();
+        env.set("counter", Value::Int(0));
+        let cell = env.get_cell("counter").unwrap();
+
+        // 外側から更新
+        env.update("counter", Value::Int(42)).unwrap();
+
+        // 共有セル経由でも最新の値が見える
+        assert_eq!(*cell.borrow(), Value::Int(42));
     }
 }

@@ -219,11 +219,12 @@ impl Evaluator {
                     }
                 };
 
-                let target = self.env.get_mut(&var_name).ok_or_else(|| {
+                let cell = self.env.get_cell(&var_name).ok_or_else(|| {
                     TsumugiError::runtime(*line, format!("未定義の変数: {}", var_name))
                 })?;
 
-                match target {
+                let mut target = cell.borrow_mut();
+                match &mut *target {
                     Value::List(list) => {
                         let i = match &idx {
                             Value::Int(n) => *n,
@@ -367,14 +368,16 @@ impl Evaluator {
             Stmt::FnDef {
                 name, params, body, ..
             } => {
-                // 関数を値として環境にセット（let f = add のように参照可能）
+                // 関数を値として環境にセット
+                // ネストされた関数定義の場合、定義時のスコープをキャプチャする
+                let captured = self.env.capture_all();
                 self.env.set(
                     name,
                     Value::Fn {
                         name: name.clone(),
                         params: params.clone(),
                         body: body.clone(),
-                        captured: std::collections::HashMap::new(),
+                        captured,
                     },
                 );
                 Ok(EvalResult::Val)
@@ -475,7 +478,6 @@ impl Evaluator {
             Expr::Ident(name) => self
                 .env
                 .get(name)
-                .cloned()
                 .ok_or_else(|| TsumugiError::runtime(line, format!("未定義の変数: {}", name))),
 
             Expr::BinOp { left, op, right } => {
@@ -492,8 +494,8 @@ impl Evaluator {
             Expr::Call { callee, args } => self.eval_call(callee, args, line),
 
             Expr::Lambda { params, body } => {
-                // 無名関数: 定義時のスコープをキャプチャして Value::Fn を生成
-                let captured = self.env.snapshot();
+                // 無名関数: 定義時のスコープの変数セルを共有してキャプチャ
+                let captured = self.env.capture_all();
                 Ok(Value::Fn {
                     name: "<lambda>".to_string(),
                     params: params.clone(),
@@ -740,7 +742,7 @@ impl Evaluator {
         // 識別子の場合: 変数 → 関数テーブルの順で検索
         let (func_name, params, body, captured) = if let Expr::Ident(name) = callee {
             // 変数として検索
-            if let Some(val) = self.env.get(name).cloned() {
+            if let Some(val) = self.env.get(name) {
                 match val {
                     Value::Fn {
                         name: fn_name,
@@ -798,10 +800,10 @@ impl Evaluator {
             arg_values.push(self.eval_expr(arg, line)?);
         }
 
-        // 新しいスコープを作ってキャプチャ変数 + 引数をバインド
+        // 新しいスコープを作ってキャプチャ変数セル + 引数をバインド
         self.env.push_scope();
-        for (k, v) in &captured {
-            self.env.set(k, v.clone());
+        for (k, cell) in &captured {
+            self.env.set_shared(k, cell.clone());
         }
         for (param, val) in params.iter().zip(arg_values) {
             self.env.set(param, val);
