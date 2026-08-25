@@ -37,11 +37,14 @@ struct LoopState {
     try_depth: usize,
 }
 
-/// upvalue の情報（外側のどの変数をキャプチャするか）
 #[derive(Debug, Clone)]
 struct Upvalue {
     /// 外側のコンパイラでのスロット位置
+    /// is_local=true の場合: 親のローカル変数スロット
+    /// is_local=false の場合: 親の upvalue インデックス
     slot: usize,
+    /// 親のローカル変数を直接キャプチャするか（false なら親の upvalue を経由）
+    is_local: bool,
     /// 変数名（デバッグ用）
     #[allow(dead_code)]
     name: String,
@@ -60,6 +63,8 @@ pub struct Compiler {
     upvalues: Vec<Upvalue>,
     /// 親コンパイラのローカル変数（クロージャ用）
     enclosing_locals: Option<Vec<Local>>,
+    /// 親コンパイラの upvalue リスト（多段キャプチャ用）
+    enclosing_upvalues: Option<Vec<Upvalue>>,
     /// 現在のスクリプトの基準ディレクトリ（import のパス解決に使用）
     base_dir: PathBuf,
     /// import 済みファイルの正規パス集合（循環 import 防止）
@@ -75,6 +80,7 @@ impl Compiler {
             loops: Vec::new(),
             upvalues: Vec::new(),
             enclosing_locals: None,
+            enclosing_upvalues: None,
             base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             imported: HashSet::new(),
         }
@@ -90,8 +96,8 @@ impl Compiler {
         }
     }
 
-    /// 子コンパイラを作成（親のローカル変数を参照可能に）
-    fn new_enclosed(enclosing_locals: Vec<Local>) -> Self {
+    /// 子コンパイラを作成（親のローカル変数と祖先のスコープを参照可能に）
+    fn new_enclosed(enclosing_locals: Vec<Local>, enclosing_upvalues: Vec<Upvalue>) -> Self {
         Compiler {
             chunk: Chunk::new(),
             locals: Vec::new(),
@@ -99,6 +105,7 @@ impl Compiler {
             loops: Vec::new(),
             upvalues: Vec::new(),
             enclosing_locals: Some(enclosing_locals),
+            enclosing_upvalues: Some(enclosing_upvalues),
             base_dir: PathBuf::from("."),
             imported: HashSet::new(),
         }
@@ -832,8 +839,11 @@ impl Compiler {
         body: &[Stmt],
         line: usize,
     ) -> Result<(), TsumugiError> {
-        // 関数本体を別の Compiler でコンパイル（親のlocalsを渡す）
-        let mut fn_compiler = Compiler::new_enclosed(self.locals.clone());
+        // 関数本体を別の Compiler でコンパイル（親のlocalsと祖先スコープを渡す）
+        // enclosing_upvalues には親が到達可能な祖先変数を渡す
+        // （親の enclosing_locals + 親の enclosing_upvalues を合成）
+        let ancestor_vars = self.build_ancestor_vars();
+        let mut fn_compiler = Compiler::new_enclosed(self.locals.clone(), ancestor_vars);
         fn_compiler.chunk.name = name.to_string();
 
         // 再帰呼び出し用に関数自身の名前を slot 0 として登録
@@ -854,7 +864,10 @@ impl Compiler {
         fn_compiler.chunk.emit(OpCode::ReturnValue, line);
 
         let fn_chunk = fn_compiler.chunk;
-        let upvalues = fn_compiler.upvalues;
+        let mut upvalues = fn_compiler.upvalues;
+
+        // 子の is_local=false upvalue を解決（親が中間キャプチャを行う）
+        self.resolve_child_upvalues(&mut upvalues);
 
         // VmFn 値を定数テーブルに追加してロード
         let fn_value = Value::VmFn {
@@ -871,7 +884,11 @@ impl Compiler {
         } else {
             // upvalue あり: 外側の変数値をスタックに積んで MakeClosure
             for uv in &upvalues {
-                self.chunk.emit(OpCode::GetLocal(uv.slot), line);
+                if uv.is_local {
+                    self.chunk.emit(OpCode::GetLocal(uv.slot), line);
+                } else {
+                    self.chunk.emit(OpCode::GetUpvalue(uv.slot), line);
+                }
             }
             self.chunk.emit(OpCode::MakeClosure(upvalues.len()), line);
         }
@@ -889,7 +906,8 @@ impl Compiler {
         body: &[Stmt],
         line: usize,
     ) -> Result<(), TsumugiError> {
-        let mut fn_compiler = Compiler::new_enclosed(self.locals.clone());
+        let ancestor_vars = self.build_ancestor_vars();
+        let mut fn_compiler = Compiler::new_enclosed(self.locals.clone(), ancestor_vars);
         fn_compiler.chunk.name = "<lambda>".to_string();
 
         // ラムダ自身は slot 0（無名なので "__lambda__"）
@@ -907,7 +925,10 @@ impl Compiler {
         fn_compiler.chunk.emit(OpCode::ReturnValue, line);
 
         let fn_chunk = fn_compiler.chunk;
-        let upvalues = fn_compiler.upvalues;
+        let mut upvalues = fn_compiler.upvalues;
+
+        // 子の is_local=false upvalue を解決（親が中間キャプチャを行う）
+        self.resolve_child_upvalues(&mut upvalues);
 
         let fn_value = Value::VmFn {
             name: "<lambda>".to_string(),
@@ -920,7 +941,11 @@ impl Compiler {
 
         if !upvalues.is_empty() {
             for uv in &upvalues {
-                self.chunk.emit(OpCode::GetLocal(uv.slot), line);
+                if uv.is_local {
+                    self.chunk.emit(OpCode::GetLocal(uv.slot), line);
+                } else {
+                    self.chunk.emit(OpCode::GetUpvalue(uv.slot), line);
+                }
             }
             self.chunk.emit(OpCode::MakeClosure(upvalues.len()), line);
         }
@@ -963,27 +988,111 @@ impl Compiler {
 
     /// 外側のスコープから変数を探し、upvalue として登録する
     /// 見つかった場合は upvalue のインデックスを返す
+    /// 多段キャプチャ: 親のローカル → 親の祖先変数の順に検索
     fn resolve_upvalue(&mut self, name: &str) -> Option<usize> {
-        let enclosing = self.enclosing_locals.as_ref()?;
-        // 親のローカル変数を検索
-        for (i, local) in enclosing.iter().enumerate().rev() {
-            if local.name == name {
-                // 既に同じスロットの upvalue があるか確認
-                for (ui, uv) in self.upvalues.iter().enumerate() {
-                    if uv.slot == i {
-                        return Some(ui);
-                    }
+        // まず親のローカル変数を検索（is_local=true）
+        if let Some(enclosing) = &self.enclosing_locals {
+            for (i, local) in enclosing.iter().enumerate().rev() {
+                if local.name == name {
+                    return Some(self.add_upvalue(i, true, name));
                 }
-                // 新しい upvalue を登録
-                let index = self.upvalues.len();
-                self.upvalues.push(Upvalue {
-                    slot: i,
-                    name: name.to_string(),
-                });
-                return Some(index);
+            }
+        }
+        // 親の祖先変数を検索（is_local=false: 親経由で祖先の変数をキャプチャ）
+        // ここでの slot は enclosing_upvalues 内のインデックス（後で親側で解決する）
+        if let Some(enclosing_uvs) = &self.enclosing_upvalues {
+            for (i, uv) in enclosing_uvs.iter().enumerate() {
+                if uv.name == name {
+                    return Some(self.add_upvalue(i, false, name));
+                }
             }
         }
         None
+    }
+
+    /// upvalue を登録する（既に同じものがあれば既存のインデックスを返す）
+    fn add_upvalue(&mut self, slot: usize, is_local: bool, name: &str) -> usize {
+        // 既に同じ upvalue が登録されているか確認
+        for (i, uv) in self.upvalues.iter().enumerate() {
+            if uv.slot == slot && uv.is_local == is_local {
+                return i;
+            }
+        }
+        let index = self.upvalues.len();
+        self.upvalues.push(Upvalue {
+            slot,
+            is_local,
+            name: name.to_string(),
+        });
+        index
+    }
+
+    /// 子コンパイラに渡す祖先変数リストを構築する
+    /// 自身の enclosing_locals + enclosing_upvalues を合成して、
+    /// 子がさらに上の変数を参照できるようにする
+    fn build_ancestor_vars(&self) -> Vec<Upvalue> {
+        let mut vars = Vec::new();
+        // 自身の enclosing_locals（自分の親のローカル変数）
+        if let Some(enclosing) = &self.enclosing_locals {
+            for local in enclosing {
+                vars.push(Upvalue {
+                    slot: 0, // 実際のスロットは resolve 時に決まる
+                    is_local: true,
+                    name: local.name.clone(),
+                });
+            }
+        }
+        // 自身の enclosing_upvalues（自分の祖先の変数）
+        if let Some(uvs) = &self.enclosing_upvalues {
+            for uv in uvs {
+                // 既に同名がなければ追加
+                if !vars.iter().any(|v| v.name == uv.name) {
+                    vars.push(uv.clone());
+                }
+            }
+        }
+        vars
+    }
+
+    /// 子コンパイラの upvalue を解決する: is_local=false の upvalue について、
+    /// 親（self）が実際にキャプチャを行い、正しい slot を設定する
+    fn resolve_child_upvalues(&mut self, child_upvalues: &mut [Upvalue]) {
+        for child_uv in child_upvalues.iter_mut() {
+            if !child_uv.is_local {
+                // 子が祖先変数を要求 → 親が自分の upvalue として確保する
+                let parent_uv_index = self.ensure_upvalue_for_ancestor(&child_uv.name);
+                child_uv.slot = parent_uv_index;
+            }
+        }
+    }
+
+    /// 指定名の変数を自身の upvalue として確保する（なければ追加）
+    /// 戻り値は self.upvalues 内のインデックス
+    fn ensure_upvalue_for_ancestor(&mut self, name: &str) -> usize {
+        // 既に自分の upvalues にあるか
+        for (i, uv) in self.upvalues.iter().enumerate() {
+            if uv.name == name {
+                return i;
+            }
+        }
+        // 自分の enclosing_locals から探す
+        if let Some(enclosing) = &self.enclosing_locals {
+            for (i, local) in enclosing.iter().enumerate().rev() {
+                if local.name == name {
+                    return self.add_upvalue(i, true, name);
+                }
+            }
+        }
+        // 自分の enclosing_upvalues から探す
+        if let Some(enclosing_uvs) = &self.enclosing_upvalues {
+            for (i, uv) in enclosing_uvs.iter().enumerate() {
+                if uv.name == name {
+                    return self.add_upvalue(i, false, name);
+                }
+            }
+        }
+        // フォールバック（到達しないはず）
+        self.add_upvalue(0, false, name)
     }
 }
 

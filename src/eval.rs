@@ -155,21 +155,26 @@ impl Evaluator {
         let mut lexer = Lexer::new(&source);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(tokens);
-        let program = parser.parse().map_err(|errors| {
-            TsumugiError::runtime_with_kind(
-                line,
-                crate::error::ErrorKind::Import,
-                format!(
-                    "import 失敗 ({}): {}",
-                    path,
-                    errors
-                        .iter()
-                        .map(|e| e.to_string())
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                ),
-            )
-        })?;
+        let program = match parser.parse() {
+            Ok(p) => p,
+            Err(errors) => {
+                // base_dir を復元してからエラーを返す
+                self.base_dir = prev_base_dir;
+                return Err(TsumugiError::runtime_with_kind(
+                    line,
+                    crate::error::ErrorKind::Import,
+                    format!(
+                        "import 失敗 ({}): {}",
+                        path,
+                        errors
+                            .iter()
+                            .map(|e| e.to_string())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                ));
+            }
+        };
 
         let result = self.run(&program);
 

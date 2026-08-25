@@ -1,0 +1,22 @@
+# map/filter/each 経由の再帰制限テスト
+
+# map コールバック内で再帰 → スタックオーバーフローが検出される
+fn recurse(x)
+    return map([x], fn(v) recurse(v) end)
+end
+
+try
+    recurse(1)
+catch e
+    print("map recursion caught: " + e["type"])
+end
+
+# 正常な map は動作する
+let doubled = map([1, 2, 3], fn(x) x * 2 end)
+print(doubled)
+
+# 正常な filter は動作する
+let evens = filter([1, 2, 3, 4], fn(x) x % 2 == 0 end)
+print(evens)
+
+print("done")
