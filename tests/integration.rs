@@ -45,6 +45,15 @@ fn run_golden_test_mode(name: &str, use_vm: bool) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mode = if use_vm { "VM" } else { "tree-walk" };
 
+    // 正常系テストは終了コード 0 を期待
+    assert!(
+        output.status.success(),
+        "ゴールデンテストが異常終了しました [{}]: {}\n--- stderr ---\n{}",
+        mode,
+        name,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
     // Windows の CRLF を LF に正規化して比較
     let actual = stdout.replace("\r\n", "\n");
     let expect = expected.replace("\r\n", "\n");

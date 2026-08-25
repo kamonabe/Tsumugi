@@ -834,21 +834,40 @@ pub fn dispatch(name: &str, args: &[Value], line: usize) -> Result<Option<Value>
 
 pub fn format_unix_timestamp(timestamp: i64, format: &str) -> String {
     let secs_per_day: i64 = 86400;
-    let mut days = timestamp / secs_per_day;
-    let day_secs = (timestamp % secs_per_day) as u32;
+
+    // days と day_secs を正しく計算（負のタイムスタンプ対応）
+    // Rust の % は truncated division なので、負の場合は補正する
+    let mut days = timestamp.div_euclid(secs_per_day);
+    let day_secs = timestamp.rem_euclid(secs_per_day) as u32;
     let hours = day_secs / 3600;
     let minutes = (day_secs % 3600) / 60;
     let seconds = day_secs % 60;
 
+    // 日数から年月日を計算（負の days = 1970年以前に対応）
     let mut year: i64 = 1970;
-    loop {
-        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-        if days < days_in_year {
-            break;
+
+    if days >= 0 {
+        // 1970年以降
+        loop {
+            let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+            if days < days_in_year {
+                break;
+            }
+            days -= days_in_year;
+            year += 1;
         }
-        days -= days_in_year;
-        year += 1;
+    } else {
+        // 1970年以前
+        loop {
+            year -= 1;
+            let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+            days += days_in_year;
+            if days >= 0 {
+                break;
+            }
+        }
     }
+
     let month_days = if is_leap_year(year) {
         [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     } else {
