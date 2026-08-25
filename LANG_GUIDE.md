@@ -221,7 +221,9 @@ end
 - NOT `begin/rescue/end` (Ruby)
 - NOT `try/except` (Python)
 - No `finally` or `ensure` block
-- The catch variable receives the error message as a string
+- The catch variable is bound to a structured Error value, not a plain string
+- Access fields via index syntax: `e["type"]`, `e["message"]`, `e["line"]`
+- It also stringifies automatically when concatenated with `+` or interpolated in an f-string
 
 **WRONG:**
 ```
@@ -430,7 +432,12 @@ end
 try
     let result = 10 / 0
 catch e
+    # e stringifies to the message when interpolated
     print(f"caught: {e}")
+    # structured access via index
+    print(e["type"])       # e.g. "RuntimeError"
+    print(e["message"])    # e.g. "division by zero"
+    print(e["line"])       # line number (integer)
 end
 ```
 
