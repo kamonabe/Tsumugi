@@ -1,0 +1,24 @@
+# slice 境界値テスト（リグレッション防止）
+
+# 正常系
+let xs = [10, 20, 30, 40, 50]
+print(slice(xs, 0, 3))
+print(slice(xs, 2, 5))
+
+# start > end → 空リスト
+print(slice(xs, 3, 1))
+print(slice(xs, 5, 0))
+
+# 負数 → 0 にクランプ
+print(slice(xs, -1, 3))
+print(slice(xs, -5, -1))
+
+# 文字列の同等テスト
+let s = "hello"
+print(slice(s, 0, 3))
+print(slice(s, 3, 1))
+print(slice(s, -2, 4))
+
+# end が長さを超える → 長さにクランプ
+print(slice(xs, 2, 100))
+print(slice(s, 1, 999))

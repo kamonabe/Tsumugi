@@ -111,6 +111,9 @@ impl Vm {
                 // ネストされた関数が暗黙 null return で終わった場合
                 let f = self.frames.pop().unwrap();
                 self.stack.truncate(f.base);
+                // 暗黙 return 時にこのフレーム内の try ハンドラを除去する
+                self.try_handlers
+                    .retain(|h| h.frame_depth <= self.frames.len());
                 self.stack.push(Value::Null);
                 continue;
             }
@@ -124,7 +127,10 @@ impl Vm {
                     let return_value = self.pop(line)?;
                     let frame = self.frames.pop().unwrap();
                     self.stack.truncate(frame.base);
-                    if self.frames.len() <= stop_depth {
+                    // return 時にこのフレーム内の try ハンドラを除去する
+                    let current_depth = self.frames.len();
+                    self.try_handlers.retain(|h| h.frame_depth <= current_depth);
+                    if current_depth <= stop_depth {
                         return Ok(return_value);
                     }
                     self.stack.push(return_value);
@@ -137,6 +143,9 @@ impl Vm {
                     // ネストされたフレーム内の Return（通常は起きないがガード）
                     let f = self.frames.pop().unwrap();
                     self.stack.truncate(f.base);
+                    // return 時にこのフレーム内の try ハンドラを除去する
+                    self.try_handlers
+                        .retain(|h| h.frame_depth <= self.frames.len());
                     self.stack.push(Value::Null);
                     Ok(())
                 }

@@ -190,18 +190,27 @@ pub fn builtin_slice(args: &[Value], line: usize) -> Result<Value, TsumugiError>
     let (Value::Int(start), Value::Int(end)) = (&args[1], &args[2]) else {
         return Err(type_error(line, "slice の開始・終了は整数で指定します"));
     };
-    let start = *start as usize;
-    let end = *end as usize;
+    // 負数は 0 にクランプ
+    let start = if *start < 0 { 0usize } else { *start as usize };
+    let end = if *end < 0 { 0usize } else { *end as usize };
     match &args[0] {
         Value::List(v) => {
             let s = start.min(v.len());
             let e = end.min(v.len());
+            // start > end の場合は空リストを返す（パニックしない）
+            if s > e {
+                return Ok(Value::List(Vec::new()));
+            }
             Ok(Value::List(v[s..e].to_vec()))
         }
         Value::Str(s) => {
             let chars: Vec<char> = s.chars().collect();
             let st = start.min(chars.len());
             let en = end.min(chars.len());
+            // start > end の場合は空文字列を返す（パニックしない）
+            if st > en {
+                return Ok(Value::Str(String::new()));
+            }
             Ok(Value::Str(chars[st..en].iter().collect()))
         }
         _ => Err(type_error(line, "slice は List/Str に対してのみ使えます")),
@@ -261,7 +270,15 @@ pub fn builtin_range(args: &[Value], line: usize) -> Result<Value, TsumugiError>
     check_arity("range", args, 2, line)?;
     if let (Value::Int(start), Value::Int(end)) = (&args[0], &args[1]) {
         let size = if *end > *start {
-            (*end - *start) as usize
+            // checked_sub でオーバーフローを防ぐ
+            let diff = end.checked_sub(*start).ok_or_else(|| {
+                TsumugiError::runtime_with_kind(
+                    line,
+                    crate::error::ErrorKind::IntOverflow,
+                    "整数オーバーフロー: range の範囲が大きすぎます",
+                )
+            })?;
+            diff as usize
         } else {
             0
         };
@@ -400,7 +417,16 @@ pub fn builtin_to_float(args: &[Value], line: usize) -> Result<Value, TsumugiErr
 pub fn builtin_abs(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("abs", args, 1, line)?;
     match &args[0] {
-        Value::Int(n) => Ok(Value::Int(n.abs())),
+        Value::Int(n) => n
+            .checked_abs()
+            .map(|v| Ok(Value::Int(v)))
+            .unwrap_or_else(|| {
+                Err(TsumugiError::runtime_with_kind(
+                    line,
+                    crate::error::ErrorKind::IntOverflow,
+                    "整数オーバーフロー: abs() の結果が表現できません",
+                ))
+            }),
         Value::Float(f) => Ok(Value::Float(f.abs())),
         _ => Err(type_error(line, "abs は数値に対してのみ使えます")),
     }

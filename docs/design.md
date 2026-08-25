@@ -598,3 +598,32 @@ VM版の `call_fn_value()`（map/filter/each のコールバック呼び出し�
 - **シンボリックリンク**: サンドボックス内に外部を指す symlink が存在する場合、新規ファイル作成時に迂回の余地がある
 - **ヒープメモリ制限なし**: 巨大なリスト・文字列の生成でOOMになる可能性がある
 - **input() の無制限読み込み**: 改行なしの巨大入力でOOM、入力なしで無限ブロック
+
+
+## 変更履歴
+
+### 2026-08-25: 安全性バグ修正（パニック防止・ハンドラリーク）
+
+外部レビューで発見された「ユーザー入力だけでホスト言語がパニックする」問題と「VM内部状態が壊れる」問題を修正。
+
+#### 修正内容
+
+| 対象 | 問題 | 修正 |
+|------|------|------|
+| `slice()` | 負数の `i64` を `usize` に変換するとラップアラウンド。`start > end` で Rust パニック | 負数は 0 にクランプ。`s > e` なら空を返す |
+| `abs()` | `i64::MIN` の `abs()` が表現不能でパニック | `checked_abs` を使い、失敗時は `IntOverflow` エラーを返す |
+| `range()` | `end - start` が `i64` オーバーフロー（例: `MIN` と `MAX` の差） | `checked_sub` でオーバーフロー検出、エラーを返す |
+| VM `ReturnValue` | try 内で return すると `TeardownTry` を通らず `try_handlers` にハンドラが残留 | フレーム pop 後に `try_handlers.retain()` で古いハンドラを除去 |
+| VM `break`/`continue` | try 内で break/continue してもハンドラが残り、後続のエラーが誤キャッチされる | `LoopState` に `try_depth` を追加し、break/continue 時に必要数の `TeardownTry` を発行 |
+
+#### 設計判断
+
+- **slice の負数**: Python の負数インデックス（末尾から数える）の導入は見送り、0 クランプとした。将来仕様として追加する場合は別途設計する
+- **try ハンドラの二重防御**: VM 側の `retain()` とコンパイラ側の `TeardownTry` 発行の両方を入れた。コンパイラ側だけでも動作するが、VM 側にも安全弁を残すことで return 経路の漏れに対するフォールバックとした
+- **abs/range のエラー**: `try/catch` で捕捉可能な Tsumugi エラーとして返す。パニックさせない
+
+#### リグレッションテスト
+
+- `tests/fixtures/slice_edge.tsg` — 負数・逆転範囲・範囲外
+- `tests/fixtures/try_break_continue.tsg` — try 内 break/continue/return
+- `tests/fixtures/overflow_edge.tsg` — abs(i64::MIN)、range オーバーフロー

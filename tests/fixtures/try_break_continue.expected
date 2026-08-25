@@ -1,0 +1,6 @@
+break result: 3
+continue result: 12
+stopped
+completed
+post-break catch: ゼロ除算
+done
