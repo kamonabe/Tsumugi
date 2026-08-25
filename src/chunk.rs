@@ -63,7 +63,10 @@ impl Chunk {
     pub fn patch_jump(&mut self, offset: usize) {
         let target = self.code.len();
         match &mut self.code[offset] {
-            OpCode::Jump(addr) | OpCode::JumpIfFalse(addr) => {
+            OpCode::Jump(addr)
+            | OpCode::JumpIfFalse(addr)
+            | OpCode::JumpIfFalseKeep(addr)
+            | OpCode::JumpIfTrueKeep(addr) => {
                 *addr = target;
             }
             _ => panic!("patch_jump: ジャンプ命令ではないオフセットが指定されました"),

@@ -945,3 +945,17 @@ fn golden_overflow_edge() {
 fn vm_golden_overflow_edge() {
     run_golden_test_vm("overflow_edge");
 }
+
+// =============================================================
+// リグレッションテスト: and/or 値返し + ループブロックスコープ
+// =============================================================
+
+#[test]
+fn golden_and_or_scope() {
+    run_golden_test("and_or_scope");
+}
+
+#[test]
+fn vm_golden_and_or_scope() {
+    run_golden_test_vm("and_or_scope");
+}

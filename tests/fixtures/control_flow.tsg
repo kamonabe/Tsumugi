@@ -10,5 +10,5 @@ end
 let count = 3
 while count > 0
     print(count)
-    let count = count - 1
+    count = count - 1
 end

@@ -1,0 +1,52 @@
+# and/or 短絡評価 + 値返しのテスト
+
+# and: 左が truthy なら右を返す
+print(true and 5)
+print("hello" and "world")
+
+# and: 左が falsy なら左を返す（右は評価しない）
+print(false and 5)
+print(null and "skip")
+print(0 and "skip")
+
+# or: 左が truthy なら左を返す（右は評価しない）
+print(true or "skip")
+print("hi" or "bye")
+print(1 or 0)
+
+# or: 左が falsy なら右を返す
+print(false or "default")
+print(null or 42)
+print(0 or "zero is falsy")
+
+# 短絡評価の確認: 副作用が実行されない
+let called = false
+fn side_effect()
+    called = true
+    return "side"
+end
+
+let x = false and side_effect()
+print(called)
+
+let y = true or side_effect()
+print(called)
+
+# ループブロックスコープのテスト
+let sum = 0
+for i in [10, 20, 30]
+    let local = i * 2
+    sum = sum + local
+end
+# local はループ外で見えない → 代わりに sum を確認
+print(sum)
+
+# while でもスコープが効く
+let count = 3
+let result = ""
+while count > 0
+    let msg = "x"
+    result = result + msg
+    count = count - 1
+end
+print(result)
