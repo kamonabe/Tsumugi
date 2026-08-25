@@ -120,6 +120,24 @@ impl Compiler {
         Ok(self.chunk)
     }
 
+    /// REPL 用インクリメンタルコンパイル: 既存のローカル変数を保持したまま
+    /// 新しいステートメントだけをコンパイルして Chunk を返す。
+    /// self は消費されず次の入力に再利用される。
+    pub fn compile_repl_line(&mut self, program: &Program) -> Result<Chunk, TsumugiError> {
+        // 新しいチャンクを作成（前のチャンクは捨てる）
+        let prev_chunk = std::mem::replace(&mut self.chunk, Chunk::new());
+        // チャンク名を引き継ぐ
+        self.chunk.name = prev_chunk.name;
+
+        for stmt in program {
+            self.compile_stmt(stmt)?;
+        }
+        self.chunk.emit(OpCode::Return, 0);
+
+        // 今回のチャンクを取り出して返す（次回用に空チャンクをセット）
+        Ok(std::mem::replace(&mut self.chunk, Chunk::new()))
+    }
+
     /// 文をコンパイル
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), TsumugiError> {
         match stmt {
