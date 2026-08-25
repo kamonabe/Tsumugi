@@ -216,7 +216,8 @@ fn classify_runtime_error(message: &str) -> ErrorKind {
         || message.contains("に対してのみ")
     {
         ErrorKind::BuiltinType
-    } else if message.contains("反復できません") || message.contains("イテレートできません") {
+    } else if message.contains("反復できません") || message.contains("イテレートできません")
+    {
         ErrorKind::Iteration
     } else if message.contains("内部エラー") {
         ErrorKind::Internal

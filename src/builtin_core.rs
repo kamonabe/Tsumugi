@@ -365,14 +365,13 @@ pub fn builtin_to_int(args: &[Value], line: usize) -> Result<Value, TsumugiError
         Value::Int(n) => Ok(Value::Int(*n)),
         Value::Float(f) => Ok(Value::Int(*f as i64)),
         Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
-        Value::Str(s) => s
-            .parse::<i64>()
-            .map(Value::Int)
-            .map_err(|_| TsumugiError::runtime_with_kind(
+        Value::Str(s) => s.parse::<i64>().map(Value::Int).map_err(|_| {
+            TsumugiError::runtime_with_kind(
                 line,
                 crate::error::ErrorKind::Conversion,
                 format!("to_int: 変換失敗: \"{}\"", s),
-            )),
+            )
+        }),
         _ => Err(type_error(line, "to_int: 変換できない型です")),
     }
 }
@@ -387,14 +386,13 @@ pub fn builtin_to_float(args: &[Value], line: usize) -> Result<Value, TsumugiErr
     match &args[0] {
         Value::Float(f) => Ok(Value::Float(*f)),
         Value::Int(n) => Ok(Value::Float(*n as f64)),
-        Value::Str(s) => s
-            .parse::<f64>()
-            .map(Value::Float)
-            .map_err(|_| TsumugiError::runtime_with_kind(
+        Value::Str(s) => s.parse::<f64>().map(Value::Float).map_err(|_| {
+            TsumugiError::runtime_with_kind(
                 line,
                 crate::error::ErrorKind::Conversion,
                 format!("to_float: 変換失敗: \"{}\"", s),
-            )),
+            )
+        }),
         _ => Err(type_error(line, "to_float: 変換できない型です")),
     }
 }

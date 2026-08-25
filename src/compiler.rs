@@ -125,13 +125,13 @@ impl Compiler {
             }
             Stmt::Assign { name, value, line } => {
                 self.compile_expr(value, *line)?;
-                let slot = self
-                    .resolve_local(name, *line)
-                    .map_err(|_| TsumugiError::runtime_with_kind(
+                let slot = self.resolve_local(name, *line).map_err(|_| {
+                    TsumugiError::runtime_with_kind(
                         *line,
                         crate::error::ErrorKind::Name,
                         format!("未定義の変数に代入: {}", name),
-                    ))?;
+                    )
+                })?;
                 self.chunk.emit(OpCode::SetLocal(slot), *line);
                 self.chunk.emit(OpCode::Pop, *line);
             }
@@ -228,11 +228,13 @@ impl Compiler {
 
         // パス解決
         let resolved = self.base_dir.join(path);
-        let canonical = std::fs::canonicalize(&resolved).map_err(|e| TsumugiError::runtime_with_kind(
-            line,
-            crate::error::ErrorKind::Import,
-            format!("import 失敗: ファイルが見つかりません: {} ({})", path, e),
-        ))?;
+        let canonical = std::fs::canonicalize(&resolved).map_err(|e| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Import,
+                format!("import 失敗: ファイルが見つかりません: {} ({})", path, e),
+            )
+        })?;
 
         // サンドボックスチェック: import 先が許可範囲内か検証
         crate::sandbox::check_path(canonical.to_str().unwrap_or(""), line)?;
@@ -244,11 +246,13 @@ impl Compiler {
         self.imported.insert(canonical.clone());
 
         // ファイル読み込み
-        let source = std::fs::read_to_string(&canonical).map_err(|e| TsumugiError::runtime_with_kind(
-            line,
-            crate::error::ErrorKind::Import,
-            format!("import 失敗: ファイルを読み込めません: {} ({})", path, e),
-        ))?;
+        let source = std::fs::read_to_string(&canonical).map_err(|e| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Import,
+                format!("import 失敗: ファイルを読み込めません: {} ({})", path, e),
+            )
+        })?;
 
         // base_dir を一時的に切り替え
         let prev_base_dir = self.base_dir.clone();
@@ -260,19 +264,21 @@ impl Compiler {
         let mut lexer = Lexer::new(&source);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(tokens);
-        let program = parser.parse().map_err(|errors| TsumugiError::runtime_with_kind(
-            line,
-            crate::error::ErrorKind::Import,
-            format!(
-                "import 失敗 ({}): {}",
-                path,
-                errors
-                    .iter()
-                    .map(|e| e.to_string())
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ),
-        ))?;
+        let program = parser.parse().map_err(|errors| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Import,
+                format!(
+                    "import 失敗 ({}): {}",
+                    path,
+                    errors
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            )
+        })?;
 
         // import 先の文をインラインでコンパイル（現在のチャンクに直接追加）
         for stmt in &program {
@@ -509,11 +515,13 @@ impl Compiler {
 
     /// break のコンパイル
     fn compile_break(&mut self, line: usize) -> Result<(), TsumugiError> {
-        let loop_state = self.loops.last().ok_or_else(|| TsumugiError::runtime_with_kind(
-            line,
-            crate::error::ErrorKind::ControlFlow,
-            "break はループの中でのみ使用できます",
-        ))?;
+        let loop_state = self.loops.last().ok_or_else(|| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::ControlFlow,
+                "break はループの中でのみ使用できます",
+            )
+        })?;
 
         // ループ内で宣言されたローカル変数をクリーンアップ
         let locals_to_pop = self.locals.len() - loop_state.locals_count;
@@ -530,11 +538,13 @@ impl Compiler {
 
     /// continue のコンパイル
     fn compile_continue(&mut self, line: usize) -> Result<(), TsumugiError> {
-        let loop_state = self.loops.last().ok_or_else(|| TsumugiError::runtime_with_kind(
-            line,
-            crate::error::ErrorKind::ControlFlow,
-            "continue はループの中でのみ使用できます",
-        ))?;
+        let loop_state = self.loops.last().ok_or_else(|| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::ControlFlow,
+                "continue はループの中でのみ使用できます",
+            )
+        })?;
         let continue_target = loop_state.continue_target;
         let continue_resolved = loop_state.continue_resolved;
 

@@ -118,11 +118,13 @@ impl Evaluator {
 
         // パス解決: base_dir からの相対パス
         let resolved = self.base_dir.join(path);
-        let canonical = std::fs::canonicalize(&resolved).map_err(|e| TsumugiError::runtime_with_kind(
-            line,
-            crate::error::ErrorKind::Import,
-            format!("import 失敗: ファイルが見つかりません: {} ({})", path, e),
-        ))?;
+        let canonical = std::fs::canonicalize(&resolved).map_err(|e| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Import,
+                format!("import 失敗: ファイルが見つかりません: {} ({})", path, e),
+            )
+        })?;
 
         // サンドボックスチェック: import 先が許可範囲内か検証
         crate::sandbox::check_path(canonical.to_str().unwrap_or(""), line)?;
@@ -135,11 +137,13 @@ impl Evaluator {
         self.imported.insert(canonical.clone());
 
         // ファイル読み込み
-        let source = std::fs::read_to_string(&canonical).map_err(|e| TsumugiError::runtime_with_kind(
-            line,
-            crate::error::ErrorKind::Import,
-            format!("import 失敗: ファイルを読み込めません: {} ({})", path, e),
-        ))?;
+        let source = std::fs::read_to_string(&canonical).map_err(|e| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Import,
+                format!("import 失敗: ファイルを読み込めません: {} ({})", path, e),
+            )
+        })?;
 
         // base_dir を一時的に import 先のディレクトリに切り替え（ネスト import 対応）
         let prev_base_dir = self.base_dir.clone();
@@ -151,19 +155,21 @@ impl Evaluator {
         let mut lexer = Lexer::new(&source);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(tokens);
-        let program = parser.parse().map_err(|errors| TsumugiError::runtime_with_kind(
-            line,
-            crate::error::ErrorKind::Import,
-            format!(
-                "import 失敗 ({}): {}",
-                path,
-                errors
-                    .iter()
-                    .map(|e| e.to_string())
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ),
-        ))?;
+        let program = parser.parse().map_err(|errors| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Import,
+                format!(
+                    "import 失敗 ({}): {}",
+                    path,
+                    errors
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            )
+        })?;
 
         let result = self.run(&program);
 
