@@ -187,6 +187,8 @@ fn run_file_vm(path: &str) {
 fn run_repl_vm() {
     println!("Tsumugi v0.1.0 [VM mode] — 終了するには Ctrl+D");
     let mut input = String::new();
+    let mut compiler = Compiler::new();
+    let mut vm = Vm::new_repl();
 
     loop {
         if input.is_empty() {
@@ -209,27 +211,31 @@ fn run_repl_vm() {
             continue;
         }
 
-        if let Err(errors) = execute_vm(&input) {
-            for e in &errors {
-                eprintln!("  エラー: {}", e);
+        // パース
+        let mut lexer = Lexer::new(&input);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        match parser.parse() {
+            Ok(program) => {
+                // インクリメンタルコンパイル
+                match compiler.compile_repl_line(&program) {
+                    Ok(chunk) => {
+                        if let Err(e) = vm.run_repl_chunk(chunk) {
+                            eprintln!("  エラー: {}", e);
+                        }
+                    }
+                    Err(e) => eprintln!("  エラー: {}", e),
+                }
+            }
+            Err(errors) => {
+                for e in &errors {
+                    eprintln!("  エラー: {}", e);
+                }
             }
         }
 
         input.clear();
     }
-}
-
-/// VMモードの実行関数
-fn execute_vm(source: &str) -> Result<(), Vec<error::TsumugiError>> {
-    let mut lexer = Lexer::new(source);
-    let tokens = lexer.tokenize();
-
-    let mut parser = Parser::new(tokens);
-    let program = parser.parse()?;
-
-    let chunk = Compiler::new().compile(&program).map_err(|e| vec![e])?;
-    let mut vm = Vm::new(chunk);
-    vm.run().map_err(|e| vec![e])
 }
 
 /// VMモードの実行関数（ファイルパス付き）

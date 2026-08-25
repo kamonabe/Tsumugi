@@ -85,8 +85,43 @@ impl Vm {
         }
     }
 
+    /// REPL 用: 空のスタックで VM を生成（最初の run_repl_chunk で使用）
+    pub fn new_repl() -> Self {
+        Vm {
+            frames: Vec::new(),
+            stack: Vec::with_capacity(256),
+            steps: 0,
+            max_steps: vm_resolve_max_steps(),
+            try_handlers: Vec::new(),
+        }
+    }
+
     /// チャンクを実行する
     pub fn run(&mut self) -> Result<(), TsumugiError> {
+        self.run_frames(0)?;
+        Ok(())
+    }
+
+    /// REPL 用: 既存のスタック（ローカル変数）を保持したまま新しいチャンクを実行する。
+    /// 前回のフレームを差し替えて実行し、終了後もスタック上の値を保持する。
+    pub fn run_repl_chunk(&mut self, chunk: Chunk) -> Result<(), TsumugiError> {
+        // トップレベルフレームを新しいチャンクに差し替える
+        // （スタックはそのまま保持 — 前回の locals が残っている）
+        let frame = CallFrame {
+            chunk: Rc::new(chunk),
+            ip: 0,
+            base: 0,
+            upvalues: Vec::new(),
+            locals_cells: Vec::new(),
+        };
+        // 前のトップレベルフレームがあれば差し替え、なければ追加
+        if self.frames.is_empty() {
+            self.frames.push(frame);
+        } else {
+            self.frames[0] = frame;
+        }
+        // ステップカウンタはリセット（各入力で予算を全額使えるように）
+        self.steps = 0;
         self.run_frames(0)?;
         Ok(())
     }
