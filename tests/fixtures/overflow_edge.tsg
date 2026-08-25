@@ -1,0 +1,28 @@
+# 整数オーバーフロー境界値テスト（リグレッション防止）
+
+# abs(i64::MIN) → オーバーフローエラー（try/catch で捕捉可能）
+try
+    let x = -9223372036854775807 - 1
+    let y = abs(x)
+    print("should not reach: " + to_str(y))
+catch e
+    print("abs overflow: " + e)
+end
+
+# abs の正常系
+print(abs(-42))
+print(abs(0))
+print(abs(100))
+
+# range オーバーフロー → エラー（try/catch で捕捉可能）
+try
+    let big = range(-4611686018427387904, 4611686018427387904)
+    print("should not reach")
+catch e
+    print("range overflow: " + e)
+end
+
+# range の正常系
+print(range(0, 5))
+print(range(3, 3))
+print(range(5, 2))

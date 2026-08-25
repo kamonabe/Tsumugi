@@ -32,6 +32,9 @@ struct LoopState {
     locals_count: usize,
     /// continue を固定先に飛ばすか（while=true）、パッチするか（for=false）
     continue_resolved: bool,
+    /// ループ内で現在アクティブな try ブロックの深さ
+    /// break/continue 時にこの数だけ TeardownTry を発行する
+    try_depth: usize,
 }
 
 /// upvalue の情報（外側のどの変数をキャプチャするか）
@@ -306,6 +309,11 @@ impl Compiler {
         let setup_offset = self.chunk.len();
         self.chunk.emit(OpCode::SetupTry(0), line);
 
+        // ループ内の try_depth をインクリメント（break/continue の TeardownTry 発行用）
+        if let Some(loop_state) = self.loops.last_mut() {
+            loop_state.try_depth += 1;
+        }
+
         // try ブロック
         self.begin_scope();
         for stmt in try_body {
@@ -315,6 +323,12 @@ impl Compiler {
 
         // try 正常完了: ハンドラを解除して catch をスキップ
         self.chunk.emit(OpCode::TeardownTry, line);
+
+        // ループ内の try_depth をデクリメント
+        if let Some(loop_state) = self.loops.last_mut() {
+            loop_state.try_depth -= 1;
+        }
+
         let jump_over_catch = self.chunk.emit_jump(OpCode::Jump(0), line);
 
         // catch ブロックの先頭アドレスをパッチ
@@ -394,6 +408,7 @@ impl Compiler {
             continues: Vec::new(),
             locals_count: self.locals.len(),
             continue_resolved: true,
+            try_depth: 0,
         });
 
         // 条件式
@@ -458,6 +473,7 @@ impl Compiler {
             continues: Vec::new(),
             locals_count: self.locals.len(),
             continue_resolved: false,
+            try_depth: 0,
         });
 
         // 条件: index < len(collection)
@@ -526,6 +542,12 @@ impl Compiler {
             )
         })?;
 
+        // break 時にアクティブな try ハンドラを解除する
+        let try_depth = loop_state.try_depth;
+        for _ in 0..try_depth {
+            self.chunk.emit(OpCode::TeardownTry, line);
+        }
+
         // ループ内で宣言されたローカル変数をクリーンアップ
         let locals_to_pop = self.locals.len() - loop_state.locals_count;
         if locals_to_pop > 0 {
@@ -550,6 +572,12 @@ impl Compiler {
         })?;
         let continue_target = loop_state.continue_target;
         let continue_resolved = loop_state.continue_resolved;
+
+        // continue 時にアクティブな try ハンドラを解除する
+        let try_depth = loop_state.try_depth;
+        for _ in 0..try_depth {
+            self.chunk.emit(OpCode::TeardownTry, line);
+        }
 
         // ループ内で宣言されたローカル変数をクリーンアップ
         let locals_to_pop = self.locals.len() - loop_state.locals_count;

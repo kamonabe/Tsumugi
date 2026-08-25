@@ -1,0 +1,66 @@
+# try 内の break/continue/return でハンドラがリークしないことを検証
+
+# --- break inside try ---
+let result = 0
+for i in [1, 2, 3, 4, 5]
+    try
+        if i == 3
+            break
+        end
+        result = result + i
+    catch e
+        print("unexpected catch: " + e)
+    end
+end
+print("break result: " + to_str(result))
+
+# --- continue inside try ---
+let total = 0
+for i in [1, 2, 3, 4, 5]
+    try
+        if i == 3
+            continue
+        end
+        total = total + i
+    catch e
+        print("unexpected catch: " + e)
+    end
+end
+print("continue result: " + to_str(total))
+
+# --- return inside try ---
+fn early_return(xs)
+    for item in xs
+        try
+            if item == "stop"
+                return "stopped"
+            end
+        catch e
+            print("unexpected: " + e)
+        end
+    end
+    return "completed"
+end
+
+print(early_return(["a", "b", "stop", "c"]))
+print(early_return(["x", "y", "z"]))
+
+# --- break/continue 後に別のエラーが正しくキャッチされる ---
+let caught = "none"
+for i in [1, 2, 3]
+    try
+        if i == 2
+            break
+        end
+    catch e
+        caught = e
+    end
+end
+
+try
+    let x = 1 / 0
+catch e
+    print("post-break catch: " + e)
+end
+
+print("done")

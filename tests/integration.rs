@@ -903,3 +903,45 @@ fn golden_closure_counter() {
 fn vm_golden_closure_counter() {
     run_golden_test_vm("closure_counter");
 }
+
+// =============================================================
+// リグレッションテスト: slice 境界値
+// =============================================================
+
+#[test]
+fn golden_slice_edge() {
+    run_golden_test("slice_edge");
+}
+
+#[test]
+fn vm_golden_slice_edge() {
+    run_golden_test_vm("slice_edge");
+}
+
+// =============================================================
+// リグレッションテスト: try 内 break/continue/return
+// =============================================================
+
+#[test]
+fn golden_try_break_continue() {
+    run_golden_test("try_break_continue");
+}
+
+#[test]
+fn vm_golden_try_break_continue() {
+    run_golden_test_vm("try_break_continue");
+}
+
+// =============================================================
+// リグレッションテスト: abs/range オーバーフロー境界値
+// =============================================================
+
+#[test]
+fn golden_overflow_edge() {
+    run_golden_test("overflow_edge");
+}
+
+#[test]
+fn vm_golden_overflow_edge() {
+    run_golden_test_vm("overflow_edge");
+}
