@@ -73,11 +73,11 @@ impl Evaluator {
     fn count_step(&mut self, line: usize) -> Result<(), TsumugiError> {
         self.steps += 1;
         if self.steps > self.max_steps {
-            let mut err = TsumugiError::Runtime {
+            let mut err = TsumugiError::runtime_with_kind(
                 line,
-                message: format!("ステップ上限に達しました (上限: {})", self.max_steps),
-                trace: Vec::new(),
-            };
+                crate::error::ErrorKind::StepLimit,
+                format!("ステップ上限に達しました (上限: {})", self.max_steps),
+            );
             if !self.call_stack.is_empty() {
                 let mut trace = self.call_stack.clone();
                 trace.reverse();
@@ -118,11 +118,11 @@ impl Evaluator {
 
         // パス解決: base_dir からの相対パス
         let resolved = self.base_dir.join(path);
-        let canonical = std::fs::canonicalize(&resolved).map_err(|e| TsumugiError::Runtime {
+        let canonical = std::fs::canonicalize(&resolved).map_err(|e| TsumugiError::runtime_with_kind(
             line,
-            message: format!("import 失敗: ファイルが見つかりません: {} ({})", path, e),
-            trace: Vec::new(),
-        })?;
+            crate::error::ErrorKind::Import,
+            format!("import 失敗: ファイルが見つかりません: {} ({})", path, e),
+        ))?;
 
         // サンドボックスチェック: import 先が許可範囲内か検証
         crate::sandbox::check_path(canonical.to_str().unwrap_or(""), line)?;
@@ -135,11 +135,11 @@ impl Evaluator {
         self.imported.insert(canonical.clone());
 
         // ファイル読み込み
-        let source = std::fs::read_to_string(&canonical).map_err(|e| TsumugiError::Runtime {
+        let source = std::fs::read_to_string(&canonical).map_err(|e| TsumugiError::runtime_with_kind(
             line,
-            message: format!("import 失敗: ファイルを読み込めません: {} ({})", path, e),
-            trace: Vec::new(),
-        })?;
+            crate::error::ErrorKind::Import,
+            format!("import 失敗: ファイルを読み込めません: {} ({})", path, e),
+        ))?;
 
         // base_dir を一時的に import 先のディレクトリに切り替え（ネスト import 対応）
         let prev_base_dir = self.base_dir.clone();
@@ -151,9 +151,10 @@ impl Evaluator {
         let mut lexer = Lexer::new(&source);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(tokens);
-        let program = parser.parse().map_err(|errors| TsumugiError::Runtime {
+        let program = parser.parse().map_err(|errors| TsumugiError::runtime_with_kind(
             line,
-            message: format!(
+            crate::error::ErrorKind::Import,
+            format!(
                 "import 失敗 ({}): {}",
                 path,
                 errors
@@ -162,8 +163,7 @@ impl Evaluator {
                     .collect::<Vec<_>>()
                     .join("; ")
             ),
-            trace: Vec::new(),
-        })?;
+        ))?;
 
         let result = self.run(&program);
 

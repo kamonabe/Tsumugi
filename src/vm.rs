@@ -186,11 +186,7 @@ impl Vm {
     fn count_step(&mut self, line: usize) -> Result<(), TsumugiError> {
         self.steps += 1;
         if self.steps > self.max_steps {
-            return Err(TsumugiError::Runtime {
-                line,
-                message: format!("ステップ上限に達しました (上限: {})", self.max_steps),
-                trace: Vec::new(),
-            });
+            return Err(TsumugiError::runtime(line, format!("ステップ上限に達しました (上限: {})", self.max_steps)));
         }
         Ok(())
     }
@@ -308,19 +304,11 @@ impl Vm {
                     Value::Int(n) => {
                         n.checked_neg()
                             .map(Value::Int)
-                            .ok_or_else(|| TsumugiError::Runtime {
-                                line,
-                                message: "整数オーバーフロー".to_string(),
-                                trace: Vec::new(),
-                            })?
+                            .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー"))?
                     }
                     Value::Float(n) => Value::Float(-n),
                     other => {
-                        return Err(TsumugiError::Runtime {
-                            line,
-                            message: format!("型エラー: -{} は計算できません", type_name(&other)),
-                            trace: Vec::new(),
-                        });
+                        return Err(TsumugiError::runtime(line, format!("型エラー: -{} は計算できません", type_name(&other))));
                     }
                 };
                 self.stack.push(result);
@@ -336,11 +324,7 @@ impl Vm {
                     .stack
                     .last()
                     .cloned()
-                    .ok_or_else(|| TsumugiError::Runtime {
-                        line,
-                        message: "内部エラー: スタックが空です".to_string(),
-                        trace: Vec::new(),
-                    })?;
+                    .ok_or_else(|| TsumugiError::runtime(line, "内部エラー: スタックが空です"))?;
                 self.stack[base + slot] = value;
             }
             OpCode::Jump(target) => {
@@ -383,24 +367,16 @@ impl Vm {
                         upvalues,
                     });
                 } else {
-                    return Err(TsumugiError::Runtime {
-                        line,
-                        message: "内部エラー: MakeClosure の対象が VmFn ではありません".to_string(),
-                        trace: Vec::new(),
-                    });
+                    return Err(TsumugiError::runtime(line, "内部エラー: MakeClosure の対象が VmFn ではありません"));
                 }
             }
             OpCode::Call(arg_count) => {
                 self.count_step(line)?;
                 if self.frames.len() >= MAX_CALL_DEPTH {
-                    return Err(TsumugiError::Runtime {
-                        line,
-                        message: format!(
+                    return Err(TsumugiError::runtime(line, format!(
                             "スタックオーバーフロー: 再帰が深すぎます (上限: {})",
                             MAX_CALL_DEPTH
-                        ),
-                        trace: Vec::new(),
-                    });
+                        )));
                 }
                 let fn_pos = self.stack.len() - 1 - arg_count;
                 let fn_value = self.stack[fn_pos].clone();
@@ -413,14 +389,10 @@ impl Vm {
                 } = fn_value
                 {
                     if arg_count != arity {
-                        return Err(TsumugiError::Runtime {
-                            line,
-                            message: format!(
+                        return Err(TsumugiError::runtime(line, format!(
                                 "関数 {} は引数{}個ですが、{}個渡されました",
                                 name, arity, arg_count
-                            ),
-                            trace: Vec::new(),
-                        });
+                            )));
                     }
                     let base = fn_pos;
                     self.frames.push(CallFrame {
@@ -430,11 +402,7 @@ impl Vm {
                         upvalues,
                     });
                 } else {
-                    return Err(TsumugiError::Runtime {
-                        line,
-                        message: format!("関数ではない値を呼び出そうとしました: {:?}", fn_value),
-                        trace: Vec::new(),
-                    });
+                    return Err(TsumugiError::runtime(line, format!("関数ではない値を呼び出そうとしました: {:?}", fn_value)));
                 }
             }
             OpCode::Print(arg_count) => {
@@ -461,14 +429,10 @@ impl Vm {
                     Value::Str(s) => s.chars().count() as i64,
                     Value::Dict(m) => m.len() as i64,
                     _ => {
-                        return Err(TsumugiError::Runtime {
-                            line,
-                            message: format!(
+                        return Err(TsumugiError::runtime(line, format!(
                                 "型エラー: {} の長さは取得できません",
                                 type_name(&value)
-                            ),
-                            trace: Vec::new(),
-                        });
+                            )));
                     }
                 };
                 self.stack.push(Value::Int(length));
@@ -481,45 +445,25 @@ impl Vm {
             }
             OpCode::ListPush => {
                 let value = self.pop(line)?;
-                let list = self.stack.last_mut().ok_or_else(|| TsumugiError::Runtime {
-                    line,
-                    message: "内部エラー: スタックが空です".to_string(),
-                    trace: Vec::new(),
-                })?;
+                let list = self.stack.last_mut().ok_or_else(|| TsumugiError::runtime(line, "内部エラー: スタックが空です"))?;
                 if let Value::List(v) = list {
                     v.push(value);
                 } else {
-                    return Err(TsumugiError::Runtime {
-                        line,
-                        message: "内部エラー: ListPush の対象がリストではありません".to_string(),
-                        trace: Vec::new(),
-                    });
+                    return Err(TsumugiError::runtime(line, "内部エラー: ListPush の対象がリストではありません"));
                 }
             }
             OpCode::DictInsert => {
                 let value = self.pop(line)?;
                 let key = self.pop(line)?;
-                let dict = self.stack.last_mut().ok_or_else(|| TsumugiError::Runtime {
-                    line,
-                    message: "内部エラー: スタックが空です".to_string(),
-                    trace: Vec::new(),
-                })?;
+                let dict = self.stack.last_mut().ok_or_else(|| TsumugiError::runtime(line, "内部エラー: スタックが空です"))?;
                 if let Value::Dict(map) = dict {
                     if let Value::Str(k) = key {
                         map.insert(k, value);
                     } else {
-                        return Err(TsumugiError::Runtime {
-                            line,
-                            message: "辞書のキーは文字列である必要があります".to_string(),
-                            trace: Vec::new(),
-                        });
+                        return Err(TsumugiError::runtime(line, "辞書のキーは文字列である必要があります"));
                     }
                 } else {
-                    return Err(TsumugiError::Runtime {
-                        line,
-                        message: "内部エラー: DictInsert の対象が辞書ではありません".to_string(),
-                        trace: Vec::new(),
-                    });
+                    return Err(TsumugiError::runtime(line, "内部エラー: DictInsert の対象が辞書ではありません"));
                 }
             }
             OpCode::SetIndex => {
@@ -540,11 +484,7 @@ impl Vm {
                         Value::List(s.chars().map(|c| Value::Str(c.to_string())).collect())
                     }
                     _ => {
-                        return Err(TsumugiError::Runtime {
-                            line,
-                            message: format!("型エラー: {:?} はイテレートできません", value),
-                            trace: Vec::new(),
-                        });
+                        return Err(TsumugiError::runtime(line, format!("型エラー: {:?} はイテレートできません", value)));
                     }
                 };
                 self.stack.push(list);
@@ -553,12 +493,10 @@ impl Vm {
                 let name = match &self.frames.last().unwrap().chunk.constants[name_idx] {
                     Value::Str(s) => s.clone(),
                     _ => {
-                        return Err(TsumugiError::Runtime {
+                        return Err(TsumugiError::runtime(
                             line,
-                            message: "内部エラー: CallBuiltin の関数名が文字列ではありません"
-                                .to_string(),
-                            trace: Vec::new(),
-                        });
+                            "内部エラー: CallBuiltin の関数名が文字列ではありません",
+                        ));
                     }
                 };
                 let mut args = Vec::with_capacity(arg_count);
@@ -593,11 +531,7 @@ impl Vm {
 
     /// スタックからpop
     fn pop(&mut self, line: usize) -> Result<Value, TsumugiError> {
-        self.stack.pop().ok_or_else(|| TsumugiError::Runtime {
-            line,
-            message: "内部エラー: スタックが空です".to_string(),
-            trace: Vec::new(),
-        })
+        self.stack.pop().ok_or_else(|| TsumugiError::runtime(line, "内部エラー: スタックが空です"))
     }
 
     /// インデックスアクセス
@@ -614,11 +548,10 @@ impl Vm {
                 } else {
                     *i as usize
                 };
-                list.get(idx).cloned().ok_or_else(|| TsumugiError::Runtime {
+                list.get(idx).cloned().ok_or_else(|| TsumugiError::runtime(
                     line,
-                    message: format!("インデックス範囲外: {} (長さ: {})", i, list.len()),
-                    trace: Vec::new(),
-                })
+                    format!("インデックス範囲外: {} (長さ: {})", i, list.len()),
+                ))
             }
             (Value::Str(s), Value::Int(i)) => {
                 let chars: Vec<char> = s.chars().collect();
@@ -630,11 +563,10 @@ impl Vm {
                 chars
                     .get(idx)
                     .map(|c| Value::Str(c.to_string()))
-                    .ok_or_else(|| TsumugiError::Runtime {
+                    .ok_or_else(|| TsumugiError::runtime(
                         line,
-                        message: format!("インデックス範囲外: {} (長さ: {})", i, chars.len()),
-                        trace: Vec::new(),
-                    })
+                        format!("インデックス範囲外: {} (長さ: {})", i, chars.len()),
+                    ))
             }
             (Value::Dict(map), Value::Str(key)) => Ok(map.get(key).cloned().unwrap_or(Value::Null)),
             (
@@ -650,14 +582,10 @@ impl Vm {
                 "line" => Ok(Value::Int(*err_line as i64)),
                 _ => Ok(Value::Null),
             },
-            _ => Err(TsumugiError::Runtime {
-                line,
-                message: format!(
+            _ => Err(TsumugiError::runtime(line, format!(
                     "型エラー: {:?} に対して {:?} でインデックスアクセスできません",
                     collection, index
-                ),
-                trace: Vec::new(),
-            }),
+                ))),
         }
     }
 
@@ -677,11 +605,10 @@ impl Vm {
                     *i as usize
                 };
                 if idx >= list.len() {
-                    return Err(TsumugiError::Runtime {
+                    return Err(TsumugiError::runtime(
                         line,
-                        message: format!("インデックス範囲外: {} (長さ: {})", i, list.len()),
-                        trace: Vec::new(),
-                    });
+                        format!("インデックス範囲外: {} (長さ: {})", i, list.len()),
+                    ));
                 }
                 list[idx] = value;
                 Ok(collection)
@@ -690,11 +617,7 @@ impl Vm {
                 map.insert(key.clone(), value);
                 Ok(collection)
             }
-            _ => Err(TsumugiError::Runtime {
-                line,
-                message: "辞書のキーは文字列である必要があります".to_string(),
-                trace: Vec::new(),
-            }),
+            _ => Err(TsumugiError::runtime(line, "辞書のキーは文字列である必要があります")),
         }
     }
 
@@ -791,11 +714,7 @@ impl Vm {
                     ))
                 }
             }
-            _ => Err(TsumugiError::Runtime {
-                line,
-                message: format!("未定義の組み込み関数: {}", name),
-                trace: Vec::new(),
-            }),
+            _ => Err(TsumugiError::runtime(line, format!("未定義の組み込み関数: {}", name))),
         }
     }
 
@@ -815,15 +734,11 @@ impl Vm {
         } = func
         {
             if args.len() != arity {
-                return Err(TsumugiError::Runtime {
-                    line,
-                    message: format!(
+                return Err(TsumugiError::runtime(line, format!(
                         "引数の数が合いません: {}個必要ですが{}個渡されました",
                         arity,
                         args.len()
-                    ),
-                    trace: Vec::new(),
-                });
+                    )));
             }
             // 関数自身をスタックに積む（slot 0）
             let base = self.stack.len();
@@ -841,11 +756,7 @@ impl Vm {
             // run_frames で実行し、target_depth まで戻ったら値を返す
             self.run_frames(target_depth)
         } else {
-            Err(TsumugiError::Runtime {
-                line,
-                message: "関数ではない値を呼び出そうとしました".to_string(),
-                trace: Vec::new(),
-            })
+            Err(TsumugiError::runtime(line, "関数ではない値を呼び出そうとしました"))
         }
     }
 
@@ -856,11 +767,7 @@ impl Vm {
             (Value::Int(a), Value::Int(b)) => {
                 a.checked_add(*b)
                     .map(Value::Int)
-                    .ok_or_else(|| TsumugiError::Runtime {
-                        line,
-                        message: "整数オーバーフロー".to_string(),
-                        trace: Vec::new(),
-                    })
+                    .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー"))
             }
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
@@ -868,11 +775,7 @@ impl Vm {
             (Value::Str(a), Value::Str(b)) => Ok(Value::Str(format!("{}{}", a, b))),
             (Value::Str(a), Value::Error { .. }) => Ok(Value::Str(format!("{}{}", a, right))),
             (Value::Error { .. }, Value::Str(b)) => Ok(Value::Str(format!("{}{}", left, b))),
-            _ => Err(TsumugiError::Runtime {
-                line,
-                message: format!("型エラー: {:?} Add {:?} は計算できません", left, right),
-                trace: Vec::new(),
-            }),
+            _ => Err(TsumugiError::runtime(line, format!("型エラー: {:?} Add {:?} は計算できません", left, right))),
         }
     }
 
@@ -881,20 +784,12 @@ impl Vm {
             (Value::Int(a), Value::Int(b)) => {
                 a.checked_sub(*b)
                     .map(Value::Int)
-                    .ok_or_else(|| TsumugiError::Runtime {
-                        line,
-                        message: "整数オーバーフロー".to_string(),
-                        trace: Vec::new(),
-                    })
+                    .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー"))
             }
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 - b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a - *b as f64)),
-            _ => Err(TsumugiError::Runtime {
-                line,
-                message: format!("型エラー: {:?} Sub {:?} は計算できません", left, right),
-                trace: Vec::new(),
-            }),
+            _ => Err(TsumugiError::runtime(line, format!("型エラー: {:?} Sub {:?} は計算できません", left, right))),
         }
     }
 
@@ -903,74 +798,42 @@ impl Vm {
             (Value::Int(a), Value::Int(b)) => {
                 a.checked_mul(*b)
                     .map(Value::Int)
-                    .ok_or_else(|| TsumugiError::Runtime {
-                        line,
-                        message: "整数オーバーフロー".to_string(),
-                        trace: Vec::new(),
-                    })
+                    .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー"))
             }
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 * b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a * *b as f64)),
-            _ => Err(TsumugiError::Runtime {
-                line,
-                message: format!("型エラー: {:?} Mul {:?} は計算できません", left, right),
-                trace: Vec::new(),
-            }),
+            _ => Err(TsumugiError::runtime(line, format!("型エラー: {:?} Mul {:?} は計算できません", left, right))),
         }
     }
 
     fn binary_div(&self, left: Value, right: Value, line: usize) -> Result<Value, TsumugiError> {
         match (&left, &right) {
-            (Value::Int(_), Value::Int(0)) => Err(TsumugiError::Runtime {
-                line,
-                message: "ゼロ除算".to_string(),
-                trace: Vec::new(),
-            }),
+            (Value::Int(_), Value::Int(0)) => Err(TsumugiError::runtime(line, "ゼロ除算")),
             (Value::Int(a), Value::Int(b)) => {
                 a.checked_div(*b)
                     .map(Value::Int)
-                    .ok_or_else(|| TsumugiError::Runtime {
-                        line,
-                        message: "整数オーバーフロー".to_string(),
-                        trace: Vec::new(),
-                    })
+                    .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー"))
             }
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a / b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 / b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a / *b as f64)),
-            _ => Err(TsumugiError::Runtime {
-                line,
-                message: format!("型エラー: {:?} Div {:?} は計算できません", left, right),
-                trace: Vec::new(),
-            }),
+            _ => Err(TsumugiError::runtime(line, format!("型エラー: {:?} Div {:?} は計算できません", left, right))),
         }
     }
 
     fn binary_mod(&self, left: Value, right: Value, line: usize) -> Result<Value, TsumugiError> {
         match (&left, &right) {
-            (Value::Int(_), Value::Int(0)) => Err(TsumugiError::Runtime {
-                line,
-                message: "ゼロ除算".to_string(),
-                trace: Vec::new(),
-            }),
+            (Value::Int(_), Value::Int(0)) => Err(TsumugiError::runtime(line, "ゼロ除算")),
             (Value::Int(a), Value::Int(b)) => {
                 a.checked_rem(*b)
                     .map(Value::Int)
-                    .ok_or_else(|| TsumugiError::Runtime {
-                        line,
-                        message: "整数オーバーフロー".to_string(),
-                        trace: Vec::new(),
-                    })
+                    .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー"))
             }
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a % b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 % b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a % *b as f64)),
-            _ => Err(TsumugiError::Runtime {
-                line,
-                message: format!("型エラー: {:?} Mod {:?} は計算できません", left, right),
-                trace: Vec::new(),
-            }),
+            _ => Err(TsumugiError::runtime(line, format!("型エラー: {:?} Mod {:?} は計算できません", left, right))),
         }
     }
 
@@ -983,11 +846,7 @@ impl Vm {
             (Value::Int(a), Value::Float(b)) => Ok(Value::Bool((*a as f64) < *b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a < *b as f64)),
             (Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a < b)),
-            _ => Err(TsumugiError::Runtime {
-                line,
-                message: format!("型エラー: {:?} と {:?} は比較できません", left, right),
-                trace: Vec::new(),
-            }),
+            _ => Err(TsumugiError::runtime(line, format!("型エラー: {:?} と {:?} は比較できません", left, right))),
         }
     }
 
@@ -998,11 +857,7 @@ impl Vm {
             (Value::Int(a), Value::Float(b)) => Ok(Value::Bool(*a as f64 > *b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a > *b as f64)),
             (Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a > b)),
-            _ => Err(TsumugiError::Runtime {
-                line,
-                message: format!("型エラー: {:?} と {:?} は比較できません", left, right),
-                trace: Vec::new(),
-            }),
+            _ => Err(TsumugiError::runtime(line, format!("型エラー: {:?} と {:?} は比較できません", left, right))),
         }
     }
 
@@ -1013,11 +868,7 @@ impl Vm {
             (Value::Int(a), Value::Float(b)) => Ok(Value::Bool(*a as f64 <= *b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a <= *b as f64)),
             (Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a <= b)),
-            _ => Err(TsumugiError::Runtime {
-                line,
-                message: format!("型エラー: {:?} と {:?} は比較できません", left, right),
-                trace: Vec::new(),
-            }),
+            _ => Err(TsumugiError::runtime(line, format!("型エラー: {:?} と {:?} は比較できません", left, right))),
         }
     }
 
@@ -1028,11 +879,7 @@ impl Vm {
             (Value::Int(a), Value::Float(b)) => Ok(Value::Bool(*a as f64 >= *b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a >= *b as f64)),
             (Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a >= b)),
-            _ => Err(TsumugiError::Runtime {
-                line,
-                message: format!("型エラー: {:?} と {:?} は比較できません", left, right),
-                trace: Vec::new(),
-            }),
+            _ => Err(TsumugiError::runtime(line, format!("型エラー: {:?} と {:?} は比較できません", left, right))),
         }
     }
 }

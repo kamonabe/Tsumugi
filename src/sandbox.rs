@@ -62,11 +62,11 @@ pub fn check_path(path_str: &str, line: usize) -> Result<(), TsumugiError> {
         }
     }
 
-    Err(TsumugiError::Runtime {
+    Err(TsumugiError::runtime_with_kind(
         line,
-        message: format!("サンドボックス違反: パス \"{}\" は許可範囲外です", path_str),
-        trace: Vec::new(),
-    })
+        crate::error::ErrorKind::Sandbox,
+        format!("サンドボックス違反: パス \"{}\" は許可範囲外です", path_str),
+    ))
 }
 
 /// パスを絶対パスに正規化する。

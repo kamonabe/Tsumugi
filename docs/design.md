@@ -1,6 +1,6 @@
 # Tsumugi — 設計ドキュメント
 
-最終更新: 2026-08-22
+最終更新: 2026-08-25
 
 ## 目的
 
@@ -213,9 +213,13 @@ let result = filter(test, fn(item) item != "kani" end)
 
 - `TsumugiError` enum でパースエラー（`Parse`）とランタイムエラー（`Runtime`）を構造的に区別
 - 各バリアントに `line: usize` と `message: String` を保持
+- `Runtime` バリアントには `kind: ErrorKind` フィールドを持ち、エラーの種別を構造的に表現する
+- `ErrorKind` enum（17バリアント）: `ZeroDivision`, `Type`, `Index`, `Name`, `StepLimit`, `StackOverflow`, `Sandbox`, `Import`, `Argument`, `IntOverflow`, `ControlFlow`, `CollectionLimit`, `Conversion`, `BuiltinType`, `Iteration`, `Internal`, `Runtime`
+- `error_type()` メソッドは `kind.as_str()` を返す — try/catch で `e["type"]` として利用される
 - `Display` 実装で「N行目: メッセージ」形式の出力を生成（従来と同じ形式を維持）
-- 全箇所で `TsumugiError::runtime(line, msg)` / `TsumugiError::parse(line, msg)` コンストラクタを使用
+- 全箇所で `TsumugiError::runtime(line, msg)`（メッセージから kind を自動推定）/ `TsumugiError::runtime_with_kind(line, kind, msg)`（明示指定）/ `TsumugiError::parse(line, msg)` コンストラクタを使用
 - `From<String>` は廃止済み — 文字列の再パースに頼らず、行番号を構造として保持する方式に統一
+- `classify_runtime_error()` はメッセージ文字列から kind を推定するフォールバック関数として残存（`runtime()` 経由の既存コード向け後方互換）
 
 ## テスト設計
 

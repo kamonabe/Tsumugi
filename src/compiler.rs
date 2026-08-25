@@ -127,11 +127,11 @@ impl Compiler {
                 self.compile_expr(value, *line)?;
                 let slot = self
                     .resolve_local(name, *line)
-                    .map_err(|_| TsumugiError::Runtime {
-                        line: *line,
-                        message: format!("未定義の変数に代入: {}", name),
-                        trace: Vec::new(),
-                    })?;
+                    .map_err(|_| TsumugiError::runtime_with_kind(
+                        *line,
+                        crate::error::ErrorKind::Name,
+                        format!("未定義の変数に代入: {}", name),
+                    ))?;
                 self.chunk.emit(OpCode::SetLocal(slot), *line);
                 self.chunk.emit(OpCode::Pop, *line);
             }
@@ -152,11 +152,11 @@ impl Compiler {
                     self.chunk.emit(OpCode::Pop, *line);
                 } else {
                     // ネストされたインデックス代入は未サポート
-                    return Err(TsumugiError::Runtime {
-                        line: *line,
-                        message: "VM未対応: ネストされたインデックス代入".to_string(),
-                        trace: Vec::new(),
-                    });
+                    return Err(TsumugiError::runtime_with_kind(
+                        *line,
+                        crate::error::ErrorKind::Runtime,
+                        "VM未対応: ネストされたインデックス代入",
+                    ));
                 }
             }
             Stmt::ExprStmt { expr, line } => {
@@ -228,11 +228,11 @@ impl Compiler {
 
         // パス解決
         let resolved = self.base_dir.join(path);
-        let canonical = std::fs::canonicalize(&resolved).map_err(|e| TsumugiError::Runtime {
+        let canonical = std::fs::canonicalize(&resolved).map_err(|e| TsumugiError::runtime_with_kind(
             line,
-            message: format!("import 失敗: ファイルが見つかりません: {} ({})", path, e),
-            trace: Vec::new(),
-        })?;
+            crate::error::ErrorKind::Import,
+            format!("import 失敗: ファイルが見つかりません: {} ({})", path, e),
+        ))?;
 
         // サンドボックスチェック: import 先が許可範囲内か検証
         crate::sandbox::check_path(canonical.to_str().unwrap_or(""), line)?;
@@ -244,11 +244,11 @@ impl Compiler {
         self.imported.insert(canonical.clone());
 
         // ファイル読み込み
-        let source = std::fs::read_to_string(&canonical).map_err(|e| TsumugiError::Runtime {
+        let source = std::fs::read_to_string(&canonical).map_err(|e| TsumugiError::runtime_with_kind(
             line,
-            message: format!("import 失敗: ファイルを読み込めません: {} ({})", path, e),
-            trace: Vec::new(),
-        })?;
+            crate::error::ErrorKind::Import,
+            format!("import 失敗: ファイルを読み込めません: {} ({})", path, e),
+        ))?;
 
         // base_dir を一時的に切り替え
         let prev_base_dir = self.base_dir.clone();
@@ -260,9 +260,10 @@ impl Compiler {
         let mut lexer = Lexer::new(&source);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(tokens);
-        let program = parser.parse().map_err(|errors| TsumugiError::Runtime {
+        let program = parser.parse().map_err(|errors| TsumugiError::runtime_with_kind(
             line,
-            message: format!(
+            crate::error::ErrorKind::Import,
+            format!(
                 "import 失敗 ({}): {}",
                 path,
                 errors
@@ -271,8 +272,7 @@ impl Compiler {
                     .collect::<Vec<_>>()
                     .join("; ")
             ),
-            trace: Vec::new(),
-        })?;
+        ))?;
 
         // import 先の文をインラインでコンパイル（現在のチャンクに直接追加）
         for stmt in &program {
@@ -509,11 +509,11 @@ impl Compiler {
 
     /// break のコンパイル
     fn compile_break(&mut self, line: usize) -> Result<(), TsumugiError> {
-        let loop_state = self.loops.last().ok_or_else(|| TsumugiError::Runtime {
+        let loop_state = self.loops.last().ok_or_else(|| TsumugiError::runtime_with_kind(
             line,
-            message: "break はループの中でのみ使用できます".to_string(),
-            trace: Vec::new(),
-        })?;
+            crate::error::ErrorKind::ControlFlow,
+            "break はループの中でのみ使用できます",
+        ))?;
 
         // ループ内で宣言されたローカル変数をクリーンアップ
         let locals_to_pop = self.locals.len() - loop_state.locals_count;
@@ -530,11 +530,11 @@ impl Compiler {
 
     /// continue のコンパイル
     fn compile_continue(&mut self, line: usize) -> Result<(), TsumugiError> {
-        let loop_state = self.loops.last().ok_or_else(|| TsumugiError::Runtime {
+        let loop_state = self.loops.last().ok_or_else(|| TsumugiError::runtime_with_kind(
             line,
-            message: "continue はループの中でのみ使用できます".to_string(),
-            trace: Vec::new(),
-        })?;
+            crate::error::ErrorKind::ControlFlow,
+            "continue はループの中でのみ使用できます",
+        ))?;
         let continue_target = loop_state.continue_target;
         let continue_resolved = loop_state.continue_resolved;
 
@@ -582,11 +582,11 @@ impl Compiler {
                     // upvalue（外側のスコープの変数）
                     self.chunk.emit(OpCode::GetUpvalue(upvalue_idx), line);
                 } else {
-                    return Err(TsumugiError::Runtime {
+                    return Err(TsumugiError::runtime_with_kind(
                         line,
-                        message: format!("未定義の変数: {}", name),
-                        trace: Vec::new(),
-                    });
+                        crate::error::ErrorKind::Name,
+                        format!("未定義の変数: {}", name),
+                    ));
                 }
             }
             Expr::BinOp { left, op, right } => {
@@ -705,11 +705,11 @@ impl Compiler {
                     if self.resolve_local(name, line).is_err()
                         && self.resolve_upvalue(name).is_none()
                     {
-                        return Err(TsumugiError::Runtime {
+                        return Err(TsumugiError::runtime_with_kind(
                             line,
-                            message: format!("未定義の関数: {}", name),
-                            trace: Vec::new(),
-                        });
+                            crate::error::ErrorKind::Name,
+                            format!("未定義の関数: {}", name),
+                        ));
                     }
                 }
                 self.compile_expr(callee, line)?;
@@ -915,11 +915,11 @@ impl Compiler {
                 return Ok(i);
             }
         }
-        Err(TsumugiError::Runtime {
+        Err(TsumugiError::runtime_with_kind(
             line,
-            message: format!("未定義の変数: {}", name),
-            trace: Vec::new(),
-        })
+            crate::error::ErrorKind::Name,
+            format!("未定義の変数: {}", name),
+        ))
     }
 
     /// 外側のスコープから変数を探し、upvalue として登録する
