@@ -889,3 +889,17 @@ fn golden_error_structured() {
 fn vm_golden_error_structured() {
     run_golden_test_vm("error_structured");
 }
+
+// =============================================================
+// クロージャ参照キャプチャ（カウンタパターン）テスト
+// =============================================================
+
+#[test]
+fn golden_closure_counter() {
+    run_golden_test("closure_counter");
+}
+
+#[test]
+fn vm_golden_closure_counter() {
+    run_golden_test_vm("closure_counter");
+}

@@ -39,8 +39,8 @@ impl Evaluator {
                     ));
                 }
                 self.env.push_scope();
-                for (k, v) in captured {
-                    self.env.set(k, v.clone());
+                for (k, cell) in captured {
+                    self.env.set_shared(k, cell.clone());
                 }
                 for (param, val) in params.iter().zip(arg_values) {
                     self.env.set(param, val);
@@ -226,10 +226,11 @@ impl Evaluator {
                     }
                 };
                 let val = self.eval_expr(&args[1], line)?;
-                let target = self.env.get_mut(&var_name).ok_or_else(|| {
+                let cell = self.env.get_cell(&var_name).ok_or_else(|| {
                     TsumugiError::runtime(line, format!("未定義の変数: {}", var_name))
                 })?;
-                match target {
+                let mut target = cell.borrow_mut();
+                match &mut *target {
                     Value::List(list) => {
                         list.push(val);
                     }
@@ -258,10 +259,11 @@ impl Evaluator {
                         ));
                     }
                 };
-                let target = self.env.get_mut(&var_name).ok_or_else(|| {
+                let cell = self.env.get_cell(&var_name).ok_or_else(|| {
                     TsumugiError::runtime(line, format!("未定義の変数: {}", var_name))
                 })?;
-                match target {
+                let mut target = cell.borrow_mut();
+                match &mut *target {
                     Value::List(list) => {
                         if list.is_empty() {
                             return Err(TsumugiError::runtime(

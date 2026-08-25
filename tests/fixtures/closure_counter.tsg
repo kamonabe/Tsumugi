@@ -1,0 +1,19 @@
+# カウンタパターン: 参照キャプチャの検証
+fn make_counter()
+  let count = 0
+  fn increment()
+    count = count + 1
+    return count
+  end
+  return increment
+end
+
+let counter = make_counter()
+print(counter())
+print(counter())
+print(counter())
+
+# 独立したカウンタ
+let counter2 = make_counter()
+print(counter2())
+print(counter())

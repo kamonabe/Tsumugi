@@ -414,14 +414,22 @@ let joined = join(parts, ", ")
 ```tsg
 fn make_counter(start)
     let count = start
-    # NOTE: value capture — counter pattern does NOT work
-    # The returned function captures `count` at definition time
-    return fn() return count end
+    fn increment()
+        count = count + 1
+        return count
+    end
+    return increment
 end
+
+let c = make_counter(0)
+print(c())  # 1
+print(c())  # 2
+print(c())  # 3
 ```
 
-> Tsumugi uses value capture for closures. Stateful closures (counters) are NOT supported.
-> Captured variables are copied at function definition time.
+> Tsumugi uses reference capture for closures. Closures share variable cells with their
+> defining scope via `Rc<RefCell<Value>>`. Mutations inside a closure are visible to
+> subsequent calls (counter pattern works).
 
 ### Error Handling Pattern
 

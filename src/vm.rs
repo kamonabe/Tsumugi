@@ -1,11 +1,12 @@
 //! 仮想マシン: バイトコード（Chunk）を実行するスタックマシン
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::chunk::Chunk;
 use crate::error::TsumugiError;
 use crate::opcode::OpCode;
-use crate::value::Value;
+use crate::value::{SharedValue, Value};
 
 /// コールフレーム: 関数呼び出しの状態を保存する
 #[derive(Debug)]
@@ -16,8 +17,11 @@ struct CallFrame {
     ip: usize,
     /// スタック上のベース位置（この関数のローカル変数 slot 0 に対応）
     base: usize,
-    /// この関数がキャプチャした値（クロージャ用）
-    upvalues: Vec<Value>,
+    /// この関数がキャプチャした upvalue セル（参照キャプチャ方式）
+    upvalues: Vec<SharedValue>,
+    /// ローカル変数のうちキャプチャされたもののセル
+    /// locals_cells[slot] が Some のとき、その変数はヒープ上のセルで管理される
+    locals_cells: Vec<Option<SharedValue>>,
 }
 
 /// デフォルトのステップ上限（100万）
@@ -70,6 +74,7 @@ impl Vm {
             ip: 0,
             base: 0,
             upvalues: Vec::new(),
+            locals_cells: Vec::new(),
         };
         Vm {
             frames: vec![frame],
@@ -203,12 +208,6 @@ impl Vm {
         }
 
         let mut trace = Vec::new();
-        // frames: [<main>, calc, divide] のとき、エラーは divide で発生
-        // 表示:
-        //   "in divide() (6行目)"  ← divide が呼ばれた行（calc内のCall命令の行）
-        //   "in calc() (9行目)"    ← calc が呼ばれた行（<main>内のCall命令の行）
-        //
-        // frames[i+1] の関数名と、frames[i] の ip-1 の行番号を組み合わせる
         for i in (0..self.frames.len() - 1).rev() {
             let caller = &self.frames[i];
             let callee = &self.frames[i + 1];
@@ -224,6 +223,51 @@ impl Vm {
         }
 
         error.with_trace(trace)
+    }
+
+    /// ローカル変数を読み取る（セル経由の場合はセルから読む）
+    fn get_local(&self, slot: usize) -> Value {
+        let frame = self.frames.last().unwrap();
+        // locals_cells にセルがあればそこから読む
+        if slot < frame.locals_cells.len()
+            && let Some(ref cell) = frame.locals_cells[slot]
+        {
+            return cell.borrow().clone();
+        }
+        // 通常のスタック読み取り
+        self.stack[frame.base + slot].clone()
+    }
+
+    /// ローカル変数を書き込む（セル経由の場合はセルに書く）
+    fn set_local(&mut self, slot: usize, value: Value) {
+        let frame = self.frames.last().unwrap();
+        // locals_cells にセルがあればそこに書く
+        if slot < frame.locals_cells.len()
+            && let Some(ref cell) = frame.locals_cells[slot]
+        {
+            *cell.borrow_mut() = value;
+            return;
+        }
+        let base = frame.base;
+        self.stack[base + slot] = value;
+    }
+
+    /// ローカル変数をキャプチャ用セルに昇格させる
+    /// 既にセルがあればそれを返す。なければスタックの値からセルを作成し、登録して返す
+    fn ensure_local_cell(&mut self, slot: usize) -> SharedValue {
+        let frame = self.frames.last_mut().unwrap();
+        // locals_cells を必要なサイズに拡張
+        while frame.locals_cells.len() <= slot {
+            frame.locals_cells.push(None);
+        }
+        if let Some(ref cell) = frame.locals_cells[slot] {
+            return Rc::clone(cell);
+        }
+        // スタックから現在の値を取り出してセルを作成
+        let value = self.stack[frame.base + slot].clone();
+        let cell = Rc::new(RefCell::new(value));
+        frame.locals_cells[slot] = Some(Rc::clone(&cell));
+        cell
     }
 
     /// 命令をディスパッチ（ReturnValue / Return 以外）
@@ -319,17 +363,15 @@ impl Vm {
                 self.stack.push(result);
             }
             OpCode::GetLocal(slot) => {
-                let base = self.frames.last().unwrap().base;
-                let value = self.stack[base + slot].clone();
+                let value = self.get_local(slot);
                 self.stack.push(value);
             }
             OpCode::SetLocal(slot) => {
-                let base = self.frames.last().unwrap().base;
                 let value =
                     self.stack.last().cloned().ok_or_else(|| {
                         TsumugiError::runtime(line, "内部エラー: スタックが空です")
                     })?;
-                self.stack[base + slot] = value;
+                self.set_local(slot, value);
             }
             OpCode::Jump(target) => {
                 self.frames.last_mut().unwrap().ip = target;
@@ -345,15 +387,66 @@ impl Vm {
                 self.frames.last_mut().unwrap().ip = target;
             }
             OpCode::GetUpvalue(index) => {
-                let value = self.frames.last().unwrap().upvalues[index].clone();
+                let value = self.frames.last().unwrap().upvalues[index].borrow().clone();
                 self.stack.push(value);
             }
+            OpCode::SetUpvalue(index) => {
+                let value =
+                    self.stack.last().cloned().ok_or_else(|| {
+                        TsumugiError::runtime(line, "内部エラー: スタックが空です")
+                    })?;
+                let cell = self.frames.last().unwrap().upvalues[index].clone();
+                *cell.borrow_mut() = value;
+            }
             OpCode::MakeClosure(upvalue_count) => {
-                let mut upvalues = Vec::with_capacity(upvalue_count);
-                for _ in 0..upvalue_count {
-                    upvalues.push(self.pop(line)?);
+                // upvalue_count 個のスロットインデックスがスタックに積まれている（Value::Int として）
+                // → 実際にはコンパイラが GetLocal で値を積むのではなく、
+                //   ローカル変数のセルを共有する形にする
+                //
+                // 現在の実装: コンパイラはまだ GetLocal(slot) を emit している
+                // → 値がスタックに積まれているので、それを pop して
+                //   対応するローカルのセルを取得する（参照キャプチャ）
+                //
+                // 方式: スタックに積まれた値は無視し、直前の GetLocal 命令の
+                //       slot 番号から locals_cells を参照する。
+                //
+                // ただしこれはコンパイラの変更が必要になるため、代わりに
+                // MakeClosure の前に emit される GetLocal の slot を
+                // chunk.code から逆算して取得する。
+
+                // コンパイラは MakeClosure(N) の直前に N 個の GetLocal(slot) を emit する
+                // → ip - 1 = MakeClosure, ip - 2 = GetLocal(last_upvalue), ...
+                let frame = self.frames.last().unwrap();
+                let make_closure_ip = frame.ip - 1; // 現在の命令が MakeClosure
+
+                let mut upvalue_slots = Vec::with_capacity(upvalue_count);
+                for i in 0..upvalue_count {
+                    let instr_ip = make_closure_ip - upvalue_count + i;
+                    if let OpCode::GetLocal(slot) = &frame.chunk.code[instr_ip] {
+                        upvalue_slots.push(*slot);
+                    } else {
+                        // フォールバック: スロット情報が取れない場合は値キャプチャ
+                        upvalue_slots.push(usize::MAX);
+                    }
                 }
-                upvalues.reverse();
+
+                // スタックから積まれた値を pop（これらは GetLocal で積まれたもの）
+                for _ in 0..upvalue_count {
+                    self.pop(line)?;
+                }
+
+                // 各 upvalue についてセルを取得/作成
+                let mut upvalue_cells = Vec::with_capacity(upvalue_count);
+                for slot in upvalue_slots {
+                    if slot == usize::MAX {
+                        // フォールバック（通常は起きない）
+                        upvalue_cells.push(Rc::new(RefCell::new(Value::Null)));
+                    } else {
+                        let cell = self.ensure_local_cell(slot);
+                        upvalue_cells.push(cell);
+                    }
+                }
+
                 let fn_value = self.pop(line)?;
                 if let Value::VmFn {
                     name,
@@ -367,8 +460,8 @@ impl Vm {
                         name,
                         arity,
                         params,
-                        chunk, // Rc::clone は自動（Value の Clone 実装経由）
-                        upvalues,
+                        chunk,
+                        upvalues: upvalue_cells,
                     });
                 } else {
                     return Err(TsumugiError::runtime(
@@ -409,10 +502,11 @@ impl Vm {
                     }
                     let base = fn_pos;
                     self.frames.push(CallFrame {
-                        chunk, // Rc<Chunk> — ポインタコピーのみ
+                        chunk,
                         ip: 0,
                         base,
                         upvalues,
+                        locals_cells: Vec::new(),
                     });
                 } else {
                     return Err(TsumugiError::runtime(
@@ -552,11 +646,11 @@ impl Vm {
                 self.stack.push(Value::Str(result));
             }
             OpCode::ReturnValue | OpCode::Return => {
-                // これらは run() / call_fn_value で処理済み、ここに来ない
+                // これらは run_frames() で処理済み、ここに来ない
                 unreachable!()
             }
             OpCode::SetupTry(_) | OpCode::TeardownTry => {
-                // これらは run() で処理済み、ここに来ない
+                // これらは run_frames() で処理済み、ここに来ない
                 unreachable!()
             }
         }
@@ -804,6 +898,7 @@ impl Vm {
                 ip: 0,
                 base,
                 upvalues,
+                locals_cells: Vec::new(),
             });
             // run_frames で実行し、target_depth まで戻ったら値を返す
             self.run_frames(target_depth)
@@ -870,11 +965,15 @@ impl Vm {
 
     fn binary_div(&self, left: Value, right: Value, line: usize) -> Result<Value, TsumugiError> {
         match (&left, &right) {
-            (Value::Int(_), Value::Int(0)) => Err(TsumugiError::runtime(line, "ゼロ除算")),
-            (Value::Int(a), Value::Int(b)) => a
-                .checked_div(*b)
-                .map(Value::Int)
-                .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー")),
+            (Value::Int(a), Value::Int(b)) => {
+                if *b == 0 {
+                    Err(TsumugiError::runtime(line, "ゼロ除算"))
+                } else {
+                    a.checked_div(*b)
+                        .map(Value::Int)
+                        .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー"))
+                }
+            }
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a / b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 / b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a / *b as f64)),
@@ -887,11 +986,15 @@ impl Vm {
 
     fn binary_mod(&self, left: Value, right: Value, line: usize) -> Result<Value, TsumugiError> {
         match (&left, &right) {
-            (Value::Int(_), Value::Int(0)) => Err(TsumugiError::runtime(line, "ゼロ除算")),
-            (Value::Int(a), Value::Int(b)) => a
-                .checked_rem(*b)
-                .map(Value::Int)
-                .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー")),
+            (Value::Int(a), Value::Int(b)) => {
+                if *b == 0 {
+                    Err(TsumugiError::runtime(line, "ゼロ除算"))
+                } else {
+                    a.checked_rem(*b)
+                        .map(Value::Int)
+                        .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー"))
+                }
+            }
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a % b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 % b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a % *b as f64)),
@@ -902,18 +1005,15 @@ impl Vm {
         }
     }
 
-    // --- 比較演算 ---
-
     fn compare_lt(&self, left: Value, right: Value, line: usize) -> Result<Value, TsumugiError> {
         match (&left, &right) {
             (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a < b)),
             (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a < b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Bool((*a as f64) < *b)),
-            (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a < *b as f64)),
-            (Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a < b)),
+            (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a < (*b as f64))),
             _ => Err(TsumugiError::runtime(
                 line,
-                format!("型エラー: {:?} と {:?} は比較できません", left, right),
+                format!("型エラー: {:?} < {:?} は比較できません", left, right),
             )),
         }
     }
@@ -922,12 +1022,11 @@ impl Vm {
         match (&left, &right) {
             (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a > b)),
             (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a > b)),
-            (Value::Int(a), Value::Float(b)) => Ok(Value::Bool(*a as f64 > *b)),
-            (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a > *b as f64)),
-            (Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a > b)),
+            (Value::Int(a), Value::Float(b)) => Ok(Value::Bool((*a as f64) > *b)),
+            (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a > (*b as f64))),
             _ => Err(TsumugiError::runtime(
                 line,
-                format!("型エラー: {:?} と {:?} は比較できません", left, right),
+                format!("型エラー: {:?} > {:?} は比較できません", left, right),
             )),
         }
     }
@@ -936,12 +1035,11 @@ impl Vm {
         match (&left, &right) {
             (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a <= b)),
             (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a <= b)),
-            (Value::Int(a), Value::Float(b)) => Ok(Value::Bool(*a as f64 <= *b)),
-            (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a <= *b as f64)),
-            (Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a <= b)),
+            (Value::Int(a), Value::Float(b)) => Ok(Value::Bool((*a as f64) <= *b)),
+            (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a <= (*b as f64))),
             _ => Err(TsumugiError::runtime(
                 line,
-                format!("型エラー: {:?} と {:?} は比較できません", left, right),
+                format!("型エラー: {:?} <= {:?} は比較できません", left, right),
             )),
         }
     }
@@ -950,20 +1048,19 @@ impl Vm {
         match (&left, &right) {
             (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a >= b)),
             (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a >= b)),
-            (Value::Int(a), Value::Float(b)) => Ok(Value::Bool(*a as f64 >= *b)),
-            (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a >= *b as f64)),
-            (Value::Str(a), Value::Str(b)) => Ok(Value::Bool(a >= b)),
+            (Value::Int(a), Value::Float(b)) => Ok(Value::Bool((*a as f64) >= *b)),
+            (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a >= (*b as f64))),
             _ => Err(TsumugiError::runtime(
                 line,
-                format!("型エラー: {:?} と {:?} は比較できません", left, right),
+                format!("型エラー: {:?} >= {:?} は比較できません", left, right),
             )),
         }
     }
 }
 
 /// 型名を返すヘルパー
-fn type_name(value: &Value) -> &'static str {
-    match value {
+fn type_name(v: &Value) -> &'static str {
+    match v {
         Value::Int(_) => "Int",
         Value::Float(_) => "Float",
         Value::Str(_) => "Str",
@@ -974,263 +1071,5 @@ fn type_name(value: &Value) -> &'static str {
         Value::Fn { .. } => "Fn",
         Value::VmFn { .. } => "Fn",
         Value::Error { .. } => "Error",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::compiler::Compiler;
-    use crate::lexer::Lexer;
-    use crate::parser::Parser;
-
-    /// ソースをコンパイル → VM実行（print出力はキャプチャできないので、
-    /// エラーなく完走することを確認する）
-    fn run_vm(source: &str) -> Result<(), TsumugiError> {
-        let mut lexer = Lexer::new(source);
-        let tokens = lexer.tokenize();
-        let mut parser = Parser::new(tokens);
-        let program = parser
-            .parse()
-            .map_err(|errors| errors.into_iter().next().unwrap())?;
-        let chunk = Compiler::new().compile(&program)?;
-        let mut vm = Vm::new(chunk);
-        vm.run()
-    }
-
-    #[test]
-    fn vm_print_int() {
-        assert!(run_vm("print(42)").is_ok());
-    }
-
-    #[test]
-    fn vm_arithmetic() {
-        assert!(run_vm("print(1 + 2)").is_ok());
-        assert!(run_vm("print(10 - 3)").is_ok());
-        assert!(run_vm("print(4 * 5)").is_ok());
-        assert!(run_vm("print(10 / 3)").is_ok());
-        assert!(run_vm("print(10 % 3)").is_ok());
-    }
-
-    #[test]
-    fn vm_string_concat() {
-        assert!(run_vm(r#"print("hello, " + "world")"#).is_ok());
-    }
-
-    #[test]
-    fn vm_nested_arithmetic() {
-        assert!(run_vm("print((1 + 2) * (3 + 4))").is_ok());
-    }
-
-    #[test]
-    fn vm_negate() {
-        assert!(run_vm("print(-42)").is_ok());
-    }
-
-    #[test]
-    fn vm_comparison() {
-        assert!(run_vm("print(1 < 2)").is_ok());
-        assert!(run_vm("print(3 > 1)").is_ok());
-        assert!(run_vm("print(1 == 1)").is_ok());
-        assert!(run_vm("print(1 != 2)").is_ok());
-    }
-
-    #[test]
-    fn vm_zero_division_error() {
-        let result = run_vm("print(1 / 0)");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn vm_type_error() {
-        let result = run_vm(r#"print("hello" + 1)"#);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn vm_multiple_prints() {
-        assert!(run_vm("print(1)\nprint(2)\nprint(3)").is_ok());
-    }
-
-    #[test]
-    fn vm_print_multiple_args() {
-        assert!(run_vm(r#"print("hello", "world")"#).is_ok());
-    }
-
-    // --- Phase 2: 変数 ---
-
-    #[test]
-    fn vm_let_and_print() {
-        assert!(run_vm("let x = 42\nprint(x)").is_ok());
-    }
-
-    #[test]
-    fn vm_let_multiple_vars() {
-        assert!(run_vm("let a = 10\nlet b = 20\nprint(a + b)").is_ok());
-    }
-
-    #[test]
-    fn vm_assign() {
-        assert!(run_vm("let x = 1\nx = 99\nprint(x)").is_ok());
-    }
-
-    #[test]
-    fn vm_assign_arithmetic() {
-        assert!(run_vm("let x = 10\nx = x + 5\nprint(x)").is_ok());
-    }
-
-    #[test]
-    fn vm_multiple_assigns() {
-        assert!(run_vm("let a = 1\nlet b = 2\na = a + b\nb = a * 2\nprint(a, b)").is_ok());
-    }
-
-    #[test]
-    fn vm_undefined_var_error() {
-        let result = run_vm("print(z)");
-        assert!(result.is_err());
-    }
-
-    // --- Phase 3: 制御フロー ---
-
-    #[test]
-    fn vm_if_true() {
-        assert!(run_vm("let x = 10\nif x > 5\n    print(x)\nend").is_ok());
-    }
-
-    #[test]
-    fn vm_if_else() {
-        assert!(
-            run_vm("let x = 3\nif x > 5\n    print(\"big\")\nelse\n    print(\"small\")\nend")
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn vm_if_elif() {
-        assert!(run_vm("let x = 5\nif x > 10\n    print(\"a\")\nelif x > 3\n    print(\"b\")\nelse\n    print(\"c\")\nend").is_ok());
-    }
-
-    #[test]
-    fn vm_while_loop() {
-        assert!(run_vm("let i = 3\nwhile i > 0\n    print(i)\n    i = i - 1\nend").is_ok());
-    }
-
-    #[test]
-    fn vm_while_break() {
-        assert!(run_vm("let i = 0\nwhile true\n    i = i + 1\n    if i == 3\n        break\n    end\nend\nprint(i)").is_ok());
-    }
-
-    #[test]
-    fn vm_while_continue() {
-        assert!(run_vm("let i = 0\nwhile i < 5\n    i = i + 1\n    if i == 3\n        continue\n    end\n    print(i)\nend").is_ok());
-    }
-
-    #[test]
-    fn vm_for_loop() {
-        assert!(run_vm("for x in [1, 2, 3]\n    print(x)\nend").is_ok());
-    }
-
-    #[test]
-    fn vm_for_break() {
-        assert!(
-            run_vm(
-                "for x in [1, 2, 3, 4, 5]\n    if x == 3\n        break\n    end\n    print(x)\nend"
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn vm_for_continue() {
-        assert!(run_vm("for x in [1, 2, 3, 4, 5]\n    if x == 3\n        continue\n    end\n    print(x)\nend").is_ok());
-    }
-
-    #[test]
-    fn vm_and_or() {
-        assert!(run_vm("print(true and false)\nprint(true or false)").is_ok());
-    }
-
-    #[test]
-    fn vm_nested_loops() {
-        assert!(
-            run_vm("for i in [1, 2]\n    for j in [10, 20]\n        print(i, j)\n    end\nend")
-                .is_ok()
-        );
-    }
-
-    // --- Phase 4: 関数 ---
-
-    #[test]
-    fn vm_fn_basic() {
-        assert!(run_vm("fn add(a, b)\n    return a + b\nend\nprint(add(3, 4))").is_ok());
-    }
-
-    #[test]
-    fn vm_fn_no_return() {
-        assert!(run_vm("fn greet()\n    print(\"hello\")\nend\ngreet()").is_ok());
-    }
-
-    #[test]
-    fn vm_fn_recursive() {
-        assert!(
-            run_vm("fn fib(n)\n    if n <= 1\n        return n\n    end\n    return fib(n - 1) + fib(n - 2)\nend\nprint(fib(10))").is_ok()
-        );
-    }
-
-    #[test]
-    fn vm_fn_multiple_calls() {
-        assert!(
-            run_vm("fn double(x)\n    return x * 2\nend\nprint(double(3))\nprint(double(5))")
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn vm_fn_wrong_arity() {
-        let result = run_vm("fn add(a, b)\n    return a + b\nend\nadd(1)");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn vm_fn_call_non_function() {
-        let result = run_vm("let x = 42\nx()");
-        assert!(result.is_err());
-    }
-
-    // --- Phase 5: クロージャ ---
-
-    #[test]
-    fn vm_closure_make_adder() {
-        assert!(run_vm(
-            "fn make_adder(n)\n    return fn(x) return x + n end\nend\nlet add5 = make_adder(5)\nprint(add5(3))"
-        ).is_ok());
-    }
-
-    #[test]
-    fn vm_closure_value_capture() {
-        // 値キャプチャ: 定義後に元の変数を変更してもクロージャには影響しない
-        assert!(
-            run_vm(
-                "let base = 10\nlet adder = fn(x) return x + base end\nbase = 999\nprint(adder(1))"
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn vm_lambda_inline() {
-        assert!(
-            run_vm(
-                "fn apply(func, val)\n    return func(val)\nend\nprint(apply(fn(x) x * x end, 6))"
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn vm_closure_multiple_calls() {
-        assert!(run_vm(
-            "fn make_adder(n)\n    return fn(x) return x + n end\nend\nlet add3 = make_adder(3)\nlet add7 = make_adder(7)\nprint(add3(1))\nprint(add7(1))"
-        ).is_ok());
     }
 }

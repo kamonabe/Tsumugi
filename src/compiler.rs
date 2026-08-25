@@ -125,14 +125,17 @@ impl Compiler {
             }
             Stmt::Assign { name, value, line } => {
                 self.compile_expr(value, *line)?;
-                let slot = self.resolve_local(name, *line).map_err(|_| {
-                    TsumugiError::runtime_with_kind(
+                if let Ok(slot) = self.resolve_local(name, *line) {
+                    self.chunk.emit(OpCode::SetLocal(slot), *line);
+                } else if let Some(upvalue_idx) = self.resolve_upvalue(name) {
+                    self.chunk.emit(OpCode::SetUpvalue(upvalue_idx), *line);
+                } else {
+                    return Err(TsumugiError::runtime_with_kind(
                         *line,
                         crate::error::ErrorKind::Name,
                         format!("未定義の変数に代入: {}", name),
-                    )
-                })?;
-                self.chunk.emit(OpCode::SetLocal(slot), *line);
+                    ));
+                }
                 self.chunk.emit(OpCode::Pop, *line);
             }
             Stmt::IndexAssign {

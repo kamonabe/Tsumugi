@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -5,8 +6,11 @@ use std::rc::Rc;
 use crate::ast::Stmt;
 use crate::chunk::Chunk;
 
+/// 共有可能な変数セル（参照キャプチャ用）
+pub type SharedValue = Rc<RefCell<Value>>;
+
 /// Tsumugi の実行時の値
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone)]
 pub enum Value {
     Int(i64),
     Float(f64),
@@ -20,7 +24,7 @@ pub enum Value {
         name: String,
         params: Vec<String>,
         body: Vec<Stmt>,
-        captured: HashMap<String, Value>,
+        captured: HashMap<String, SharedValue>,
     },
     /// VM用関数値（コンパイル済みバイトコード）
     /// Rc<Chunk> により関数呼び出し・クロージャ生成時のディープコピーを回避
@@ -29,8 +33,8 @@ pub enum Value {
         arity: usize,
         params: Vec<String>,
         chunk: Rc<Chunk>,
-        /// クロージャがキャプチャした値（値キャプチャ方式）
-        upvalues: Vec<Value>,
+        /// クロージャがキャプチャした値（参照キャプチャ方式）
+        upvalues: Vec<SharedValue>,
     },
     /// 構造化エラー値（try/catch で捕捉したエラー）
     /// Display では message を返すため、既存の文字列結合と互換性がある。
@@ -40,6 +44,62 @@ pub enum Value {
         message: String,
         line: usize,
     },
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Null, Value::Null) => true,
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Dict(a), Value::Dict(b)) => a == b,
+            (Value::Fn { name: a, .. }, Value::Fn { name: b, .. }) => a == b,
+            (Value::VmFn { name: a, .. }, Value::VmFn { name: b, .. }) => a == b,
+            (
+                Value::Error {
+                    error_type: t1,
+                    message: m1,
+                    line: l1,
+                },
+                Value::Error {
+                    error_type: t2,
+                    message: m2,
+                    line: l2,
+                },
+            ) => t1 == t2 && m1 == m2 && l1 == l2,
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Int(n) => write!(f, "Int({})", n),
+            Value::Float(n) => write!(f, "Float({})", n),
+            Value::Str(s) => write!(f, "Str({:?})", s),
+            Value::Bool(b) => write!(f, "Bool({})", b),
+            Value::Null => write!(f, "Null"),
+            Value::List(items) => write!(f, "List({:?})", items),
+            Value::Dict(map) => write!(f, "Dict({:?})", map),
+            Value::Fn { name, params, .. } => {
+                write!(f, "Fn({}, params={:?})", name, params)
+            }
+            Value::VmFn { name, arity, .. } => {
+                write!(f, "VmFn({}, arity={})", name, arity)
+            }
+            Value::Error {
+                error_type,
+                message,
+                line,
+            } => {
+                write!(f, "Error({}: {} at line {})", error_type, message, line)
+            }
+        }
+    }
 }
 
 impl Value {
