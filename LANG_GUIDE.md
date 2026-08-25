@@ -224,6 +224,11 @@ end
 - The catch variable is bound to a structured Error value, not a plain string
 - Access fields via index syntax: `e["type"]`, `e["message"]`, `e["line"]`
 - It also stringifies automatically when concatenated with `+` or interpolated in an f-string
+- `e["type"]` values (snake_case identifiers):
+  `zero_division`, `type`, `index`, `name`, `limit`, `overflow`,
+  `sandbox`, `import`, `argument`, `int_overflow`, `control_flow`,
+  `collection_limit`, `conversion`, `builtin_type`, `iteration`,
+  `internal`, `runtime`
 
 **WRONG:**
 ```
@@ -435,7 +440,7 @@ catch e
     # e stringifies to the message when interpolated
     print(f"caught: {e}")
     # structured access via index
-    print(e["type"])       # e.g. "RuntimeError"
+    print(e["type"])       # e.g. "zero_division"
     print(e["message"])    # e.g. "division by zero"
     print(e["line"])       # line number (integer)
 end
