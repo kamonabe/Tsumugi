@@ -632,6 +632,20 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 ## 変更履歴
 
+### 2026-08-26: if・try・catchのブロックスコープ統一（AUD-008）
+
+**問題:** ツリーウォーク版は`if`、`try`、`catch`を現在scopeで実行していたため、block内の`let`やcatch変数が外へ漏れた。一方、Compiler/VMは各bodyをlexical scopeとして扱い、終了時またはtry unwind時にlocal slotを破棄していた。
+
+**決定:** 実行対象に選ばれた各`if` / `elif` / `else` body、`try` body、`catch` bodyを独立scopeとする。`try`と`catch`は相互にlocalを共有せず、catch変数はcatch内限定とする。`let`は現在scopeでshadowし、通常代入は最寄りの外側bindingを更新する。escaping closureはblock localのcellを保持できる。
+
+**実装:** tree evaluatorに、bodyの結果を保持してscopeをpopしてから伝播する`exec_scoped_block`を追加。正常終了、runtime error、`return`、`break`、`continue`の全経路でscopeを解放する。catchは専用scopeへError値をbindし、同様に結果保存後にpopする。Compiler/VMは既にこの契約を満たすため変更しない。
+
+**不採用案:** VMをtree版の旧非scope仕様へ合わせる案は、条件分岐ごとのlocal slot差、未初期化値、try途中失敗時の部分宣言、REPL stack/checkpointを再設計する必要があり、AUD-001/004で修正したinvariantを再び危険にするため不採用。
+
+**互換性と境界:** block内で宣言して外へ値を渡していたコードは、外側で宣言してblock内では代入する形へ移行する。正常終了または同一実行内でcatchされたエラーでは、scope解放自体はrollbackを行わずouter assignment、collection mutation、外部I/Oを保持する。未捕捉REPL入力のcommit/rollbackはengine間で未統一のためAUD-024で継続する。dead branchのname resolution（AUD-011）、同一scope再宣言のcell identity（AUD-016）も別課題とする。
+
+**回帰テスト:** paired golden testでshadowing、outer assignment、caught error前のcollection mutation/I/O、catch lifetime、error・break・continue後も生存するescaping closure、returnを検証する。tree/VM REPLテストではif/try/catch localが次入力へ漏れないことに加え、解放slotの再利用とclosure保持cellの分離を検証する。
+
 ### 2026-08-26: importのトップレベル限定（AUD-007）
 
 ツリーウォーク版のruntime importとVM版のcompile-time inlineで意味論が一致しないため、`import`をプログラムのトップレベルだけで有効な構文に確定した。Parserがプログラム直下とblock内を区別し、非トップレベルのimportをファイルI/O前の共通パースエラーとして拒否する。if/while/for/関数/try/catch/複数行ラムダのparserテストと、tree/VM共通のintegrationテストを追加した。

@@ -315,13 +315,7 @@ impl Evaluator {
                 } else {
                     else_body
                 };
-                for s in body {
-                    match self.exec_stmt(s)? {
-                        EvalResult::Val => {}
-                        other => return Ok(other),
-                    }
-                }
-                Ok(EvalResult::Val)
+                self.exec_scoped_block(body)
             }
 
             Stmt::While {
@@ -428,25 +422,22 @@ impl Evaluator {
                 catch_body,
                 line: _,
             } => {
-                // try本体を実行し、エラーが発生したらcatchブロックへ
-                let try_result = self.exec_block(try_body);
-                match try_result {
+                // tryとcatchは別scope。outerへの代入は保持し、block localだけを破棄する。
+                match self.exec_scoped_block(try_body) {
                     Ok(result) => Ok(result),
                     Err(e) => {
-                        // 構造化エラーを変数にバインドしてcatchブロックを実行
                         let error_value = Value::Error {
                             error_type: e.error_type().to_string(),
                             message: e.message().to_string(),
                             line: e.line(),
                         };
+
+                        self.env.push_scope();
                         self.env.set(var, error_value);
-                        for s in catch_body {
-                            match self.exec_stmt(s)? {
-                                EvalResult::Val => {}
-                                other => return Ok(other),
-                            }
-                        }
-                        Ok(EvalResult::Val)
+                        let catch_result = self.exec_block(catch_body);
+                        // error・return・break・continueの全経路でcatch scopeを先に解放する。
+                        self.env.pop_scope();
+                        catch_result
                     }
                 }
             }
@@ -458,7 +449,7 @@ impl Evaluator {
         }
     }
 
-    /// ブロック（文のリスト）を実行する（try/catch用）
+    /// ブロック（文のリスト）を実行する。
     fn exec_block(&mut self, stmts: &[Stmt]) -> Result<EvalResult, TsumugiError> {
         for s in stmts {
             match self.exec_stmt(s)? {
@@ -467,6 +458,14 @@ impl Evaluator {
             }
         }
         Ok(EvalResult::Val)
+    }
+
+    /// 独立scopeでブロックを実行し、全ての終了経路でscopeを解放する。
+    fn exec_scoped_block(&mut self, stmts: &[Stmt]) -> Result<EvalResult, TsumugiError> {
+        self.env.push_scope();
+        let result = self.exec_block(stmts);
+        self.env.pop_scope();
+        result
     }
 
     /// 式を評価して値を返す（line は文の行番号をエラー表示に使う）

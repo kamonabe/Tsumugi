@@ -1,0 +1,152 @@
+# if / elif / else / try / catch のblock scope統一
+
+let if_value = "outer-if"
+if true
+    let if_value = "inner-if"
+    print(if_value)
+end
+print(if_value)
+
+let branch_value = "outer-branch"
+if false
+    let branch_value = "inner-if-unused"
+elif true
+    let branch_value = "inner-elif"
+    print(branch_value)
+else
+    let branch_value = "inner-else-unused"
+end
+print(branch_value)
+
+let else_value = "outer-else"
+if false
+    let else_value = "inner-if-unused"
+else
+    let else_value = "inner-else"
+    print(else_value)
+end
+print(else_value)
+
+let assigned = "before-if"
+if true
+    assigned = "if-assigned"
+end
+if false
+    assigned = "wrong"
+end
+print(assigned)
+
+let if_closure = null
+if true
+    let if_captured = "if-closure"
+    if_closure = fn() if_captured end
+end
+print(if_closure())
+
+let try_value = "outer-try"
+let committed = "before-try"
+let try_closure = null
+try
+    let try_value = "inner-try"
+    committed = "try-assigned"
+    let try_captured = "try-closure"
+    try_closure = fn() try_captured end
+    print(try_value)
+catch unexpected
+    print("unexpected catch")
+end
+print(try_value)
+print(committed)
+print(try_closure())
+
+let catch_name = "outer-catch"
+let catch_closure = null
+let error_closure = null
+let effects = []
+try
+    committed = "before-error"
+    let discarded_try_local = "error-closure"
+    error_closure = fn() discarded_try_local end
+    push(effects, "kept")
+    print("before-caught-error")
+    let failed = 1 / 0
+catch catch_name
+    print(catch_name["type"])
+    let catch_captured = "catch-closure"
+    catch_closure = fn() catch_captured + ":" + catch_name["type"] end
+end
+print(catch_name)
+print(committed)
+print(catch_closure())
+print(error_closure())
+print(effects)
+
+let error_shadow = "outer-error"
+try
+    if true
+        let error_shadow = "inner-error"
+        let failed = 1 / 0
+    end
+catch caught
+    print(error_shadow)
+end
+print(error_shadow)
+
+let break_closure = null
+for i in [1]
+    try
+        if true
+            let break_captured = "break-closure"
+            break_closure = fn() break_captured end
+            break
+        end
+    catch unexpected
+        print("unexpected break catch")
+    end
+end
+print(break_closure())
+
+let continue_closure = null
+for i in [1]
+    try
+        if true
+            let continue_captured = "continue-closure"
+            continue_closure = fn() continue_captured end
+            continue
+        end
+    catch unexpected
+        print("unexpected continue catch")
+    end
+end
+print(continue_closure())
+
+fn return_from_if()
+    if true
+        let result = "if-return"
+        return result
+    end
+    return "unreachable"
+end
+
+fn return_from_try()
+    try
+        let result = "try-return"
+        return result
+    catch unexpected
+        return "unexpected"
+    end
+end
+
+fn return_from_catch()
+    try
+        let failed = 1 / 0
+    catch caught
+        let result = "catch-return"
+        return result
+    end
+    return "unreachable"
+end
+
+print(return_from_if())
+print(return_from_try())
+print(return_from_catch())
