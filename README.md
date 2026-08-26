@@ -102,6 +102,7 @@ print(square(5))    # 25
 - パースエラーの回復（複数のエラーを一度にまとめて報告）
 - スタックトレース（関数呼び出し経路の表示）
 - ステップ予算（無限ループ・無限再帰の強制停止、環境変数 `TSUMUGI_MAX_STEPS` で上限変更可能）
+- コレクションサイズ上限（List/Dictの生成・拡張を制限、環境変数 `TSUMUGI_MAX_COLLECTION_SIZE` で変更可能）
 - ファイルI/Oサンドボックス（環境変数 `TSUMUGI_SANDBOX` でアクセス許可パスを制限、import含む全ファイル操作が対象）
 - 環境変数アクセス制御（環境変数 `TSUMUGI_ENV_ALLOW` で読み取り可能なキーを許可リスト制限）
 
@@ -169,7 +170,7 @@ cargo test parser::
 | 種別 | 場所 | 内容 |
 |---|---|---|
 | ユニットテスト | `src/*.rs` 内 `#[cfg(test)]` | 各モジュールの個別ロジック検証 |
-| 統合テスト | `tests/integration.rs` | `.tsg` ファイル実行 → 期待出力と比較（ゴールデンテスト） |
+| 統合テスト | `tests/integration.rs` | ファイル実行のゴールデンテスト + stdin駆動REPLの状態回復・資源上限テスト |
 | テストデータ | `tests/fixtures/` | 正常系 `.tsg` + `.expected` / エラー系 `.tsg` + `.expected_err` |
 
 ## CI

@@ -88,6 +88,12 @@ impl Evaluator {
         Ok(())
     }
 
+    /// REPLの新しい入力を開始する前にステップ予算をリセットする。
+    /// importは同じ`run`を再帰利用するため、`run`自身ではリセットしない。
+    pub fn reset_step_budget(&mut self) {
+        self.steps = 0;
+    }
+
     /// プログラム全体を実行
     pub fn run(&mut self, program: &Program) -> Result<(), TsumugiError> {
         for stmt in program {
@@ -136,14 +142,21 @@ impl Evaluator {
         }
         self.imported.insert(canonical.clone());
 
-        // ファイル読み込み
-        let source = std::fs::read_to_string(&canonical).map_err(|e| {
-            TsumugiError::runtime_with_kind(
-                line,
-                crate::error::ErrorKind::Import,
-                format!("import 失敗: ファイルを読み込めません: {} ({})", path, e),
-            )
-        })?;
+        // ファイル読み込み。失敗したimportはloaded扱いにせず、同一pathを再試行可能にする。
+        let source = match std::fs::read_to_string(&canonical) {
+            Ok(source) => source,
+            Err(error) => {
+                self.imported.remove(&canonical);
+                return Err(TsumugiError::runtime_with_kind(
+                    line,
+                    crate::error::ErrorKind::Import,
+                    format!(
+                        "import 失敗: ファイルを読み込めません: {} ({})",
+                        path, error
+                    ),
+                ));
+            }
+        };
 
         // base_dir を一時的に import 先のディレクトリに切り替え（ネスト import 対応）
         let prev_base_dir = self.base_dir.clone();
@@ -158,8 +171,9 @@ impl Evaluator {
         let program = match parser.parse() {
             Ok(p) => p,
             Err(errors) => {
-                // base_dir を復元してからエラーを返す
+                // base_dirとimport markerを復元してからエラーを返す
                 self.base_dir = prev_base_dir;
+                self.imported.remove(&canonical);
                 return Err(TsumugiError::runtime_with_kind(
                     line,
                     crate::error::ErrorKind::Import,
@@ -180,6 +194,11 @@ impl Evaluator {
 
         // base_dir を復元
         self.base_dir = prev_base_dir;
+        if result.is_err() {
+            // runtime errorで完了しなかったmoduleもloaded扱いにしない。
+            // 既に発生した代入や外部I/OのrollbackはAUD-024で別途仕様化する。
+            self.imported.remove(&canonical);
+        }
 
         result
     }
@@ -260,6 +279,12 @@ impl Evaluator {
                                 ));
                             }
                         };
+                        if !map.contains_key(&key) {
+                            crate::builtin_core::check_collection_size_public(
+                                map.len().saturating_add(1),
+                                *line,
+                            )?;
+                        }
                         map.insert(key, val);
                     }
                     _ => {
@@ -310,24 +335,14 @@ impl Evaluator {
                         break;
                     }
                     self.env.push_scope();
-                    let mut should_break = false;
-                    for s in body {
-                        match self.exec_stmt(s)? {
-                            EvalResult::Return(v) => {
-                                self.env.pop_scope();
-                                return Ok(EvalResult::Return(v));
-                            }
-                            EvalResult::Break => {
-                                should_break = true;
-                                break;
-                            }
-                            EvalResult::Continue => break,
-                            EvalResult::Val => {}
-                        }
-                    }
+                    let body_result = self.exec_block(body);
+                    // body内のruntime errorも含め、全ての経路で反復scopeを解放してから
+                    // 制御フローまたはエラーを伝播する。
                     self.env.pop_scope();
-                    if should_break {
-                        break;
+                    match body_result? {
+                        EvalResult::Return(v) => return Ok(EvalResult::Return(v)),
+                        EvalResult::Break => break,
+                        EvalResult::Continue | EvalResult::Val => {}
                     }
                     self.count_step(*line)?;
                 }
@@ -342,9 +357,19 @@ impl Evaluator {
             } => {
                 let collection = self.eval_expr(iter, *line)?;
                 let items: Vec<Value> = match &collection {
-                    Value::List(list) => list.clone(),
-                    Value::Dict(map) => map.keys().map(|k| Value::Str(k.clone())).collect(),
-                    Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string())).collect(),
+                    Value::List(list) => {
+                        crate::builtin_core::check_collection_size_public(list.len(), *line)?;
+                        list.clone()
+                    }
+                    Value::Dict(map) => {
+                        crate::builtin_core::check_collection_size_public(map.len(), *line)?;
+                        map.keys().map(|k| Value::Str(k.clone())).collect()
+                    }
+                    Value::Str(s) => {
+                        let size = s.chars().count();
+                        crate::builtin_core::check_collection_size_public(size, *line)?;
+                        s.chars().map(|c| Value::Str(c.to_string())).collect()
+                    }
                     _ => {
                         return Err(TsumugiError::runtime(
                             *line,
@@ -356,24 +381,14 @@ impl Evaluator {
                 for item in items {
                     self.env.push_scope();
                     self.env.set(var, item);
-                    let mut should_break = false;
-                    for s in body {
-                        match self.exec_stmt(s)? {
-                            EvalResult::Return(v) => {
-                                self.env.pop_scope();
-                                return Ok(EvalResult::Return(v));
-                            }
-                            EvalResult::Break => {
-                                should_break = true;
-                                break;
-                            }
-                            EvalResult::Continue => break,
-                            EvalResult::Val => {}
-                        }
-                    }
+                    let body_result = self.exec_block(body);
+                    // whileと同様に、エラー・return・break・continueの全経路で
+                    // iteration scopeを先に解放する。
                     self.env.pop_scope();
-                    if should_break {
-                        break;
+                    match body_result? {
+                        EvalResult::Return(v) => return Ok(EvalResult::Return(v)),
+                        EvalResult::Break => break,
+                        EvalResult::Continue | EvalResult::Val => {}
                     }
                     self.count_step(*line)?;
                 }
@@ -466,9 +481,13 @@ impl Evaluator {
             Expr::List(items) => {
                 let mut values = Vec::new();
                 for item in items {
-                    values.push(self.eval_expr(item, line)?);
+                    let value = self.eval_expr(item, line)?;
+                    crate::builtin_core::check_collection_size_public(
+                        values.len().saturating_add(1),
+                        line,
+                    )?;
+                    values.push(value);
                 }
-                crate::builtin_core::check_collection_size_public(values.len(), line)?;
                 Ok(Value::List(values))
             }
 
@@ -485,6 +504,12 @@ impl Evaluator {
                         }
                     };
                     let val = self.eval_expr(val_expr, line)?;
+                    if !map.contains_key(&key) {
+                        crate::builtin_core::check_collection_size_public(
+                            map.len().saturating_add(1),
+                            line,
+                        )?;
+                    }
                     map.insert(key, val);
                 }
                 Ok(Value::Dict(map))

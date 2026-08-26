@@ -121,7 +121,8 @@ fn run_repl() {
             continue;
         }
 
-        // 実行
+        // 実行。ステップ予算はREPL入力ごとに独立させる。
+        evaluator.reset_step_budget();
         if let Err(errors) = execute(&input, &mut evaluator) {
             for e in &errors {
                 eprintln!("  エラー: {}", e);
@@ -217,14 +218,22 @@ fn run_repl_vm() {
         let mut parser = Parser::new(tokens);
         match parser.parse() {
             Ok(program) => {
-                // インクリメンタルコンパイル
+                // CompilerとVMを1つのREPL transactionとして扱う。compile成功後でも
+                // runtime errorなら、未実行のbinding/import情報をCompilerへ残さない。
+                let compiler_checkpoint = compiler.clone();
                 match compiler.compile_repl_line(&program) {
                     Ok(chunk) => {
                         if let Err(e) = vm.run_repl_chunk(chunk) {
+                            compiler = compiler_checkpoint;
                             eprintln!("  エラー: {}", e);
                         }
                     }
-                    Err(e) => eprintln!("  エラー: {}", e),
+                    // compile_repl_line自身もrollbackするが、ここでも入力開始時の
+                    // checkpointを保持することでtransaction境界を明示する。
+                    Err(e) => {
+                        compiler = compiler_checkpoint;
+                        eprintln!("  エラー: {}", e);
+                    }
                 }
             }
             Err(errors) => {

@@ -1,6 +1,54 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-08-25
+最終更新: 2026-08-26
+
+## 2026-08-26 深層監査バックログ
+
+ツリーウォーク版とVM版を、REPL継続実行・失敗時状態・スコープ・クロージャ・import・全組み込み関数・資源上限・既存仕様の観点で横断監査した。既存テストは全件成功したが、REPL入力間の状態回復や実行系差を検出できない空白がある。優先度は、ホストプロセス停止／メモリ枯渇につながるものを **P0**、誤実行・状態漏洩・主要仕様差を **P1**、診断性・境界値・文書不整合を **P2** とする。
+
+### P0 — Critical
+
+| ID | 項目 | 再現・影響 | 状態 |
+|---|---|---|---|
+| AUD-001 | VM REPLのコンパイル失敗をtransactionalにする | ブロック内でlocal追加後に未定義名を置くと、Compilerだけが更新され、次入力の`GetLocal`でRustの範囲外panic。stale loopから`Jump(0)`生成にも到達可能 | ✅ 完了（REPL回帰テスト追加） |
+| AUD-002 | VM REPLの未捕捉runtime error後にstack/frame/handler/compilerを復元する | 一時値・callee frame・未実行bindingが次入力へ残り、誤値参照、古い関数の再開、二次panicを起こす | ✅ 完了（REPL回帰テスト追加） |
+| AUD-003 | コレクション上限を全生成経路へ一貫適用する | VMのlist/dict literal、`push`、`map`/`filter`、keys/values等で`TSUMUGI_MAX_COLLECTION_SIZE`を迂回でき、メモリDoS防止の完了記載と矛盾 | ✅ 言語から到達する生成・拡張経路を修正。総heap quotaは対象外 |
+
+### P1 — High
+
+| ID | 項目 | 再現・影響 | 状態 |
+|---|---|---|---|
+| AUD-004 | VMの`locals_cells`をREPL入力・try unwindで正しく保存／復元する | 入力ごとにtop-level cell対応が消え、closureと変数が別値になる。try内localのcellがcatch変数slotと衝突する | ✅ 完了（cell同一性・catch回帰テスト追加） |
+| AUD-005 | treeのwhile/forでエラー時もscopeを必ず解放する | ループ内エラーをcatchすると反復localが後続処理・次REPL入力から見える | ✅ 完了（caught error回帰テスト追加） |
+| AUD-006 | import失敗時の`base_dir`・loading/loaded marker・compiler状態を復元する | 同一fileの再試行がsilent skip。VMでは次の相対import基準やlocalsも汚染する | ✅ 失敗rollback完了。import意味論の再設計はAUD-007/024で継続 |
+| AUD-007 | 非トップレベルimportの意味論を統一する | VMはcompile-time inlineのためfalse branchでもloaded扱い、loopでは複数実行、関数内relative path/control-flowもtreeと異なる | ⬜ 設計判断が必要 |
+| AUD-008 | `if` / `try` / `catch`のscope仕様を確定し両engineを統一する | treeではblock内`let`が外から可視、VMではcompile error。公開ガイドの「ifはscopeを作らない」とVMが不一致 | ⬜ 設計判断が必要 |
+| AUD-009 | tree REPLのstep予算を入力単位でresetする | step数がセッション全体で累積し、一度上限に達すると以後の入力も失敗。VMと不一致 | ✅ 完了（入力間回帰テスト追加） |
+| AUD-010 | for変数のclosure bindingを反復単位で統一する | `[1,2,3]`で作ったclosureがtreeは`1,2,3`、VMは全て`3` | ⬜ 未着手 |
+| AUD-011 | VMのcompile-time name resolution差を仕様化／縮小する | dead branchの未定義名、global forward reference、引数評価順がtreeと異なる | ⬜ 設計判断が必要 |
+| AUD-012 | context依存builtinの契約を統一する | `exit`/`args`/`input`、`push`/`pop` upvalue、map/filter/each self-binding・error kind・CRLF処理に差 | 🟡 `exit`/`args`/`input`・callback self-binding完了。push/pop upvalue等は継続 |
+| AUD-013 | VM index assignmentのupvalue対応と評価順を統一する | captured listへ代入不可。object取得順の違いで副作用後に古いlistを書き戻す | ⬜ 未着手 |
+| AUD-014 | equality / relational comparisonの対象型を統一する | List/Dict/Function/Error、Int×Floatでtreeはtype error、VMはboolを返す場合がある | ⬜ 仕様確定待ち |
+
+### P2 — Medium / Quality
+
+| ID | 項目 | 再現・影響 | 状態 |
+|---|---|---|---|
+| AUD-015 | callback内`break`/`continue`を通常関数と同じくエラー化する | treeのmap/filter/eachだけ`break`を暗黙`null`として扱い、VMはcompile error | ✅ 完了（control-flow回帰テスト追加） |
+| AUD-016 | 同一scopeの`let`再宣言時のbinding identityを仕様化する | 既存closureがtreeでは旧cell、VMでは更新済みcellを参照 | ⬜ 未着手 |
+| AUD-017 | call-depth境界を統一する | 上限128にtop-level frameを含めるVMだけ、許容user frame数が1少ない | ⬜ 未着手 |
+| AUD-018 | CLIからscript引数を渡せるようにする | `args()`を公開しているがCLIが2個目以降の非flag引数をusage errorにする | ⬜ 未着手 |
+| AUD-019 | engine固有error kind/messageを統一する | iteration/index/push/pop/map等で`runtime`/`type`/`builtin_type`が異なる | ⬜ 未着手 |
+| AUD-020 | sandboxの脅威モデルとTOCTOU制約を明記する | canonicalize後のcheckとI/Oは別system callであり、外部processによるsymlink raceは残る | ⬜ 未着手 |
+| AUD-021 | language-spec / LANG_GUIDE / designのdriftを解消する | closureが値capture表記、catchが文字列表記、call depthが256/128併記、engine parity断言などが現実装と矛盾 | 🟡 closure/catch/depth/今回の制約を更新。残る意味論確定後に継続 |
+| AUD-022 | REPL・differential・limit境界・defensive VMテストを追加する | 現行golden testはREPL継続、stdin/argv/exit、collection上限、panic/hang、厳密なstderr/stdout副作用を検査しない | 🟡 REPL transaction・limit・builtin回帰を追加。網羅matrix/fuzzは継続 |
+| AUD-023 | VMのunchecked index/`unwrap()`を構造化internal errorへ置換する | compiler/VM invariantが崩れるとhost panic。AUD-001/002でユーザー入力から到達可能だった | ⬜ transaction修正後も防御的に継続 |
+| AUD-024 | import・REPLの状態commit方針を明文化する | 未捕捉error前の代入/list mutation/upvalue更新を保持するかrollbackするか未定義。外部I/Oはrollback不能 | ⬜ 設計判断が必要 |
+| AUD-025 | VM REPL checkpointの複製コストを削減する | 入力ごとの`stack.clone()`が保持中List/Dictをdeep cloneし、時間・一時メモリがREPL状態量に比例する | ⬜ 計測後にCOW/mutation logを検討 |
+
+### 今回の改修境界
+
+まず、ユーザー入力だけでホストpanic／状態破損へ到達する **AUD-001 / AUD-002** を最優先で解消する。同じ状態境界に属する **AUD-004 / AUD-006**、独立して安全に修正できる **AUD-003（主要生成経路）/ AUD-005 / AUD-009 / AUD-012（一部）/ AUD-015 / AUD-022** までを回帰テスト付きで扱う。言語仕様の選択を伴う項目は、誤った互換性変更を避けるためバックログに残す。
 
 ## 実装済み
 
@@ -15,7 +63,7 @@
 - [x] 関数定義・呼び出し（fn / return / end）
 - [x] 第一級関数（関数を変数に代入・引数として渡す）
 - [x] 無名関数 / ラムダ（`fn(x) expr end`）
-- [x] クロージャ（値キャプチャ方式・定義時のスコープをコピー）
+- [x] クロージャ（変数セルの参照キャプチャ・状態共有）
 - [x] リスト・辞書
 - [x] インデックスアクセス・代入
 - [x] 組み込み関数（print, len, push, pop, keys, type, slice, contains, split, join, to_int, to_str, range）
@@ -270,7 +318,7 @@ Tsumugi にはファイルI/O やサンドボックス機能が既に実装さ�
 | サンドボックスの `OnceLock` テスタビリティ | テスト時に環境変数を切り替え可能な設計にする | 未着手 |
 | サンドボックスの中間シンボリックリンク迂回修正 | 新規書き込み時に親ディレクトリを `canonicalize()` してからチェック | ✅ 完了 |
 | 整数オーバーフローのエラー化 | `checked_add` 等に置き換え、release ビルドでもサイレントラップを防止 | ✅ 完了 |
-| メモリ DoS 対策（コレクションサイズ上限） | `range` / `split` / `read_lines` に上限ガード。`TSUMUGI_MAX_COLLECTION_SIZE` で変更可能 | ✅ 完了 |
+| メモリ DoS 対策（コレクションサイズ上限） | List/Dictの生成・拡張、List生成builtin、反復変換に上限ガード。`TSUMUGI_MAX_COLLECTION_SIZE` で変更可能 | ✅ 完了（総heap quotaは別課題） |
 | ファジングテスト導入 | `cargo-fuzz` でレキサー/パーサー/評価器に無作為入力 | 未着手 |
 | VM の `unwrap()` 除去 | コンパイラバグ時にパニックではなく構造化エラーを返す | 未着手 |
 | エラー種別の enum 化 | `classify_runtime_error()` の `contains()` 判定を `ErrorKind` enum に移行 | ✅ 完了 |

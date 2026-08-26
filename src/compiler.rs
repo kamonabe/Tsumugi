@@ -19,7 +19,7 @@ struct Local {
 }
 
 /// ループのコンパイル状態（break/continue のパッチに使う）
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LoopState {
     /// continue の飛び先（while: 条件チェック先頭、for: インクリメント先頭）
     /// for では本体コンパイル後にパッチする
@@ -51,6 +51,7 @@ struct Upvalue {
 }
 
 /// AST をバイトコードにコンパイルする
+#[derive(Clone)]
 pub struct Compiler {
     chunk: Chunk,
     /// ローカル変数テーブル（スタック上の位置 = Vec のインデックス）
@@ -124,18 +125,29 @@ impl Compiler {
     /// 新しいステートメントだけをコンパイルして Chunk を返す。
     /// self は消費されず次の入力に再利用される。
     pub fn compile_repl_line(&mut self, program: &Program) -> Result<Chunk, TsumugiError> {
-        // 新しいチャンクを作成（前のチャンクは捨てる）
-        let prev_chunk = std::mem::replace(&mut self.chunk, Chunk::new());
-        // チャンク名を引き継ぐ
-        self.chunk.name = prev_chunk.name;
+        // コンパイル途中で失敗しても、永続する locals / scope / loop / import 状態を
+        // 次の入力へ持ち越さない。VM 側は失敗チャンクを実行しないため、Compiler も
+        // 入力開始時点へ戻す必要がある。
+        let checkpoint = self.clone();
+        let result = (|| -> Result<Chunk, TsumugiError> {
+            // 新しいチャンクを作成（前のチャンクは捨てる）
+            let prev_chunk = std::mem::replace(&mut self.chunk, Chunk::new());
+            // チャンク名を引き継ぐ
+            self.chunk.name = prev_chunk.name;
 
-        for stmt in program {
-            self.compile_stmt(stmt)?;
+            for stmt in program {
+                self.compile_stmt(stmt)?;
+            }
+            self.chunk.emit(OpCode::Return, 0);
+
+            // 今回のチャンクを取り出して返す（次回用に空チャンクをセット）
+            Ok(std::mem::replace(&mut self.chunk, Chunk::new()))
+        })();
+
+        if result.is_err() {
+            *self = checkpoint;
         }
-        self.chunk.emit(OpCode::Return, 0);
-
-        // 今回のチャンクを取り出して返す（次回用に空チャンクをセット）
-        Ok(std::mem::replace(&mut self.chunk, Chunk::new()))
+        result
     }
 
     /// 文をコンパイル
