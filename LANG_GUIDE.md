@@ -172,27 +172,45 @@ for i in range(10):         # ERROR: no colon
 
 ### Scoping
 
-- `while` and `for` loop bodies have **block scope**: variables declared with `let` inside a loop are local to that iteration and not visible outside
-- `if`/`elif`/`else` blocks do **not** create a new scope
-- Functions create their own scope
-- To modify an outer variable inside a loop, use assignment (`x = x + 1`), not `let`
+- Each selected `if` / `elif` / `else` body has its own block scope
+- Each `while` / `for` iteration has its own block scope
+- `try` and `catch` have separate block scopes
+- The catch variable exists only inside its `catch` block
+- Functions create their own lexical scope
+- `let` declares or shadows a name in the current scope; assignment without `let` updates the nearest existing binding
+- A closure may keep a captured block-local cell alive after block exit, but the name is not directly visible outside
+- Scope cleanup happens on normal completion, errors, `return`, `break`, and `continue`
+- For normal completion or an error caught within the same execution, scope cleanup itself does not roll back assignment to outer variables, collection mutation, or external I/O
+- Commit/rollback after an unhandled REPL submission is not yet unified between engines and remains tracked by AUD-024
 
 ```tsg
 let total = 0
 for i in [1, 2, 3]
-    let temp = i * 2    # temp is local to this iteration
-    total = total + temp # modifying outer variable via assignment
+    let temp = i * 2      # local to this iteration
+    total = total + temp  # assignment updates the outer variable
 end
-# print(temp)  → ERROR: temp is not defined here
-print(total)   # 12
+print(total)              # 12
+
+let result = null
+if true
+    let temporary = "done"
+    result = temporary    # export through a predeclared outer binding
+end
+print(result)             # done
+# print(temporary)        # ERROR: not defined outside the if block
 ```
 
 **WRONG:**
 ```
 let count = 3
 while count > 0
-    let count = count - 1  # ERROR: creates a new local, outer count never changes → infinite loop
+    let count = count - 1  # ERROR: shadows count; the outer value never changes
 end
+
+if true
+    let result = "local"
+end
+print(result)              # ERROR: result is block-local
 ```
 
 ### Data Types
@@ -247,6 +265,9 @@ end
 - NOT `try/except` (Python)
 - No `finally` or `ensure` block
 - The catch variable is bound to a structured Error value, not a plain string
+- `try` and `catch` have separate scopes; declarations made with `let` in `try` are not visible in `catch`
+- The catch variable and declarations made in `catch` disappear when that block ends
+- To pass a value out of either block, declare it outside and update it with assignment
 - Access fields via index syntax: `e["type"]`, `e["message"]`, `e["line"]`
 - It also stringifies automatically when concatenated with `+` or interpolated in an f-string
 - `e["type"]` values (snake_case identifiers):

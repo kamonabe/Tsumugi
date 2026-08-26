@@ -1080,6 +1080,104 @@ fn vm_golden_scope_isolation() {
     run_golden_test_vm("scope_isolation");
 }
 
+#[test]
+fn golden_block_scope_semantics() {
+    run_golden_test("block_scope_semantics");
+}
+
+#[test]
+fn vm_golden_block_scope_semantics() {
+    run_golden_test_vm("block_scope_semantics");
+}
+
+#[test]
+fn repl_control_flow_block_locals_do_not_leak() {
+    let source = "let escaped_if = null\n\
+                  if true\n    let if_local = \"if-cell\"\n    escaped_if = fn() if_local end\nend\n\
+                  let reused_if = \"after-if\"\n\
+                  print(reused_if)\n\
+                  print(escaped_if())\n\
+                  print(if_local)\n\
+                  let escaped_try = null\n\
+                  try\n    let try_local = \"try-cell\"\n    escaped_try = fn() try_local end\ncatch unused\n    print(\"unexpected-normal-catch\")\nend\n\
+                  let reused_try = \"after-try\"\n\
+                  print(reused_try)\n\
+                  print(escaped_try())\n\
+                  print(try_local)\n\
+                  let escaped_catch = null\n\
+                  try\n    let failed = 1 / 0\ncatch catch_error\n    let catch_local = \"catch-cell\"\n    escaped_catch = fn() catch_local + \":\" + catch_error[\"type\"] end\nend\n\
+                  let reused_catch = \"after-catch\"\n\
+                  print(reused_catch)\n\
+                  print(escaped_catch())\n\
+                  print(catch_error)\n\
+                  print(catch_local)\n\
+                  try\n    let try_only = 4\n    let failed = 1 / 0\ncatch separated\n    print(try_only)\nend\n\
+                  let reused_failed = \"after-failed\"\n\
+                  print(reused_failed)\n\
+                  print(separated)\n\
+                  print(\"alive\")\n";
+    let expected_output = [
+        "after-if",
+        "if-cell",
+        "after-try",
+        "try-cell",
+        "after-catch",
+        "catch-cell:zero_division",
+        "after-failed",
+        "alive",
+    ];
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+        let prompt = if use_vm { "tsumugi:vm> " } else { "tsumugi> " };
+        let visible_output: Vec<_> = stdout
+            .lines()
+            .filter_map(|line| {
+                line.rsplit_once(prompt)
+                    .map(|(_, value)| value)
+                    .filter(|value| !value.is_empty())
+            })
+            .collect();
+        let diagnostics: Vec<_> = stderr
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert_eq!(
+            visible_output, expected_output,
+            "{mode}でslot再利用・escaping closure・後続実行が不正: {stdout}"
+        );
+        assert_eq!(
+            diagnostics.len(),
+            6,
+            "{mode}で予期しない診断が発生: {stderr}"
+        );
+        for name in [
+            "if_local",
+            "try_local",
+            "catch_error",
+            "catch_local",
+            "try_only",
+            "separated",
+        ] {
+            let expected = format!("未定義の変数: {name}");
+            assert_eq!(
+                stderr.matches(&expected).count(),
+                1,
+                "{mode}で{name}のscopeまたは診断が不正: {stderr}"
+            );
+        }
+        assert!(!stdout.contains("unexpected-normal-catch"));
+        assert!(
+            !stderr.contains("panicked at"),
+            "{mode}でhost panic: {stderr}"
+        );
+    }
+}
+
 // =============================================================
 // 深層監査リグレッション: REPL transaction / 状態回復 / 資源上限
 // =============================================================
