@@ -274,6 +274,7 @@ except Exception as e:      # ERROR: no `except`, no type, no `as`
 import "path/to/module.tsg"
 ```
 
+- Import statements are valid only at the program top level; using one inside any block is a parse error
 - All definitions from the imported file are injected into the current scope (flat, no namespace)
 - Path is relative to the current script file
 - No `require`, no `from ... import`, no selective imports
@@ -285,6 +286,9 @@ require "module"                    # ERROR: no `require`
 from module import func             # ERROR: no `from` import
 import module                       # ERROR: must be a string path
 import "module" as m                # ERROR: no `as` aliasing
+if true
+    import "module.tsg"             # ERROR: import must be top-level
+end
 ```
 
 ### Operators
@@ -636,10 +640,11 @@ Tsumugi source files use the `.tsg` extension.
 ## Grammar (Formal)
 
 ```
-program        = stmt*
+program        = top_level_stmt*
+top_level_stmt = import_stmt | stmt
 stmt           = let_stmt | assign_stmt | index_assign | return_stmt
                | if_stmt | while_stmt | for_stmt | break_stmt | continue_stmt
-               | fn_def | import_stmt | try_catch_stmt | expr_stmt
+               | fn_def | try_catch_stmt | expr_stmt
 let_stmt       = "let" IDENT "=" expr NEWLINE
 assign_stmt    = IDENT "=" expr NEWLINE
 index_assign   = postfix "[" expr "]" "=" expr NEWLINE

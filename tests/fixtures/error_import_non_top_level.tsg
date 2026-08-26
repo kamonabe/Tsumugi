@@ -1,0 +1,4 @@
+if false
+    import "file-that-must-not-be-read.tsg"
+end
+print("unreachable")

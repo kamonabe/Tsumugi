@@ -1026,12 +1026,44 @@ fn vm_error_fstring_extra() {
 }
 
 // =============================================================
-// リグレッションテスト: import 失敗後の復旧（tree-walk のみ）
+// リグレッションテスト: import はトップレベル限定
 // =============================================================
 
 #[test]
-fn golden_import_recovery() {
-    run_golden_test("import_recovery");
+fn error_import_non_top_level_is_identical_in_both_engines() {
+    let dir = fixtures_dir();
+    let script = dir.join("error_import_non_top_level.tsg");
+    let expected = std::fs::read_to_string(dir.join("error_import_non_top_level.expected_err"))
+        .expect("期待エラーファイルが読めません")
+        .replace("\r\n", "\n");
+    let mut actual_errors = Vec::new();
+
+    for use_vm in [false, true] {
+        let mut cmd = Command::new(tsumugi_bin());
+        if use_vm {
+            cmd.arg("--vm");
+        }
+        let output = cmd
+            .arg(&script)
+            .output()
+            .expect("tsumugi バイナリの実行に失敗");
+        let mode = if use_vm { "VM" } else { "tree-walk" };
+        let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+        let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
+
+        assert!(!output.status.success(), "{mode}が終了コード0を返しました");
+        assert_eq!(stdout, "", "{mode}がパースエラー後に実行されました");
+        assert_eq!(
+            stderr, expected,
+            "{mode}のエラーが完全一致しないか、import先へI/Oしました"
+        );
+        actual_errors.push(stderr);
+    }
+
+    assert_eq!(
+        actual_errors[0], actual_errors[1],
+        "tree-walkとVMのエラーが一致しません"
+    );
 }
 
 // =============================================================
@@ -1209,22 +1241,26 @@ fn tree_repl_resets_step_budget_per_submission() {
 #[test]
 fn tree_repl_retries_failed_import() {
     let output = run_repl_process(
-        "try\n    import \"tests/fixtures/import_bad_syntax.tsg\"\ncatch e\n    print(\"caught first\")\nend\n\
-         try\n    import \"tests/fixtures/import_bad_syntax.tsg\"\ncatch e\n    print(\"caught second\")\nend\n",
+        "import \"tests/fixtures/import_bad_syntax.tsg\"\n\
+         import \"tests/fixtures/import_bad_syntax.tsg\"\n\
+         import \"tests/fixtures/import_lib.tsg\"\n\
+         print(add(3, 4))\n",
         false,
         &[],
     );
     let (stdout, stderr) = output_text(&output);
 
     assert!(output.status.success(), "tree REPLが異常終了: {stderr}");
-    assert!(stderr.is_empty(), "import errorがcatchを抜けた: {stderr}");
-    assert!(
-        stdout.contains("caught first\n"),
-        "最初のimport errorが未捕捉: {stdout}"
+    assert_eq!(
+        stderr
+            .matches("import 失敗 (tests/fixtures/import_bad_syntax.tsg)")
+            .count(),
+        2,
+        "失敗したimportがloaded扱いになったか、base_dirが復元されていない: {stderr}"
     );
     assert!(
-        stdout.contains("caught second\n"),
-        "失敗したimportがloaded扱いでskipされた: {stdout}"
+        stdout.contains("7\n"),
+        "失敗後の相対importまたは後続実行に失敗: {stdout}\n--- stderr ---\n{stderr}"
     );
 }
 
