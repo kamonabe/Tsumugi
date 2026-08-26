@@ -24,7 +24,7 @@
 | AUD-007 | 非トップレベルimportの意味論を統一する | VMはcompile-time inlineのためfalse branchでもloaded扱い、loopでは複数実行、関数内relative path/control-flowもtreeと異なる | ✅ トップレベル限定として統一（全ネスト構文のparserテスト・tree/VM回帰テスト追加） |
 | AUD-008 | `if` / `try` / `catch`のscope仕様を確定し両engineを統一する | treeではblock内`let`が外から可視、VMではcompile error。公開ガイドの「ifはscopeを作らない」とVMが不一致 | ✅ 独立block scopeへ統一（shadowing・error/control-flow・closure・REPL回帰テスト追加） |
 | AUD-009 | tree REPLのstep予算を入力単位でresetする | step数がセッション全体で累積し、一度上限に達すると以後の入力も失敗。VMと不一致 | ✅ 完了（入力間回帰テスト追加） |
-| AUD-010 | for変数のclosure bindingを反復単位で統一する | `[1,2,3]`で作ったclosureがtreeは`1,2,3`、VMは全て`3` | ⬜ 未着手 |
+| AUD-010 | for変数のclosure bindingを反復単位で統一する | `[1,2,3]`で作ったclosureがtreeは`1,2,3`、VMは全て`3` | ✅ 反復ごとのfresh cellへ統一（closure・control-flow・REPL slot再利用回帰テスト追加） |
 | AUD-011 | VMのcompile-time name resolution差を仕様化／縮小する | dead branchの未定義名、global forward reference、引数評価順がtreeと異なる | ⬜ 設計判断が必要 |
 | AUD-012 | context依存builtinの契約を統一する | `exit`/`args`/`input`、`push`/`pop` upvalue、map/filter/each self-binding・error kind・CRLF処理に差 | 🟡 `exit`/`args`/`input`・callback self-binding完了。push/pop upvalue等は継続 |
 | AUD-013 | VM index assignmentのupvalue対応と評価順を統一する | captured listへ代入不可。object取得順の違いで副作用後に古いlistを書き戻す | ⬜ 未着手 |

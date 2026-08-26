@@ -1,0 +1,157 @@
+# for変数は反復ごとに独立したcellへbindされる
+
+# 直接captureしたclosureは各反復の値を保持する
+let direct = []
+for i in [1, 2, 3]
+    push(direct, fn() i end)
+end
+print(direct[0]())
+print(direct[1]())
+print(direct[2]())
+
+# 同一反復内の代入はその反復のcellを更新する
+let mutated = []
+for i in [1, 2, 3]
+    push(mutated, fn() i end)
+    i = i * 10
+end
+print(mutated[0]())
+print(mutated[1]())
+print(mutated[2]())
+
+# named functionも同じ反復bindingをcaptureする
+let named = []
+for i in [4, 5]
+    fn current()
+        return i
+    end
+    push(named, current)
+end
+print(named[0]())
+print(named[1]())
+
+# DictとUnicode文字列でも反復ごとにbindingを分離する
+let dict_keys = []
+for key in {"b": 2, "a": 1}
+    push(dict_keys, fn() key end)
+end
+print(dict_keys[0]())
+print(dict_keys[1]())
+
+let chars = []
+for ch in "Aあ"
+    push(chars, fn() ch end)
+end
+print(chars[0]())
+print(chars[1]())
+
+# nested loopではouter/inner双方の反復bindingを保持する
+let pairs = []
+for outer in [1, 2]
+    for inner in ["a", "b"]
+        push(pairs, fn() to_str(outer) + ":" + inner end)
+    end
+end
+print(pairs[0]())
+print(pairs[1]())
+print(pairs[2]())
+print(pairs[3]())
+
+# loop変数は同名のouter bindingをshadowする
+let item = "outer"
+let shadowed = null
+for item in ["inner"]
+    shadowed = fn() item end
+end
+print(item)
+print(shadowed())
+
+# continue/break後もescaping cellを保持する
+let continued = []
+for value in [6, 7]
+    push(continued, fn() value end)
+    continue
+end
+print(continued[0]())
+print(continued[1]())
+
+let broken = null
+for value in [8, 9]
+    broken = fn() value end
+    break
+end
+print(broken())
+
+# catchされたruntime error後も現在反復のcellを保持する
+let errored = null
+for value in [10]
+    try
+        errored = fn() value end
+        let failed = 1 / 0
+    catch caught
+        print(caught["type"])
+    end
+end
+print(errored())
+
+# frame終了後もreturnされたclosureのcellを保持する
+fn return_loop_closure()
+    for value in [11, 12]
+        return fn() value end
+    end
+    return fn() 0 end
+end
+let returned = return_loop_closure()
+print(returned())
+
+# empty iterableでもouter bindingと解放slotを壊さない
+let empty_value = "outer-empty"
+for empty_value in []
+    print("unexpected-empty")
+end
+let empty_reuse_collection = "unused-collection-slot"
+let empty_reuse_index = "unused-index-slot"
+let empty_reuse_var = "after-empty"
+let empty_reuse_reader = fn() empty_reuse_var end
+print(empty_value)
+print(empty_reuse_reader())
+
+# 同一反復の複数closureは代入後の同じcellを見る
+let shared = []
+for value in [12]
+    push(shared, fn() value end)
+    push(shared, fn() value end)
+    value = 120
+end
+print(shared[0]())
+print(shared[1]())
+
+# body-localの同名letはloop bindingをshadowする
+let loop_bindings = []
+let body_bindings = []
+for value in [13, 14]
+    push(loop_bindings, fn() value end)
+    let value = value * 10
+    push(body_bindings, fn() value end)
+end
+print(loop_bindings[0]())
+print(body_bindings[0]())
+print(loop_bindings[1]())
+print(body_bindings[1]())
+
+# loop外のcatchへunwindしてもescaping cellを保持し、slotを再利用できる
+let unwound = null
+try
+    for value in [15]
+        unwound = fn() value end
+        let failed = 1 / 0
+    end
+catch outer_error
+    print(outer_error["type"])
+end
+let unwind_reuse_collection = "unused-collection-slot"
+let unwind_reuse_index = "unused-index-slot"
+let unwind_reuse_var = "after-unwind"
+let unwind_reuse_reader = fn() unwind_reuse_var end
+print(unwind_reuse_reader())
+print(unwound())

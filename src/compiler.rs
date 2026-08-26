@@ -498,9 +498,8 @@ impl Compiler {
         let index_slot = self.locals.len();
         self.add_local("__index__".to_string());
 
-        // ループ変数を null で初期化
+        // ループ変数をnullで初期化
         self.chunk.emit_constant(Value::Null, line);
-        let var_slot = self.locals.len();
         self.add_local(var.to_string());
 
         // ループ先頭
@@ -522,12 +521,13 @@ impl Compiler {
         self.chunk.emit(OpCode::Lt, line);
         let exit_jump = self.chunk.emit_jump(OpCode::JumpIfFalse(0), line);
 
-        // ループ変数 = collection[index]
+        // ループ変数を反復ごとに新しいcellへ再bindする。
+        // 前回値をpopするとlocals_cellsの対応も解除され、escaping closureが
+        // 保持する旧cellと次の反復で作られるcellが分離される。
+        self.chunk.emit(OpCode::Pop, line);
         self.chunk.emit(OpCode::GetLocal(collection_slot), line);
         self.chunk.emit(OpCode::GetLocal(index_slot), line);
         self.chunk.emit(OpCode::Index, line);
-        self.chunk.emit(OpCode::SetLocal(var_slot), line);
-        self.chunk.emit(OpCode::Pop, line);
 
         // ループ本体（ブロックスコープあり）
         self.begin_scope();
