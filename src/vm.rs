@@ -590,9 +590,24 @@ impl Vm {
                 println!("{}", output.join(" "));
             }
             OpCode::Pop => {
+                // 単一 pop 時もセルをクリア
+                let frame = self.frames.last_mut().unwrap();
+                let slot = self.stack.len() - 1 - frame.base;
+                if slot < frame.locals_cells.len() {
+                    frame.locals_cells[slot] = None;
+                }
                 self.pop(line)?;
             }
             OpCode::PopN(count) => {
+                // スコープ終了: 対応する locals_cells をクリアしてからスタックを削除
+                let frame = self.frames.last_mut().unwrap();
+                let stack_top = self.stack.len();
+                for i in 0..count {
+                    let slot = stack_top - 1 - i - frame.base;
+                    if slot < frame.locals_cells.len() {
+                        frame.locals_cells[slot] = None;
+                    }
+                }
                 for _ in 0..count {
                     self.pop(line)?;
                 }

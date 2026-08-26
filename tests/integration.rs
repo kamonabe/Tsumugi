@@ -1033,3 +1033,17 @@ fn vm_error_fstring_extra() {
 fn golden_import_recovery() {
     run_golden_test("import_recovery");
 }
+
+// =============================================================
+// リグレッションテスト: レキシカルスコープ・locals_cells リーク防止
+// =============================================================
+
+#[test]
+fn golden_scope_isolation() {
+    run_golden_test("scope_isolation");
+}
+
+#[test]
+fn vm_golden_scope_isolation() {
+    run_golden_test_vm("scope_isolation");
+}

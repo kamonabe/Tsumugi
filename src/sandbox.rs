@@ -44,21 +44,22 @@ fn allowed_paths() -> &'static Option<Vec<PathBuf>> {
 }
 
 /// 指定パスがサンドボックスの許可範囲内かチェックする。
-/// サンドボックスが無効（環境変数未設定）の場合は常に Ok。
+/// サンドボックスが無効（環境変数未設定）の場合は正規化パスを返す。
 /// 範囲外の場合はランタイムエラーを返す。
-pub fn check_path(path_str: &str, line: usize) -> Result<(), TsumugiError> {
-    let Some(allowed) = allowed_paths() else {
-        // サンドボックス無効
-        return Ok(());
-    };
-
+/// 戻り値の PathBuf を実際のファイル操作に使うことで TOCTOU を防止する。
+pub fn check_path(path_str: &str, line: usize) -> Result<PathBuf, TsumugiError> {
     // 対象パスを絶対パスに正規化
     let target = normalize_path(path_str);
+
+    let Some(allowed) = allowed_paths() else {
+        // サンドボックス無効: 正規化パスをそのまま返す
+        return Ok(target);
+    };
 
     // 許可パスのいずれかのプレフィックスに合致するか
     for allowed_path in allowed {
         if target.starts_with(allowed_path) {
-            return Ok(());
+            return Ok(target);
         }
     }
 

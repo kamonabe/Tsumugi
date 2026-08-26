@@ -1,0 +1,58 @@
+# レキシカルスコープ・locals_cells リーク防止のリグレッションテスト
+
+# --- AST レキシカルスコープ: 関数は呼び出し元のローカル変数を見えない ---
+# キャプチャされていない変数は関数内から参照不可
+let visible = "global"
+fn reader()
+    return visible
+end
+
+fn writer()
+    let visible = "local in writer"
+    return reader()
+end
+
+# reader は global の visible を見る（writer のローカルではない）
+print(writer())
+
+# --- クロージャは定義時のキャプチャ変数だけ見える ---
+let val = "outer"
+fn make_reader()
+    return fn() val end
+end
+
+fn caller()
+    let val = "should not see"
+    let r = make_reader()
+    return r()
+end
+
+print(caller())
+
+# --- VM locals_cells リーク: スコープ終了後のセル再利用防止 ---
+let saved = null
+if true
+    let x = 100
+    saved = fn() x end
+end
+if true
+    let y = 200
+    print(y)
+end
+print(saved())
+
+# --- ループ内キャプチャ後のスロット再利用 ---
+let closures = []
+for i in [1, 2, 3]
+    let v = i * 10
+    push(closures, fn() v end)
+end
+# ループ終了後に別のスコープで同じスロットを使っても干渉しない
+if true
+    let z = 999
+    print(z)
+end
+# クロージャは元の値を保持
+print(closures[0]())
+print(closures[1]())
+print(closures[2]())
