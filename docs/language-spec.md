@@ -211,7 +211,27 @@ print(result)     # block local
 - 正常終了または同一実行内でcatchされたエラーでは、scope解放自体はトランザクションrollbackを行わない。外側変数への代入、外側コレクションの変更、外部I/Oは保持される
 - 未捕捉エラーで終了したREPL入力のcommit/rollback方針は両engineで未統一であり、AUD-024で継続する
 
-block外の未定義名は両実行方式でエラーになるが、ツリーウォーク版は実行時、VM版はコンパイル時に検出する場合がある。
+### 名前の可視性と解決時期
+
+- local変数と定義時に見えていた外側bindingは、通常のレキシカルスコープで解決する
+- 変数・関数名の存在は、その名前を含む式または代入文を**実行した時点**で検査する。到達しない`if` / loop / `catch`、短絡された`and` / `or`の右辺、未呼出し関数、`return`後の文に未定義名があってもエラーにならない
+- top-levelの`let`と関数定義は、その宣言を実行した時点からglobalとして見える。宣言前のtop-level文から直接読むhoistingは行わない
+- 関数・ラムダは、定義時に存在したレキシカルbindingを変数セルとして捕捉する。定義時に未解決だった名前は呼出し時のglobalを参照するため、globalの宣言後に呼び出せばforward referenceとtop-level mutual recursionが可能
+- 定義後に作られたblock localはforward referenceの対象にならない。block localを関数から使うには、関数定義時にそのbindingが見えている必要がある
+- importされたtop-level定義も同じglobal scopeへ入り、caller側で後から宣言され、呼出し前に実行済みとなったglobalを参照できる
+- 実行時にも名前が存在しなければ`name`ランタイムエラーとなり、`try` / `catch`で捕捉できる。未定義calleeでは引数を評価しない
+
+```
+fn read_later()
+    return later
+end
+
+let later = 42
+print(read_later())  # 42: 呼出し前にglobal宣言が実行済み
+
+# print(not_yet_defined)  # runtime error: この文の実行時点では未定義
+# let not_yet_defined = 1
+```
 
 ## 演算子
 
@@ -615,7 +635,7 @@ end
 - ゼロ除算
 - 型エラー（異なる型同士の演算）
 - インデックス範囲外
-- 未定義の変数（ツリーウォーク版のみ。VM版ではコンパイル時に検出）
+- 未定義の変数・関数（名前を実際に評価した時点で発生）
 - 関数の引数不一致
 - リスト/辞書以外へのインデックス代入
 - `to_int` の変換失敗

@@ -1,0 +1,3 @@
+# REPL transaction中にglobal登録後のruntime errorを発生させる
+let failed_global = "must-not-survive"
+print(missing_in_failed_import)

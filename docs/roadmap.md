@@ -10,7 +10,7 @@
 
 | ID | 項目 | 再現・影響 | 状態 |
 |---|---|---|---|
-| AUD-001 | VM REPLのコンパイル失敗をtransactionalにする | ブロック内でlocal追加後に未定義名を置くと、Compilerだけが更新され、次入力の`GetLocal`でRustの範囲外panic。stale loopから`Jump(0)`生成にも到達可能 | ✅ 完了（REPL回帰テスト追加） |
+| AUD-001 | VM REPLのコンパイル失敗をtransactionalにする | ブロック内でlocal追加後に未解決index assignment target等のcompile errorを置くと、Compilerだけが更新され、次入力の`GetLocal`でRustの範囲外panic。stale loopから`Jump(0)`生成にも到達可能 | ✅ 完了（REPL回帰テスト追加） |
 | AUD-002 | VM REPLの未捕捉runtime error後にstack/frame/handler/compilerを復元する | 一時値・callee frame・未実行bindingが次入力へ残り、誤値参照、古い関数の再開、二次panicを起こす | ✅ 完了（REPL回帰テスト追加） |
 | AUD-003 | コレクション上限を全生成経路へ一貫適用する | VMのlist/dict literal、`push`、`map`/`filter`、keys/values等で`TSUMUGI_MAX_COLLECTION_SIZE`を迂回でき、メモリDoS防止の完了記載と矛盾 | ✅ 言語から到達する生成・拡張経路を修正。総heap quotaは対象外 |
 
@@ -25,7 +25,7 @@
 | AUD-008 | `if` / `try` / `catch`のscope仕様を確定し両engineを統一する | treeではblock内`let`が外から可視、VMではcompile error。公開ガイドの「ifはscopeを作らない」とVMが不一致 | ✅ 独立block scopeへ統一（shadowing・error/control-flow・closure・REPL回帰テスト追加） |
 | AUD-009 | tree REPLのstep予算を入力単位でresetする | step数がセッション全体で累積し、一度上限に達すると以後の入力も失敗。VMと不一致 | ✅ 完了（入力間回帰テスト追加） |
 | AUD-010 | for変数のclosure bindingを反復単位で統一する | `[1,2,3]`で作ったclosureがtreeは`1,2,3`、VMは全て`3` | ✅ 反復ごとのfresh cellへ統一（closure・control-flow・REPL slot再利用回帰テスト追加） |
-| AUD-011 | VMのcompile-time name resolution差を仕様化／縮小する | dead branchの未定義名、global forward reference、引数評価順がtreeと異なる | 🟡 user functionのcall validation順を統一。dead code / forward globalのname visibility・検出時期は継続 |
+| AUD-011 | VMのcompile-time name resolution差を仕様化／縮小する | dead branchの未定義名、global forward reference、引数評価順がtreeと異なる | ✅ call validation順とruntime global fallbackを統一（dead code・forward read/write・mutual recursion・REPL/import回帰テスト追加） |
 | AUD-012 | context依存builtinの契約を統一する | `exit`/`args`/`input`、`push`/`pop` upvalue、map/filter/each self-binding・error kind・CRLF処理に差 | 🟡 `exit`/`args`/`input`・callback self-binding完了。push/pop upvalue等は継続 |
 | AUD-013 | VM index assignmentのupvalue対応と評価順を統一する | captured listへ代入不可。object取得順の違いで副作用後に古いlistを書き戻す | ⬜ 未着手 |
 | AUD-014 | equality / relational comparisonの対象型を統一する | List/Dict/Function/Error、Int×Floatでtreeはtype error、VMはboolを返す場合がある | ⬜ 仕様確定待ち |
@@ -40,7 +40,7 @@
 | AUD-018 | CLIからscript引数を渡せるようにする | `args()`を公開しているがCLIが2個目以降の非flag引数をusage errorにする | ⬜ 未着手 |
 | AUD-019 | engine固有error kind/messageを統一する | iteration/index/push/pop/map等で`runtime`/`type`/`builtin_type`が異なる | ⬜ 未着手 |
 | AUD-020 | sandboxの脅威モデルとTOCTOU制約を明記する | canonicalize後のcheckとI/Oは別system callであり、外部processによるsymlink raceは残る | ⬜ 未着手 |
-| AUD-021 | language-spec / LANG_GUIDE / designのdriftを解消する | closureが値capture表記、catchが文字列表記、call depthが256/128併記、engine parity断言などが現実装と矛盾 | 🟡 closure/catch/depth/import/block scopeを更新。残る意味論確定後に継続 |
+| AUD-021 | language-spec / LANG_GUIDE / designのdriftを解消する | closureが値capture表記、catchが文字列表記、call depthが256/128併記、engine parity断言などが現実装と矛盾 | 🟡 closure/catch/depth/import/block scope/name visibilityを更新。残る意味論確定後に継続 |
 | AUD-022 | REPL・differential・limit境界・defensive VMテストを追加する | 現行golden testはREPL継続、stdin/argv/exit、collection上限、panic/hang、厳密なstderr/stdout副作用を検査しない | 🟡 REPL transaction・limit・builtin・block scope回帰を追加。網羅matrix/fuzzは継続 |
 | AUD-023 | VMのunchecked index/`unwrap()`を構造化internal errorへ置換する | compiler/VM invariantが崩れるとhost panic。AUD-001/002でユーザー入力から到達可能だった | ⬜ transaction修正後も防御的に継続 |
 | AUD-024 | import・REPLの状態commit方針を明文化する | 未捕捉error前の代入/list mutation/upvalue更新を保持するかrollbackするか未定義。外部I/Oはrollback不能 | ⬜ 設計判断が必要 |

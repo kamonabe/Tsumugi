@@ -1,0 +1,8 @@
+import "runtime_global_import_lib.tsg"
+
+let caller_later = "from-caller"
+let caller_mutable = "before"
+
+print(imported_entry())
+imported_write("after")
+print(caller_mutable)

@@ -1182,6 +1182,118 @@ fn invalid_call_repl_recovers_without_argument_effects() {
 }
 
 // =============================================================
+// リグレッションテスト: runtime global name visibility
+// =============================================================
+
+#[test]
+fn golden_runtime_global_name_resolution() {
+    run_golden_test("runtime_global_name_resolution");
+}
+
+#[test]
+fn vm_golden_runtime_global_name_resolution() {
+    run_golden_test_vm("runtime_global_name_resolution");
+}
+
+#[test]
+fn golden_runtime_global_import() {
+    run_golden_test("runtime_global_import");
+}
+
+#[test]
+fn vm_golden_runtime_global_import() {
+    run_golden_test_vm("runtime_global_import");
+}
+
+#[test]
+fn runtime_globals_resolve_across_repl_submissions() {
+    let source = concat!(
+        "fn repl_read()\n",
+        "    return repl_later\n",
+        "end\n",
+        "fn repl_write(value)\n",
+        "    repl_mutable = value\n",
+        "end\n",
+        "fn repl_even(n)\n",
+        "    if n == 0\n",
+        "        return true\n",
+        "    end\n",
+        "    return repl_odd(n - 1)\n",
+        "end\n",
+        "fn repl_odd(n)\n",
+        "    if n == 0\n",
+        "        return false\n",
+        "    end\n",
+        "    return repl_even(n - 1)\n",
+        "end\n",
+        "let repl_later = \"repl-later\"\n",
+        "let repl_mutable = \"before\"\n",
+        "print(repl_read())\n",
+        "repl_write(\"repl-after\")\n",
+        "print(repl_mutable)\n",
+        "print(repl_even(6))\n",
+    );
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+        let prompt = if use_vm { "tsumugi:vm> " } else { "tsumugi> " };
+        let visible_output: Vec<_> = stdout
+            .lines()
+            .filter_map(|line| {
+                line.rsplit_once(prompt)
+                    .map(|(_, value)| value)
+                    .filter(|value| !value.is_empty())
+            })
+            .collect();
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(stderr.is_empty(), "{mode} REPLで予期しない診断: {stderr}");
+        assert_eq!(
+            visible_output,
+            ["repl-later", "repl-after", "true"],
+            "{mode}で入力間forward globalまたはmutual recursionが不正: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn vm_repl_rolls_back_runtime_global_registry_after_error() {
+    let source = concat!(
+        "import \"tests/fixtures/runtime_global_failed_import.tsg\"\n",
+        "print(failed_global)\n",
+        "let failed_global = \"recovered\"\n",
+        "print(failed_global)\n",
+    );
+    let output = run_repl_process(source, true, &[]);
+    let (stdout, stderr) = output_text(&output);
+
+    assert!(output.status.success(), "VM REPLが異常終了: {stderr}");
+    assert_eq!(
+        stderr
+            .matches("未定義の変数: missing_in_failed_import")
+            .count(),
+        1,
+        "import内の元のruntime errorが不正: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("未定義の変数: failed_global").count(),
+        1,
+        "失敗入力のglobal registry entryが残留: {stderr}"
+    );
+    assert!(
+        stdout.contains("recovered\n"),
+        "rollback後に同名globalを再定義できない: {stdout}"
+    );
+    assert!(
+        !stderr.contains("global registryのslotが不正"),
+        "rollback後にstale global slotを参照: {stderr}"
+    );
+    assert!(!stderr.contains("panicked at"), "host panic: {stderr}");
+}
+
+// =============================================================
 // リグレッションテスト: レキシカルスコープ・locals_cells リーク防止
 // =============================================================
 
@@ -1422,7 +1534,7 @@ fn output_text(output: &std::process::Output) -> (String, String) {
 #[test]
 fn vm_repl_recovers_after_compile_error() {
     let output = run_repl_process(
-        "if true\n    let ghost = 1\n    print(missing)\nend\n\
+        "if true\n    let ghost = 1\n    missing_index[0] = 2\nend\n\
          let live = 2\nprint(live)\nprint(ghost)\n",
         true,
         &[],
@@ -1435,7 +1547,7 @@ fn vm_repl_recovers_after_compile_error() {
         "正常な次入力が実行されていない: {stdout}"
     );
     assert!(
-        stderr.contains("未定義の変数: missing"),
+        stderr.contains("未定義の変数: missing_index"),
         "元のcompile errorがない: {stderr}"
     );
     assert!(

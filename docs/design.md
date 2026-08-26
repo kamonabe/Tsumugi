@@ -496,6 +496,12 @@ Parserはプログラム直下とblock内の文を区別し、block内のimport�
   6: Return         → 実行終了
 ```
 
+### 変数名のhybrid解決
+
+Compilerは識別子を、現在のlocal slot、lexical upvalueの順にstatic解決する。どちらにも見つからない通常read/callee/plain assignmentはcompile errorにせず、`GetGlobal` / `GetGlobalForCall` / `SetGlobal`として実行時へ残す。
+
+top-levelの`let` / `fn`は`RegisterGlobal(name, slot)`で宣言実行時に公開される。VMの`globals`は値ではなく`name → top-level slot`だけを保持し、read/write時はtop-level frameのstackまたは`locals_cells`へ到達する。したがってstatic upvalueとruntime globalは同じbinding/cellを共有し、別のglobal value storeは持たない。
+
 ### 実装フェーズ
 
 | Phase | 内容 | 状態 |
@@ -604,7 +610,7 @@ REPLではtree版・VM版とも入力開始時にステップカウンタを0へ
 REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionではない。ただし、次入力を安全に処理するための内部構造状態は入力開始時点へ戻す。
 
 - Compiler: `locals`、scope/loop、import集合、base directoryをcheckpointし、compile errorまたはVM runtime errorで復元
-- VM: value stack、call frame、try handler、step状態をcheckpointし、未捕捉runtime errorで復元
+- VM: value stack、call frame、try handler、step状態、runtime global registryのname→slot対応をcheckpointし、未捕捉runtime errorで復元
 - top-levelの`locals_cells`は正常入力間で引き継ぎ、既存closureとの参照同一性を維持
 - try/catchは開始時の有効local slot数を保存し、unwind時はtry-local cellだけを破棄する。既存localがtry中に初めてcell化された場合は昇格を維持する
 - catch済みエラーは通常の制御フローとしてcommitする
@@ -632,6 +638,22 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 ## 変更履歴
 
+### 2026-08-26: runtime global name resolutionの導入（AUD-011 後半）
+
+**問題:** VM Compilerは全ASTを実行前に走査し、識別子をその時点で既知のlocal/upvalue slotへだけ解決していた。そのため、dead branch・短絡された式・未呼出し関数内の未定義名もcompile errorとなり、先行I/Oを実行せず、`try` / `catch`でも捕捉できなかった。また、関数定義後に宣言されるtop-level globalや後続関数をfunction bodyから参照できず、tree evaluatorが持つlive global scopeと不一致だった。
+
+**決定:** 既知のlocal/upvalueは従来どおりstatic slot/cellへ解決し、そこで未解決の通常read、callee、単純代入だけをruntime global lookupへfallbackするhybrid方式を採用する。名前の存在は式・代入を実行した時点で検査し、到達しないコードでは検査しない。top-level bindingは宣言の実行時に公開し、hoist/predeclareはしないため、宣言前の直接参照は従来どおりruntime Name errorとなる。関数定義時に未解決だった名前は、呼出し時点のglobalを参照する。
+
+**実装:** Compilerは`compile_name_read`で`GetLocal → GetUpvalue → GetGlobal`の順にloweringし、識別子calleeの未解決時は診断を保つ`GetGlobalForCall`、単純代入の未解決時は`SetGlobal`を生成する。script top-levelの新規`let` / `fn`は値がstack slotへ置かれた直後に`RegisterGlobal(name, slot)`を実行する。importは同じroot Compilerへinline展開されるため、import先のtop-level宣言も同じ手順で登録される。
+
+VMのregistryは`HashMap<String, usize>`として**名前からtop-level slotだけ**を保持し、値やcellを複製しない。global read/writeはtop-level `locals_cells[slot]`があればその`Rc<RefCell<Value>>`を、なければ同じstack slotを使う。これにより、後からclosure captureでcell化されてもstatic upvalueとdynamic globalが同じbindingを見る。すべてのglobalを一律cell化せず、既存のREPL値commit挙動も変更しない。`run_repl_chunk`は未捕捉error時にregistryのname→slot対応もcheckpointへ戻し、失敗入力で登録されたstale slotを次入力へ残さない。
+
+**不採用案:** tree evaluatorへ全面static resolverを追加する案はdead code、catch可能なName error、live globalを破壊する。top-level名を事前登録する案は未初期化状態を導入し、宣言到達前の可視性とAUD-016を巻き込む。全名前をdynamic化する案は既存local/upvalue slotの性能とlexical bindingを不要に変える。globalごとに別cellを作る案はtop-level slot・upvalueとのidentityを二重化し、AUD-004で修正したclosure共有とAUD-024のrollback境界を壊すため採用しない。
+
+**互換性と境界:** VMでcompile errorだった未定義名は、実際に到達した場合だけruntime Name errorになる。このためエラー前のprint/I/Oは実行され、同一実行内の`try` / `catch`で捕捉可能になる。これはtree semanticsへの意図的な統一である。同一scopeの`let`再宣言identityはAUD-016、未捕捉REPL入力の値mutation commit/rollbackはAUD-024、error message/traceの完全一致はAUD-019として維持する。`push` / `pop`の識別子更新はAUD-012、index assignmentのupvalue・評価順はAUD-013の特殊mutation loweringとして本変更の対象外とする。
+
+**回帰テスト:** paired golden testでdead `if` / loop / catch、short-circuit、未呼出しfunction/lambda、`return`後、catch可能なName error、未定義calleeの引数非評価、invalid call validation優先、forward global read/write、nested closure、後続cell化、top-level mutual recursion、block-local非公開を検証する。import fixtureではimport内の後続関数とcaller側の後続globalを、両engineのREPLテストでは入力間forward referenceを検証する。VM REPLでは失敗import後にregistry entryとslotがrollbackされ、同名globalを安全に再定義できることも検証する。
+
 ### 2026-08-26: user function call validation順序の統一（AUD-011 前半）
 
 **問題:** ツリーウォーク版はuser function callでstep/depth、callee、callable/arityを検査してから引数を評価していた。一方、VMはcalleeと全引数を評価した後の`Call`で検査していたため、wrong arityやnon-callableでも引数のprint・collection mutation・I/OがVMだけ実行された。引数内のruntime errorとcall validation errorの優先順もengine間で異なり得た。
@@ -642,7 +664,7 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 **不採用案:** treeをVM旧仕様のargs-firstへ合わせる案は、invalid callで新たに外部副作用を発生させ、既存treeコードのerror precedenceを壊すため不採用。Compilerで静的にarityを検査するだけの案はfirst-class functionやcallee式を扱えず、non-callableも解決しない。
 
-**互換性と境界:** VMでinvalid callの引数副作用に依存していたコードは変化する。必要な副作用はcall引数の外で明示的に実行する。builtin固有の引数・callback契約はAUD-012、non-callableを含むerror messageの完全一致はAUD-019で扱う。dead codeの未定義名、global forward reference、未定義argの実行前拒否はslot-only eager name resolutionが原因であり、runtime global cell・AUD-016・AUD-024を伴うAUD-011後半へ分離する。
+**互換性と境界:** VMでinvalid callの引数副作用に依存していたコードは変化する。必要な副作用はcall引数の外で明示的に実行する。builtin固有の引数・callback契約はAUD-012、non-callableを含むerror messageの完全一致はAUD-019で扱う。dead codeの未定義名、global forward reference、未定義argの実行前拒否はcall validationとは別のname resolution問題であり、AUD-011後半（前節）のruntime global fallbackで対応する。
 
 **回帰テスト:** paired golden testで成功時のcallee→arg1→arg2→body、wrong arity/non-callable時の引数非評価、callee runtime errorの優先、引数の左から右評価とarg error時のbody非実行を検証する。tree/VM REPLテストではstep上限をcallee評価前に検査し、caught `limit` error後もcallee副作用が発生しないことを検証する。
 

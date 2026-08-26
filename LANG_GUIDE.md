@@ -181,6 +181,11 @@ for i in range(10):         # ERROR: no colon
 - `try` and `catch` have separate block scopes
 - The catch variable exists only inside its `catch` block
 - Functions create their own lexical scope
+- Names are checked when the expression or assignment is executed, not while unreachable code is compiled. Undefined names in dead branches, short-circuited operands, uncalled functions, or code after `return` do not fail
+- A top-level `let` or function becomes globally visible when its declaration executes; globals are not hoisted before that point
+- Functions capture lexical bindings visible at definition time. A name unresolved at definition uses the live global scope when executed, so a function may reference a later top-level declaration if it is called after that declaration; top-level mutual recursion is valid after both definitions run
+- A block-local declared after a function definition is not a forward global and is not made visible to that function
+- Missing variables/functions produce catchable `name` runtime errors; a missing callee does not evaluate its arguments
 - `let` declares or shadows a name in the current scope; assignment without `let` updates the nearest existing binding
 - A closure may keep a captured block-local cell alive after block exit, but the name is not directly visible outside
 - Scope cleanup happens on normal completion, errors, `return`, `break`, and `continue`

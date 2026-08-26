@@ -1,0 +1,128 @@
+# runtime global name resolution: dead code / error timing / forward reference
+
+print("dead-code-start")
+
+# 到達しない構文内の未定義名は評価しない
+if false
+    print(missing_if)
+    missing_dead_call(print("dead-call-arg-not-run"))
+end
+
+while false
+    print(missing_while)
+end
+
+for item in []
+    print(missing_for)
+end
+
+try
+    print("try-live")
+catch unused_catch
+    print(missing_catch)
+end
+
+fn never_called()
+    return missing_function_body
+end
+
+let never_lambda = fn()
+    return missing_lambda_body
+end
+
+print(false and missing_and)
+print(true or missing_or)
+
+fn early_return()
+    return "early-return"
+    print(missing_after_return)
+end
+print(early_return())
+print("dead-code-end")
+
+# 実行された未定義名は先行副作用の後にruntime Name errorとなりcatch可能
+try
+    print("before-runtime-name")
+    print(missing_runtime)
+    print("after-runtime-name-not-run")
+catch name_error
+    print("caught-" + name_error["type"])
+end
+
+# 未定義calleeは引数を評価せずruntime errorになる
+try
+    missing_function(print("missing-call-arg-not-run"))
+catch function_error
+    print("missing-function-" + function_error["type"])
+end
+
+# invalid callの未定義引数はarity validationより先に検査しない
+fn zero()
+    return 0
+end
+try
+    let unused = zero(missing_invalid_argument)
+catch validation_error
+    print("validation-" + validation_error["type"])
+end
+
+# 定義後に追加されたglobalをfunction bodyから読み書きできる
+fn read_later()
+    return later
+end
+let later = 42
+print(read_later())
+
+fn write_later(value)
+    later_mutable = value
+end
+let later_mutable = "before"
+write_later("after")
+print(later_mutable)
+
+# nested closureも定義時に存在しなかったglobalをlive lookupする
+fn make_dynamic_reader()
+    return fn() future_shared end
+end
+let dynamic_reader = make_dynamic_reader()
+let future_shared = "nested-one"
+print(dynamic_reader())
+future_shared = "nested-two"
+print(dynamic_reader())
+
+# 後からstatic captureでcell化されてもdynamic global lookupは同じbindingを読む
+fn make_static_reader()
+    return fn() future_shared end
+end
+let static_reader = make_static_reader()
+future_shared = "shared-cell"
+print(dynamic_reader())
+print(static_reader())
+
+# 後続関数名をruntime global lookupすることでtop-level mutual recursionを許可
+fn is_even(n)
+    if n == 0
+        return true
+    end
+    return is_odd(n - 1)
+end
+
+fn is_odd(n)
+    if n == 0
+        return false
+    end
+    return is_even(n - 1)
+end
+
+print(is_even(6))
+print(is_odd(7))
+
+# block localはglobal registryへ公開しない
+if true
+    let block_only = "hidden"
+end
+try
+    print(block_only)
+catch block_error
+    print("block-" + block_error["type"])
+end
