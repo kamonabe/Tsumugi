@@ -127,7 +127,7 @@ impl Evaluator {
         })?;
 
         // サンドボックスチェック: import 先が許可範囲内か検証
-        crate::sandbox::check_path(canonical.to_str().unwrap_or(""), line)?;
+        let _ = crate::sandbox::check_path(canonical.to_str().unwrap_or(""), line)?;
 
         // 循環 import チェック
         if self.imported.contains(&canonical) {
@@ -833,8 +833,8 @@ impl Evaluator {
             arg_values.push(self.eval_expr(arg, line)?);
         }
 
-        // 新しいスコープを作ってキャプチャ変数セル + 引数をバインド
-        self.env.push_scope();
+        // レキシカルスコープ: 呼び出し元のスコープを退避し、独立環境で実行
+        let saved_scopes = self.env.push_call_frame();
         for (k, cell) in &captured {
             self.env.set_shared(k, cell.clone());
         }
@@ -858,7 +858,7 @@ impl Evaluator {
                 }
                 Ok(EvalResult::Break) => {
                     self.call_stack.pop();
-                    self.env.pop_scope();
+                    self.env.pop_call_frame(saved_scopes);
                     return Err(TsumugiError::runtime(
                         line,
                         "break はループの中でのみ使用できます",
@@ -866,7 +866,7 @@ impl Evaluator {
                 }
                 Ok(EvalResult::Continue) => {
                     self.call_stack.pop();
-                    self.env.pop_scope();
+                    self.env.pop_call_frame(saved_scopes);
                     return Err(TsumugiError::runtime(
                         line,
                         "continue はループの中でのみ使用できます",
@@ -877,14 +877,14 @@ impl Evaluator {
                     let mut trace = self.call_stack.clone();
                     trace.reverse();
                     self.call_stack.pop();
-                    self.env.pop_scope();
+                    self.env.pop_call_frame(saved_scopes);
                     return Err(e.with_trace(trace));
                 }
             }
         }
 
         self.call_stack.pop();
-        self.env.pop_scope();
+        self.env.pop_call_frame(saved_scopes);
         Ok(result)
     }
 }

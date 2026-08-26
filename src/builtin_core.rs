@@ -511,8 +511,8 @@ pub fn builtin_format_time(args: &[Value], line: usize) -> Result<Value, Tsumugi
 pub fn builtin_read_file(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("read_file", args, 1, line)?;
     if let Value::Str(path) = &args[0] {
-        crate::sandbox::check_path(path, line)?;
-        match std::fs::read_to_string(path) {
+        let safe_path = crate::sandbox::check_path(path, line)?;
+        match std::fs::read_to_string(&safe_path) {
             Ok(content) => Ok(Value::Str(content)),
             Err(_) => Ok(Value::Null),
         }
@@ -524,8 +524,8 @@ pub fn builtin_read_file(args: &[Value], line: usize) -> Result<Value, TsumugiEr
 pub fn builtin_read_lines(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("read_lines", args, 1, line)?;
     if let Value::Str(path) = &args[0] {
-        crate::sandbox::check_path(path, line)?;
-        match std::fs::read_to_string(path) {
+        let safe_path = crate::sandbox::check_path(path, line)?;
+        match std::fs::read_to_string(&safe_path) {
             Ok(content) => {
                 let lines: Vec<Value> =
                     content.lines().map(|l| Value::Str(l.to_string())).collect();
@@ -542,12 +542,12 @@ pub fn builtin_read_lines(args: &[Value], line: usize) -> Result<Value, TsumugiE
 pub fn builtin_write_file(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("write_file", args, 2, line)?;
     if let Value::Str(path) = &args[0] {
-        crate::sandbox::check_path(path, line)?;
+        let safe_path = crate::sandbox::check_path(path, line)?;
         let content = match &args[1] {
             Value::Str(s) => s.clone(),
             other => other.to_string(),
         };
-        Ok(Value::Bool(std::fs::write(path, &content).is_ok()))
+        Ok(Value::Bool(std::fs::write(&safe_path, &content).is_ok()))
     } else {
         Err(type_error(
             line,
@@ -559,7 +559,7 @@ pub fn builtin_write_file(args: &[Value], line: usize) -> Result<Value, TsumugiE
 pub fn builtin_append_file(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("append_file", args, 2, line)?;
     if let Value::Str(path) = &args[0] {
-        crate::sandbox::check_path(path, line)?;
+        let safe_path = crate::sandbox::check_path(path, line)?;
         let content = match &args[1] {
             Value::Str(s) => s.clone(),
             other => other.to_string(),
@@ -569,7 +569,7 @@ pub fn builtin_append_file(args: &[Value], line: usize) -> Result<Value, Tsumugi
         let result = OpenOptions::new()
             .append(true)
             .create(true)
-            .open(path)
+            .open(&safe_path)
             .and_then(|mut f| f.write_all(content.as_bytes()));
         Ok(Value::Bool(result.is_ok()))
     } else {
@@ -649,8 +649,8 @@ pub fn builtin_env(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
 pub fn builtin_path_exists(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("path_exists", args, 1, line)?;
     if let Value::Str(path) = &args[0] {
-        crate::sandbox::check_path(path, line)?;
-        Ok(Value::Bool(std::path::Path::new(path).exists()))
+        let safe_path = crate::sandbox::check_path(path, line)?;
+        Ok(Value::Bool(safe_path.exists()))
     } else {
         Err(type_error(line, "path_exists(str) の形式で使います"))
     }
@@ -670,8 +670,8 @@ pub fn builtin_path_join(args: &[Value], line: usize) -> Result<Value, TsumugiEr
 pub fn builtin_mkdir(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("mkdir", args, 1, line)?;
     if let Value::Str(path) = &args[0] {
-        crate::sandbox::check_path(path, line)?;
-        Ok(Value::Bool(std::fs::create_dir_all(path).is_ok()))
+        let safe_path = crate::sandbox::check_path(path, line)?;
+        Ok(Value::Bool(std::fs::create_dir_all(&safe_path).is_ok()))
     } else {
         Err(type_error(line, "mkdir(str) の形式で使います"))
     }
@@ -680,12 +680,11 @@ pub fn builtin_mkdir(args: &[Value], line: usize) -> Result<Value, TsumugiError>
 pub fn builtin_remove(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("remove", args, 1, line)?;
     if let Value::Str(path) = &args[0] {
-        crate::sandbox::check_path(path, line)?;
-        let p = std::path::Path::new(path);
-        let result = if p.is_dir() {
-            std::fs::remove_dir(path)
+        let safe_path = crate::sandbox::check_path(path, line)?;
+        let result = if safe_path.is_dir() {
+            std::fs::remove_dir(&safe_path)
         } else {
-            std::fs::remove_file(path)
+            std::fs::remove_file(&safe_path)
         };
         Ok(Value::Bool(result.is_ok()))
     } else {
@@ -696,8 +695,8 @@ pub fn builtin_remove(args: &[Value], line: usize) -> Result<Value, TsumugiError
 pub fn builtin_remove_dir(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("remove_dir", args, 1, line)?;
     if let Value::Str(path) = &args[0] {
-        crate::sandbox::check_path(path, line)?;
-        Ok(Value::Bool(std::fs::remove_dir_all(path).is_ok()))
+        let safe_path = crate::sandbox::check_path(path, line)?;
+        Ok(Value::Bool(std::fs::remove_dir_all(&safe_path).is_ok()))
     } else {
         Err(type_error(line, "remove_dir(str) の形式で使います"))
     }
@@ -706,9 +705,9 @@ pub fn builtin_remove_dir(args: &[Value], line: usize) -> Result<Value, TsumugiE
 pub fn builtin_rename(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("rename", args, 2, line)?;
     if let (Value::Str(from), Value::Str(to)) = (&args[0], &args[1]) {
-        crate::sandbox::check_path(from, line)?;
-        crate::sandbox::check_path(to, line)?;
-        Ok(Value::Bool(std::fs::rename(from, to).is_ok()))
+        let safe_from = crate::sandbox::check_path(from, line)?;
+        let safe_to = crate::sandbox::check_path(to, line)?;
+        Ok(Value::Bool(std::fs::rename(&safe_from, &safe_to).is_ok()))
     } else {
         Err(type_error(line, "rename(str, str) の形式で使います"))
     }
@@ -717,8 +716,8 @@ pub fn builtin_rename(args: &[Value], line: usize) -> Result<Value, TsumugiError
 pub fn builtin_list_dir(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("list_dir", args, 1, line)?;
     if let Value::Str(path) = &args[0] {
-        crate::sandbox::check_path(path, line)?;
-        match std::fs::read_dir(path) {
+        let safe_path = crate::sandbox::check_path(path, line)?;
+        match std::fs::read_dir(&safe_path) {
             Ok(entries) => {
                 let mut names: Vec<Value> = entries
                     .filter_map(|e| e.ok())
@@ -737,8 +736,8 @@ pub fn builtin_list_dir(args: &[Value], line: usize) -> Result<Value, TsumugiErr
 pub fn builtin_file_size(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("file_size", args, 1, line)?;
     if let Value::Str(path) = &args[0] {
-        crate::sandbox::check_path(path, line)?;
-        match std::fs::metadata(path) {
+        let safe_path = crate::sandbox::check_path(path, line)?;
+        match std::fs::metadata(&safe_path) {
             Ok(meta) => Ok(Value::Int(meta.len() as i64)),
             Err(_) => Ok(Value::Null),
         }
@@ -750,8 +749,8 @@ pub fn builtin_file_size(args: &[Value], line: usize) -> Result<Value, TsumugiEr
 pub fn builtin_is_file(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("is_file", args, 1, line)?;
     if let Value::Str(path) = &args[0] {
-        crate::sandbox::check_path(path, line)?;
-        Ok(Value::Bool(std::path::Path::new(path).is_file()))
+        let safe_path = crate::sandbox::check_path(path, line)?;
+        Ok(Value::Bool(safe_path.is_file()))
     } else {
         Err(type_error(line, "is_file(str) の形式で使います"))
     }
@@ -760,8 +759,8 @@ pub fn builtin_is_file(args: &[Value], line: usize) -> Result<Value, TsumugiErro
 pub fn builtin_is_dir(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("is_dir", args, 1, line)?;
     if let Value::Str(path) = &args[0] {
-        crate::sandbox::check_path(path, line)?;
-        Ok(Value::Bool(std::path::Path::new(path).is_dir()))
+        let safe_path = crate::sandbox::check_path(path, line)?;
+        Ok(Value::Bool(safe_path.is_dir()))
     } else {
         Err(type_error(line, "is_dir(str) の形式で使います"))
     }

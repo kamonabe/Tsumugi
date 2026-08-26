@@ -50,7 +50,7 @@ impl Evaluator {
                         ),
                     ));
                 }
-                self.env.push_scope();
+                let saved_scopes = self.env.push_call_frame();
                 for (k, cell) in captured {
                     self.env.set_shared(k, cell.clone());
                 }
@@ -77,13 +77,13 @@ impl Evaluator {
                             let mut trace = self.call_stack.clone();
                             trace.reverse();
                             self.call_stack.pop();
-                            self.env.pop_scope();
+                            self.env.pop_call_frame(saved_scopes);
                             return Err(e.with_trace(trace));
                         }
                     }
                 }
                 self.call_stack.pop();
-                self.env.pop_scope();
+                self.env.pop_call_frame(saved_scopes);
                 Ok(result)
             }
             _ => Err(TsumugiError::runtime(

@@ -86,6 +86,23 @@ impl Env {
         }
         captured
     }
+
+    /// 関数呼び出し用: 現在のスコープスタックを退避し、
+    /// グローバルスコープ + 関数スコープだけの独立環境に切り替える。
+    /// 戻り値は復元用のスコープスタック。
+    pub fn push_call_frame(&mut self) -> Vec<HashMap<String, SharedValue>> {
+        // グローバルスコープ（最下層）を保持し、残りを退避
+        let global = self.scopes[0].clone();
+        let saved = std::mem::replace(&mut self.scopes, vec![global]);
+        // 関数用のローカルスコープを作成
+        self.scopes.push(HashMap::new());
+        saved
+    }
+
+    /// 関数から戻る時: 退避していたスコープスタックを復元する。
+    pub fn pop_call_frame(&mut self, saved: Vec<HashMap<String, SharedValue>>) {
+        self.scopes = saved;
+    }
 }
 
 #[cfg(test)]
