@@ -1,6 +1,6 @@
 # Tsumugi — 設計ドキュメント
 
-最終更新: 2026-08-25
+最終更新: 2026-08-26
 
 ## 目的
 
@@ -391,7 +391,8 @@ let f = fn(x) x * 2 end
 #### 循環 import: サイレントスキップ
 
 - 正規化パスの `HashSet` で管理
-- 2回目以降の import は何もせずスキップ（エラーにしない）
+- 正常に完了したimportの2回目以降は何もせずスキップ（エラーにしない）
+- 読み込み・パース・実行に失敗した場合はmarkerと一時的な`base_dir`を復元し、同じpathを再試行可能にする
 - これにより A→B→A のような循環参照が安全に処理される
 - Python の挙動に近い（部分的に実行済みのモジュールオブジェクトを返す）
 
@@ -403,6 +404,7 @@ let f = fn(x) x * 2 end
 
 ### 制約・トレードオフ
 
+- importの互換性保証範囲はトップレベル文。tree版は実行時読込、VM版はコンパイル時インライン展開のため、条件分岐・ループ・関数内importは実行回数やerror phaseが異なり得る
 - 名前空間が分離されないため、大規模なプロジェクトでは名前衝突のリスクがある
 - ファイルのトップレベルで副作用のあるコード（print 等）がある場合、import 時に実行される
 - 将来的に名前空間分離が必要になったら、クラス + ドット演算子の実装と合わせて対応する
@@ -565,6 +567,7 @@ builtin_core.rs
 | 環境変数 | 対象 | 動作 |
 |---|---|---|
 | `TSUMUGI_MAX_STEPS` | ループ反復 + 関数呼び出し | 上限超過でランタイムエラー |
+| `TSUMUGI_MAX_COLLECTION_SIZE` | List/Dictの生成・拡張とList生成builtin | 要素数上限超過でランタイムエラー |
 | `TSUMUGI_SANDBOX` | 全ファイル操作（read/write/import） | 許可パス外へのアクセスをブロック |
 | `TSUMUGI_ENV_ALLOW` | `env()` 関数 | 許可リスト外のキーは null を返す |
 
@@ -586,6 +589,25 @@ builtin_core.rs
 
 VM版の `call_fn_value()`（map/filter/each のコールバック呼び出し）にもステップカウントを適用。巨大リストに対するコールバックでステップ予算をバイパスされる問題を防止。
 
+REPLではtree版・VM版とも入力開始時にステップカウンタを0へ戻す。importは同じ評価呼び出し内で実行するため、1入力から到達したimport・関数・callbackは予算を共有する。
+
+### REPL入力の状態transaction
+
+REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionではない。ただし、次入力を安全に処理するための内部構造状態は入力開始時点へ戻す。
+
+- Compiler: `locals`、scope/loop、import集合、base directoryをcheckpointし、compile errorまたはVM runtime errorで復元
+- VM: value stack、call frame、try handler、step状態をcheckpointし、未捕捉runtime errorで復元
+- top-levelの`locals_cells`は正常入力間で引き継ぎ、既存closureとの参照同一性を維持
+- try/catchは開始時の有効local slot数を保存し、unwind時はtry-local cellだけを破棄する。既存localがtry中に初めてcell化された場合は昇格を維持する
+- catch済みエラーは通常の制御フローとしてcommitする
+- エラー前の外部I/Oや共有cellへの代入をどこまでrollbackするかは、完全な意味論を今後仕様化する
+
+### コレクションサイズ上限
+
+`TSUMUGI_MAX_COLLECTION_SIZE`（デフォルト1,000,000）を、言語から到達するList/Dictの主要な生成・拡張経路へ共通適用する。チェックは可能な限り追加前に行い、上限超過時は`ErrorKind::CollectionLimit`を返す。
+
+対象にはliteral、`push`、辞書の新規キー、`range`、`split`、`read_lines`、`keys`/`values`、`map`/`filter`、`list_dir`、for用変換を含む。文字列のbyte数や全Valueの総メモリ量を追跡するglobal heap quotaではない。
+
 ### 設計判断
 
 - **エラーにするか null を返すか**: ファイルI/O のサンドボックス違反はランタイムエラー（意図せぬアクセスを即座に検出するため）。env() の許可リスト外は null を返す（「存在しないキー」と同じ挙動にして、スクリプト側に漏洩情報を与えない）
@@ -596,11 +618,37 @@ VM版の `call_fn_value()`（map/filter/each のコールバック呼び出し�
 
 - ~~**スタック深度制限**: 深い再帰で Rust の実スタックが溢れるとプロセスごとクラッシュする。ステップ予算では防げない~~ → **解決済み**: `MAX_CALL_DEPTH = 128` + 8MB スタックスレッドで対策
 - **シンボリックリンク**: サンドボックス内に外部を指す symlink が存在する場合、新規ファイル作成時に迂回の余地がある
-- **ヒープメモリ制限なし**: 巨大なリスト・文字列の生成でOOMになる可能性がある
+- **総ヒープメモリ制限なし**: List/Dictの要素数上限はあるが、巨大文字列、要素自身のサイズ、全コレクション合計量にはglobal quotaがなくOOMの可能性が残る
 - **input() の無制限読み込み**: 改行なしの巨大入力でOOM、入力なしで無限ブロック
 
 
 ## 変更履歴
+
+### 2026-08-26: 深層監査修正（REPL transaction・scope回復・collection上限）
+
+#### VM REPLの失敗時rollback
+
+**問題:** インクリメンタルCompilerとVMが、compile/runtime error後の部分状態を次入力へ持ち越していた。Compilerだけにlocal slotが残ると`GetLocal`の範囲外indexでRust panic、stale loopが残ると未patchの`Jump(0)`、callee frameや一時値が残ると古い処理の再開・誤値参照へ到達できた。
+
+**修正:** `compile_repl_line`をcheckpoint付きにし、compile errorではCompiler全状態を復元。compile成功後のruntime errorでは`main`がCompiler checkpointを復元し、`Vm::run_repl_chunk`もframe/stack/handlerを入力開始状態へ戻す。正常入力ではtop-level `locals_cells`を引き継ぐ。
+
+#### try/catchとtree scopeの回復
+
+- `TryHandler`がtry開始時の有効local slot数を保存。unwind時はtry-local cellだけを破棄し、catch変数slotとの衝突を防ぎつつ既存localの新しいcell昇格を保持
+- tree版while/forはbody結果を一旦保持し、error/return/break/continueの全経路でscopeをpopしてから伝播
+- tree REPLのstep予算を入力単位でreset
+- 失敗importは`base_dir`とimport markerを復元し、同じpathを再試行可能に変更
+
+#### コレクション・builtin契約
+
+- List/Dict literal、`push`、辞書新規キー、map/filter、keys/values、list_dir、args、for変換などへ共通collection limitを適用
+- VMの`exit`/`args` arity・type検査と`input` CRLF除去をtree版へ整合
+- callback内break/continueをtree版でもcontrol-flow error化
+- VM callbackのslot 0に関数自身を置き、direct named callbackの自己再帰を修正
+
+#### 回帰テスト
+
+`tests/integration.rs`にstdin駆動のREPL subprocessテストを追加。compile/runtime error後の継続、panic非再発、frame再開防止、top-level/try cell、loop scope、step reset、import retry、collection limit、callback/exit契約を同一process内の連続入力で検証する。
 
 ### 2026-08-25: 安全性バグ修正（パニック防止・ハンドラリーク）
 
@@ -772,7 +820,7 @@ tsumugi:vm> fn f() return x end  ← 関数定義が保持される
 
 **修正:** `Env` に `push_call_frame()` / `pop_call_frame()` を追加。関数実行時にグローバルスコープ以外を退避し、キャプチャ変数+引数だけの独立環境で実行。終了後に復元。
 
-**設計判断:** グローバルスコープ（`scopes[0]`）は関数内からも参照可能とした。これはトップレベルで定義した関数や変数を関数内から使えるようにするため。キャプチャは定義時のスナップショット（`capture_all()`）で行われるため、レキシカルスコープの要件を満たす。
+**設計判断:** グローバルスコープ（`scopes[0]`）は関数内からも参照可能とした。これはトップレベルで定義した関数や変数を関数内から使えるようにするため。キャプチャは定義時に`capture_all()`で到達可能な変数セルを記録し、その`Rc<RefCell<Value>>`を共有するため、レキシカルスコープと参照キャプチャの要件を満たす。
 
 #### サンドボックス TOCTOU 修正
 

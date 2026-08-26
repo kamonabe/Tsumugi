@@ -102,6 +102,7 @@ pub fn builtin_push(args: &[Value], line: usize) -> Result<Value, TsumugiError> 
     check_arity("push", args, 2, line)?;
     let mut list = args[0].clone();
     if let Value::List(ref mut v) = list {
+        check_collection_size(v.len().saturating_add(1), line)?;
         v.push(args[1].clone());
         Ok(list)
     } else {
@@ -143,6 +144,7 @@ pub fn builtin_pop_update(args: &[Value], line: usize) -> Result<Value, TsumugiE
 pub fn builtin_keys(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("keys", args, 1, line)?;
     if let Value::Dict(map) = &args[0] {
+        check_collection_size(map.len(), line)?;
         let keys: Vec<Value> = map.keys().map(|k| Value::Str(k.clone())).collect();
         Ok(Value::List(keys))
     } else {
@@ -153,6 +155,7 @@ pub fn builtin_keys(args: &[Value], line: usize) -> Result<Value, TsumugiError> 
 pub fn builtin_values(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("values", args, 1, line)?;
     if let Value::Dict(map) = &args[0] {
+        check_collection_size(map.len(), line)?;
         let vals: Vec<Value> = map.values().cloned().collect();
         Ok(Value::List(vals))
     } else {
@@ -297,11 +300,11 @@ pub fn builtin_range(args: &[Value], line: usize) -> Result<Value, TsumugiError>
 pub fn builtin_split(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("split", args, 2, line)?;
     if let (Value::Str(s), Value::Str(sep)) = (&args[0], &args[1]) {
-        let parts: Vec<Value> = s
-            .split(sep.as_str())
-            .map(|p| Value::Str(p.to_string()))
-            .collect();
-        check_collection_size(parts.len(), line)?;
+        let mut parts = Vec::new();
+        for part in s.split(sep.as_str()) {
+            check_collection_size(parts.len().saturating_add(1), line)?;
+            parts.push(Value::Str(part.to_string()));
+        }
         Ok(Value::List(parts))
     } else {
         Err(type_error(line, "split(str, str) の形式で使います"))
@@ -527,9 +530,11 @@ pub fn builtin_read_lines(args: &[Value], line: usize) -> Result<Value, TsumugiE
         let safe_path = crate::sandbox::check_path(path, line)?;
         match std::fs::read_to_string(&safe_path) {
             Ok(content) => {
-                let lines: Vec<Value> =
-                    content.lines().map(|l| Value::Str(l.to_string())).collect();
-                check_collection_size(lines.len(), line)?;
+                let mut lines = Vec::new();
+                for content_line in content.lines() {
+                    check_collection_size(lines.len().saturating_add(1), line)?;
+                    lines.push(Value::Str(content_line.to_string()));
+                }
                 Ok(Value::List(lines))
             }
             Err(_) => Ok(Value::Null),
@@ -719,10 +724,11 @@ pub fn builtin_list_dir(args: &[Value], line: usize) -> Result<Value, TsumugiErr
         let safe_path = crate::sandbox::check_path(path, line)?;
         match std::fs::read_dir(&safe_path) {
             Ok(entries) => {
-                let mut names: Vec<Value> = entries
-                    .filter_map(|e| e.ok())
-                    .map(|e| Value::Str(e.file_name().to_string_lossy().to_string()))
-                    .collect();
+                let mut names = Vec::new();
+                for entry in entries.flatten() {
+                    check_collection_size(names.len().saturating_add(1), line)?;
+                    names.push(Value::Str(entry.file_name().to_string_lossy().to_string()));
+                }
                 names.sort_by_key(|v| v.to_string());
                 Ok(Value::List(names))
             }

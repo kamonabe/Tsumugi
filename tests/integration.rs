@@ -1047,3 +1047,271 @@ fn golden_scope_isolation() {
 fn vm_golden_scope_isolation() {
     run_golden_test_vm("scope_isolation");
 }
+
+// =============================================================
+// 深層監査リグレッション: REPL transaction / 状態回復 / 資源上限
+// =============================================================
+
+fn run_repl_process(source: &str, use_vm: bool, envs: &[(&str, &str)]) -> std::process::Output {
+    use std::io::Write as _;
+
+    let mut command = Command::new(tsumugi_bin());
+    if use_vm {
+        command.arg("--vm");
+    }
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+
+    let mut child = command.spawn().expect("REPLプロセスの起動に失敗");
+    let mut stdin = child.stdin.take().expect("REPL stdinの取得に失敗");
+    stdin
+        .write_all(source.as_bytes())
+        .expect("REPL stdinへの書き込みに失敗");
+    drop(stdin); // EOFを送り、REPLを終了させる
+
+    child.wait_with_output().expect("REPLプロセスの待機に失敗")
+}
+
+fn output_text(output: &std::process::Output) -> (String, String) {
+    (
+        String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
+        String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n"),
+    )
+}
+
+#[test]
+fn vm_repl_recovers_after_compile_error() {
+    let output = run_repl_process(
+        "if true\n    let ghost = 1\n    print(missing)\nend\n\
+         let live = 2\nprint(live)\nprint(ghost)\n",
+        true,
+        &[],
+    );
+    let (stdout, stderr) = output_text(&output);
+
+    assert!(output.status.success(), "VM REPLが異常終了: {stderr}");
+    assert!(
+        stdout.contains("2\n"),
+        "正常な次入力が実行されていない: {stdout}"
+    );
+    assert!(
+        stderr.contains("未定義の変数: missing"),
+        "元のcompile errorがない: {stderr}"
+    );
+    assert!(
+        stderr.contains("未定義の変数: ghost"),
+        "失敗入力のlocalが残留: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at"),
+        "host panicが再発: {stderr}"
+    );
+}
+
+#[test]
+fn vm_repl_recovers_after_runtime_error() {
+    let output = run_repl_process(
+        "fn boom()\n    let temp = 1\n    let bad = 1 / 0\n    print(\"SHOULD_NOT_RUN\")\nend\n\
+         boom()\nlet live = 222\nprint(live)\n",
+        true,
+        &[],
+    );
+    let (stdout, stderr) = output_text(&output);
+
+    assert!(output.status.success(), "VM REPLが異常終了: {stderr}");
+    assert!(
+        stderr.contains("ゼロ除算"),
+        "runtime errorが報告されていない: {stderr}"
+    );
+    assert!(
+        !stdout.contains("SHOULD_NOT_RUN"),
+        "失敗したcalleeが次入力で再開された: {stdout}"
+    );
+    assert!(
+        stdout.contains("222\n"),
+        "rollback後のlocal値が不正: {stdout}"
+    );
+    assert!(
+        !stderr.contains("panicked at"),
+        "host panicが再発: {stderr}"
+    );
+}
+
+#[test]
+fn vm_repl_preserves_top_level_and_try_cells() {
+    let output = run_repl_process(
+        "let x = 1\n\
+         fn get()\n    return x\nend\n\
+         x = 2\nprint(get())\n\
+         try\n    let local = 7\n    let capture = fn() local end\n    let bad = 1 / 0\ncatch e\n    print(e[\"type\"])\nend\n",
+        true,
+        &[],
+    );
+    let (stdout, stderr) = output_text(&output);
+
+    assert!(output.status.success(), "VM REPLが異常終了: {stderr}");
+    assert!(stderr.is_empty(), "捕捉済みエラー以外が発生: {stderr}");
+    assert!(
+        stdout.contains("2\n"),
+        "top-level cellとclosureが分離: {stdout}"
+    );
+    assert!(
+        stdout.contains("zero_division\n"),
+        "catch変数slotがtry local cellと衝突: {stdout}"
+    );
+}
+
+#[test]
+fn tree_repl_cleans_loop_scope_after_caught_error() {
+    let output = run_repl_process(
+        "try\n    while true\n        let leaked = 42\n        print(1 / 0)\n    end\ncatch e\n    print(\"caught\")\nend\n\
+         print(leaked)\n",
+        false,
+        &[],
+    );
+    let (stdout, stderr) = output_text(&output);
+
+    assert!(output.status.success(), "tree REPLが異常終了: {stderr}");
+    assert!(
+        stdout.contains("caught\n"),
+        "エラーがcatchされていない: {stdout}"
+    );
+    assert!(!stdout.contains("42\n"), "loop localがREPLへ漏洩: {stdout}");
+    assert!(
+        stderr.contains("未定義の変数: leaked"),
+        "漏洩検査が期待どおり失敗しない: {stderr}"
+    );
+}
+
+#[test]
+fn tree_repl_resets_step_budget_per_submission() {
+    let output = run_repl_process(
+        "fn one()\n    return 1\nend\nprint(one())\nprint(one())\n",
+        false,
+        &[("TSUMUGI_MAX_STEPS", "1")],
+    );
+    let (stdout, stderr) = output_text(&output);
+
+    assert!(output.status.success(), "tree REPLが異常終了: {stderr}");
+    assert!(stderr.is_empty(), "入力間でstep予算が累積: {stderr}");
+    assert_eq!(
+        stdout.matches("1\n").count(),
+        2,
+        "各入力が独立予算で実行されていない: {stdout}"
+    );
+}
+
+#[test]
+fn tree_repl_retries_failed_import() {
+    let output = run_repl_process(
+        "try\n    import \"tests/fixtures/import_bad_syntax.tsg\"\ncatch e\n    print(\"caught first\")\nend\n\
+         try\n    import \"tests/fixtures/import_bad_syntax.tsg\"\ncatch e\n    print(\"caught second\")\nend\n",
+        false,
+        &[],
+    );
+    let (stdout, stderr) = output_text(&output);
+
+    assert!(output.status.success(), "tree REPLが異常終了: {stderr}");
+    assert!(stderr.is_empty(), "import errorがcatchを抜けた: {stderr}");
+    assert!(
+        stdout.contains("caught first\n"),
+        "最初のimport errorが未捕捉: {stdout}"
+    );
+    assert!(
+        stdout.contains("caught second\n"),
+        "失敗したimportがloaded扱いでskipされた: {stdout}"
+    );
+}
+
+#[test]
+fn collection_limit_is_consistent_in_both_engines() {
+    let source = "print([1, 2, 3])\n\
+                  print({\"a\": 1, \"b\": 2, \"c\": 3})\n\
+                  let xs = []\npush(xs, 1)\npush(xs, 2)\npush(xs, 3)\nprint(xs)\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_COLLECTION_SIZE", "2")]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert_eq!(
+            stderr.matches("コレクションサイズ上限超過").count(),
+            3,
+            "{mode}でliteral/pushの上限適用が不一致: {stderr}"
+        );
+        assert!(
+            stdout.contains("[1, 2]\n"),
+            "{mode}で失敗したpushが部分commit: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn context_builtins_reject_invalid_control_flow_and_exit_type() {
+    let tree = run_repl_process(
+        "fn stop(x)\n    break\nend\nprint(map([1], stop))\n",
+        false,
+        &[],
+    );
+    let (_, tree_stderr) = output_text(&tree);
+    assert!(tree.status.success(), "tree REPLが異常終了: {tree_stderr}");
+    assert!(
+        tree_stderr.contains("break はループの中でのみ使用できます"),
+        "callback内breakが暗黙nullになった: {tree_stderr}"
+    );
+
+    let vm = run_repl_process("exit(\"bad\")\nprint(\"alive\")\n", true, &[]);
+    let (vm_stdout, vm_stderr) = output_text(&vm);
+    assert!(vm.status.success(), "VM REPLが異常終了: {vm_stderr}");
+    assert!(vm_stderr.contains("exit() の引数は整数である必要があります"));
+    assert!(
+        vm_stdout.contains("alive\n"),
+        "不正なexitがprocessを終了した: {vm_stdout}"
+    );
+}
+
+#[test]
+fn vm_direct_recursive_callback_keeps_self_binding() {
+    let output = run_repl_process(
+        "fn down(n)\n    if n == 0\n        return 0\n    end\n    return down(n - 1)\nend\n\
+         print(map([2], down))\n",
+        true,
+        &[],
+    );
+    let (stdout, stderr) = output_text(&output);
+
+    assert!(output.status.success(), "VM REPLが異常終了: {stderr}");
+    assert!(
+        stderr.is_empty(),
+        "direct callbackの自己再帰に失敗: {stderr}"
+    );
+    assert!(stdout.contains("[0]\n"), "callback結果が不正: {stdout}");
+}
+
+#[test]
+fn vm_try_unwind_preserves_existing_local_cell_promotion() {
+    let output = run_repl_process(
+        "fn demo()\n    let x = 1\n    let holder = null\n    try\n        holder = fn() x end\n        let bad = 1 / 0\n    catch e\n        print(e[\"type\"])\n    end\n    x = 2\n    return holder()\nend\n\
+         print(demo())\n",
+        true,
+        &[],
+    );
+    let (stdout, stderr) = output_text(&output);
+
+    assert!(output.status.success(), "VM REPLが異常終了: {stderr}");
+    assert!(stderr.is_empty(), "catch済みエラー以外が発生: {stderr}");
+    assert!(
+        stdout.contains("zero_division\n"),
+        "try内エラーがcatchされていない: {stdout}"
+    );
+    assert!(
+        stdout.contains("2\n"),
+        "try内で初めてcell化した既存localとescape closureが分離: {stdout}"
+    );
+}

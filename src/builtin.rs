@@ -71,7 +71,28 @@ impl Evaluator {
                             result = v;
                             break;
                         }
-                        Ok(super::EvalResult::Break | super::EvalResult::Continue) => break,
+                        Ok(super::EvalResult::Break) => {
+                            let mut trace = self.call_stack.clone();
+                            trace.reverse();
+                            self.call_stack.pop();
+                            self.env.pop_call_frame(saved_scopes);
+                            return Err(TsumugiError::runtime(
+                                stmt.line(),
+                                "break はループの中でのみ使用できます",
+                            )
+                            .with_trace(trace));
+                        }
+                        Ok(super::EvalResult::Continue) => {
+                            let mut trace = self.call_stack.clone();
+                            trace.reverse();
+                            self.call_stack.pop();
+                            self.env.pop_call_frame(saved_scopes);
+                            return Err(TsumugiError::runtime(
+                                stmt.line(),
+                                "continue はループの中でのみ使用できます",
+                            )
+                            .with_trace(trace));
+                        }
                         Ok(super::EvalResult::Val) => {}
                         Err(e) => {
                             let mut trace = self.call_stack.clone();
@@ -182,6 +203,7 @@ impl Evaluator {
                     ));
                 }
                 let argv: Vec<Value> = std::env::args().skip(2).map(Value::Str).collect();
+                crate::builtin_core::check_collection_size_public(argv.len(), line)?;
                 Ok(Some(Value::List(argv)))
             }
             "exit" => {
@@ -244,6 +266,10 @@ impl Evaluator {
                 let mut target = cell.borrow_mut();
                 match &mut *target {
                     Value::List(list) => {
+                        crate::builtin_core::check_collection_size_public(
+                            list.len().saturating_add(1),
+                            line,
+                        )?;
                         list.push(val);
                     }
                     _ => {
@@ -312,6 +338,10 @@ impl Evaluator {
                 let mut result = Vec::new();
                 for item in list {
                     let val = self.call_fn_value(&func, vec![item], line)?;
+                    crate::builtin_core::check_collection_size_public(
+                        result.len().saturating_add(1),
+                        line,
+                    )?;
                     result.push(val);
                 }
                 Ok(Some(Value::List(result)))
@@ -337,6 +367,10 @@ impl Evaluator {
                 for item in list {
                     let val = self.call_fn_value(&func, vec![item.clone()], line)?;
                     if val.is_truthy() {
+                        crate::builtin_core::check_collection_size_public(
+                            result.len().saturating_add(1),
+                            line,
+                        )?;
                         result.push(item);
                     }
                 }

@@ -9,7 +9,7 @@ use crate::opcode::OpCode;
 use crate::value::{SharedValue, Value};
 
 /// コールフレーム: 関数呼び出しの状態を保存する
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CallFrame {
     /// この関数の Chunk（Rc で共有）
     chunk: Rc<Chunk>,
@@ -39,7 +39,7 @@ fn vm_resolve_max_steps() -> u64 {
 }
 
 /// 例外ハンドラ: try/catch のスタック状態を保持
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TryHandler {
     /// catch ブロックの先頭命令アドレス
     catch_ip: usize,
@@ -47,6 +47,11 @@ struct TryHandler {
     stack_depth: usize,
     /// try 開始時のフレーム深さ
     frame_depth: usize,
+    /// try 開始時に対象フレームで有効だったローカル変数数
+    ///
+    /// unwind時はこの境界より後ろのtry-local cellだけを破棄する。境界内の既存localが
+    /// try中に初めてcell化された場合、その昇格はcatch後も維持する。
+    locals_count: usize,
 }
 
 /// スタックベースの仮想マシン
@@ -105,25 +110,47 @@ impl Vm {
     /// REPL 用: 既存のスタック（ローカル変数）を保持したまま新しいチャンクを実行する。
     /// 前回のフレームを差し替えて実行し、終了後もスタック上の値を保持する。
     pub fn run_repl_chunk(&mut self, chunk: Chunk) -> Result<(), TsumugiError> {
-        // トップレベルフレームを新しいチャンクに差し替える
-        // （スタックはそのまま保持 — 前回の locals が残っている）
+        // 未捕捉エラー時に、入力途中の一時値・callee frame・try handlerを
+        // 次の入力へ持ち越さないための構造状態checkpoint。
+        let frames_checkpoint = self.frames.clone();
+        let stack_checkpoint = self.stack.clone();
+        let handlers_checkpoint = self.try_handlers.clone();
+        let steps_checkpoint = self.steps;
+
+        // top-levelでcell化された変数は入力間でも同じcellを使う。
+        // これを空にすると既存closureとtop-level変数の参照先が分離する。
+        let locals_cells = self
+            .frames
+            .first()
+            .map(|frame| frame.locals_cells.clone())
+            .unwrap_or_default();
         let frame = CallFrame {
             chunk: Rc::new(chunk),
             ip: 0,
             base: 0,
             upvalues: Vec::new(),
-            locals_cells: Vec::new(),
+            locals_cells,
         };
-        // 前のトップレベルフレームがあれば差し替え、なければ追加
         if self.frames.is_empty() {
             self.frames.push(frame);
         } else {
+            // 正常時は常にtop-level frameだけだが、防御的に古いcalleeを除去する。
+            self.frames.truncate(1);
             self.frames[0] = frame;
         }
         // ステップカウンタはリセット（各入力で予算を全額使えるように）
         self.steps = 0;
-        self.run_frames(0)?;
-        Ok(())
+
+        match self.run_frames(0) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                self.frames = frames_checkpoint;
+                self.stack = stack_checkpoint;
+                self.try_handlers = handlers_checkpoint;
+                self.steps = steps_checkpoint;
+                Err(error)
+            }
+        }
     }
 
     /// フレーム実行ループ（共通エンジン）
@@ -186,10 +213,16 @@ impl Vm {
                 }
                 OpCode::SetupTry(catch_ip) => {
                     let catch_ip = *catch_ip;
+                    let locals_count = self
+                        .frames
+                        .last()
+                        .map(|frame| self.stack.len().saturating_sub(frame.base))
+                        .unwrap_or(0);
                     self.try_handlers.push(TryHandler {
                         catch_ip,
                         stack_depth: self.stack.len(),
                         frame_depth: self.frames.len(),
+                        locals_count,
                     });
                     Ok(())
                 }
@@ -207,6 +240,11 @@ impl Vm {
                     if handler.frame_depth > stop_depth {
                         // フレームを巻き戻す
                         self.frames.truncate(handler.frame_depth);
+                        // try開始時から有効だったslotのcell昇格は維持し、try内で
+                        // 追加されたlocalのcell対応だけを破棄してcatch slotとの衝突を防ぐ。
+                        if let Some(frame) = self.frames.last_mut() {
+                            frame.locals_cells.truncate(handler.locals_count);
+                        }
                         // スタックを巻き戻す
                         self.stack.truncate(handler.stack_depth);
                         // 構造化エラーをスタックに積む
@@ -640,6 +678,10 @@ impl Vm {
                     .last_mut()
                     .ok_or_else(|| TsumugiError::runtime(line, "内部エラー: スタックが空です"))?;
                 if let Value::List(v) = list {
+                    crate::builtin_core::check_collection_size_public(
+                        v.len().saturating_add(1),
+                        line,
+                    )?;
                     v.push(value);
                 } else {
                     return Err(TsumugiError::runtime(
@@ -657,6 +699,12 @@ impl Vm {
                     .ok_or_else(|| TsumugiError::runtime(line, "内部エラー: スタックが空です"))?;
                 if let Value::Dict(map) = dict {
                     if let Value::Str(k) = key {
+                        if !map.contains_key(&k) {
+                            crate::builtin_core::check_collection_size_public(
+                                map.len().saturating_add(1),
+                                line,
+                            )?;
+                        }
                         map.insert(k, value);
                     } else {
                         return Err(TsumugiError::runtime(
@@ -681,11 +729,17 @@ impl Vm {
             OpCode::ToIterList => {
                 let value = self.pop(line)?;
                 let list = match value {
-                    Value::List(_) => value,
+                    Value::List(ref values) => {
+                        crate::builtin_core::check_collection_size_public(values.len(), line)?;
+                        value
+                    }
                     Value::Dict(ref map) => {
+                        crate::builtin_core::check_collection_size_public(map.len(), line)?;
                         Value::List(map.keys().map(|k| Value::Str(k.clone())).collect())
                     }
                     Value::Str(ref s) => {
+                        let size = s.chars().count();
+                        crate::builtin_core::check_collection_size_public(size, line)?;
                         Value::List(s.chars().map(|c| Value::Str(c.to_string())).collect())
                     }
                     _ => {
@@ -831,6 +885,12 @@ impl Vm {
                 Ok(collection)
             }
             (Value::Dict(map), Value::Str(key)) => {
+                if !map.contains_key(key) {
+                    crate::builtin_core::check_collection_size_public(
+                        map.len().saturating_add(1),
+                        line,
+                    )?;
+                }
                 map.insert(key.clone(), value);
                 Ok(collection)
             }
@@ -861,27 +921,46 @@ impl Vm {
                 let mut buf = String::new();
                 match std::io::stdin().read_line(&mut buf) {
                     Ok(0) => Ok(Value::Null),
-                    Ok(_) => Ok(Value::Str(buf.trim_end_matches('\n').to_string())),
+                    Ok(_) => {
+                        if buf.ends_with('\n') {
+                            buf.pop();
+                            if buf.ends_with('\r') {
+                                buf.pop();
+                            }
+                        }
+                        Ok(Value::Str(buf))
+                    }
                     Err(_) => Ok(Value::Null),
                 }
             }
             "exit" => {
-                let code = if args.is_empty() {
-                    0
-                } else if let Value::Int(n) = &args[0] {
-                    *n as i32
-                } else {
-                    0
+                if args.len() > 1 {
+                    return Err(TsumugiError::runtime(
+                        line,
+                        format!("exit() は引数0〜1個ですが、{}個渡されました", args.len()),
+                    ));
+                }
+                let code = match args.first() {
+                    None => 0,
+                    Some(Value::Int(n)) => *n as i32,
+                    Some(_) => {
+                        return Err(TsumugiError::runtime(
+                            line,
+                            "exit() の引数は整数である必要があります",
+                        ));
+                    }
                 };
                 std::process::exit(code);
             }
             "args" => {
+                crate::builtin_core::check_arity(name, &args, 0, line)?;
                 let argv: Vec<Value> = std::env::args()
                     .skip(1)
                     .filter(|a| a != "--vm")
                     .skip(1) // スクリプトパスをスキップ
                     .map(Value::Str)
                     .collect();
+                crate::builtin_core::check_collection_size_public(argv.len(), line)?;
                 Ok(Value::List(argv))
             }
             "map" => {
@@ -890,7 +969,12 @@ impl Vm {
                     let func = args[1].clone();
                     let mut result = Vec::new();
                     for item in list {
-                        result.push(self.call_fn_value(func.clone(), vec![item.clone()], line)?);
+                        let value = self.call_fn_value(func.clone(), vec![item.clone()], line)?;
+                        crate::builtin_core::check_collection_size_public(
+                            result.len().saturating_add(1),
+                            line,
+                        )?;
+                        result.push(value);
                     }
                     Ok(Value::List(result))
                 } else {
@@ -908,6 +992,10 @@ impl Vm {
                     for item in list {
                         let cond = self.call_fn_value(func.clone(), vec![item.clone()], line)?;
                         if cond.is_truthy() {
+                            crate::builtin_core::check_collection_size_public(
+                                result.len().saturating_add(1),
+                                line,
+                            )?;
                             result.push(item.clone());
                         }
                     }
@@ -960,6 +1048,7 @@ impl Vm {
                 ),
             ));
         }
+        let self_value = func.clone();
         if let Value::VmFn {
             arity,
             chunk,
@@ -977,9 +1066,10 @@ impl Vm {
                     ),
                 ));
             }
-            // 関数自身をスタックに積む（slot 0）
+            // 関数自身をスタックに積む（slot 0）。direct callback内の自己再帰でも
+            // 通常のOpCode::Callと同じself bindingを参照できるようにする。
             let base = self.stack.len();
-            self.stack.push(Value::Null); // slot 0 placeholder
+            self.stack.push(self_value);
             for arg in args {
                 self.stack.push(arg);
             }

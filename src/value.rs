@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn display() {
         assert_eq!(Value::Int(42).to_string(), "42");
-        assert_eq!(Value::Float(3.14).to_string(), "3.14");
+        assert_eq!(Value::Float(2.5).to_string(), "2.5");
         assert_eq!(Value::Str("hi".to_string()).to_string(), "hi");
         assert_eq!(Value::Bool(true).to_string(), "true");
         assert_eq!(Value::Null.to_string(), "null");

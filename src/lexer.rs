@@ -552,8 +552,8 @@ mod tests {
 
     #[test]
     fn float_literal() {
-        let tokens = tokens_only("3.14");
-        assert_eq!(tokens, vec![Token::Float(3.14), Token::Eof]);
+        let tokens = tokens_only("2.5");
+        assert_eq!(tokens, vec![Token::Float(2.5), Token::Eof]);
     }
 
     #[test]
