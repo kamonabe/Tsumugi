@@ -632,6 +632,20 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 ## 変更履歴
 
+### 2026-08-26: for変数のclosure bindingを反復単位へ統一（AUD-010）
+
+**問題:** ツリーウォーク版は`for`の各反復でloop変数に新しいcellを作るため、`[1, 2, 3]`から作ったclosureはそれぞれ`1`、`2`、`3`を返した。一方、Compiler/VMはloop全体で同じlocal slotと昇格済み`locals_cells`を更新していたため、すべてのclosureが最終値`3`を返した。
+
+**決定:** `for`のloop変数は各反復開始時にfresh cellへbindする。異なる反復のclosureはcellを共有せず、同一反復内の複数closureと通常代入は同じcellを共有する。各iterationを独立lexical scopeとする既存仕様およびtree版の挙動を正とする。
+
+**実装:** `Compiler::compile_for`のstatic slot layoutは維持し、現在要素を積む前に前反復のloop-var slotを`Pop`する。VMの`Pop`が該当`locals_cells` mappingを解除した後、`Index`の結果が同じslot位置を占めるため、次にcaptureされた際は新しいcellへ昇格する。escaping closureが保持する旧`Rc`は生存する。body scope、`LoopState.locals_count`、break/continue target、try unwind、REPL checkpoint、VM/opcode、tree evaluatorは変更しない。
+
+**不採用案:** tree版をloop全体で単一cellを共有する仕様へ変更する案は、既存のobservable behaviorとiteration scope仕様を壊し、AUD-005で修正したerror/control-flow cleanupを再び複雑化するため不採用。loop変数をcompile-time body scopeへ移す案はbreak/continue cleanupとshadowingを組み替え、同一scope再宣言のAUD-016を巻き込む。専用opcode追加も既存`Pop`で必要なcell detachを表現できるため採用しない。
+
+**互換性と境界:** VMでloop変数を直接captureしたclosureがすべて最終値を返すことに依存したコードは、反復ごとの値を返すように変わる。意図的に単一cellを共有する場合はloop外で変数を宣言し、各反復でそのouter bindingへ代入してcaptureする。同一scopeの`let`再宣言identityはAUD-016、未捕捉REPL入力の値commit/rollbackはAUD-024として分離する。
+
+**回帰テスト:** paired golden testでdirect capture、同一反復内代入、named function、List/Dict/Unicode文字列、nested loop、shadowing、`continue`、`break`、caught error、`return`をtree/VM双方で検証する。VM REPLテストではloop終了後にcollection/index/loop-var相当slotを再利用してcellへ再昇格・更新しても、旧closureのcellが変化しないことを検証する。
+
 ### 2026-08-26: if・try・catchのブロックスコープ統一（AUD-008）
 
 **問題:** ツリーウォーク版は`if`、`try`、`catch`を現在scopeで実行していたため、block内の`let`やcatch変数が外へ漏れた。一方、Compiler/VMは各bodyをlexical scopeとして扱い、終了時またはtry unwind時にlocal slotを破棄していた。

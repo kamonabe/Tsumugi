@@ -1091,6 +1091,96 @@ fn vm_golden_block_scope_semantics() {
 }
 
 #[test]
+fn golden_for_closure_binding() {
+    run_golden_test("for_closure_binding");
+}
+
+#[test]
+fn vm_golden_for_closure_binding() {
+    run_golden_test_vm("for_closure_binding");
+}
+
+#[test]
+fn vm_repl_for_closure_cells_survive_slot_reuse() {
+    let source = concat!(
+        "let saved = []\n",
+        "for i in [1, 2, 3]\n",
+        "    push(saved, fn() i end)\n",
+        "end\n",
+        "let reused_collection = \"reused-collection\"\n",
+        "let reused_index = \"reused-index\"\n",
+        "let reused_var = \"reused-var\"\n",
+        "let reused_reader = fn() reused_var end\n",
+        "print(reused_reader())\n",
+        "print(saved[0]())\n",
+        "print(saved[1]())\n",
+        "print(saved[2]())\n",
+        "reused_var = \"changed-var\"\n",
+        "print(reused_reader())\n",
+        "print(saved[0]())\n",
+        "print(saved[1]())\n",
+        "print(saved[2]())\n",
+    );
+    let output = run_repl_process(source, true, &[]);
+    let (stdout, stderr) = output_text(&output);
+    let visible_output: Vec<_> = stdout
+        .lines()
+        .filter_map(|line| {
+            line.rsplit_once("tsumugi:vm> ")
+                .map(|(_, value)| value)
+                .filter(|value| !value.is_empty())
+        })
+        .collect();
+
+    assert!(output.status.success(), "VM REPLが異常終了: {stderr}");
+    assert!(stderr.is_empty(), "VM REPLで予期しない診断: {stderr}");
+    assert_eq!(
+        visible_output,
+        ["reused-var", "1", "2", "3", "changed-var", "1", "2", "3"],
+        "loop slotの再利用でescaping closureのcellが変化: {stdout}"
+    );
+}
+
+#[test]
+fn vm_repl_recovers_structure_after_for_closure_error() {
+    let source = concat!(
+        "for i in [1]\n",
+        "    let doomed = fn() i end\n",
+        "    let failed = 1 / 0\n",
+        "end\n",
+        "let recovered_collection = \"unused-collection-slot\"\n",
+        "let recovered_index = \"unused-index-slot\"\n",
+        "let recovered_var = \"recovered\"\n",
+        "let recovered_reader = fn() recovered_var end\n",
+        "print(recovered_reader())\n",
+        "print(\"alive\")\n",
+    );
+    let output = run_repl_process(source, true, &[]);
+    let (stdout, stderr) = output_text(&output);
+    let visible_output: Vec<_> = stdout
+        .lines()
+        .filter_map(|line| {
+            line.rsplit_once("tsumugi:vm> ")
+                .map(|(_, value)| value)
+                .filter(|value| !value.is_empty())
+        })
+        .collect();
+
+    assert!(output.status.success(), "VM REPLが異常終了: {stderr}");
+    assert_eq!(
+        stderr.matches("ゼロ除算").count(),
+        1,
+        "元のruntime errorが正確に報告されていない: {stderr}"
+    );
+    assert_eq!(
+        visible_output,
+        ["recovered", "alive"],
+        "失敗したforのstack/cell状態が後続入力へ残留: {stdout}"
+    );
+    assert!(!stderr.contains("panicked at"), "host panic: {stderr}");
+}
+
+#[test]
 fn repl_control_flow_block_locals_do_not_leak() {
     let source = "let escaped_if = null\n\
                   if true\n    let if_local = \"if-cell\"\n    escaped_if = fn() if_local end\nend\n\

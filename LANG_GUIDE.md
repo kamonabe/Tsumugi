@@ -174,6 +174,7 @@ for i in range(10):         # ERROR: no colon
 
 - Each selected `if` / `elif` / `else` body has its own block scope
 - Each `while` / `for` iteration has its own block scope
+- A `for` loop variable is rebound to a fresh variable cell at the start of every iteration. Closures from different iterations retain separate cells; closures and assignments within the same iteration share that iteration's cell
 - `try` and `catch` have separate block scopes
 - The catch variable exists only inside its `catch` block
 - Functions create their own lexical scope
