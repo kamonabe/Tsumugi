@@ -1067,6 +1067,121 @@ fn error_import_non_top_level_is_identical_in_both_engines() {
 }
 
 // =============================================================
+// リグレッションテスト: user function call validation順序
+// =============================================================
+
+#[test]
+fn golden_call_validation_order() {
+    run_golden_test("call_validation_order");
+}
+
+#[test]
+fn vm_golden_call_validation_order() {
+    run_golden_test_vm("call_validation_order");
+}
+
+#[test]
+fn call_budget_is_checked_before_callee_in_both_engines() {
+    let rejected_source = concat!(
+        "fn make_step_callee()\n",
+        "    print(\"step-callee-ran\")\n",
+        "    return fn() null end\n",
+        "end\n",
+        "try\n",
+        "    let unused = make_step_callee()()\n",
+        "catch step_error\n",
+        "    print(step_error[\"type\"])\n",
+        "end\n",
+    );
+    let exact_once_source = concat!(
+        "fn once()\n",
+        "    print(\"once-body\")\n",
+        "    return 1\n",
+        "end\n",
+        "print(once())\n",
+    );
+
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let rejected = run_repl_process(rejected_source, use_vm, &[("TSUMUGI_MAX_STEPS", "0")]);
+        let (rejected_stdout, rejected_stderr) = output_text(&rejected);
+
+        assert!(
+            rejected.status.success(),
+            "{mode} REPLが異常終了: {rejected_stderr}"
+        );
+        assert!(
+            rejected_stderr.is_empty(),
+            "{mode}で捕捉外の診断: {rejected_stderr}"
+        );
+        assert!(
+            !rejected_stdout.contains("step-callee-ran"),
+            "{mode}でstep検査前にcalleeを評価: {rejected_stdout}"
+        );
+        assert_eq!(
+            rejected_stdout.matches("limit\n").count(),
+            1,
+            "{mode}でstep errorの捕捉結果が不正: {rejected_stdout}"
+        );
+
+        let exact_once = run_repl_process(exact_once_source, use_vm, &[("TSUMUGI_MAX_STEPS", "1")]);
+        let (exact_once_stdout, exact_once_stderr) = output_text(&exact_once);
+        assert!(
+            exact_once.status.success(),
+            "{mode} REPLが異常終了: {exact_once_stderr}"
+        );
+        assert!(
+            exact_once_stderr.is_empty(),
+            "{mode}でcall stepを二重count: {exact_once_stderr}"
+        );
+        assert_eq!(
+            exact_once_stdout.matches("once-body\n").count(),
+            1,
+            "{mode}でcallを正確に1 stepとして実行していない: {exact_once_stdout}"
+        );
+    }
+}
+
+#[test]
+fn invalid_call_repl_recovers_without_argument_effects() {
+    let source = concat!(
+        "fn zero()\n",
+        "    return 0\n",
+        "end\n",
+        "zero(print(\"invalid-arg-ran\"))\n",
+        "let recovered = \"alive\"\n",
+        "fn read_recovered()\n",
+        "    return recovered\n",
+        "end\n",
+        "print(read_recovered())\n",
+    );
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("引数"),
+            "{mode}でarity errorがない: {stderr}"
+        );
+        assert!(
+            !stdout.contains("invalid-arg-ran"),
+            "{mode}でinvalid callの引数副作用が発生: {stdout}"
+        );
+        assert!(
+            stdout.contains("alive\n"),
+            "{mode}でvalidation error後の入力を実行できない: {stdout}"
+        );
+        assert!(
+            !stderr.contains("panicked at"),
+            "{mode}でhost panic: {stderr}"
+        );
+    }
+}
+
+// =============================================================
 // リグレッションテスト: レキシカルスコープ・locals_cells リーク防止
 // =============================================================
 

@@ -1,0 +1,69 @@
+# user function callの評価・validation順序
+
+fn mark(label, value)
+    print(label)
+    return value
+end
+
+# 成功時: callee → args（左から右）→ body
+fn make_binary()
+    print("success-callee")
+    return fn(a, b)
+        print("success-body")
+        return a + b
+    end
+end
+let success = make_binary()(mark("success-arg1", 1), mark("success-arg2", 2))
+print(success)
+
+# wrong arity: calleeは評価するが、引数とbodyは評価しない
+fn make_zero()
+    print("arity-callee")
+    return fn()
+        print("arity-body-not-run")
+        return 0
+    end
+end
+try
+    let unused = make_zero()(mark("arity-arg-not-run", 1))
+catch arity_error
+    print("arity-" + arity_error["type"])
+end
+
+# non-callable: calleeは評価するが、引数は評価しない
+fn make_number()
+    print("noncall-callee")
+    return 7
+end
+try
+    let unused = make_number()(mark("noncall-arg-not-run", 1))
+catch noncall_error
+    print("noncall-" + noncall_error["type"])
+end
+
+# callee評価中のruntime errorは引数より先に伝播する
+fn make_failure()
+    print("failing-callee")
+    let failed = 1 / 0
+    return fn(value) value end
+end
+try
+    let unused = make_failure()(mark("callee-error-arg-not-run", 1))
+catch callee_error
+    print("callee-error-" + callee_error["type"])
+end
+
+# valid callの引数は左から右へ評価し、引数error時はbodyを実行しない
+fn explode_arg(label)
+    print(label)
+    return 1 / 0
+end
+fn consume(first, second)
+    print("arg-error-body-not-run")
+    return first + second
+end
+try
+    let unused = consume(mark("arg-error-arg1", 1), explode_arg("arg-error-arg2"))
+catch arg_error
+    print("arg-error-" + arg_error["type"])
+end

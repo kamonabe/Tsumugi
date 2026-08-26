@@ -775,7 +775,8 @@ impl Compiler {
                         return Ok(());
                     }
                 }
-                // ユーザー定義関数呼び出し: callee を評価 → 引数を評価 → Call
+                // ユーザー定義関数呼び出し:
+                // step/depth検査 → callee評価 → callable/arity検査 → 引数評価 → Call
                 if let Expr::Ident(name) = callee.as_ref() {
                     // 関数呼び出しのコンテキストでは「未定義の関数」エラーを出す
                     if self.resolve_local(name, line).is_err()
@@ -788,8 +789,10 @@ impl Compiler {
                         ));
                     }
                 }
-                self.compile_expr(callee, line)?;
                 let arg_count = args.len();
+                self.chunk.emit(OpCode::PrepareCall, line);
+                self.compile_expr(callee, line)?;
+                self.chunk.emit(OpCode::ValidateCall(arg_count), line);
                 for arg in args {
                     self.compile_expr(arg, line)?;
                 }
