@@ -1,0 +1,12 @@
+# caller側で後から定義されるglobalと、import内の後続関数を参照する
+fn imported_entry()
+    return imported_helper()
+end
+
+fn imported_helper()
+    return caller_later
+end
+
+fn imported_write(value)
+    caller_mutable = value
+end

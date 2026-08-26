@@ -37,6 +37,20 @@ pub enum OpCode {
     /// operand: スタック上のスロット位置
     SetLocal(usize),
 
+    /// 実行時にglobal名を解決し、値をスタックトップにコピーする。
+    /// static local/upvalueで解決できなかった識別子だけに使用する。
+    GetGlobal(String),
+
+    /// 関数callee用のglobal名解決。未定義時は「未定義の関数」として報告する。
+    GetGlobalForCall(String),
+
+    /// スタックトップの値で実行時globalを更新する（値はスタックに残る）。
+    SetGlobal(String),
+
+    /// top-level宣言の名前と既存ローカルslotをglobal registryへ登録する。
+    /// 値は複製せず、stack/locals_cells上の同じbindingを参照する。
+    RegisterGlobal(String, usize),
+
     // --- ジャンプ ---
     /// 無条件ジャンプ（ip を指定位置に設定）
     Jump(usize),

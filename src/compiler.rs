@@ -160,7 +160,7 @@ impl Compiler {
                     self.chunk.emit(OpCode::SetLocal(slot), *line);
                     self.chunk.emit(OpCode::Pop, *line);
                 } else {
-                    self.add_local(name.clone());
+                    self.declare_local(name.clone(), *line);
                 }
             }
             Stmt::Assign { name, value, line } => {
@@ -170,11 +170,8 @@ impl Compiler {
                 } else if let Some(upvalue_idx) = self.resolve_upvalue(name) {
                     self.chunk.emit(OpCode::SetUpvalue(upvalue_idx), *line);
                 } else {
-                    return Err(TsumugiError::runtime_with_kind(
-                        *line,
-                        crate::error::ErrorKind::Name,
-                        format!("未定義の変数に代入: {}", name),
-                    ));
+                    // tree evaluatorと同様、未解決名の存在確認は代入の実行時まで遅延する。
+                    self.chunk.emit(OpCode::SetGlobal(name.clone()), *line);
                 }
                 self.chunk.emit(OpCode::Pop, *line);
             }
@@ -657,19 +654,7 @@ impl Compiler {
                 self.chunk.emit_constant(Value::Null, line);
             }
             Expr::Ident(name) => {
-                // ローカル変数を検索
-                if let Ok(slot) = self.resolve_local(name, line) {
-                    self.chunk.emit(OpCode::GetLocal(slot), line);
-                } else if let Some(upvalue_idx) = self.resolve_upvalue(name) {
-                    // upvalue（外側のスコープの変数）
-                    self.chunk.emit(OpCode::GetUpvalue(upvalue_idx), line);
-                } else {
-                    return Err(TsumugiError::runtime_with_kind(
-                        line,
-                        crate::error::ErrorKind::Name,
-                        format!("未定義の変数: {}", name),
-                    ));
-                }
+                self.compile_name_read(name, line, false);
             }
             Expr::BinOp { left, op, right } => {
                 match op {
@@ -777,21 +762,15 @@ impl Compiler {
                 }
                 // ユーザー定義関数呼び出し:
                 // step/depth検査 → callee評価 → callable/arity検査 → 引数評価 → Call
-                if let Expr::Ident(name) = callee.as_ref() {
-                    // 関数呼び出しのコンテキストでは「未定義の関数」エラーを出す
-                    if self.resolve_local(name, line).is_err()
-                        && self.resolve_upvalue(name).is_none()
-                    {
-                        return Err(TsumugiError::runtime_with_kind(
-                            line,
-                            crate::error::ErrorKind::Name,
-                            format!("未定義の関数: {}", name),
-                        ));
-                    }
-                }
                 let arg_count = args.len();
                 self.chunk.emit(OpCode::PrepareCall, line);
-                self.compile_expr(callee, line)?;
+                if let Expr::Ident(name) = callee.as_ref() {
+                    // 未解決calleeもcompile errorにせずruntime global lookupへ落とす。
+                    // 存在しない場合の診断はtree evaluatorと同じ「未定義の関数」にする。
+                    self.compile_name_read(name, line, true);
+                } else {
+                    self.compile_expr(callee, line)?;
+                }
                 self.chunk.emit(OpCode::ValidateCall(arg_count), line);
                 for arg in args {
                     self.compile_expr(arg, line)?;
@@ -838,6 +817,20 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// 識別子読み取りをstatic slot優先でloweringし、未解決名だけをruntime globalへ落とす。
+    fn compile_name_read(&mut self, name: &str, line: usize, for_call: bool) {
+        if let Ok(slot) = self.resolve_local(name, line) {
+            self.chunk.emit(OpCode::GetLocal(slot), line);
+        } else if let Some(upvalue_idx) = self.resolve_upvalue(name) {
+            self.chunk.emit(OpCode::GetUpvalue(upvalue_idx), line);
+        } else if for_call {
+            self.chunk
+                .emit(OpCode::GetGlobalForCall(name.to_string()), line);
+        } else {
+            self.chunk.emit(OpCode::GetGlobal(name.to_string()), line);
+        }
     }
 
     // --- スコープ管理 ---
@@ -926,8 +919,8 @@ impl Compiler {
             self.chunk.emit(OpCode::MakeClosure(upvalues.len()), line);
         }
 
-        // 関数名をローカル変数として登録
-        self.add_local(name.to_string());
+        // 関数名を現在のscopeへ登録する。script top-levelならruntime globalにも公開する。
+        self.declare_local(name.to_string(), line);
 
         Ok(())
     }
@@ -984,6 +977,17 @@ impl Compiler {
         }
 
         Ok(())
+    }
+
+    /// 言語上のbindingを現在scopeへ追加する。
+    /// script top-levelだけは、宣言が実際に実行された時点で同じslotをglobal公開する。
+    fn declare_local(&mut self, name: String, line: usize) {
+        let slot = self.locals.len();
+        let is_script_top_level = self.scope_depth == 0 && self.enclosing_locals.is_none();
+        self.add_local(name.clone());
+        if is_script_top_level {
+            self.chunk.emit(OpCode::RegisterGlobal(name, slot), line);
+        }
     }
 
     fn add_local(&mut self, name: String) {

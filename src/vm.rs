@@ -1,6 +1,7 @@
 //! 仮想マシン: バイトコード（Chunk）を実行するスタックマシン
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::chunk::Chunk;
@@ -62,6 +63,10 @@ pub struct Vm {
     /// 値スタック
     stack: Vec<Value>,
 
+    /// 実行済みtop-level宣言の名前からstack slotへの対応。
+    /// 値自体はstack/locals_cellsをsource of truthとし、bindingを複製しない。
+    globals: HashMap<String, usize>,
+
     /// 実行ステップカウンタ（ループ反復 + 関数呼び出し）
     steps: u64,
 
@@ -84,6 +89,7 @@ impl Vm {
         Vm {
             frames: vec![frame],
             stack: Vec::with_capacity(256),
+            globals: HashMap::new(),
             steps: 0,
             max_steps: vm_resolve_max_steps(),
             try_handlers: Vec::new(),
@@ -95,6 +101,7 @@ impl Vm {
         Vm {
             frames: Vec::new(),
             stack: Vec::with_capacity(256),
+            globals: HashMap::new(),
             steps: 0,
             max_steps: vm_resolve_max_steps(),
             try_handlers: Vec::new(),
@@ -114,6 +121,7 @@ impl Vm {
         // 次の入力へ持ち越さないための構造状態checkpoint。
         let frames_checkpoint = self.frames.clone();
         let stack_checkpoint = self.stack.clone();
+        let globals_checkpoint = self.globals.clone();
         let handlers_checkpoint = self.try_handlers.clone();
         let steps_checkpoint = self.steps;
 
@@ -146,6 +154,7 @@ impl Vm {
             Err(error) => {
                 self.frames = frames_checkpoint;
                 self.stack = stack_checkpoint;
+                self.globals = globals_checkpoint;
                 self.try_handlers = handlers_checkpoint;
                 self.steps = steps_checkpoint;
                 Err(error)
@@ -352,6 +361,126 @@ impl Vm {
         cell
     }
 
+    /// runtime globalを読み取る。registryはtop-level slotだけを保持し、
+    /// cell化済みなら同じSharedValue、未cell化なら同じstack slotから値を得る。
+    fn get_global(&self, name: &str, line: usize, for_call: bool) -> Result<Value, TsumugiError> {
+        let slot = self.globals.get(name).copied().ok_or_else(|| {
+            let message = if for_call {
+                format!("未定義の関数: {}", name)
+            } else {
+                format!("未定義の変数: {}", name)
+            };
+            TsumugiError::runtime_with_kind(line, crate::error::ErrorKind::Name, message)
+        })?;
+        let frame = self.frames.first().ok_or_else(|| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Internal,
+                "global参照用のtop-level frameがありません",
+            )
+        })?;
+        if let Some(Some(cell)) = frame.locals_cells.get(slot) {
+            return Ok(cell.borrow().clone());
+        }
+        let stack_index = frame.base.checked_add(slot).ok_or_else(|| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Internal,
+                "global slotの計算がオーバーフローしました",
+            )
+        })?;
+        self.stack.get(stack_index).cloned().ok_or_else(|| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Internal,
+                format!("global registryのslotが不正です: {}", name),
+            )
+        })
+    }
+
+    /// runtime globalを更新する。既存cellがあればcell、なければtop-level stackへ書く。
+    fn set_global(&mut self, name: &str, value: Value, line: usize) -> Result<(), TsumugiError> {
+        let slot = self.globals.get(name).copied().ok_or_else(|| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Name,
+                format!("未定義の変数に代入: {}", name),
+            )
+        })?;
+        let (base, cell) = {
+            let frame = self.frames.first().ok_or_else(|| {
+                TsumugiError::runtime_with_kind(
+                    line,
+                    crate::error::ErrorKind::Internal,
+                    "global更新用のtop-level frameがありません",
+                )
+            })?;
+            (
+                frame.base,
+                frame.locals_cells.get(slot).and_then(|entry| entry.clone()),
+            )
+        };
+        if let Some(cell) = cell {
+            *cell.borrow_mut() = value;
+            return Ok(());
+        }
+        let stack_index = base.checked_add(slot).ok_or_else(|| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Internal,
+                "global slotの計算がオーバーフローしました",
+            )
+        })?;
+        let target = self.stack.get_mut(stack_index).ok_or_else(|| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Internal,
+                format!("global registryのslotが不正です: {}", name),
+            )
+        })?;
+        *target = value;
+        Ok(())
+    }
+
+    /// 実行済みtop-level宣言をglobal registryへ公開する。
+    fn register_global(
+        &mut self,
+        name: String,
+        slot: usize,
+        line: usize,
+    ) -> Result<(), TsumugiError> {
+        if self.frames.len() != 1 {
+            return Err(TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Internal,
+                "関数frameからglobalを登録しようとしました",
+            ));
+        }
+        let frame = self.frames.first().ok_or_else(|| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Internal,
+                "global登録用のtop-level frameがありません",
+            )
+        })?;
+        let stack_index = frame.base.checked_add(slot).ok_or_else(|| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Internal,
+                "global slotの計算がオーバーフローしました",
+            )
+        })?;
+        if stack_index >= self.stack.len() {
+            return Err(TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Internal,
+                format!("global登録対象のslotが不正です: {}", name),
+            ));
+        }
+        self.globals.insert(name, slot);
+        Ok(())
+    }
+
     /// 命令をディスパッチ（ReturnValue / Return 以外）
     fn dispatch(&mut self, instruction: OpCode, line: usize) -> Result<(), TsumugiError> {
         match instruction {
@@ -454,6 +583,27 @@ impl Vm {
                         TsumugiError::runtime(line, "内部エラー: スタックが空です")
                     })?;
                 self.set_local(slot, value);
+            }
+            OpCode::GetGlobal(name) => {
+                let value = self.get_global(&name, line, false)?;
+                self.stack.push(value);
+            }
+            OpCode::GetGlobalForCall(name) => {
+                let value = self.get_global(&name, line, true)?;
+                self.stack.push(value);
+            }
+            OpCode::SetGlobal(name) => {
+                let value = self.stack.last().cloned().ok_or_else(|| {
+                    TsumugiError::runtime_with_kind(
+                        line,
+                        crate::error::ErrorKind::Internal,
+                        "SetGlobalの値がスタックにありません",
+                    )
+                })?;
+                self.set_global(&name, value, line)?;
+            }
+            OpCode::RegisterGlobal(name, slot) => {
+                self.register_global(name, slot, line)?;
             }
             OpCode::Jump(target) => {
                 self.frames.last_mut().unwrap().ip = target;
