@@ -33,7 +33,7 @@ impl Parser {
         self.skip_newlines();
 
         while !self.is_at_end() {
-            match self.parse_stmt() {
+            match self.parse_stmt(true) {
                 Ok(stmt) => stmts.push(stmt),
                 Err(e) => {
                     self.errors.push(e);
@@ -79,9 +79,26 @@ impl Parser {
         }
     }
 
+    /// 現在行の残りを捨て、次の行まで進める。
+    fn discard_current_line(&mut self) {
+        while !matches!(self.peek_token(), Token::Newline | Token::Eof) {
+            self.advance();
+        }
+        if self.peek_token() == Token::Newline {
+            self.advance();
+        }
+    }
+
+    /// block内のimportをoperandの妥当性に関係なく配置エラーとして消費する。
+    fn reject_non_top_level_import(&mut self) -> TsumugiError {
+        let line = self.current_line();
+        self.discard_current_line();
+        TsumugiError::parse(line, "import はトップレベルでのみ使用できます")
+    }
+
     // --- 文のパース ---
 
-    fn parse_stmt(&mut self) -> Result<Stmt, TsumugiError> {
+    fn parse_stmt(&mut self, is_top_level: bool) -> Result<Stmt, TsumugiError> {
         // ブロックを持つ文のネストも深度制限の対象
         self.depth += 1;
         if self.depth > MAX_PARSE_DEPTH {
@@ -91,12 +108,12 @@ impl Parser {
                 format!("ネストが深すぎます (上限: {})", MAX_PARSE_DEPTH),
             ));
         }
-        let result = self.parse_stmt_inner();
+        let result = self.parse_stmt_inner(is_top_level);
         self.depth -= 1;
         result
     }
 
-    fn parse_stmt_inner(&mut self) -> Result<Stmt, TsumugiError> {
+    fn parse_stmt_inner(&mut self, is_top_level: bool) -> Result<Stmt, TsumugiError> {
         match self.peek_token() {
             Token::Let => self.parse_let(),
             Token::Return => self.parse_return(),
@@ -106,7 +123,8 @@ impl Parser {
             Token::Fn => self.parse_fn_def(),
             Token::Break => self.parse_break(),
             Token::Continue => self.parse_continue(),
-            Token::Import => self.parse_import(),
+            Token::Import if is_top_level => self.parse_import(),
+            Token::Import => Err(self.reject_non_top_level_import()),
             Token::Try => self.parse_try_catch(),
             Token::Ident(_) => {
                 // 識別子 + '=' なら再代入文
@@ -503,7 +521,15 @@ impl Parser {
         let mut stmts = Vec::new();
 
         while !self.is_at_end() && !terminators.contains(&self.peek_token()) {
-            let stmt = self.parse_stmt()?;
+            // parse_stmtの深度ガードより先に処理し、必ずtokenを進めてから回復する。
+            if self.peek_token() == Token::Import {
+                let error = self.reject_non_top_level_import();
+                self.errors.push(error);
+                self.skip_newlines();
+                continue;
+            }
+
+            let stmt = self.parse_stmt(false)?;
             stmts.push(stmt);
             self.skip_newlines();
         }
@@ -1289,6 +1315,71 @@ mod tests {
             errors[0].message().contains("文字列パス"),
             "error should mention string path: {}",
             errors[0]
+        );
+    }
+
+    #[test]
+    fn parse_import_rejects_non_top_level_contexts() {
+        let cases = [
+            ("if true\n  import \"nested.tsg\"\nend", 2),
+            (
+                "if false\n  print(0)\nelif true\n  import \"nested.tsg\"\nend",
+                4,
+            ),
+            (
+                "if false\n  print(0)\nelse\n  import \"nested.tsg\"\nend",
+                4,
+            ),
+            ("while true\n  import \"nested.tsg\"\nend", 2),
+            ("for x in [1]\n  import \"nested.tsg\"\nend", 2),
+            ("fn load()\n  import \"nested.tsg\"\nend", 2),
+            ("try\n  import \"nested.tsg\"\ncatch e\n  print(e)\nend", 2),
+            ("try\n  print(1)\ncatch e\n  import \"nested.tsg\"\nend", 4),
+            ("let load = fn()\n  import \"nested.tsg\"\nend", 2),
+        ];
+
+        for (source, line) in cases {
+            let errors = parse(source).expect_err("nested import must be rejected");
+            assert_eq!(
+                errors,
+                vec![TsumugiError::parse(
+                    line,
+                    "import はトップレベルでのみ使用できます"
+                )],
+                "unexpected errors for {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_import_recovers_within_block_and_prioritizes_placement() {
+        let source =
+            "if true\n  import \"first.tsg\"\n  import 123\nelse\n  import \"third.tsg\"\nend";
+        let errors = parse(source).expect_err("every nested import must be rejected");
+
+        assert_eq!(
+            errors,
+            vec![
+                TsumugiError::parse(2, "import はトップレベルでのみ使用できます"),
+                TsumugiError::parse(3, "import はトップレベルでのみ使用できます"),
+                TsumugiError::parse(5, "import はトップレベルでのみ使用できます"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_import_at_max_block_depth_makes_progress() {
+        let mut source = "fn nested()\n".repeat(MAX_PARSE_DEPTH);
+        source.push_str("import 123\n");
+        source.push_str(&"end\n".repeat(MAX_PARSE_DEPTH));
+
+        let errors = parse(&source).expect_err("nested import must be rejected without hanging");
+        assert_eq!(
+            errors,
+            vec![TsumugiError::parse(
+                MAX_PARSE_DEPTH + 1,
+                "import はトップレベルでのみ使用できます"
+            )]
         );
     }
 }

@@ -255,10 +255,11 @@ GitHub Actions (`.github/workflows/ci.yml`) で push / PR 時に自動実行:
 ## 文法仕様 (v0.3)
 
 ```
-program        = stmt*
+program        = top_level_stmt*
+top_level_stmt = import_stmt | stmt
 stmt           = let_stmt | assign_stmt | index_assign | return_stmt
                | if_stmt | while_stmt | for_stmt | break_stmt | continue_stmt
-               | fn_def | import_stmt | try_catch_stmt | expr_stmt
+               | fn_def | try_catch_stmt | expr_stmt
 let_stmt       = "let" IDENT "=" expr NEWLINE
 assign_stmt    = IDENT "=" expr NEWLINE
 index_assign   = postfix "[" expr "]" "=" expr NEWLINE
@@ -370,6 +371,14 @@ let f = fn(x) x * 2 end
 
 ### 設計判断
 
+#### import をトップレベルに限定
+
+`import` はプログラムのトップレベルでのみ有効とし、関数・条件分岐・ループ・`try` / `catch`・複数行ラムダのブロック内ではパースエラーにする。
+
+ツリーウォーク版は import 文へ到達した実行時にファイルを読み込む一方、VM版はコンパイル時にASTをインライン展開する。非トップレベルを許可すると、false branchでの読込有無、loopでの実行回数、関数呼び出し時の読込、相対パス基準、エラー発生フェーズを同一にできない。VMへruntime import命令を追加する大規模な再設計や、tree版をcompile-time展開へ変更する意味論変更は行わず、非本質的な配置を構文上禁止して両engineを統一する。
+
+Parserはプログラム直下とblock内の文を区別し、block内のimportをファイルI/O前に `import はトップレベルでのみ使用できます` で拒否する。これによりtree版・VM版でエラーフェーズとメッセージが一致し、到達不能branch内でもimport先へアクセスしない。
+
 #### フラットなインジェクション方式を採用
 
 検討した選択肢:
@@ -400,11 +409,10 @@ let f = fn(x) x * 2 end
 
 - VM ではファイルを読み込んでパースし、得られた AST を現在の `Compiler` でそのままコンパイルする
 - ランタイムの新しい OpCode は不要（コンパイル時に解決される）
-- ネスト import 対応のため、コンパイル中に `base_dir` を一時切り替えする
+- import先ファイルからの再帰的なimportに対応するため、コンパイル中に `base_dir` を一時切り替えする
 
 ### 制約・トレードオフ
 
-- importの互換性保証範囲はトップレベル文。tree版は実行時読込、VM版はコンパイル時インライン展開のため、条件分岐・ループ・関数内importは実行回数やerror phaseが異なり得る
 - 名前空間が分離されないため、大規模なプロジェクトでは名前衝突のリスクがある
 - ファイルのトップレベルで副作用のあるコード（print 等）がある場合、import 時に実行される
 - 将来的に名前空間分離が必要になったら、クラス + ドット演算子の実装と合わせて対応する
@@ -623,6 +631,10 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 
 ## 変更履歴
+
+### 2026-08-26: importのトップレベル限定（AUD-007）
+
+ツリーウォーク版のruntime importとVM版のcompile-time inlineで意味論が一致しないため、`import`をプログラムのトップレベルだけで有効な構文に確定した。Parserがプログラム直下とblock内を区別し、非トップレベルのimportをファイルI/O前の共通パースエラーとして拒否する。if/while/for/関数/try/catch/複数行ラムダのparserテストと、tree/VM共通のintegrationテストを追加した。
 
 ### 2026-08-26: 深層監査修正（REPL transaction・scope回復・collection上限）
 
