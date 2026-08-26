@@ -573,7 +573,7 @@ impl Vm {
                     ));
                 }
             }
-            OpCode::Call(arg_count) => {
+            OpCode::PrepareCall => {
                 self.count_step(line)?;
                 if self.frames.len() >= MAX_CALL_DEPTH {
                     return Err(TsumugiError::runtime(
@@ -584,7 +584,46 @@ impl Vm {
                         ),
                     ));
                 }
-                let fn_pos = self.stack.len() - 1 - arg_count;
+            }
+            OpCode::ValidateCall(arg_count) => {
+                let fn_value = self.stack.last().ok_or_else(|| {
+                    TsumugiError::runtime(line, "内部エラー: ValidateCall のcalleeがありません")
+                })?;
+                if let Value::VmFn { name, arity, .. } = fn_value {
+                    if arg_count != *arity {
+                        return Err(TsumugiError::runtime(
+                            line,
+                            format!(
+                                "関数 {} は引数{}個ですが、{}個渡されました",
+                                name, arity, arg_count
+                            ),
+                        ));
+                    }
+                } else {
+                    return Err(TsumugiError::runtime(
+                        line,
+                        format!("関数ではない値を呼び出そうとしました: {:?}", fn_value),
+                    ));
+                }
+            }
+            OpCode::Call(arg_count) => {
+                // PrepareCallを経由しない不正bytecodeでもframe上限を迂回させない。
+                // stepはPrepareCallだけで数え、ここでは二重countしない。
+                if self.frames.len() >= MAX_CALL_DEPTH {
+                    return Err(TsumugiError::runtime(
+                        line,
+                        format!(
+                            "スタックオーバーフロー: 再帰が深すぎます (上限: {})",
+                            MAX_CALL_DEPTH
+                        ),
+                    ));
+                }
+                let required = arg_count.checked_add(1).ok_or_else(|| {
+                    TsumugiError::runtime(line, "内部エラー: Call の引数数が不正です")
+                })?;
+                let fn_pos = self.stack.len().checked_sub(required).ok_or_else(|| {
+                    TsumugiError::runtime(line, "内部エラー: Call のスタック要素が不足しています")
+                })?;
                 let fn_value = self.stack[fn_pos].clone();
                 if let Value::VmFn {
                     name,
@@ -594,6 +633,8 @@ impl Vm {
                     ..
                 } = fn_value
                 {
+                    // ValidateCall後にcalleeが変化しないことを前提とするが、
+                    // 不正bytecodeに対する防御として再検査する。
                     if arg_count != arity {
                         return Err(TsumugiError::runtime(
                             line,
@@ -1252,5 +1293,64 @@ fn type_name(v: &Value) -> &'static str {
         Value::Fn { .. } => "Fn",
         Value::VmFn { .. } => "Fn",
         Value::Error { .. } => "Error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chunk::Chunk;
+    use crate::opcode::OpCode;
+    use std::rc::Rc;
+
+    #[test]
+    fn call_without_prepare_still_enforces_depth_limit() {
+        let mut recursive = Chunk::new();
+        recursive.name = "malformed_recursive".to_string();
+        recursive.emit(OpCode::GetLocal(0), 1);
+        recursive.emit(OpCode::Call(0), 1);
+        recursive.emit(OpCode::ReturnValue, 1);
+
+        let function = Value::VmFn {
+            name: "malformed_recursive".to_string(),
+            arity: 0,
+            params: Vec::new(),
+            chunk: Rc::new(recursive),
+            upvalues: Vec::new(),
+        };
+        let mut main = Chunk::new();
+        main.emit_constant(function, 1);
+        main.emit(OpCode::Call(0), 1);
+        main.emit(OpCode::Return, 1);
+
+        let error = Vm::new(main)
+            .run()
+            .expect_err("PrepareCallなしの再帰Callが成功しました");
+        assert_eq!(error.error_type(), "overflow");
+        assert!(error.message().contains("スタックオーバーフロー"));
+    }
+
+    #[test]
+    fn malformed_call_with_missing_stack_returns_internal_error() {
+        let mut chunk = Chunk::new();
+        chunk.emit(OpCode::Call(0), 1);
+        chunk.emit(OpCode::Return, 1);
+
+        let error = Vm::new(chunk)
+            .run()
+            .expect_err("calleeのないCallが成功しました");
+        assert!(error.message().contains("Call のスタック要素が不足"));
+    }
+
+    #[test]
+    fn malformed_call_with_overflowing_arg_count_returns_internal_error() {
+        let mut chunk = Chunk::new();
+        chunk.emit(OpCode::Call(usize::MAX), 1);
+        chunk.emit(OpCode::Return, 1);
+
+        let error = Vm::new(chunk)
+            .run()
+            .expect_err("overflowする引数数のCallが成功しました");
+        assert!(error.message().contains("Call の引数数が不正"));
     }
 }

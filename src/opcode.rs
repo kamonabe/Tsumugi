@@ -54,7 +54,14 @@ pub enum OpCode {
     Loop(usize),
 
     // --- 関数呼び出し ---
-    /// 関数を呼び出す。operand: 引数の数
+    /// 呼び出しのstep予算と深度をcallee評価前に検査する
+    PrepareCall,
+
+    /// calleeが関数でarityが一致することを引数評価前に検査する
+    /// operand: 引数の数。スタックトップのcalleeは保持する
+    ValidateCall(usize),
+
+    /// 検査済みの関数を呼び出す。operand: 引数の数
     /// スタック: [fn, arg0, arg1, ...] → 関数を実行
     Call(usize),
 

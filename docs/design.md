@@ -632,6 +632,20 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 ## 変更履歴
 
+### 2026-08-26: user function call validation順序の統一（AUD-011 前半）
+
+**問題:** ツリーウォーク版はuser function callでstep/depth、callee、callable/arityを検査してから引数を評価していた。一方、VMはcalleeと全引数を評価した後の`Call`で検査していたため、wrong arityやnon-callableでも引数のprint・collection mutation・I/OがVMだけ実行された。引数内のruntime errorとcall validation errorの優先順もengine間で異なり得た。
+
+**決定:** user function callを「step予算とcall depth → callee評価 → callable/arity検査 → 引数を左から右 → body」の順に統一する。callee評価やvalidationに失敗した場合は引数を評価せず、引数評価中に失敗した場合は残りの引数とbodyを実行しない。既存tree semanticsを正とする。
+
+**実装:** `PrepareCall`でstep/depthをcallee評価前に、`ValidateCall(arg_count)`でcallable/arityをcallee評価後かつargs評価前に検査する。Compilerは`PrepareCall → callee → ValidateCall → args → Call`を生成し、`Call`はframe構築を担当する。不正bytecodeへの防御として`Call`側でもframe depth、stack shape、callable/arityを再検査するが、stepは二重countしない。
+
+**不採用案:** treeをVM旧仕様のargs-firstへ合わせる案は、invalid callで新たに外部副作用を発生させ、既存treeコードのerror precedenceを壊すため不採用。Compilerで静的にarityを検査するだけの案はfirst-class functionやcallee式を扱えず、non-callableも解決しない。
+
+**互換性と境界:** VMでinvalid callの引数副作用に依存していたコードは変化する。必要な副作用はcall引数の外で明示的に実行する。builtin固有の引数・callback契約はAUD-012、non-callableを含むerror messageの完全一致はAUD-019で扱う。dead codeの未定義名、global forward reference、未定義argの実行前拒否はslot-only eager name resolutionが原因であり、runtime global cell・AUD-016・AUD-024を伴うAUD-011後半へ分離する。
+
+**回帰テスト:** paired golden testで成功時のcallee→arg1→arg2→body、wrong arity/non-callable時の引数非評価、callee runtime errorの優先、引数の左から右評価とarg error時のbody非実行を検証する。tree/VM REPLテストではstep上限をcallee評価前に検査し、caught `limit` error後もcallee副作用が発生しないことを検証する。
+
 ### 2026-08-26: for変数のclosure bindingを反復単位へ統一（AUD-010）
 
 **問題:** ツリーウォーク版は`for`の各反復でloop変数に新しいcellを作るため、`[1, 2, 3]`から作ったclosureはそれぞれ`1`、`2`、`3`を返した。一方、Compiler/VMはloop全体で同じlocal slotと昇格済み`locals_cells`を更新していたため、すべてのclosureが最終値`3`を返した。

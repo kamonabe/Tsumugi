@@ -69,6 +69,9 @@ end
 - Return is explicit: `return expr`
 - No implicit return of last expression (unlike Ruby)
 - No type annotations on parameters or return
+- User-defined calls run in this order: step/depth check, callee evaluation, callable/arity validation, arguments left-to-right, then the function body
+- If the callee is not callable or the arity is wrong, arguments and the function body are not evaluated
+- If callee evaluation or an argument fails, later arguments and the function body are not evaluated
 
 **WRONG:**
 ```
