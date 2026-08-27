@@ -187,6 +187,8 @@ let result = filter(test, fn(item) item != "kani" end)
 - 再帰下降構文解析
 - `Vec<Spanned>` を入力として受け取る
 - 演算子の優先順位（低→高）: or → and → 比較 → 加減 → 乗除 → 単項 → 関数呼び出し
+- `MAX_AST_DEPTH = 256`をblock・括弧・unary・`elif`などの再帰edgeへ共通適用し、nested f-stringの子Lexer/Parserにも親深度を引き継ぐ
+- 左結合BinOpと連続call/indexは複合ノードの構築直後に実AST深度を非再帰検査し、最初の上限超過ノード（深度257）で停止して、それ以上の深い連鎖を蓄積しない
 - ブロックは終端トークン（`end`, `else`）を目印に解析
 - エラー発生時に `Spanned.line` を参照して「N行目: ...」メッセージを生成
 - エラー回復: 1つ目のエラーで停止せず、複数のパースエラーをまとめて報告する
@@ -197,6 +199,7 @@ let result = filter(test, fn(item) item != "kani" end)
 ### 評価器 (eval.rs)
 
 - AST を再帰的にたどって Value を返す
+- `run()`入口ではProgramを非再帰worklistでpreflightし、Parserを迂回した公開ASTも深度256超過なら`StackOverflow`として拒否する
 - 環境（Env）で変数スコープをスタック管理
 - 関数呼び出し時に新しいスコープを push、終了時に pop
 - `return` 文は EvalResult::Return で早期脱出を表現
@@ -410,7 +413,9 @@ Parserはプログラム直下とblock内の文を区別し、block内のimport�
 - 正規化パスの `HashSet` で管理
 - 正常に完了したimportの2回目以降は何もせずスキップ（エラーにしない）
 - 読み込み・パース・実行に失敗した場合はmarkerと一時的な`base_dir`を復元し、同じpathを再試行可能にする
-- A→B→Aのように同じ正規化pathへ戻る循環は停止できる。ただし、異なるファイルだけをたどる深い非循環chainにはdepth上限がなく、host stack overflow対策にはならない（AUD-028）
+- A→B→Aのように同じ正規化pathへ戻る循環は、深度検査前の既訪問判定で従来どおり停止する
+- `Evaluator`と`Compiler`はloaded集合と分離した`import_depth`でactive chainだけを数え、root scriptを除く128ファイルまで許可する。129段目は`ErrorKind::Import`で拒否し、marker挿入前に停止する
+- active depthと一時的な`base_dir`はinner処理の成否にかかわらず呼び出し元の値へ復元する
 - Python の挙動に近い（部分的に実行済みのモジュールオブジェクトを返す）
 
 #### VM版: コンパイル時にインライン展開
@@ -583,16 +588,19 @@ builtin_core.rs
 ## 実行安全性の設計
 
 誤操作と過剰な資源消費を抑えるdefense-in-depth機構。これは敵対的コードを隔離するsecurity sandboxではなく、非信頼コードにはOS・コンテナ側の権限、CPU、メモリ、filesystem、実行時間制限を併用する。
-全て環境変数で制御し、未設定時は制限なしのfail-openとなる（開発時のUXを阻害しない）。
+実行量・collection・I/Oの制御は環境変数で設定し、構文・AST・call frame・import chainの構造的上限はコンパイル時定数で固定する。環境変数方式は未設定時に既定値または制限なしのfail-openとなる（開発時のUXを阻害しない）。
 
 ### 制御機構一覧
 
-| 環境変数 | 対象 | 動作 |
+| 設定 / 定数 | 対象 | 動作 |
 |---|---|---|
 | `TSUMUGI_MAX_STEPS` | ループ反復 + 関数呼び出し | 上限超過でランタイムエラー |
 | `TSUMUGI_MAX_COLLECTION_SIZE` | List/Dictの生成・拡張とList生成builtin | 要素数上限超過でランタイムエラー |
 | `TSUMUGI_SANDBOX` | 全ファイル操作（read/write/import） | 許可パス外へのアクセスをブロック |
 | `TSUMUGI_ENV_ALLOW` | `env()` 関数 | 許可リスト外のキーは null を返す |
+| `MAX_CALL_DEPTH = 128` | ユーザー関数のcall frame | 上限超過で`StackOverflow` |
+| `MAX_AST_DEPTH = 256` | Parser生成物と公開AST | Parser生成時とCompiler/Evaluator入口で拒否 |
+| `MAX_IMPORT_DEPTH = 128` | rootを除くactive import chain | 129段目を`Import`エラーで拒否 |
 
 ### コールフレーム深度制限
 
@@ -601,7 +609,19 @@ builtin_core.rs
 - ツリーウォーク版: `call_stack.len()` でチェック
 - VM版: `frames.len()` でチェック
 - main() は8MB stackのthreadで実行し、通常の評価再帰に余裕を持たせる
-- この上限は単項式、左深AST、`elif`、parser/compilerの走査、非循環import chainには適用されない。8MB stackはoverflowを遅らせるだけで、AUD-027 / AUD-028のhost abortを防ぐ境界ではない
+
+### 構文・AST深度制限
+
+`src/limits.rs`の`MAX_AST_DEPTH = 256`をLexer・Parser・AST・Compiler・Evaluatorで共有する。
+
+- Parserの再帰counterはblock、括弧、unary、`elif`、nested f-string間でリセットせず継承する
+- 左深BinOpとpostfix chainは各ノード構築直後に非再帰worklistで実深度を検査し、最初の深度257ノードで停止してそれ以上を蓄積しない
+- Parserが完成した各文はbody・lambdaを含めて再検査する
+- `Compiler::compile`、`compile_repl_line`、`Evaluator::run`はProgram全体を非再帰preflightし、外部コードが公開ASTを手組みしてParserを迂回しても処理系自身の再帰走査前に`ErrorKind::StackOverflow`を返す。このAPIはProgramを借用するため、制限を大幅に超えるcaller所有ASTの破棄までstack-safeにするものではない
+
+### import chain深度制限
+
+`MAX_IMPORT_DEPTH = 128`でroot scriptを除くactive import chainを制限する。loaded module総数とは分離したcounterを使うため、REPLで正常importが累積しても許容量は減らない。canonicalize・sandbox・既訪問skipの後、marker挿入前に深度を検査し、129段目は`ErrorKind::Import`で拒否する。
 
 ### TSUMUGI_* 環境変数の保護
 
@@ -640,8 +660,7 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 ### 未対応の既知の制約
 
-- **未保護の再帰経路**: ユーザー関数には深度上限があるが、単項式、`elif`、左深AST、parser/compiler/evaluator走査は全てをカバーしておらず、host stack overflowへ到達し得る（AUD-027）
-- **非循環import chain**: pathの再訪は検出するが、異なるファイルをたどるchainにはdepth・step上限がなく、treeの実行再帰とVMのcompile再帰がhost stackを消費する（AUD-028）
+- **caller所有ASTの破棄**: 公開AST APIのpreflightはCompiler/Evaluator自身の再帰走査を防ぐが、借用元がParserを使わず任意深度の再帰ASTを構築した場合、そのASTの通常Dropはcaller側のhost stackを使用する
 - **シンボリックリンクとTOCTOU**: checkと実I/Oの間の置換raceを防げず、破壊的操作ではfinal symlink自体でなくlink先を削除・移動し得る。許可外pathの存在情報がcanonicalize結果から観測できる場合もある（AUD-020 / AUD-032）
 - **Windows環境変数**: OS側はkeyの大文字小文字を区別しないが、`TSUMUGI_` prefix保護はcase-sensitiveである（AUD-031）
 - **総ヒープメモリ制限なし**: List/Dictの要素数上限はあるが、巨大文字列、要素自身のサイズ、全コレクション合計量にはglobal quotaがなくOOMの可能性が残る

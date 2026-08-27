@@ -16,8 +16,8 @@
 | AUD-002 | VM REPLの未捕捉runtime error後にstack/frame/handler/compilerを復元する | 一時値・callee frame・未実行bindingが次入力へ残り、誤値参照、古い関数の再開、二次panicを起こす | ✅ 完了（REPL回帰テスト追加） |
 | AUD-003 | コレクション上限を全生成経路へ一貫適用する | VMのlist/dict literal、`push`、`map`/`filter`、keys/values等で`TSUMUGI_MAX_COLLECTION_SIZE`を迂回でき、メモリDoS防止の完了記載と矛盾 | ✅ 言語から到達する生成・拡張経路を修正。総heap quotaは対象外 |
 | AUD-026 | `format_time`の極端なtimestampを定数時間で処理する | `format_time(9223372036854775807, "%Y")`は1970年から1年ずつ進むため実用上停止せず、step予算も消費しない。tree/VMとも2秒以内に完了せず、timeout（終了124）で強制停止 | ✅ 完了（400年周期化・両engineのi64極値timeout回帰テスト追加） |
-| AUD-027 | parser・compiler・evaluatorの全再帰経路へ深度制限を適用する | 10万個の`not`連鎖で`MAX_PARSE_DEPTH`を迂回し、Rust stack overflowでabort（終了134）。`elif`直再帰や左深BinOp ASTにも同種の経路がある | ⬜ 未着手（host abort再現済み） |
-| AUD-028 | 非循環import chainの深度を制限する | treeはimport実行を、VMはinline compileを再帰するがimport深度・step上限がなく、長い非循環chainでhost stack overflowに到達し得る | ⬜ 未着手（上限設計・回帰テストが必要） |
+| AUD-027 | parser・compiler・evaluatorの全再帰経路へ深度制限を適用する | 10万個の`not`連鎖で旧`MAX_PARSE_DEPTH`を迂回し、Rust stack overflowでabort（終了134）。`elif`直再帰や左深BinOp ASTにも同種の経路があった | ✅ 完了（`MAX_AST_DEPTH=256`、生成時検査・子f-string深度継承・実行前の非再帰preflight） |
+| AUD-028 | 非循環import chainの深度を制限する | treeのimport実行とVMのinline compileが、旧実装では深い非循環chainでhost stack overflowに到達し得た | ✅ 完了（rootを除くactive chainを128に制限、tree/VM共通エラー） |
 
 ### P1 — High
 
@@ -78,7 +78,7 @@ Criterionの平均値は次のとおり。各iterationにparseを含み、VMはc
 
 ### 追加監査後の推奨改修順
 
-1. **停止性:** AUD-026 / AUD-027 / AUD-028を先行し、timeout・深度制限・host abortなしを回帰テストで固定する。
+1. **停止性:** AUD-026 / AUD-027 / AUD-028は完了。timeout・深度境界・host abortなしを継続検証する。
 2. **誤実行・安全境界:** AUD-029 / AUD-031 / AUD-032 / AUD-037を処理し、意味論選択が必要なAUD-012 / AUD-013 / AUD-014 / AUD-030は仕様決定後に実装する。
 3. **品質基盤:** AUD-022でtimeout・一時directory分離・厳密differential harnessを整備し、AUD-038でbenchmarkを分解してVM loop退行をprofileしてから、P2境界とfuzzを拡充する。
 
@@ -350,7 +350,9 @@ Tsumugi にはファイルI/O やサンドボックス機能が既に実装さ�
 
 | 項目 | 詳細 | 状態 |
 |---|---|---|
-| ユーザー関数のコール深度制限 | 関数再帰をRust実stack overflow前にエラー化。parser/compiler/evaluator/importの未保護経路はAUD-027 / AUD-028で継続 | 🟡 関数callは完了 |
+| ユーザー関数のコール深度制限 | 関数再帰を128フレームでRust実stack overflow前にエラー化 | ✅ 完了（境界差はAUD-017で継続） |
+| 構文・AST深度制限 | Parser生成時とCompiler/Evaluator入口でAST深度256を検査。nested f-stringにも親深度を継承 | ✅ 完了（AUD-027） |
+| import chain深度制限 | rootを除くactive import chainをtree/VMとも128に制限 | ✅ 完了（AUD-028） |
 | サンドボックスの `OnceLock` テスタビリティ | テスト時に環境変数を切り替え可能な設計にする | 未着手 |
 | サンドボックスの中間シンボリックリンク迂回修正 | 新規書き込み時に親ディレクトリを `canonicalize()` してからチェック | ✅ 完了 |
 | 整数オーバーフローのエラー化 | `checked_add` 等に置き換え、release ビルドでもサイレントラップを防止 | ✅ 完了 |

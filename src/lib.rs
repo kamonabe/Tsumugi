@@ -15,6 +15,7 @@ pub mod env;
 pub mod error;
 pub mod eval;
 pub mod lexer;
+pub(crate) mod limits;
 pub mod opcode;
 pub mod parser;
 pub mod sandbox;

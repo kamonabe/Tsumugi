@@ -6,6 +6,7 @@ mod env;
 mod error;
 mod eval;
 mod lexer;
+mod limits;
 mod opcode;
 mod parser;
 mod sandbox;

@@ -1,3 +1,4 @@
+use crate::limits::MAX_AST_DEPTH;
 use crate::token::{FStrPart, Spanned, Token};
 
 /// ソースコードをトークン列に変換するレキサー
@@ -5,14 +6,21 @@ pub struct Lexer {
     input: Vec<char>,
     pos: usize,
     line: usize,
+    /// f-string式を再tokenizeする子Lexerの深度。
+    fstring_depth: usize,
 }
 
 impl Lexer {
     pub fn new(input: &str) -> Self {
+        Self::new_with_fstring_depth(input, 0)
+    }
+
+    fn new_with_fstring_depth(input: &str, fstring_depth: usize) -> Self {
         Self {
             input: input.chars().collect(),
             pos: 0,
             line: 1,
+            fstring_depth,
         }
     }
 
@@ -362,9 +370,16 @@ impl Lexer {
             }
         }
 
-        // サブ Lexer で式部分をトークン化
+        // サブ Lexer で式部分をトークン化。親f-stringの深度を引き継ぎ、
+        // Lexer::newによる再帰深度リセットを防ぐ。
+        if self.fstring_depth >= MAX_AST_DEPTH {
+            return Err(format!(
+                "f-stringのネストが深すぎます (上限: {})",
+                MAX_AST_DEPTH
+            ));
+        }
         let expr_str: String = expr_chars.into_iter().collect();
-        let mut sub_lexer = Lexer::new(&expr_str);
+        let mut sub_lexer = Lexer::new_with_fstring_depth(&expr_str, self.fstring_depth + 1);
         let tokens: Vec<Spanned> = sub_lexer
             .tokenize()
             .into_iter()

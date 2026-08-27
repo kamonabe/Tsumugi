@@ -193,3 +193,172 @@ pub enum UnaryOpKind {
     Neg, // -
     Not, // not
 }
+
+/// 深度検証用の非再帰work item。
+enum AstNode<'a> {
+    Stmt(&'a Stmt),
+    Expr(&'a Expr),
+}
+
+/// ASTを非再帰で走査し、上限を超えた最初のノードの行番号を返す。
+fn excessive_depth_line(mut worklist: Vec<(AstNode<'_>, usize, usize)>) -> Option<usize> {
+    use crate::limits::MAX_AST_DEPTH;
+
+    while let Some((node, depth, line)) = worklist.pop() {
+        if depth > MAX_AST_DEPTH {
+            return Some(line);
+        }
+
+        let child_depth = depth + 1;
+        match node {
+            AstNode::Stmt(stmt) => match stmt {
+                Stmt::Let { value, .. }
+                | Stmt::Assign { value, .. }
+                | Stmt::Return { value, .. } => {
+                    worklist.push((AstNode::Expr(value), child_depth, line));
+                }
+                Stmt::IndexAssign {
+                    object,
+                    index,
+                    value,
+                    ..
+                } => {
+                    worklist.push((AstNode::Expr(value), child_depth, line));
+                    worklist.push((AstNode::Expr(index), child_depth, line));
+                    worklist.push((AstNode::Expr(object), child_depth, line));
+                }
+                Stmt::If {
+                    condition,
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    for child in else_body.iter().rev() {
+                        worklist.push((AstNode::Stmt(child), child_depth, child.line()));
+                    }
+                    for child in then_body.iter().rev() {
+                        worklist.push((AstNode::Stmt(child), child_depth, child.line()));
+                    }
+                    worklist.push((AstNode::Expr(condition), child_depth, line));
+                }
+                Stmt::While {
+                    condition, body, ..
+                } => {
+                    for child in body.iter().rev() {
+                        worklist.push((AstNode::Stmt(child), child_depth, child.line()));
+                    }
+                    worklist.push((AstNode::Expr(condition), child_depth, line));
+                }
+                Stmt::For { iter, body, .. } => {
+                    for child in body.iter().rev() {
+                        worklist.push((AstNode::Stmt(child), child_depth, child.line()));
+                    }
+                    worklist.push((AstNode::Expr(iter), child_depth, line));
+                }
+                Stmt::FnDef { body, .. } => {
+                    for child in body.iter().rev() {
+                        worklist.push((AstNode::Stmt(child), child_depth, child.line()));
+                    }
+                }
+                Stmt::TryCatch {
+                    try_body,
+                    catch_body,
+                    ..
+                } => {
+                    for child in catch_body.iter().rev() {
+                        worklist.push((AstNode::Stmt(child), child_depth, child.line()));
+                    }
+                    for child in try_body.iter().rev() {
+                        worklist.push((AstNode::Stmt(child), child_depth, child.line()));
+                    }
+                }
+                Stmt::ExprStmt { expr, .. } => {
+                    worklist.push((AstNode::Expr(expr), child_depth, line));
+                }
+                Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Import { .. } => {}
+            },
+            AstNode::Expr(expr) => match expr {
+                Expr::List(items) => {
+                    for child in items.iter().rev() {
+                        worklist.push((AstNode::Expr(child), child_depth, line));
+                    }
+                }
+                Expr::Dict(pairs) => {
+                    for (key, value) in pairs.iter().rev() {
+                        worklist.push((AstNode::Expr(value), child_depth, line));
+                        worklist.push((AstNode::Expr(key), child_depth, line));
+                    }
+                }
+                Expr::BinOp { left, right, .. } => {
+                    worklist.push((AstNode::Expr(right), child_depth, line));
+                    worklist.push((AstNode::Expr(left), child_depth, line));
+                }
+                Expr::UnaryOp { expr, .. } => {
+                    worklist.push((AstNode::Expr(expr), child_depth, line));
+                }
+                Expr::Call { callee, args } => {
+                    for child in args.iter().rev() {
+                        worklist.push((AstNode::Expr(child), child_depth, line));
+                    }
+                    worklist.push((AstNode::Expr(callee), child_depth, line));
+                }
+                Expr::Lambda { body, .. } => {
+                    for child in body.iter().rev() {
+                        worklist.push((AstNode::Stmt(child), child_depth, child.line()));
+                    }
+                }
+                Expr::Index { object, index } => {
+                    worklist.push((AstNode::Expr(index), child_depth, line));
+                    worklist.push((AstNode::Expr(object), child_depth, line));
+                }
+                Expr::FStr(parts) => {
+                    for part in parts.iter().rev() {
+                        if let FStrExprPart::Expr(child) = part {
+                            worklist.push((AstNode::Expr(child), child_depth, line));
+                        }
+                    }
+                }
+                Expr::Int(_)
+                | Expr::Float(_)
+                | Expr::Str(_)
+                | Expr::Bool(_)
+                | Expr::Null
+                | Expr::Ident(_) => {}
+            },
+        }
+    }
+
+    None
+}
+
+/// Parserが複合式を構築するたびに、危険な深さへ到達していないか確認する。
+pub(crate) fn expr_depth_exceeds_limit(expr: &Expr) -> bool {
+    excessive_depth_line(vec![(AstNode::Expr(expr), 1, 0)]).is_some()
+}
+
+/// Parserが文を構築した時点で、文と配下の式・blockをまとめて確認する。
+pub(crate) fn stmt_depth_exceeds_limit(stmt: &Stmt) -> bool {
+    excessive_depth_line(vec![(AstNode::Stmt(stmt), 1, stmt.line())]).is_some()
+}
+
+/// Compiler/Evaluatorへ渡されたProgramを、再帰処理へ入る前に検証する。
+pub(crate) fn validate_program_depth(program: &Program) -> Result<(), crate::error::TsumugiError> {
+    use crate::error::{ErrorKind, TsumugiError};
+    use crate::limits::MAX_AST_DEPTH;
+
+    let worklist = program
+        .iter()
+        .rev()
+        .map(|stmt| (AstNode::Stmt(stmt), 1, stmt.line()))
+        .collect();
+
+    if let Some(line) = excessive_depth_line(worklist) {
+        return Err(TsumugiError::runtime_with_kind(
+            line,
+            ErrorKind::StackOverflow,
+            format!("ASTのネストが深すぎます (上限: {})", MAX_AST_DEPTH),
+        ));
+    }
+
+    Ok(())
+}
