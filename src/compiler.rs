@@ -21,6 +21,14 @@ struct Local {
     depth: usize,
 }
 
+/// push/pop後に更新したListを書き戻すbinding。
+#[derive(Debug, Clone)]
+enum MutationTarget {
+    Local(usize),
+    Upvalue(usize),
+    Global(String),
+}
+
 /// ループのコンパイル状態（break/continue のパッチに使う）
 #[derive(Debug, Clone)]
 struct LoopState {
@@ -733,7 +741,7 @@ impl Compiler {
                 }
             }
             Expr::Call { callee, args } => {
-                // 組み込み関数かチェック
+                // printは予約tokenのため常にbuiltinへ直接dispatchする。
                 if let Expr::Ident(name) = callee.as_ref() {
                     if name == "print" {
                         let arg_count = args.len();
@@ -744,64 +752,29 @@ impl Compiler {
                         self.chunk.emit_constant(Value::Null, line);
                         return Ok(());
                     }
+
                     if is_builtin(name) {
-                        // push/pop は第一引数のリストを破壊的に変更する
-                        // → 実行後に元の変数スロットを更新する
-                        if (name == "push" || name == "pop")
-                            && !args.is_empty()
-                            && let Expr::Ident(var_name) = &args[0]
-                        {
-                            let slot = self.resolve_local(var_name, line)?;
-                            let arg_count = args.len();
-                            for arg in args {
-                                self.compile_expr(arg, line)?;
-                            }
-                            let name_idx = self.chunk.add_constant(Value::Str(name.clone()));
-                            self.chunk
-                                .emit(OpCode::CallBuiltin(name_idx, arg_count), line);
-                            if name == "push" {
-                                self.chunk.emit(OpCode::SetLocal(slot), line);
-                                self.chunk.emit(OpCode::Pop, line);
-                                self.chunk.emit_constant(Value::Null, line);
-                            }
-                            if name == "pop" {
-                                self.chunk.emit(OpCode::GetLocal(slot), line);
-                                let pop_update_idx = self
-                                    .chunk
-                                    .add_constant(Value::Str("__pop_update".to_string()));
-                                self.chunk
-                                    .emit(OpCode::CallBuiltin(pop_update_idx, 1), line);
-                                self.chunk.emit(OpCode::SetLocal(slot), line);
-                                self.chunk.emit(OpCode::Pop, line);
-                            }
+                        // lexical bindingがあればuser callとしてcompileする。
+                        // 未解決時はruntime globalの有無でuser/builtinを選び、
+                        // 後続宣言・import・REPLでも実行時のbindingを優先する。
+                        let has_static_binding = self.resolve_local(name, line).is_ok()
+                            || self.resolve_upvalue(name).is_some();
+                        if !has_static_binding {
+                            let user_jump = self
+                                .chunk
+                                .emit_jump(OpCode::JumpIfGlobalDefined(name.clone(), 0), line);
+                            self.compile_builtin_call(name, args, line)?;
+                            let end_jump = self.chunk.emit_jump(OpCode::Jump(0), line);
+
+                            self.chunk.patch_jump(user_jump);
+                            self.compile_user_call(callee, args, line)?;
+                            self.chunk.patch_jump(end_jump);
                             return Ok(());
                         }
-                        let arg_count = args.len();
-                        for arg in args {
-                            self.compile_expr(arg, line)?;
-                        }
-                        let name_idx = self.chunk.add_constant(Value::Str(name.clone()));
-                        self.chunk
-                            .emit(OpCode::CallBuiltin(name_idx, arg_count), line);
-                        return Ok(());
                     }
                 }
-                // ユーザー定義関数呼び出し:
-                // step/depth検査 → callee評価 → callable/arity検査 → 引数評価 → Call
-                let arg_count = args.len();
-                self.chunk.emit(OpCode::PrepareCall, line);
-                if let Expr::Ident(name) = callee.as_ref() {
-                    // 未解決calleeもcompile errorにせずruntime global lookupへ落とす。
-                    // 存在しない場合の診断はtree evaluatorと同じ「未定義の関数」にする。
-                    self.compile_name_read(name, line, true);
-                } else {
-                    self.compile_expr(callee, line)?;
-                }
-                self.chunk.emit(OpCode::ValidateCall(arg_count), line);
-                for arg in args {
-                    self.compile_expr(arg, line)?;
-                }
-                self.chunk.emit(OpCode::Call(arg_count), line);
+
+                self.compile_user_call(callee, args, line)?;
             }
             Expr::List(elements) => {
                 self.chunk.emit_constant(Value::List(Vec::new()), line);
@@ -842,6 +815,110 @@ impl Compiler {
                 self.chunk.emit(OpCode::FStrConcat(part_count), line);
             }
         }
+        Ok(())
+    }
+
+    /// builtin callを現在のengine固有契約でcompileする。
+    fn compile_builtin_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<(), TsumugiError> {
+        // push/pop は第一引数のリストを破壊的に変更する
+        // → 実行後に元の変数スロットを更新する
+        if (name == "push" || name == "pop")
+            && !args.is_empty()
+            && let Expr::Ident(var_name) = &args[0]
+        {
+            let target = self.resolve_mutation_target(var_name, line);
+            let arg_count = args.len();
+            for arg in args {
+                self.compile_expr(arg, line)?;
+            }
+            let name_idx = self.chunk.add_constant(Value::Str(name.to_string()));
+            self.chunk
+                .emit(OpCode::CallBuiltin(name_idx, arg_count), line);
+            if name == "push" {
+                self.emit_set_mutation_target(&target, line);
+                self.chunk.emit(OpCode::Pop, line);
+                self.chunk.emit_constant(Value::Null, line);
+            }
+            if name == "pop" {
+                self.emit_get_mutation_target(&target, line);
+                let pop_update_idx = self
+                    .chunk
+                    .add_constant(Value::Str("__pop_update".to_string()));
+                self.chunk
+                    .emit(OpCode::CallBuiltin(pop_update_idx, 1), line);
+                self.emit_set_mutation_target(&target, line);
+                self.chunk.emit(OpCode::Pop, line);
+            }
+            return Ok(());
+        }
+
+        let arg_count = args.len();
+        for arg in args {
+            self.compile_expr(arg, line)?;
+        }
+        let name_idx = self.chunk.add_constant(Value::Str(name.to_string()));
+        self.chunk
+            .emit(OpCode::CallBuiltin(name_idx, arg_count), line);
+        Ok(())
+    }
+
+    fn resolve_mutation_target(&mut self, name: &str, line: usize) -> MutationTarget {
+        if let Ok(slot) = self.resolve_local(name, line) {
+            MutationTarget::Local(slot)
+        } else if let Some(index) = self.resolve_upvalue(name) {
+            MutationTarget::Upvalue(index)
+        } else {
+            MutationTarget::Global(name.to_string())
+        }
+    }
+
+    fn emit_get_mutation_target(&mut self, target: &MutationTarget, line: usize) {
+        match target {
+            MutationTarget::Local(slot) => self.chunk.emit(OpCode::GetLocal(*slot), line),
+            MutationTarget::Upvalue(index) => self.chunk.emit(OpCode::GetUpvalue(*index), line),
+            MutationTarget::Global(name) => {
+                self.chunk.emit(OpCode::GetGlobal(name.clone()), line);
+            }
+        }
+    }
+
+    fn emit_set_mutation_target(&mut self, target: &MutationTarget, line: usize) {
+        match target {
+            MutationTarget::Local(slot) => self.chunk.emit(OpCode::SetLocal(*slot), line),
+            MutationTarget::Upvalue(index) => self.chunk.emit(OpCode::SetUpvalue(*index), line),
+            MutationTarget::Global(name) => {
+                self.chunk.emit(OpCode::SetGlobal(name.clone()), line);
+            }
+        }
+    }
+
+    /// user function callを規範順序でcompileする。
+    fn compile_user_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<(), TsumugiError> {
+        // step/depth検査 → callee評価 → callable/arity検査 → 引数評価 → Call
+        let arg_count = args.len();
+        self.chunk.emit(OpCode::PrepareCall, line);
+        if let Expr::Ident(name) = callee {
+            // 未解決calleeもcompile errorにせずruntime global lookupへ落とす。
+            // 存在しない場合の診断はtree evaluatorと同じ「未定義の関数」にする。
+            self.compile_name_read(name, line, true);
+        } else {
+            self.compile_expr(callee, line)?;
+        }
+        self.chunk.emit(OpCode::ValidateCall(arg_count), line);
+        for arg in args {
+            self.compile_expr(arg, line)?;
+        }
+        self.chunk.emit(OpCode::Call(arg_count), line);
         Ok(())
     }
 
@@ -962,8 +1039,8 @@ impl Compiler {
         let mut fn_compiler = Compiler::new_enclosed(self.locals.clone(), ancestor_vars);
         fn_compiler.chunk.name = "<lambda>".to_string();
 
-        // ラムダ自身は slot 0（無名なので "__lambda__"）
-        fn_compiler.add_local("__lambda__".to_string());
+        // ラムダ自身は物理slot 0を使うが、sourceから参照できない内部名にする。
+        fn_compiler.add_local("<lambda>".to_string());
 
         for param in params {
             fn_compiler.add_local(param.clone());

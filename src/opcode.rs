@@ -51,6 +51,10 @@ pub enum OpCode {
     /// 値は複製せず、stack/locals_cells上の同じbindingを参照する。
     RegisterGlobal(String, usize),
 
+    /// 実行時globalに名前が登録済みなら指定位置へジャンプする。
+    /// builtin名とuser bindingのruntime fallback選択に使用する。
+    JumpIfGlobalDefined(String, usize),
+
     // --- ジャンプ ---
     /// 無条件ジャンプ（ip を指定位置に設定）
     Jump(usize),

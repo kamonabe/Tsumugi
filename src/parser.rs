@@ -965,7 +965,7 @@ impl Parser {
         if self.peek_token() == Token::Newline {
             self.advance(); // consume newline
             let body = self.parse_block(&[Token::End])?;
-            self.advance(); // consume 'end'
+            self.expect(Token::End)?;
             self.check_expr_depth(Expr::Lambda { params, body }, lambda_line)
         } else {
             // 1行ラムダ: fn(x) expr end → 暗黙的に return 扱い

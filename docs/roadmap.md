@@ -31,14 +31,14 @@
 | AUD-009 | tree REPLのstep予算を入力単位でresetする | step数がセッション全体で累積し、一度上限に達すると以後の入力も失敗。VMと不一致 | ✅ 完了（入力間回帰テスト追加） |
 | AUD-010 | for変数のclosure bindingを反復単位で統一する | `[1,2,3]`で作ったclosureがtreeは`1,2,3`、VMは全て`3` | ✅ 反復ごとのfresh cellへ統一（closure・control-flow・REPL slot再利用回帰テスト追加） |
 | AUD-011 | VMのcompile-time name resolution差を仕様化／縮小する | dead branchの未定義名、global forward reference、引数評価順がtreeと異なる | ✅ call validation順とruntime global fallbackを統一（dead code・forward read/write・mutual recursion・REPL/import回帰テスト追加） |
-| AUD-012 | context依存builtinの契約を統一する | `input(side())`等の不正arityでtreeは引数を評価せず、VMは副作用後に拒否する。`push`/`pop`はupvalue・一時List・error kindにも差がある | 🟡 callback self-binding・通常I/O処理は完了。不正arity評価順、push/pop upvalue・一時値、error kindは継続 |
+| AUD-012 | context依存builtinの契約を統一する | `input(side())`等の不正arityでtreeは引数を評価せず、VMは副作用後に拒否する。`push`/`pop`はupvalue・一時List・error kindにも差がある | 🟡 callback self-binding・通常I/O処理・push/popのlocal/upvalue/runtime global writebackは完了。不正arity評価順、一時値、error kindは継続 |
 | AUD-013 | VM index assignmentのupvalue対応と評価順を統一する | captured listへ代入不可。object取得順の違いで副作用後に古いlistを書き戻す | ⬜ 未着手 |
 | AUD-014 | equality / relational comparisonの対象型を統一する | List/Dict/Function/Error、Int×Floatでtreeはtype error、VMはboolを返す場合がある | ⬜ 仕様確定待ち |
-| AUD-029 | 複数行lambdaの終端`end`を必須検証する | `let f = fn(x)\n return x`をtree/VMとも構文エラーにせず終了コード0で受理する。EOFを`end`として無条件消費している | ⬜ 未着手（両engineで再現済み） |
+| AUD-029 | 複数行lambdaの終端`end`を必須検証する | `let f = fn(x)\n return x`をtree/VMとも構文エラーにせず終了コード0で受理する。EOFを`end`として無条件消費している | ✅ Parserで`End`を必須検証し、tree/VM共通でEOFを構文エラー化 |
 | AUD-030 | top-level importの評価時点を統一／仕様化する | `print("BEFORE")`後の失敗importでtreeだけ先行出力する。実行中に生成したmoduleもtreeだけimport可能で、VMのcompile-time inlineと観測可能な差がある | ⬜ 仕様確定待ち（両engine差を再現済み） |
-| AUD-031 | Windowsで`TSUMUGI_*`環境変数保護をcase-insensitiveにする | Windowsの環境変数検索は大文字小文字を区別しないがprefix検査は区別するため、`env("tsumugi_sandbox")`等で保護値を読める可能性がある | ⬜ 未着手（Windows実機回帰が必要） |
+| AUD-031 | Windowsで`TSUMUGI_*`環境変数保護をcase-insensitiveにする | Windowsの環境変数検索は大文字小文字を区別しないがprefix検査は区別するため、`env("tsumugi_sandbox")`等で保護値を読める可能性がある | 🟡 WindowsでUnicode uppercase後のprefixを検査し、ASCII大小文字・Unicode case aliasを保護。Windows実機CI確認待ち |
 | AUD-032 | 破壊的ファイル操作のfinal symlink意味論を修正する | 旧`check_path`は最終symlinkまでcanonicalizeし、`remove`/`remove_dir`/`rename`がlink自体ではなくlink先を削除・移動していた | ✅ 完了（中間componentのみ解決し、final directory entryを操作） |
-| AUD-037 | ローカル名前付き関数のself-bindingを両engineで統一する | 関数内で定義した再帰関数がtreeでは自身を捕捉できず`未定義の関数`、VMでは正常完了する。`factorial(5)`相当でtree失敗／VM `120`を再現 | ⬜ 未着手（両engine差を再現済み） |
+| AUD-037 | ローカル名前付き関数のself-bindingを両engineで統一する | 関数内で定義した再帰関数がtreeでは自身を捕捉できず`未定義の関数`、VMでは正常完了する。`factorial(5)`相当でtree失敗／VM `120`を再現 | ✅ 呼び出し時self-bindingとuser binding優先のbuiltin fallbackをtree/VMで統一。匿名lambdaの内部slot名も非公開化 |
 
 ### P2 — Medium / Quality
 
@@ -79,7 +79,7 @@ Criterionの平均値は次のとおり。各iterationにparseを含み、VMはc
 ### 追加監査後の推奨改修順
 
 1. **停止性:** AUD-026 / AUD-027 / AUD-028は完了。timeout・深度境界・host abortなしを継続検証する。
-2. **誤実行・安全境界:** AUD-029 / AUD-031 / AUD-037を処理し、意味論選択が必要なAUD-012 / AUD-013 / AUD-014 / AUD-030は仕様決定後に実装する。
+2. **誤実行・安全境界:** AUD-029 / AUD-037は完了。AUD-031はWindows実機CIで修正を確認後に完了とし、意味論選択が必要なAUD-012 / AUD-013 / AUD-014 / AUD-030は仕様決定後に実装する。
 3. **品質基盤:** AUD-022でtimeout・一時directory分離・厳密differential harnessを整備し、AUD-038でbenchmarkを分解してVM loop退行をprofileしてから、P2境界とfuzzを拡充する。
 
 ### 初回監査の改修境界（記録）
