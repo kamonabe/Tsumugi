@@ -1,28 +1,36 @@
+# テスト専用ディレクトリを使う（tree/VM・実行ごとに別パスなので競合しない）
+let root = path_join(env("TSG_TEST_DIR"), "fs_test")
+let sub = path_join(root, "sub")
+let old = path_join(root, "old")
+let a = path_join(sub, "a.txt")
+let b = path_join(sub, "b.txt")
+let moved = path_join(old, "a.txt")
+
 # ディレクトリ作成
-print(mkdir("/tmp/tsg_fs_test/sub"))
-print(path_exists("/tmp/tsg_fs_test/sub"))
+print(mkdir(sub))
+print(path_exists(sub))
 
 # ファイル作成
-write_file("/tmp/tsg_fs_test/sub/a.txt", "aaa")
-write_file("/tmp/tsg_fs_test/sub/b.txt", "bb")
+write_file(a, "aaa")
+write_file(b, "bb")
 
 # list_dir
-let entries = list_dir("/tmp/tsg_fs_test/sub")
+let entries = list_dir(sub)
 print(entries)
 
 # file_size
-print(file_size("/tmp/tsg_fs_test/sub/a.txt"))
-print(file_size("/tmp/tsg_fs_test/sub/b.txt"))
+print(file_size(a))
+print(file_size(b))
 
 # rename（移動）
-mkdir("/tmp/tsg_fs_test/old")
-print(rename("/tmp/tsg_fs_test/sub/a.txt", "/tmp/tsg_fs_test/old/a.txt"))
-print(path_exists("/tmp/tsg_fs_test/old/a.txt"))
+mkdir(old)
+print(rename(a, moved))
+print(path_exists(moved))
 
 # remove（ファイル削除）
-print(remove("/tmp/tsg_fs_test/sub/b.txt"))
-print(path_exists("/tmp/tsg_fs_test/sub/b.txt"))
+print(remove(b))
+print(path_exists(b))
 
 # remove_dir（再帰削除）
-print(remove_dir("/tmp/tsg_fs_test"))
-print(path_exists("/tmp/tsg_fs_test"))
+print(remove_dir(root))
+print(path_exists(root))

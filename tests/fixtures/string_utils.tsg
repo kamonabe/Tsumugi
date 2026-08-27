@@ -32,6 +32,7 @@ print(sort(["cherry", "apple", "banana"]))
 print(reverse([1, 2, 3]))
 print(reverse("hello"))
 
-# is_file / is_dir
-print(is_dir("/tmp"))
-print(is_file("/tmp"))
+# is_file / is_dir（テスト専用ディレクトリはOS非依存で必ず存在する）
+let dir = env("TSG_TEST_DIR")
+print(is_dir(dir))
+print(is_file(dir))

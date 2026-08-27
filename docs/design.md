@@ -246,10 +246,16 @@ let result = filter(test, fn(item) item != "kani" end)
 
 `tests/integration.rs` で `.tsg` ファイルをバイナリ実行し、出力を期待値と比較する。
 
-- 正常系: `tests/fixtures/<name>.tsg` + `<name>.expected`
-- エラー系: `tests/fixtures/<name>.tsg` + `<name>.expected_err`
+- 正常系: `tests/fixtures/<name>.tsg` + `<name>.expected`（終了コード0・stderr空・stdout完全一致）
+- エラー系: `tests/fixtures/<name>.tsg` + `<name>.expected_err`（終了コード非0・stderr完全一致・stdoutは `<name>.expected_out`。既定は空）
 
-テストデータ追加時は `.tsg` と `.expected` / `.expected_err` ペアを置いて `integration.rs` にテスト関数を追加するだけ。
+fixture 追加手順は、`.tsg` と期待ファイルを置き、`fixture_tests!` へ名前を1行宣言する。宣言から tree / VM 両方のテスト（`<name>::tree` / `<name>::vm`）が生成されるため、片側の登録漏れが起きない。`fixture_declarations_match_directory` が宣言とディレクトリの整合を検査するので、未宣言の fixture はテスト失敗として検出される。
+
+- OS・ロケール依存の文字列は期待ファイル側で `{*}` に逃がす（それ以外は完全一致）
+- engine 間で意図的に差が残る箇所は `<name>.expected_err.vm` で明示する
+- 期待ファイルを持たず専用テストから実行する fixture は `CUSTOM_FIXTURES`、import 先の補助ファイルは `HELPER_FIXTURES` に分類する
+- ファイルを触る fixture は `env("TSG_TEST_DIR")` で実行ごとの一時ディレクトリを受け取る（固定パスを共有しない）
+- 子プロセスは必ず制限時間付きで待つため、停止しないコードは失敗として検出される
 
 ### CI
 
@@ -675,6 +681,22 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 
 ## 変更履歴
+
+### 2026-08-27: 統合テストharnessの整備（AUD-022 harness分）
+
+**問題:** fixtureを実行する子プロセスに制限時間がなく、停止しないコードを踏むとCIがハングした。エラー系の期待ファイルは行ごとの部分一致だったため、stack traceの行番号やimportエラーのファイル名を検証できず、エラー前後のstdout副作用も未検証だった。fixtureのtree/VM登録は手書きの`#[test]`を2つ並べる方式で、片側の登録漏れを検出できなかった。さらにファイルI/O系fixtureが`/tmp`の固定パスを共有し、tree/VMの並列実行やテスト間で同じパスを読み書きしていた。
+
+**決定:** 判定は完全一致を既定とし、逃がす範囲を期待ファイル上で明示する。OS・ロケール依存の文字列だけ`{*}`ワイルドカードを許可し、engine間で意図的に残る差は`<name>.expected_err.vm`として可視化する。fixtureは1行の宣言からtree/VM両方のテストを生成し、宣言とfixtureディレクトリの整合をテストで検査する。ファイルを触るfixtureには実行ごとに専用の一時ディレクトリを渡し、固定パスを共有しない。子プロセスは必ず制限時間付きで待つ。
+
+**実装:** `wait_with_timeout`を共通ヘルパーへ移し、fixture実行・bespokeスクリプト実行・REPL実行のすべてを既定30秒で待つ。停止性を検証する`format_time_extreme`だけ2秒に短縮する。`run_fixture`が正常系（終了コード0・stderr空・stdout一致）とエラー系（終了コード非0・stderr一致・stdout一致）を判定し、`fixture_tests!`が`<fixture>::tree` / `<fixture>::vm`を生成する。`fixture_declarations_match_directory`が期待ファイル・宣言テーブル・`.tsg`の全数を突き合わせ、専用テストで実行するfixtureは`CUSTOM_FIXTURES`、import先の補助ファイルは`HELPER_FIXTURES`として分類を明示する。
+
+一時ディレクトリは`TestDir`がテスト・engine・プロセス・連番ごとに作成し、`Drop`で削除する。パスは`TSG_TEST_DIR`でスクリプトへ渡す（`TSUMUGI_`始まりは処理系が保護して`env()`から読めないため別prefix）。ファイルI/O系fixtureは`TSUMUGI_SANDBOX`もその一時ディレクトリだけに限定する。REPLのプロンプト除去は`repl_visible_lines`へ集約した。
+
+**不採用案:** 全fixtureを1つのテストでループする案はテスト名から失敗箇所が分からず、並列実行の粒度も失う。`concat_idents`相当のためにpasteクレートを追加する案は依存を増やすため、宣言側でテスト名を兼ねるモジュール名を書く方式にした。`error_stack_overflow`に129行の期待ファイルを置く案は、AUD-017のframe数差（tree 128 / VM 127）が大量の同一行に埋もれるため、frame数を数値で明示する専用テストに置き換えた。部分一致を残す案は、どこを検証していないかが期待ファイルから読み取れないため採用しない。
+
+**互換性と境界:** テスト名が`golden_<name>` / `vm_golden_<name>`から`<name>::tree` / `<name>::vm`へ変わる。fixtureを追加する際は`fixture_tests!`への宣言が必須になり、宣言しないとテストが失敗する。ファイルを触るfixtureは`/tmp`の固定パスではなく`env("TSG_TEST_DIR")`を使う。網羅matrixの拡充とfuzz導入はAUD-022の残件として継続する。
+
+**回帰テスト:** harness自身の検出力を、未登録fixtureの追加、期待stderrの1文字変更、正常系へのstderr混入、無限ループfixtureのtimeout、`{*}`を含む期待文の別メッセージ化で確認した。並列2プロセスで同じファイルI/O fixtureを実行しても競合しないこと、実行後に一時ディレクトリが残らないことも確認した。
 
 ### 2026-08-27: index assignmentの対象bindingと評価順の統一（AUD-013）
 
