@@ -682,14 +682,20 @@ pub fn builtin_mkdir(args: &[Value], line: usize) -> Result<Value, TsumugiError>
     }
 }
 
+fn remove_symlink_entry(path: &std::path::Path) -> std::io::Result<()> {
+    // Unixではremove_file、Windowsのdirectory symlink/junctionではremove_dirが必要な場合がある。
+    // どちらもfinal entry pathへ適用し、link targetは操作しない。
+    std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path))
+}
+
 pub fn builtin_remove(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("remove", args, 1, line)?;
     if let Value::Str(path) = &args[0] {
-        let safe_path = crate::sandbox::check_path(path, line)?;
-        let result = if safe_path.is_dir() {
-            std::fs::remove_dir(&safe_path)
-        } else {
-            std::fs::remove_file(&safe_path)
+        let safe_path = crate::sandbox::check_entry_path(path, line)?;
+        let result = match std::fs::symlink_metadata(&safe_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => remove_symlink_entry(&safe_path),
+            Ok(metadata) if metadata.is_dir() => std::fs::remove_dir(&safe_path),
+            _ => std::fs::remove_file(&safe_path),
         };
         Ok(Value::Bool(result.is_ok()))
     } else {
@@ -700,8 +706,12 @@ pub fn builtin_remove(args: &[Value], line: usize) -> Result<Value, TsumugiError
 pub fn builtin_remove_dir(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("remove_dir", args, 1, line)?;
     if let Value::Str(path) = &args[0] {
-        let safe_path = crate::sandbox::check_path(path, line)?;
-        Ok(Value::Bool(std::fs::remove_dir_all(&safe_path).is_ok()))
+        let safe_path = crate::sandbox::check_entry_path(path, line)?;
+        let result = match std::fs::symlink_metadata(&safe_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => remove_symlink_entry(&safe_path),
+            _ => std::fs::remove_dir_all(&safe_path),
+        };
+        Ok(Value::Bool(result.is_ok()))
     } else {
         Err(type_error(line, "remove_dir(str) の形式で使います"))
     }
@@ -710,8 +720,8 @@ pub fn builtin_remove_dir(args: &[Value], line: usize) -> Result<Value, TsumugiE
 pub fn builtin_rename(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("rename", args, 2, line)?;
     if let (Value::Str(from), Value::Str(to)) = (&args[0], &args[1]) {
-        let safe_from = crate::sandbox::check_path(from, line)?;
-        let safe_to = crate::sandbox::check_path(to, line)?;
+        let safe_from = crate::sandbox::check_entry_path(from, line)?;
+        let safe_to = crate::sandbox::check_entry_path(to, line)?;
         Ok(Value::Bool(std::fs::rename(&safe_from, &safe_to).is_ok()))
     } else {
         Err(type_error(line, "rename(str, str) の形式で使います"))

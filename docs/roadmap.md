@@ -37,7 +37,7 @@
 | AUD-029 | 複数行lambdaの終端`end`を必須検証する | `let f = fn(x)\n return x`をtree/VMとも構文エラーにせず終了コード0で受理する。EOFを`end`として無条件消費している | ⬜ 未着手（両engineで再現済み） |
 | AUD-030 | top-level importの評価時点を統一／仕様化する | `print("BEFORE")`後の失敗importでtreeだけ先行出力する。実行中に生成したmoduleもtreeだけimport可能で、VMのcompile-time inlineと観測可能な差がある | ⬜ 仕様確定待ち（両engine差を再現済み） |
 | AUD-031 | Windowsで`TSUMUGI_*`環境変数保護をcase-insensitiveにする | Windowsの環境変数検索は大文字小文字を区別しないがprefix検査は区別するため、`env("tsumugi_sandbox")`等で保護値を読める可能性がある | ⬜ 未着手（Windows実機回帰が必要） |
-| AUD-032 | 破壊的ファイル操作のfinal symlink意味論を修正する | `check_path`が最終symlinkまでcanonicalizeし、`remove`/`remove_dir`/`rename`がlink自体ではなくlink先を削除・移動する。意図しないデータ破壊につながる | ⬜ 未着手（隔離symlink回帰が必要） |
+| AUD-032 | 破壊的ファイル操作のfinal symlink意味論を修正する | 旧`check_path`は最終symlinkまでcanonicalizeし、`remove`/`remove_dir`/`rename`がlink自体ではなくlink先を削除・移動していた | ✅ 完了（中間componentのみ解決し、final directory entryを操作） |
 | AUD-037 | ローカル名前付き関数のself-bindingを両engineで統一する | 関数内で定義した再帰関数がtreeでは自身を捕捉できず`未定義の関数`、VMでは正常完了する。`factorial(5)`相当でtree失敗／VM `120`を再現 | ⬜ 未着手（両engine差を再現済み） |
 
 ### P2 — Medium / Quality
@@ -49,7 +49,7 @@
 | AUD-017 | call-depth境界を統一する | 上限128にtop-level frameを含めるVMだけ、許容user frame数が1少ない | ⬜ 未着手 |
 | AUD-018 | CLIからscript引数を渡せるようにする | `args()`を公開しているがCLIが2個目以降の非flag引数をusage errorにする | ⬜ 未着手 |
 | AUD-019 | engine固有error kind/messageを統一する | iteration/index/push/pop/map等で`runtime`/`type`/`builtin_type`が異なる | ⬜ 未着手 |
-| AUD-020 | sandboxの脅威モデルとTOCTOU制約を明記する | checkとI/O間のsymlink raceに加え、sandbox検査前のcanonicalizeによる許可外path存在oracle、空設定のfail-open意味論が未整理 | 🟡 security boundaryではないこと、fail-open、未保護資源、symlink/TOCTOU制約を文書化。実装修正と隔離環境ガイドは継続 |
+| AUD-020 | sandboxの脅威モデルとTOCTOU制約を明記する | checkとI/O間のsymlink race、sandbox検査前のcanonicalizeによる許可外path存在oracle、dangling final symlink経由の新規write/append、空設定のfail-open意味論が未整理 | 🟡 security boundaryではないこと、fail-open、未保護資源、symlink/TOCTOU制約を文書化。dangling linkを含む実装修正と隔離環境ガイドは継続 |
 | AUD-021 | language-spec / LANG_GUIDE / designのdriftを解消する | engine parity・Float完全一致・全module unit test・coverage/benchmark gate等の記載が現実装やAUD残件と矛盾する | 🟡 規範仕様と既知非適合、VMの実験的位置付け、sandbox制約、予約語、循環参照を更新。意味論確定後の更新は継続 |
 | AUD-022 | REPL・differential・limit境界・defensive VMテストを追加する | subprocess timeoutなし、error goldenが部分一致、fixture登録が手動、tree/VMが固定`/tmp`を共有して並列raceする。厳密なstderr/stdout副作用比較も不足 | 🟡 REPL transaction・limit・builtin・block scope回帰を追加。harness改善・網羅matrix・fuzzは継続 |
 | AUD-023 | VMのunchecked index/`unwrap()`を構造化internal errorへ置換する | compiler/VM invariantが崩れるとhost panic。AUD-001/002でユーザー入力から到達可能だった | ⬜ transaction修正後も防御的に継続 |
@@ -79,7 +79,7 @@ Criterionの平均値は次のとおり。各iterationにparseを含み、VMはc
 ### 追加監査後の推奨改修順
 
 1. **停止性:** AUD-026 / AUD-027 / AUD-028は完了。timeout・深度境界・host abortなしを継続検証する。
-2. **誤実行・安全境界:** AUD-029 / AUD-031 / AUD-032 / AUD-037を処理し、意味論選択が必要なAUD-012 / AUD-013 / AUD-014 / AUD-030は仕様決定後に実装する。
+2. **誤実行・安全境界:** AUD-029 / AUD-031 / AUD-037を処理し、意味論選択が必要なAUD-012 / AUD-013 / AUD-014 / AUD-030は仕様決定後に実装する。
 3. **品質基盤:** AUD-022でtimeout・一時directory分離・厳密differential harnessを整備し、AUD-038でbenchmarkを分解してVM loop退行をprofileしてから、P2境界とfuzzを拡充する。
 
 ### 初回監査の改修境界（記録）

@@ -657,11 +657,12 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 - **エラーにするか null を返すか**: ファイルI/O のサンドボックス違反はランタイムエラー（意図せぬアクセスを即座に検出するため）。env() の許可リスト外は null を返す（「存在しないキー」と同じ挙動にして、スクリプト側に漏洩情報を与えない）
 - **OnceLock による初期化**: 許可リストはプロセス起動時に一度だけ読み込む。テスト時に動的に切り替えたい場合の課題が残っている（ロードマップ「サンドボックスの OnceLock テスタビリティ」参照）
 - **import のサンドボックス対応**: canonicalize 後に check_path を呼ぶ。ファイルが存在しない場合は canonicalize が先に失敗するため、存在しないパスへの import は「ファイルが見つかりません」エラーになる（サンドボックス違反ではない）
+- **破壊的操作のdirectory entry検査**: `remove` / `remove_dir` / `rename`は中間componentをcanonicalizeしつつfinal componentを保持する`check_entry_path`を使う。final symlinkが許可範囲内ならlink entry自体だけを操作し、targetの場所は認可・操作対象にしない。中間symlinkは従来どおり解決し、許可範囲外への迂回を拒否する
 
 ### 未対応の既知の制約
 
 - **caller所有ASTの破棄**: 公開AST APIのpreflightはCompiler/Evaluator自身の再帰走査を防ぐが、借用元がParserを使わず任意深度の再帰ASTを構築した場合、そのASTの通常Dropはcaller側のhost stackを使用する
-- **シンボリックリンクとTOCTOU**: checkと実I/Oの間の置換raceを防げず、破壊的操作ではfinal symlink自体でなくlink先を削除・移動し得る。許可外pathの存在情報がcanonicalize結果から観測できる場合もある（AUD-020 / AUD-032）
+- **シンボリックリンクとsandbox制約**: 破壊的操作がfinal symlinkを決定論的にtargetへ置換する問題はAUD-032で修正した。ただしtargetが未作成のdangling final symlinkを通じた`write_file` / `append_file`は、fallback正規化がlink entryを許可範囲内と判定した後にOSが許可範囲外のtargetを作成し得る。またcheckと実I/Oの間のsymlink差し替えraceは防げず、許可外pathの存在情報がcanonicalize結果から観測できる場合もある（AUD-020）
 - **Windows環境変数**: OS側はkeyの大文字小文字を区別しないが、`TSUMUGI_` prefix保護はcase-sensitiveである（AUD-031）
 - **総ヒープメモリ制限なし**: List/Dictの要素数上限はあるが、巨大文字列、要素自身のサイズ、全コレクション合計量にはglobal quotaがなくOOMの可能性が残る
 - **input() の無制限読み込み**: 改行なしの巨大入力でOOM、入力なしで無限ブロック
