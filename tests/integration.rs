@@ -1337,6 +1337,20 @@ fn invalid_call_repl_recovers_without_argument_effects() {
 }
 
 // =============================================================
+// リグレッションテスト: index assignment の対象binding / 評価順 / in-place更新
+// =============================================================
+
+#[test]
+fn golden_index_assign_binding() {
+    run_golden_test("index_assign_binding");
+}
+
+#[test]
+fn vm_golden_index_assign_binding() {
+    run_golden_test_vm("index_assign_binding");
+}
+
+// =============================================================
 // リグレッションテスト: runtime global name visibility
 // =============================================================
 
@@ -1688,8 +1702,10 @@ fn output_text(output: &std::process::Output) -> (String, String) {
 
 #[test]
 fn vm_repl_recovers_after_compile_error() {
+    // ブロック内でlocalを追加した後にcompile errorへ到達させ、Compilerだけが
+    // 更新された状態を次入力へ持ち越さないことを検証する。
     let output = run_repl_process(
-        "if true\n    let ghost = 1\n    missing_index[0] = 2\nend\n\
+        "if true\n    let ghost = 1\n    break\nend\n\
          let live = 2\nprint(live)\nprint(ghost)\n",
         true,
         &[],
@@ -1702,7 +1718,7 @@ fn vm_repl_recovers_after_compile_error() {
         "正常な次入力が実行されていない: {stdout}"
     );
     assert!(
-        stderr.contains("未定義の変数: missing_index"),
+        stderr.contains("break はループの中でのみ使用できます"),
         "元のcompile errorがない: {stderr}"
     );
     assert!(
@@ -1854,6 +1870,47 @@ fn collection_limit_is_consistent_in_both_engines() {
         assert!(
             stdout.contains("[1, 2]\n"),
             "{mode}で失敗したpushが部分commit: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn index_assign_recovers_and_writes_across_inputs_in_both_engines() {
+    // 未定義targetはcompile errorではなくcatch可能なruntime errorとして扱い、
+    // 入力をまたいでも同じbindingへ書き込めること。
+    let source = "let shared = [1, 2]\n\
+                  missing_target[0] = 1\n\
+                  shared[0] = 9\nprint(shared)\n\
+                  fn write_shared()\n    shared[1] = 8\nend\n\
+                  write_shared()\nprint(shared)\n\
+                  let capture = fn()\n    shared[0] = 7\nend\n\
+                  capture()\nprint(shared)\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("未定義の変数: missing_target"),
+            "{mode}で未定義targetが報告されていない: {stderr}"
+        );
+        assert!(
+            stdout.contains("[9, 2]\n"),
+            "{mode}で失敗入力後のindex代入が実行されていない: {stdout}"
+        );
+        assert!(
+            stdout.contains("[9, 8]\n"),
+            "{mode}で関数内からのglobal index代入が反映されていない: {stdout}"
+        );
+        assert!(
+            stdout.contains("[7, 8]\n"),
+            "{mode}でclosureが同じbindingを更新していない: {stdout}"
+        );
+        assert!(
+            !stderr.contains("panicked at"),
+            "{mode}でhost panic: {stderr}"
         );
     }
 }

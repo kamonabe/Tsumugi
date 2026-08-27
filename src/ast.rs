@@ -20,9 +20,12 @@ pub enum Stmt {
         line: usize,
     },
 
-    /// expr[expr] = expr（インデックス代入）
+    /// name[expr] = expr（インデックス代入）
+    ///
+    /// 代入対象は識別子に限る。パーサーが `ident[...] =` の形だけを
+    /// この文として受理するため、対象が変数でない状態は表現できない。
     IndexAssign {
-        object: Expr,
+        name: String,
         index: Expr,
         value: Expr,
         line: usize,
@@ -217,15 +220,9 @@ fn excessive_depth_line(mut worklist: Vec<(AstNode<'_>, usize, usize)>) -> Optio
                 | Stmt::Return { value, .. } => {
                     worklist.push((AstNode::Expr(value), child_depth, line));
                 }
-                Stmt::IndexAssign {
-                    object,
-                    index,
-                    value,
-                    ..
-                } => {
+                Stmt::IndexAssign { index, value, .. } => {
                     worklist.push((AstNode::Expr(value), child_depth, line));
                     worklist.push((AstNode::Expr(index), child_depth, line));
-                    worklist.push((AstNode::Expr(object), child_depth, line));
                 }
                 Stmt::If {
                     condition,

@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use crate::chunk::Chunk;
 use crate::error::TsumugiError;
-use crate::opcode::OpCode;
+use crate::opcode::{MutationTarget, OpCode};
 use crate::value::{SharedValue, Value};
 
 /// コールフレーム: 関数呼び出しの状態を保存する
@@ -53,6 +53,15 @@ struct TryHandler {
     /// unwind時はこの境界より後ろのtry-local cellだけを破棄する。境界内の既存localが
     /// try中に初めてcell化された場合、その昇格はcatch後も維持する。
     locals_count: usize,
+}
+
+/// binding の値が置かれている場所
+///
+/// cell化済みならヒープ上のセル、未cell化ならスタックスロットを指す。
+/// 破壊的更新をbinding全体の書き戻しなしで適用するために使う。
+enum BindingStorage {
+    Cell(SharedValue),
+    Stack(usize),
 }
 
 /// スタックベースの仮想マシン
@@ -398,6 +407,93 @@ impl Vm {
         })
     }
 
+    /// runtime globalが定義済みかだけを検査する（値は読み出さない）。
+    /// 破壊的更新の対象bindingを、他の被演算子の評価前に検証するために使う。
+    fn require_global(&self, name: &str, line: usize) -> Result<(), TsumugiError> {
+        if self.globals.contains_key(name) {
+            return Ok(());
+        }
+        Err(TsumugiError::runtime_with_kind(
+            line,
+            crate::error::ErrorKind::Name,
+            format!("未定義の変数: {}", name),
+        ))
+    }
+
+    /// binding の値が置かれている場所を解決する（値は複製しない）。
+    fn resolve_binding_storage(
+        &self,
+        target: &MutationTarget,
+        line: usize,
+    ) -> Result<BindingStorage, TsumugiError> {
+        match target {
+            MutationTarget::Local(slot) => {
+                let frame = self.frames.last().ok_or_else(|| {
+                    TsumugiError::runtime_with_kind(
+                        line,
+                        crate::error::ErrorKind::Internal,
+                        "local参照用のframeがありません",
+                    )
+                })?;
+                if let Some(Some(cell)) = frame.locals_cells.get(*slot) {
+                    return Ok(BindingStorage::Cell(Rc::clone(cell)));
+                }
+                let stack_index = frame.base.checked_add(*slot).ok_or_else(|| {
+                    TsumugiError::runtime_with_kind(
+                        line,
+                        crate::error::ErrorKind::Internal,
+                        "local slotの計算がオーバーフローしました",
+                    )
+                })?;
+                Ok(BindingStorage::Stack(stack_index))
+            }
+            MutationTarget::Upvalue(index) => {
+                let frame = self.frames.last().ok_or_else(|| {
+                    TsumugiError::runtime_with_kind(
+                        line,
+                        crate::error::ErrorKind::Internal,
+                        "upvalue参照用のframeがありません",
+                    )
+                })?;
+                let cell = frame.upvalues.get(*index).ok_or_else(|| {
+                    TsumugiError::runtime_with_kind(
+                        line,
+                        crate::error::ErrorKind::Internal,
+                        format!("upvalue indexが不正です: {}", index),
+                    )
+                })?;
+                Ok(BindingStorage::Cell(Rc::clone(cell)))
+            }
+            MutationTarget::Global(name) => {
+                let slot = self.globals.get(name).copied().ok_or_else(|| {
+                    TsumugiError::runtime_with_kind(
+                        line,
+                        crate::error::ErrorKind::Name,
+                        format!("未定義の変数: {}", name),
+                    )
+                })?;
+                let frame = self.frames.first().ok_or_else(|| {
+                    TsumugiError::runtime_with_kind(
+                        line,
+                        crate::error::ErrorKind::Internal,
+                        "global参照用のtop-level frameがありません",
+                    )
+                })?;
+                if let Some(Some(cell)) = frame.locals_cells.get(slot) {
+                    return Ok(BindingStorage::Cell(Rc::clone(cell)));
+                }
+                let stack_index = frame.base.checked_add(slot).ok_or_else(|| {
+                    TsumugiError::runtime_with_kind(
+                        line,
+                        crate::error::ErrorKind::Internal,
+                        "global slotの計算がオーバーフローしました",
+                    )
+                })?;
+                Ok(BindingStorage::Stack(stack_index))
+            }
+        }
+    }
+
     /// runtime globalを更新する。既存cellがあればcell、なければtop-level stackへ書く。
     fn set_global(&mut self, name: &str, value: Value, line: usize) -> Result<(), TsumugiError> {
         let slot = self.globals.get(name).copied().ok_or_else(|| {
@@ -609,6 +705,9 @@ impl Vm {
                 if self.globals.contains_key(&name) {
                     self.frames.last_mut().unwrap().ip = target;
                 }
+            }
+            OpCode::RequireGlobal(name) => {
+                self.require_global(&name, line)?;
             }
             OpCode::Jump(target) => {
                 self.frames.last_mut().unwrap().ip = target;
@@ -915,12 +1014,10 @@ impl Vm {
                     ));
                 }
             }
-            OpCode::SetIndex => {
+            OpCode::SetIndex(target) => {
                 let value = self.pop(line)?;
                 let index = self.pop(line)?;
-                let collection = self.pop(line)?;
-                let updated = self.set_index(collection, index, value, line)?;
-                self.stack.push(updated);
+                self.assign_index_binding(&target, &index, value, line)?;
             }
             OpCode::ToIterList => {
                 let value = self.pop(line)?;
@@ -1064,44 +1161,32 @@ impl Vm {
         }
     }
 
-    /// インデックス代入
-    fn set_index(
-        &self,
-        mut collection: Value,
-        index: Value,
+    /// インデックス代入を対象bindingへin-placeで適用する。
+    ///
+    /// binding全体を書き戻さないため、index/valueの評価中に同じbindingへ
+    /// 加えられた変更を上書きしない。境界判定とエラーメッセージは
+    /// `builtin_core::assign_index` に集約し、tree evaluatorと共有する。
+    fn assign_index_binding(
+        &mut self,
+        target: &MutationTarget,
+        index: &Value,
         value: Value,
         line: usize,
-    ) -> Result<Value, TsumugiError> {
-        match (&mut collection, &index) {
-            (Value::List(list), Value::Int(i)) => {
-                let idx = if *i < 0 {
-                    (list.len() as i64 + i) as usize
-                } else {
-                    *i as usize
-                };
-                if idx >= list.len() {
-                    return Err(TsumugiError::runtime(
-                        line,
-                        format!("インデックス範囲外: {} (長さ: {})", i, list.len()),
-                    ));
-                }
-                list[idx] = value;
-                Ok(collection)
+    ) -> Result<(), TsumugiError> {
+        match self.resolve_binding_storage(target, line)? {
+            BindingStorage::Cell(cell) => {
+                crate::builtin_core::assign_index(&mut cell.borrow_mut(), index, value, line)
             }
-            (Value::Dict(map), Value::Str(key)) => {
-                if !map.contains_key(key) {
-                    crate::builtin_core::check_collection_size_public(
-                        map.len().saturating_add(1),
+            BindingStorage::Stack(stack_index) => {
+                let slot = self.stack.get_mut(stack_index).ok_or_else(|| {
+                    TsumugiError::runtime_with_kind(
                         line,
-                    )?;
-                }
-                map.insert(key.clone(), value);
-                Ok(collection)
+                        crate::error::ErrorKind::Internal,
+                        "インデックス代入の対象slotが不正です",
+                    )
+                })?;
+                crate::builtin_core::assign_index(slot, index, value, line)
             }
-            _ => Err(TsumugiError::runtime(
-                line,
-                "辞書のキーは文字列である必要があります",
-            )),
         }
     }
 

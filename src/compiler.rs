@@ -10,7 +10,7 @@ use crate::ast::{
 use crate::chunk::Chunk;
 use crate::error::TsumugiError;
 use crate::limits::MAX_IMPORT_DEPTH;
-use crate::opcode::OpCode;
+use crate::opcode::{MutationTarget, OpCode};
 use crate::value::Value;
 
 /// ローカル変数の情報
@@ -19,14 +19,6 @@ struct Local {
     name: String,
     /// スコープの深さ（0 = トップレベル）
     depth: usize,
-}
-
-/// push/pop後に更新したListを書き戻すbinding。
-#[derive(Debug, Clone)]
-enum MutationTarget {
-    Local(usize),
-    Upvalue(usize),
-    Global(String),
 }
 
 /// ループのコンパイル状態（break/continue のパッチに使う）
@@ -193,28 +185,24 @@ impl Compiler {
                 self.chunk.emit(OpCode::Pop, *line);
             }
             Stmt::IndexAssign {
-                object,
+                name,
                 index,
                 value,
                 line,
             } => {
-                // object が変数参照の場合、更新後の値を元のスロットに書き戻す
-                if let Expr::Ident(name) = object {
-                    let slot = self.resolve_local(name, *line)?;
-                    self.chunk.emit(OpCode::GetLocal(slot), *line);
-                    self.compile_expr(index, *line)?;
-                    self.compile_expr(value, *line)?;
-                    self.chunk.emit(OpCode::SetIndex, *line);
-                    self.chunk.emit(OpCode::SetLocal(slot), *line);
-                    self.chunk.emit(OpCode::Pop, *line);
-                } else {
-                    // ネストされたインデックス代入は未サポート
-                    return Err(TsumugiError::runtime_with_kind(
-                        *line,
-                        crate::error::ErrorKind::Runtime,
-                        "VM未対応: ネストされたインデックス代入",
-                    ));
+                // 規範順序: target binding解決 → index → value → in-place更新。
+                // targetはlocal/upvalue/globalのいずれでもよく、引数評価前に
+                // 解決してupvalueキャプチャを確定させる（push/popと同じ扱い）。
+                let target = self.resolve_mutation_target(name, *line);
+                if let MutationTarget::Global(global) = &target {
+                    // 未定義bindingはindex/valueの副作用より先に報告する
+                    // （treeのget_cell検査と同じ順序）。
+                    self.chunk
+                        .emit(OpCode::RequireGlobal(global.clone()), *line);
                 }
+                self.compile_expr(index, *line)?;
+                self.compile_expr(value, *line)?;
+                self.chunk.emit(OpCode::SetIndex(target), *line);
             }
             Stmt::ExprStmt { expr, line } => {
                 self.compile_expr(expr, *line)?;

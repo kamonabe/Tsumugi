@@ -150,6 +150,62 @@ pub fn builtin_len(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     }
 }
 
+/// `target[index] = value` を対象コレクションへ in-place で適用する。
+///
+/// ツリーウォーク評価器と VM の双方がこの関数だけを使うため、境界判定・
+/// コレクション上限・エラーメッセージは両エンジンで同一になる。
+/// 呼び出し側は index と value を評価し終えた後に呼ぶこと（規範評価順）。
+pub fn assign_index(
+    target: &mut Value,
+    index: &Value,
+    value: Value,
+    line: usize,
+) -> Result<(), TsumugiError> {
+    match target {
+        Value::List(list) => {
+            let i = match index {
+                Value::Int(n) => *n,
+                _ => {
+                    return Err(TsumugiError::runtime(
+                        line,
+                        "リストのインデックスは整数である必要があります",
+                    ));
+                }
+            };
+            let len = list.len() as i64;
+            let actual_idx = if i < 0 { len + i } else { i };
+            if actual_idx < 0 || actual_idx >= len {
+                return Err(TsumugiError::runtime(
+                    line,
+                    format!("インデックス範囲外: {} (長さ: {})", i, len),
+                ));
+            }
+            list[actual_idx as usize] = value;
+            Ok(())
+        }
+        Value::Dict(map) => {
+            let key = match index {
+                Value::Str(s) => s.clone(),
+                _ => {
+                    return Err(TsumugiError::runtime(
+                        line,
+                        "辞書のキーは文字列である必要があります",
+                    ));
+                }
+            };
+            if !map.contains_key(&key) {
+                check_collection_size(map.len().saturating_add(1), line)?;
+            }
+            map.insert(key, value);
+            Ok(())
+        }
+        _ => Err(TsumugiError::runtime(
+            line,
+            "インデックス代入はリストまたは辞書にのみ使用できます",
+        )),
+    }
+}
+
 pub fn builtin_push(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("push", args, 2, line)?;
     let mut list = args[0].clone();

@@ -1,5 +1,16 @@
 //! バイトコード命令セット
 
+/// 破壊的更新の対象となる binding。
+///
+/// `push` / `pop` の書き戻しと、インデックス代入の in-place 更新で共有する。
+/// local / upvalue はコンパイル時に解決し、それ以外は実行時 global として扱う。
+#[derive(Debug, Clone, PartialEq)]
+pub enum MutationTarget {
+    Local(usize),
+    Upvalue(usize),
+    Global(String),
+}
+
 /// VM が実行する命令
 #[derive(Debug, Clone, PartialEq)]
 pub enum OpCode {
@@ -54,6 +65,10 @@ pub enum OpCode {
     /// 実行時globalに名前が登録済みなら指定位置へジャンプする。
     /// builtin名とuser bindingのruntime fallback選択に使用する。
     JumpIfGlobalDefined(String, usize),
+
+    /// 実行時globalが定義済みであることだけを検査する（値は積まない）。
+    /// 破壊的更新の対象bindingを、他の被演算子の評価前に検証するために使う。
+    RequireGlobal(String),
 
     // --- ジャンプ ---
     /// 無条件ジャンプ（ip を指定位置に設定）
@@ -123,8 +138,11 @@ pub enum OpCode {
     /// 辞書ビルド用: スタックの [dict, key, value] → dict に key:value を挿入 → dict を残す
     DictInsert,
 
-    /// インデックス代入: スタックの [collection, index, value] → collection[index] = value
-    SetIndex,
+    /// インデックス代入: スタックの [index, value] を pop し、
+    /// 対象 binding が保持するコレクションを in-place で更新する（値は積まない）。
+    /// binding 全体を書き戻さないため、index/value の評価中に同じ binding へ
+    /// 加えられた変更を上書きしない。
+    SetIndex(MutationTarget),
 
     /// for ループ用: コレクションをイテレート可能なリストに変換
     /// List → そのまま、Dict → keys のリスト、Str → 1文字ずつのリスト

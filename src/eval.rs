@@ -233,76 +233,22 @@ impl Evaluator {
             }
 
             Stmt::IndexAssign {
-                object,
+                name,
                 index,
                 value,
                 line,
             } => {
+                // 規範順序: target binding解決 → index → value → in-place更新。
+                // bindingを先に解決するため、未定義変数はindex/valueの副作用より前に報告する。
+                let cell = self.env.get_cell(name).ok_or_else(|| {
+                    TsumugiError::runtime(*line, format!("未定義の変数: {}", name))
+                })?;
                 let idx = self.eval_expr(index, *line)?;
                 let val = self.eval_expr(value, *line)?;
 
-                // object は変数参照であるはず
-                let var_name = match object {
-                    Expr::Ident(name) => name.clone(),
-                    _ => {
-                        return Err(TsumugiError::runtime(
-                            *line,
-                            "インデックス代入の対象は変数である必要があります",
-                        ));
-                    }
-                };
-
-                let cell = self.env.get_cell(&var_name).ok_or_else(|| {
-                    TsumugiError::runtime(*line, format!("未定義の変数: {}", var_name))
-                })?;
-
-                let mut target = cell.borrow_mut();
-                match &mut *target {
-                    Value::List(list) => {
-                        let i = match &idx {
-                            Value::Int(n) => *n,
-                            _ => {
-                                return Err(TsumugiError::runtime(
-                                    *line,
-                                    "リストのインデックスは整数である必要があります",
-                                ));
-                            }
-                        };
-                        let len = list.len() as i64;
-                        let actual_idx = if i < 0 { len + i } else { i };
-                        if actual_idx < 0 || actual_idx >= len {
-                            return Err(TsumugiError::runtime(
-                                *line,
-                                format!("インデックス範囲外: {} (長さ: {})", i, len),
-                            ));
-                        }
-                        list[actual_idx as usize] = val;
-                    }
-                    Value::Dict(map) => {
-                        let key = match &idx {
-                            Value::Str(s) => s.clone(),
-                            _ => {
-                                return Err(TsumugiError::runtime(
-                                    *line,
-                                    "辞書のキーは文字列である必要があります",
-                                ));
-                            }
-                        };
-                        if !map.contains_key(&key) {
-                            crate::builtin_core::check_collection_size_public(
-                                map.len().saturating_add(1),
-                                *line,
-                            )?;
-                        }
-                        map.insert(key, val);
-                    }
-                    _ => {
-                        return Err(TsumugiError::runtime(
-                            *line,
-                            "インデックス代入はリストまたは辞書にのみ使用できます",
-                        ));
-                    }
-                }
+                // 更新はcellへのin-place代入。index/valueの評価中に同じbindingが
+                // 変更されていても、その最新状態に対して書き込む。
+                crate::builtin_core::assign_index(&mut cell.borrow_mut(), &idx, val, *line)?;
 
                 Ok(EvalResult::Val)
             }

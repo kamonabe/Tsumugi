@@ -742,5 +742,5 @@ This guide and `docs/language-spec.md` describe the normative language. Both exe
 When generating portable `.tsg` code:
 
 - Use string literals or expressions that evaluate to strings for Dict keys. The parser may accept another expression form, but runtime semantics require a String key.
-- Do not depend on equality for List, Dict, Function, or Error values, mixed Int/Float comparison, same-scope redeclaration cell identity, captured collection index assignment, or import side-effect timing until the engine-parity issues are resolved.
+- Do not depend on equality for List, Dict, Function, or Error values, mixed Int/Float comparison, same-scope redeclaration cell identity, or import side-effect timing until the engine-parity issues are resolved.
 - Treat `TSUMUGI_SANDBOX` and resource limits as defense-in-depth, not as isolation for untrusted code.

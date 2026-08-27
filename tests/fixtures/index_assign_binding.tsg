@@ -1,0 +1,181 @@
+# index assignment: 対象binding種別 / 評価順 / in-place更新
+
+# --- 対象bindingの種別 ---
+
+# closureがキャプチャしたlist（upvalue）
+let counter = [0]
+let bump = fn()
+    counter[0] = counter[0] + 1
+end
+bump()
+bump()
+print(counter[0])
+
+# closureがキャプチャしたdict（upvalue）
+let config = {"count": 0}
+let record = fn(value)
+    config["count"] = value
+end
+record(7)
+print(config["count"])
+
+# 多段クロージャからのキャプチャ
+fn nested_capture()
+    let box = [0]
+    let middle = fn()
+        let inner = fn()
+            box[0] = box[0] + 10
+        end
+        inner()
+    end
+    middle()
+    return box
+end
+print(nested_capture())
+
+# 逃げたclosureごとに独立した状態を保持する
+fn make_counter()
+    let state = [0]
+    return fn()
+        state[0] = state[0] + 1
+        return state[0]
+    end
+end
+let first = make_counter()
+let second = make_counter()
+print(first())
+print(first())
+print(second())
+
+# 関数内からtop-level binding（runtime global）へ代入する
+let shared_list = [1, 2, 3]
+let shared_dict = {"key": "before"}
+fn write_shared()
+    shared_list[0] = 99
+    shared_dict["key"] = "after"
+end
+write_shared()
+print(shared_list)
+print(shared_dict["key"])
+
+# 宣言前のbindingへはruntime Name errorになりcatch可能
+fn write_later()
+    later_list[0] = "written"
+end
+try
+    write_later()
+catch forward_error
+    print("forward-" + forward_error["type"])
+end
+let later_list = ["before"]
+write_later()
+print(later_list)
+
+# 関数引数（local）とforループ変数
+fn overwrite_first(items)
+    items[0] = "X"
+    return items
+end
+print(overwrite_first([1, 2]))
+
+for row in [[1, 2], [3, 4]]
+    row[0] = 0
+    print(row)
+end
+
+# 負のインデックスと新規キー追加
+let signed = [1, 2, 3]
+signed[-1] = 30
+print(signed)
+let fresh = {}
+fresh["a"] = 1
+fresh["a"] = 2
+print(fresh)
+
+# --- 評価順: target解決 → index → value ---
+
+fn note(tag, value)
+    print("note-" + tag)
+    return value
+end
+
+# 未定義targetはindex/valueの副作用より前に報告する
+try
+    missing_target[note("index-not-run", 0)] = note("value-not-run", 1)
+catch target_error
+    print("target-" + target_error["type"] + "-" + target_error["message"])
+end
+
+# indexとvalueは左から右へ評価する
+let ordered = [0, 0]
+ordered[note("index", 1)] = note("value", 5)
+print(ordered)
+
+# --- in-place更新: index/value評価中の変更を上書きしない ---
+
+# valueの評価中に加えられた別要素への変更を保持する
+let kept = [1, 2, 3]
+fn touch_second()
+    kept[1] = 20
+    return 10
+end
+kept[0] = touch_second()
+print(kept)
+
+# indexの評価でtargetが伸びた場合、伸びた後のlistへ書き込む
+let grown = [1]
+fn extend_grown()
+    push(grown, 2)
+    return 1
+end
+grown[extend_grown()] = 7
+print(grown)
+
+# valueの評価でtargetが縮んだ場合、縮んだ後の長さで境界判定する
+let shrunk = [1, 2]
+fn shrink_shrunk()
+    pop(shrunk)
+    return 5
+end
+try
+    shrunk[1] = shrink_shrunk()
+catch bounds_error
+    print("bounds-" + bounds_error["type"] + "-" + bounds_error["message"])
+end
+print(shrunk)
+
+# --- 型・境界エラーのメッセージ ---
+
+let list_target = [1, 2]
+try
+    list_target["key"] = 1
+catch list_key_error
+    print("list-key-" + list_key_error["type"] + "-" + list_key_error["message"])
+end
+try
+    list_target[2] = 1
+catch upper_error
+    print("upper-" + upper_error["type"] + "-" + upper_error["message"])
+end
+try
+    list_target[-3] = 1
+catch lower_error
+    print("lower-" + lower_error["type"] + "-" + lower_error["message"])
+end
+
+let dict_target = {"a": 1}
+try
+    dict_target[0] = 1
+catch dict_key_error
+    print("dict-key-" + dict_key_error["type"] + "-" + dict_key_error["message"])
+end
+
+let scalar_target = 5
+try
+    scalar_target[0] = 1
+catch scalar_error
+    print("scalar-" + scalar_error["type"] + "-" + scalar_error["message"])
+end
+print(list_target)
+print(dict_target)
+print(scalar_target)
