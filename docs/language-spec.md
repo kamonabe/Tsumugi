@@ -1,6 +1,6 @@
 # Tsumugi 言語仕様
 
-バージョン: 0.5
+バージョン: 0.6
 
 最終更新: 2026-08-27
 
@@ -10,7 +10,7 @@
 
 ### 現在の既知非適合
 
-現行実装には、比較対象型、同一scopeでの再宣言、captured collectionへのindex代入、context依存builtinの評価順、top-level importの評価時点、未捕捉REPLエラー後の状態に両engine差がある。また、`path_join`の非文字列argument無視は両engine共通の仕様違反である。これらの挙動へ依存するコードは移植可能とみなさない。
+現行実装には、比較対象型、同一scopeでの再宣言、captured collectionへのindex代入、top-level importの評価時点、未捕捉REPLエラー後の状態に両engine差がある。また、`path_join`の非文字列argument無視は両engine共通の仕様違反である。これらの挙動へ依存するコードは移植可能とみなさない。
 
 本書の文法どおり、複数行lambdaの終端`end`は必須である。
 
@@ -404,6 +404,21 @@ let result = add(3, 4)
 
 上記のユーザー関数呼び出し順序は、builtinとユーザーbindingの選択後にユーザー関数が選ばれた場合の契約である。組み込み関数は、破壊的更新やcallbackなど各関数固有の契約に従う。
 
+### コンテキスト依存組み込み関数の呼び出し順序
+
+`input`、`args`、`exit`、`push`、`pop`、`map`、`filter`、`each`は、ユーザーbindingよりbuiltinが選ばれた後、次の順で処理する。
+
+1. 引数の個数を検査する
+2. `push` / `pop`では、第1引数のsource式が識別子であることを検査する
+3. 引数を左から右へ評価する
+4. 評価済みの値について型・状態を検査し、builtin本体を実行する
+
+引数個数が不正な場合、または`push` / `pop`の第1引数が識別子でない場合、引数式は一つも評価しない。前者は`argument`、後者は`builtin_type`エラーとする。`print`は可変長引数を左から右へ評価する。その他の共通builtinは、引数を左から右へ評価してから関数固有の個数・型検査を行う。
+
+`push` / `pop`の第1引数は、実行時に存在するList bindingでなければならない。local、captured binding、runtime globalを使用できるが、List literal、index式、関数の戻り値などの一時値は指定できない。`push`は第1引数の値を読み取ってから第2引数を評価し、そのsnapshotへ値を追加して同じbindingへ書き戻し、`null`を返す。第2引数の評価中に同じbindingが再代入・変更されても、最終的には先に読み取ったsnapshotを基にしたListを書き戻す。`pop`は末尾要素を除いたListを書き戻し、取り出した要素を返す。非List bindingと空Listからの`pop`は`builtin_type`エラーとする。
+
+`map` / `filter` / `each`は外側の2引数を左から右へ評価した後で、第1引数がListか検査する。callbackのcallable・arity検査は各要素を処理するときに行い、空Listではcallbackを呼び出さない。
+
 ### 第一級関数
 
 関数は値として扱える。変数に代入したり、別の関数に引数として渡したりできる。
@@ -685,8 +700,8 @@ end
 |---|---|
 | `print(値, ...)` | 値を標準出力に表示。複数引数はスペース区切りで出力 |
 | `len(x)` | 文字列・リスト・辞書の長さを返す |
-| `push(list, val)` | リストの末尾に値を追加（破壊的操作） |
-| `pop(list)` | リストの末尾の値を取り出して返す（破壊的操作） |
+| `push(list_variable, val)` | List変数の末尾へ値を追加して同じbindingへ書き戻し、nullを返す（破壊的操作） |
+| `pop(list_variable)` | List変数の末尾の値を取り出して返し、残りを同じbindingへ書き戻す（破壊的操作） |
 | `keys(dict)` | 辞書のキー一覧をリストで返す |
 | `type(x)` | 値の型名を文字列で返す |
 | `slice(collection, start, end)` | リスト/文字列の部分を切り出す（start から end の手前まで） |

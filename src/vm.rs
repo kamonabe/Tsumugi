@@ -947,6 +947,14 @@ impl Vm {
                 };
                 self.stack.push(list);
             }
+            OpCode::ValidateBuiltinCall(name, arg_count, first_arg_is_identifier) => {
+                crate::builtin_core::validate_context_builtin_call(
+                    &name,
+                    arg_count,
+                    first_arg_is_identifier,
+                    line,
+                )?;
+            }
             OpCode::CallBuiltin(name_idx, arg_count) => {
                 let name = match &self.frames.last().unwrap().chunk.constants[name_idx] {
                     Value::Str(s) => s.clone(),
