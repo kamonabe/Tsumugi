@@ -2,6 +2,17 @@
 //!
 //! ツリーウォーク版（デフォルト）と VM 版（--vm）の両方で同じ fixture を回し、
 //! 両実行方式で同じ言語仕様を満たすことを保証する。
+//!
+//! ハーネスの規約:
+//! - fixture は `fixture_tests!` に1行宣言すると tree/VM 両方のテストが生成される。
+//!   `fixture_declarations_match_directory` がディレクトリとの整合を検査するため、
+//!   宣言漏れの fixture は残らない。
+//! - 判定は完全一致。正常系は stdout（stderrは空）、エラー系は stderr と stdout の
+//!   両方を検証する。OS依存の文字列だけ期待ファイル側で `{*}` に逃がせる。
+//! - engine間で意図的に差が残る箇所は `<name>.expected_err.vm` で明示する。
+//! - 子プロセスは必ず制限時間付きで待つ。ハングはテスト失敗として検出する。
+//! - ファイルを触る fixture には実行ごとに専用の一時ディレクトリを渡す
+//!   （`TSG_TEST_DIR`）。固定パスを共有しないため並列・連続実行で競合しない。
 
 use std::path::Path;
 use std::process::Command;
@@ -15,586 +26,587 @@ fn fixtures_dir() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-/// 正常系: .tsg を実行して stdout が .expected と一致することを確認
-fn run_golden_test(name: &str) {
-    run_golden_test_mode(name, false);
+/// 子プロセスの既定実行上限。ハングをテスト失敗として検出する。
+const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// fixture がスクリプトへ渡す一時ディレクトリのキー。
+///
+/// `TSUMUGI_` 始まりは処理系が保護して `env()` から読めないため、別prefixを使う。
+const TEST_DIR_ENV: &str = "TSG_TEST_DIR";
+
+/// fixture の判定方式
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixtureKind {
+    /// 終了コード0・stderr空・stdoutが `.expected` と完全一致
+    Golden,
+    /// 終了コード非0・stderrが `.expected_err` と完全一致・stdoutが `.expected_out`（既定は空）と一致
+    Error,
 }
 
-/// 正常系（VM版）: --vm フラグ付きで実行
-fn run_golden_test_vm(name: &str) {
-    run_golden_test_mode(name, true);
-}
+/// 子プロセスの完了を待つ。制限時間を超えたら kill して失敗させる。
+fn wait_with_timeout(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+    context: &str,
+) -> std::process::Output {
+    let deadline = std::time::Instant::now() + timeout;
 
-/// 正常系の共通実装
-fn run_golden_test_mode(name: &str, use_vm: bool) {
-    let dir = fixtures_dir();
-    let script = dir.join(format!("{}.tsg", name));
-    let expected_file = dir.join(format!("{}.expected", name));
-
-    let expected = std::fs::read_to_string(&expected_file)
-        .unwrap_or_else(|_| panic!("期待出力ファイルが読めません: {:?}", expected_file));
-
-    let mut cmd = Command::new(tsumugi_bin());
-    if use_vm {
-        cmd.arg("--vm");
-    }
-    cmd.arg(script.to_str().unwrap());
-
-    let output = cmd.output().expect("tsumugi バイナリの実行に失敗");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mode = if use_vm { "VM" } else { "tree-walk" };
-
-    // 正常系テストは終了コード 0 を期待
-    assert!(
-        output.status.success(),
-        "ゴールデンテストが異常終了しました [{}]: {}\n--- stderr ---\n{}",
-        mode,
-        name,
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    // Windows の CRLF を LF に正規化して比較
-    let actual = stdout.replace("\r\n", "\n");
-    let expect = expected.replace("\r\n", "\n");
-
-    assert_eq!(
-        actual.trim_end(),
-        expect.trim_end(),
-        "ゴールデンテスト失敗 [{}]: {}\n--- 実際の出力 ---\n{}\n--- 期待出力 ---\n{}",
-        mode,
-        name,
-        actual,
-        expect
-    );
-}
-
-/// エラー系: .tsg を実行して stderr に期待メッセージが含まれることを確認
-fn run_error_test(name: &str) {
-    run_error_test_mode(name, false);
-}
-
-/// エラー系（VM版）
-fn run_error_test_vm(name: &str) {
-    run_error_test_mode(name, true);
-}
-
-/// エラー系の共通実装
-fn run_error_test_mode(name: &str, use_vm: bool) {
-    let dir = fixtures_dir();
-    let script = dir.join(format!("{}.tsg", name));
-    let expected_err_file = dir.join(format!("{}.expected_err", name));
-
-    let expected_err = std::fs::read_to_string(&expected_err_file)
-        .unwrap_or_else(|_| panic!("期待エラーファイルが読めません: {:?}", expected_err_file));
-
-    let mut cmd = Command::new(tsumugi_bin());
-    if use_vm {
-        cmd.arg("--vm");
-    }
-    cmd.arg(script.to_str().unwrap());
-
-    let output = cmd.output().expect("tsumugi バイナリの実行に失敗");
-
-    let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
-    let mode = if use_vm { "VM" } else { "tree-walk" };
-
-    for line in expected_err.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child.wait_with_output().unwrap_or_else(|error| {
+                    panic!("{context}: プロセスの出力取得に失敗: {error}")
+                });
+            }
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{context}: {}秒以内に完了しませんでした", timeout.as_secs());
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{context}: プロセス状態の取得に失敗: {error}");
+            }
         }
+    }
+}
+
+/// テスト専用の一時ディレクトリ。tree/VM・テストごとに別パスを使い、
+/// 並列実行や連続実行で同じパスを共有しないようにする。
+struct TestDir {
+    path: std::path::PathBuf,
+}
+
+impl TestDir {
+    fn new(label: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "tsumugi-it-{}-{}-{}",
+            label,
+            std::process::id(),
+            unique
+        ));
+        std::fs::remove_dir_all(&path).ok();
+        std::fs::create_dir_all(&path)
+            .unwrap_or_else(|error| panic!("一時ディレクトリの作成に失敗 {path:?}: {error}"));
+        Self { path }
+    }
+
+    fn as_str(&self) -> &str {
+        self.path
+            .to_str()
+            .expect("一時ディレクトリのパスがUTF-8ではありません")
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+/// fixture 固有の追加環境変数。fixture 名からここだけで決める。
+fn fixture_envs(name: &str, test_dir: &str) -> Vec<(String, String)> {
+    let mut envs = vec![(TEST_DIR_ENV.to_string(), test_dir.to_string())];
+    match name {
+        // ファイルI/O系はテスト専用ディレクトリだけを許可する。
+        // error_sandbox はその範囲外（/etc/hostname）への読み取りを拒否させる。
+        "file_io" | "filesystem" | "string_utils" | "error_sandbox" => {
+            envs.push(("TSUMUGI_SANDBOX".to_string(), test_dir.to_string()));
+        }
+        // 無限ループを短い予算で止める
+        "error_step_limit" => {
+            envs.push(("TSUMUGI_MAX_STEPS".to_string(), "100".to_string()));
+        }
+        _ => {}
+    }
+    envs
+}
+
+/// fixture 固有の実行上限。既定より短くするのは停止性を検証する fixture だけ。
+fn fixture_timeout(name: &str) -> std::time::Duration {
+    match name {
+        // AUD-026: i64極値のtimestampでも定数時間で完了することの検証
+        "format_time_extreme" => std::time::Duration::from_secs(2),
+        _ => DEFAULT_TIMEOUT,
+    }
+}
+
+/// 期待ファイルを読む。`<name>.<ext>.vm` があれば VM 版だけそちらを優先する
+/// （engine間で意図的に差が残っている箇所を明示するため）。
+fn read_expected(name: &str, ext: &str, use_vm: bool) -> Option<String> {
+    let dir = fixtures_dir();
+    if use_vm {
+        let vm_specific = dir.join(format!("{}.{}.vm", name, ext));
+        if vm_specific.exists() {
+            return Some(normalize(
+                &std::fs::read_to_string(&vm_specific)
+                    .unwrap_or_else(|e| panic!("期待ファイルが読めません {vm_specific:?}: {e}")),
+            ));
+        }
+    }
+    let shared = dir.join(format!("{}.{}", name, ext));
+    if !shared.exists() {
+        return None;
+    }
+    Some(normalize(&std::fs::read_to_string(&shared).unwrap_or_else(
+        |e| panic!("期待ファイルが読めません {shared:?}: {e}"),
+    )))
+}
+
+/// 改行を LF に揃え、末尾の空白を落とす
+fn normalize(text: &str) -> String {
+    text.replace("\r\n", "\n").trim_end().to_string()
+}
+
+/// 期待テキストと実出力を比較する。
+///
+/// 既定は完全一致。期待側の `{*}` だけはワイルドカードとして扱い、
+/// OS・ロケール依存の文字列（`io::Error` のメッセージ等）を逃がす。
+/// 逃がす範囲を期待ファイル上で明示するため、部分一致は導入しない。
+fn matches_expected(actual: &str, expected: &str) -> bool {
+    const WILDCARD: &str = "{*}";
+    if !expected.contains(WILDCARD) {
+        return actual == expected;
+    }
+
+    let parts: Vec<&str> = expected.split(WILDCARD).collect();
+    let last = parts.len() - 1;
+    let mut rest = actual;
+    for (index, part) in parts.iter().enumerate() {
+        if index == 0 {
+            let Some(tail) = rest.strip_prefix(part) else {
+                return false;
+            };
+            rest = tail;
+        } else if index == last {
+            if rest.len() < part.len() || !rest.ends_with(part) {
+                return false;
+            }
+        } else {
+            match rest.find(part) {
+                Some(at) => rest = &rest[at + part.len()..],
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
+/// fixture を1つ実行して stdout / stderr / 終了コードを検証する
+fn run_fixture(name: &str, kind: FixtureKind, use_vm: bool) {
+    let mode = if use_vm { "VM" } else { "tree-walk" };
+    let label = format!("{}-{}", name, if use_vm { "vm" } else { "tree" });
+    let test_dir = TestDir::new(&label);
+    let script = fixtures_dir().join(format!("{}.tsg", name));
+    assert!(script.exists(), "fixtureがありません: {script:?}");
+
+    let mut command = Command::new(tsumugi_bin());
+    if use_vm {
+        command.arg("--vm");
+    }
+    command
+        .arg(&script)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in fixture_envs(name, test_dir.as_str()) {
+        command.env(key, value);
+    }
+
+    let context = format!("{name} [{mode}]");
+    let child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("{context}: tsumugi バイナリの起動に失敗: {error}"));
+    let output = wait_with_timeout(child, fixture_timeout(name), &context);
+
+    let stdout = normalize(&String::from_utf8_lossy(&output.stdout));
+    let stderr = normalize(&String::from_utf8_lossy(&output.stderr));
+    assert!(
+        !stderr.contains("panicked at"),
+        "{context}: host panicが発生しました\n--- stderr ---\n{stderr}"
+    );
+
+    match kind {
+        FixtureKind::Golden => {
+            let expected = read_expected(name, "expected", use_vm)
+                .unwrap_or_else(|| panic!("{context}: .expected がありません"));
+            assert!(
+                output.status.success(),
+                "{context}: 正常系が異常終了しました\n--- stderr ---\n{stderr}"
+            );
+            assert_eq!(
+                stderr, "",
+                "{context}: 正常系で診断が出力されました\n--- stderr ---\n{stderr}"
+            );
+            assert!(
+                matches_expected(&stdout, &expected),
+                "{context}: stdoutが期待出力と一致しません\n--- 実際 ---\n{stdout}\n--- 期待 ---\n{expected}"
+            );
+        }
+        FixtureKind::Error => {
+            let expected_err = read_expected(name, "expected_err", use_vm)
+                .unwrap_or_else(|| panic!("{context}: .expected_err がありません"));
+            let expected_out = read_expected(name, "expected_out", use_vm).unwrap_or_default();
+            assert!(
+                !output.status.success(),
+                "{context}: エラー系が終了コード0で終了しました\n--- stdout ---\n{stdout}"
+            );
+            assert!(
+                matches_expected(&stderr, &expected_err),
+                "{context}: stderrが期待エラーと一致しません\n--- 実際 ---\n{stderr}\n--- 期待 ---\n{expected_err}"
+            );
+            assert!(
+                matches_expected(&stdout, &expected_out),
+                "{context}: エラー前後のstdout副作用が期待と一致しません\n--- 実際 ---\n{stdout}\n--- 期待 ---\n{expected_out}"
+            );
+        }
+    }
+}
+
+/// fixture 以外の任意スクリプトを timeout 付きで実行する（bespokeテスト用）
+fn run_script_process(
+    script: &std::path::Path,
+    use_vm: bool,
+    envs: &[(&str, &str)],
+    context: &str,
+) -> std::process::Output {
+    let mut command = Command::new(tsumugi_bin());
+    if use_vm {
+        command.arg("--vm");
+    }
+    command
+        .arg(script)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("{context}: tsumugi バイナリの起動に失敗: {error}"));
+    wait_with_timeout(child, DEFAULT_TIMEOUT, context)
+}
+
+/// fixture 宣言から tree/VM 両方の `#[test]` を生成する。
+///
+/// 1行の宣言で必ず両engine分が作られるため、片側の登録漏れが起きない。
+/// 生成されるテスト名は `<fixture>::tree` / `<fixture>::vm`。
+macro_rules! fixture_tests {
+    ($table:ident, $kind:expr, [ $($name:ident),* $(,)? ]) => {
+        /// このテーブルに宣言された fixture 名（ディレクトリとの整合を検査する）
+        const $table: &[&str] = &[ $(stringify!($name)),* ];
+
+        $(
+            mod $name {
+                #[test]
+                fn tree() {
+                    super::run_fixture(stringify!($name), $kind, false);
+                }
+
+                #[test]
+                fn vm() {
+                    super::run_fixture(stringify!($name), $kind, true);
+                }
+            }
+        )*
+    };
+}
+
+// =============================================================
+// fixture 宣言（tree/VM 両方が自動生成される）
+// =============================================================
+
+fixture_tests!(
+    GOLDEN_FIXTURES,
+    crate::FixtureKind::Golden,
+    [
+        and_or_scope,
+        arithmetic,
+        assign,
+        block_scope_semantics,
+        break_continue,
+        builtins,
+        call_validation_order,
+        closure,
+        closure_counter,
+        closure_try_catch,
+        control_flow,
+        deep_closure,
+        dict_utils,
+        edge_cases,
+        error_structured,
+        file_io,
+        filesystem,
+        first_class_fn,
+        fizzbuzz,
+        float_special,
+        for_closure_binding,
+        for_loop,
+        format_time_extreme,
+        fstring,
+        hello,
+        higher_order,
+        import_basic,
+        import_circular,
+        import_nested,
+        index_assign_binding,
+        list_dict,
+        local_utils,
+        logic,
+        map_recursion_limit,
+        numeric_utils,
+        overflow_edge,
+        runtime_global_import,
+        runtime_global_name_resolution,
+        scope_isolation,
+        slice_edge,
+        sort_numeric,
+        string_utils,
+        try_break_continue,
+        try_catch,
+    ]
+);
+
+fixture_tests!(
+    ERROR_FIXTURES,
+    crate::FixtureKind::Error,
+    [
+        error_assign_undefined,
+        error_break_outside_loop,
+        error_continue_outside_loop,
+        error_dict_key_type,
+        error_fstring_extra,
+        error_import_non_top_level,
+        error_import_not_found,
+        error_index_out_of_bounds,
+        error_integer_overflow,
+        error_parse,
+        error_parse_multi,
+        error_sandbox,
+        error_stack_trace,
+        error_step_limit,
+        error_type,
+        error_unclosed_string,
+        error_unclosed_string_eof,
+        error_undefined_fn,
+        error_undefined_var,
+        error_unknown_char,
+        error_wrong_arg_count,
+        error_zero_division,
+    ]
+);
+
+/// 期待ファイルを持たず、専用テストから実行する fixture。
+const CUSTOM_FIXTURES: &[&str] = &[
+    // 環境変数の組み合わせを複数回すため専用テストで実行する
+    "env_allow",
+    "env_protected_windows",
+    // engine間でtrace frame数が異なる（AUD-017）ため専用テストで検証する
+    "error_stack_overflow",
+];
+
+/// 他の fixture から import される補助ファイル（単体では実行しない）。
+const HELPER_FIXTURES: &[&str] = &[
+    "import_bad_syntax",
+    "import_circular_a",
+    "import_circular_b",
+    "import_lib",
+    "import_nested_base",
+    "import_nested_mid",
+    "runtime_global_failed_import",
+    "runtime_global_import_lib",
+];
+
+/// 期待ファイルを持つ fixture が必ず宣言テーブルに載っていることを検査する。
+///
+/// 宣言漏れの fixture が誰にも実行されないまま残る状態を防ぐ。
+#[test]
+fn fixture_declarations_match_directory() {
+    let dir = fixtures_dir();
+    let entries = std::fs::read_dir(&dir).expect("fixtureディレクトリが読めません");
+
+    let mut golden_files = Vec::new();
+    let mut error_files = Vec::new();
+    for entry in entries {
+        let path = entry.expect("fixtureエントリが読めません").path();
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // `.vm` / `.expected_out` は補助ファイルなので一覧の対象にしない
+        if let Some(stem) = file_name.strip_suffix(".expected") {
+            golden_files.push(stem.to_string());
+        } else if let Some(stem) = file_name.strip_suffix(".expected_err") {
+            error_files.push(stem.to_string());
+        }
+    }
+    golden_files.sort();
+    error_files.sort();
+
+    for (label, files, declared) in [
+        ("正常系", &golden_files, GOLDEN_FIXTURES),
+        ("エラー系", &error_files, ERROR_FIXTURES),
+    ] {
+        for file in files {
+            assert!(
+                declared.contains(&file.as_str()),
+                "{label} fixture `{file}` が宣言テーブルに登録されていません。\
+                 fixture_tests! へ追加してください"
+            );
+        }
+        for name in declared {
+            assert!(
+                files.iter().any(|file| file == name),
+                "{label} fixture `{name}` が宣言されていますが期待ファイルがありません"
+            );
+            assert!(
+                dir.join(format!("{}.tsg", name)).exists(),
+                "{label} fixture `{name}` の .tsg がありません"
+            );
+        }
+    }
+
+    // すべての .tsg がいずれかの分類に属していること（放置された fixture の検出）
+    for entry in std::fs::read_dir(&dir).expect("fixtureディレクトリが読めません") {
+        let path = entry.expect("fixtureエントリが読めません").path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".tsg") else {
+            continue;
+        };
+        let classified = GOLDEN_FIXTURES.contains(&stem)
+            || ERROR_FIXTURES.contains(&stem)
+            || CUSTOM_FIXTURES.contains(&stem)
+            || HELPER_FIXTURES.contains(&stem);
         assert!(
-            stderr.contains(line),
-            "エラーテスト失敗 [{}]: {}\nstderr に期待文字列が含まれません: {:?}\n--- stderr ---\n{}",
-            mode,
-            name,
-            line,
-            stderr
+            classified,
+            "fixture `{stem}.tsg` がどのテストからも実行されていません。\
+             fixture_tests! / CUSTOM_FIXTURES / HELPER_FIXTURES のいずれかへ登録してください"
         );
     }
-
-    assert!(
-        !output.status.success(),
-        "エラーケースなのに終了コード0で終了しました [{}]: {}",
-        mode,
-        name
-    );
+    for name in CUSTOM_FIXTURES.iter().chain(HELPER_FIXTURES) {
+        assert!(
+            dir.join(format!("{}.tsg", name)).exists(),
+            "宣言された fixture `{name}.tsg` がありません"
+        );
+    }
 }
-
-// =============================================================
-// 正常系ゴールデンテスト（ツリーウォーク）
-// =============================================================
-
-#[test]
-fn golden_hello() {
-    run_golden_test("hello");
-}
-
-#[test]
-fn golden_arithmetic() {
-    run_golden_test("arithmetic");
-}
-
-#[test]
-fn golden_control_flow() {
-    run_golden_test("control_flow");
-}
-
-#[test]
-fn golden_logic() {
-    run_golden_test("logic");
-}
-
-#[test]
-fn golden_assign() {
-    run_golden_test("assign");
-}
-
-#[test]
-fn golden_list_dict() {
-    run_golden_test("list_dict");
-}
-
-#[test]
-fn golden_for_loop() {
-    run_golden_test("for_loop");
-}
-
-#[test]
-fn golden_break_continue() {
-    run_golden_test("break_continue");
-}
-
-#[test]
-fn golden_fizzbuzz() {
-    run_golden_test("fizzbuzz");
-}
-
-#[test]
-fn golden_builtins() {
-    run_golden_test("builtins");
-}
-
-#[test]
-fn golden_file_io() {
-    run_golden_test("file_io");
-}
-
-#[test]
-fn golden_local_utils() {
-    run_golden_test("local_utils");
-}
-
-#[test]
-fn golden_filesystem() {
-    run_golden_test("filesystem");
-}
-
-#[test]
-fn golden_string_utils() {
-    run_golden_test("string_utils");
-}
-
-#[test]
-fn golden_first_class_fn() {
-    run_golden_test("first_class_fn");
-}
-
-#[test]
-fn golden_closure() {
-    run_golden_test("closure");
-}
-
-#[test]
-fn golden_higher_order() {
-    run_golden_test("higher_order");
-}
-
-#[test]
-fn golden_numeric_utils() {
-    run_golden_test("numeric_utils");
-}
-
-#[test]
-fn golden_dict_utils() {
-    run_golden_test("dict_utils");
-}
-
-// =============================================================
-// 正常系ゴールデンテスト（VM）
-// =============================================================
-
-#[test]
-fn vm_golden_hello() {
-    run_golden_test_vm("hello");
-}
-
-#[test]
-fn vm_golden_arithmetic() {
-    run_golden_test_vm("arithmetic");
-}
-
-#[test]
-fn vm_golden_control_flow() {
-    run_golden_test_vm("control_flow");
-}
-
-#[test]
-fn vm_golden_logic() {
-    run_golden_test_vm("logic");
-}
-
-#[test]
-fn vm_golden_assign() {
-    run_golden_test_vm("assign");
-}
-
-#[test]
-fn vm_golden_list_dict() {
-    run_golden_test_vm("list_dict");
-}
-
-#[test]
-fn vm_golden_for_loop() {
-    run_golden_test_vm("for_loop");
-}
-
-#[test]
-fn vm_golden_break_continue() {
-    run_golden_test_vm("break_continue");
-}
-
-#[test]
-fn vm_golden_fizzbuzz() {
-    run_golden_test_vm("fizzbuzz");
-}
-
-#[test]
-fn vm_golden_builtins() {
-    run_golden_test_vm("builtins");
-}
-
-#[test]
-fn vm_golden_file_io() {
-    run_golden_test_vm("file_io");
-}
-
-#[test]
-fn vm_golden_local_utils() {
-    run_golden_test_vm("local_utils");
-}
-
-#[test]
-fn vm_golden_filesystem() {
-    run_golden_test_vm("filesystem");
-}
-
-#[test]
-fn vm_golden_string_utils() {
-    run_golden_test_vm("string_utils");
-}
-
-#[test]
-fn vm_golden_first_class_fn() {
-    run_golden_test_vm("first_class_fn");
-}
-
-#[test]
-fn vm_golden_closure() {
-    run_golden_test_vm("closure");
-}
-
-#[test]
-fn vm_golden_higher_order() {
-    run_golden_test_vm("higher_order");
-}
-
-#[test]
-fn vm_golden_numeric_utils() {
-    run_golden_test_vm("numeric_utils");
-}
-
-#[test]
-fn vm_golden_dict_utils() {
-    run_golden_test_vm("dict_utils");
-}
-
-// =============================================================
-// エラー系テスト（ツリーウォーク）
-// =============================================================
-
-#[test]
-fn error_undefined_var() {
-    run_error_test("error_undefined_var");
-}
-
-#[test]
-fn error_assign_undefined() {
-    run_error_test("error_assign_undefined");
-}
-
-#[test]
-fn error_parse() {
-    let dir = fixtures_dir();
-    let script = dir.join("error_parse.tsg");
-
-    let output = Command::new(tsumugi_bin())
-        .arg(script.to_str().unwrap())
-        .output()
-        .expect("tsumugi バイナリの実行に失敗");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("2行目"),
-        "parse error should mention line 2: {}",
-        stderr
-    );
-    assert!(!output.status.success());
-}
-
-#[test]
-fn error_parse_multi() {
-    run_error_test("error_parse_multi");
-}
-
-#[test]
-fn error_type() {
-    let dir = fixtures_dir();
-    let script = dir.join("error_type.tsg");
-
-    let output = Command::new(tsumugi_bin())
-        .arg(script.to_str().unwrap())
-        .output()
-        .expect("tsumugi バイナリの実行に失敗");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("型エラー"),
-        "should contain type error: {}",
-        stderr
-    );
-    assert!(!output.status.success());
-}
-
-#[test]
-fn error_zero_division() {
-    run_error_test("error_zero_division");
-}
-
-#[test]
-fn error_wrong_arg_count() {
-    run_error_test("error_wrong_arg_count");
-}
-
-#[test]
-fn error_undefined_fn() {
-    run_error_test("error_undefined_fn");
-}
-
-#[test]
-fn error_break_outside_loop() {
-    run_error_test("error_break_outside_loop");
-}
-
-#[test]
-fn error_continue_outside_loop() {
-    run_error_test("error_continue_outside_loop");
-}
-
-#[test]
-fn error_index_out_of_bounds() {
-    run_error_test("error_index_out_of_bounds");
-}
-
-#[test]
-fn error_dict_key_type() {
-    run_error_test("error_dict_key_type");
-}
-
-#[test]
-fn error_unknown_char() {
-    run_error_test("error_unknown_char");
-}
-
-#[test]
-fn error_stack_trace() {
-    run_error_test("error_stack_trace");
-}
-
-#[test]
-fn error_step_limit() {
-    let dir = fixtures_dir();
-    let script = dir.join("error_step_limit.tsg");
-
-    let output = Command::new(tsumugi_bin())
-        .arg(script.to_str().unwrap())
-        .env("TSUMUGI_MAX_STEPS", "100")
-        .output()
-        .expect("tsumugi バイナリの実行に失敗");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("ステップ上限に達しました"),
-        "ステップ予算エラーが出ません: {}",
-        stderr
-    );
-    assert!(!output.status.success());
-}
-
-#[test]
-fn vm_error_step_limit() {
-    let dir = fixtures_dir();
-    let script = dir.join("error_step_limit.tsg");
-
-    let output = Command::new(tsumugi_bin())
-        .arg("--vm")
-        .arg(script.to_str().unwrap())
-        .env("TSUMUGI_MAX_STEPS", "100")
-        .output()
-        .expect("tsumugi バイナリの実行に失敗");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("ステップ上限に達しました"),
-        "[VM] ステップ予算エラーが出ません: {}",
-        stderr
-    );
-    assert!(!output.status.success());
-}
-
 // =============================================================
 // スタックオーバーフロー（コールフレーム深度制限）テスト
 // =============================================================
 
+/// 深度上限エラーとスタックトレースを厳密に検証する。
+///
+/// trace frame数だけは engine 間で異なる（VMは上限128にtop-level frameを含めるため
+/// 許容user frameが1少ない = AUD-017）。129行の期待ファイルを置く代わりに、
+/// 差分を数値として明示し、AUD-017の修正時にこのテストが落ちるようにしている。
 #[test]
-fn error_stack_overflow() {
-    run_error_test("error_stack_overflow");
+fn stack_overflow_reports_depth_limit_with_trace() {
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree-walk" };
+        let context = format!("error_stack_overflow [{mode}]");
+        let script = fixtures_dir().join("error_stack_overflow.tsg");
+        let output = run_script_process(&script, use_vm, &[], &context);
+        let stdout = normalize(&String::from_utf8_lossy(&output.stdout));
+        let stderr = normalize(&String::from_utf8_lossy(&output.stderr));
+        let lines: Vec<&str> = stderr.lines().collect();
+
+        assert!(
+            !output.status.success(),
+            "{context}: 終了コード0で終了しました"
+        );
+        assert_eq!(stdout, "", "{context}: 予期しないstdout: {stdout}");
+        assert_eq!(
+            lines.first().copied(),
+            Some("3行目: スタックオーバーフロー: 再帰が深すぎます (上限: 128)"),
+            "{context}: 先頭のエラー行が一致しません: {stderr}"
+        );
+
+        let expected_frames = if use_vm { 127 } else { 128 };
+        assert_eq!(
+            lines.len(),
+            expected_frames + 1,
+            "{context}: trace行数が期待と異なります: {}",
+            lines.len()
+        );
+        for line in &lines[1..expected_frames] {
+            assert_eq!(
+                *line, "  in recurse() (3行目)",
+                "{context}: 再帰フレームの表示が一致しません: {line}"
+            );
+        }
+        assert_eq!(
+            lines.last().copied(),
+            Some("  in recurse() (6行目)"),
+            "{context}: 最外のcall元フレームが一致しません: {stderr}"
+        );
+    }
 }
 
-#[test]
-fn vm_error_stack_overflow() {
-    run_error_test_vm("error_stack_overflow");
-}
+// =============================================================
+// サンドボックス境界テスト（import 先の検証）
+// =============================================================
 
 #[test]
-fn error_sandbox() {
-    let dir = fixtures_dir();
-    let script = dir.join("error_sandbox.tsg");
+fn import_outside_sandbox_is_blocked_in_both_engines() {
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree-walk" };
+        let label = format!("sandbox-import-{}", if use_vm { "vm" } else { "tree" });
+        let dir = TestDir::new(&label);
 
-    let output = Command::new(tsumugi_bin())
-        .arg(script.to_str().unwrap())
-        .env("TSUMUGI_SANDBOX", "/tmp")
-        .output()
-        .expect("tsumugi バイナリの実行に失敗");
+        // サンドボックス外の実在ファイルと、それをimportするスクリプトを用意する
+        let outside = dir.path.join("outside.tsg");
+        std::fs::write(&outside, "print(\"leaked\")").expect("import先の作成に失敗");
+        let script = dir.path.join("main.tsg");
+        std::fs::write(
+            &script,
+            format!(
+                "import \"{}\"",
+                outside
+                    .to_str()
+                    .expect("パスがUTF-8ではありません")
+                    .replace('\\', "/")
+            ),
+        )
+        .expect("スクリプトの作成に失敗");
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("サンドボックス違反"),
-        "サンドボックスエラーが出ません: {}",
-        stderr
-    );
-    assert!(!output.status.success());
-}
+        // サンドボックスは fixtures ディレクトリのみ → 一時ディレクトリのimport先は許可外
+        let sandbox = fixtures_dir();
+        let context = format!("sandbox import [{mode}]");
+        let output = run_script_process(
+            &script,
+            use_vm,
+            &[(
+                "TSUMUGI_SANDBOX",
+                sandbox.to_str().expect("パスがUTF-8ではありません"),
+            )],
+            &context,
+        );
+        let stdout = normalize(&String::from_utf8_lossy(&output.stdout));
+        let stderr = normalize(&String::from_utf8_lossy(&output.stderr));
 
-#[test]
-fn vm_error_sandbox() {
-    let dir = fixtures_dir();
-    let script = dir.join("error_sandbox.tsg");
-
-    let output = Command::new(tsumugi_bin())
-        .arg("--vm")
-        .arg(script.to_str().unwrap())
-        .env("TSUMUGI_SANDBOX", "/tmp")
-        .output()
-        .expect("tsumugi バイナリの実行に失敗");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("サンドボックス違反"),
-        "[VM] サンドボックスエラーが出ません: {}",
-        stderr
-    );
-    assert!(!output.status.success());
-}
-
-#[test]
-fn error_sandbox_import() {
-    // サンドボックス外の実在ファイルを用意してテスト
-    let temp_dir = std::env::temp_dir();
-    let outside_file = temp_dir.join("tsg_sandbox_import_test.tsg");
-    std::fs::write(&outside_file, "print(\"leaked\")").unwrap();
-
-    // スクリプト本体を一時ディレクトリに作成（import先はプロジェクトディレクトリ外）
-    let script = temp_dir.join("tsg_sandbox_import_main.tsg");
-    std::fs::write(
-        &script,
-        format!(
-            "import \"{}\"",
-            outside_file.to_str().unwrap().replace('\\', "/")
-        ),
-    )
-    .unwrap();
-
-    // サンドボックスを fixtures ディレクトリに設定 → 一時ディレクトリの import 先はブロック
-    let sandbox_path = fixtures_dir().to_str().unwrap().to_string();
-
-    let output = Command::new(tsumugi_bin())
-        .arg(script.to_str().unwrap())
-        .env("TSUMUGI_SANDBOX", &sandbox_path)
-        .output()
-        .expect("tsumugi バイナリの実行に失敗");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("サンドボックス違反"),
-        "import のサンドボックスエラーが出ません: {}",
-        stderr
-    );
-    assert!(!output.status.success());
-
-    // cleanup
-    std::fs::remove_file(&outside_file).ok();
-    std::fs::remove_file(&script).ok();
-}
-
-#[test]
-fn vm_error_sandbox_import() {
-    // サンドボックス外の実在ファイルを用意してテスト
-    let temp_dir = std::env::temp_dir();
-    let outside_file = temp_dir.join("tsg_sandbox_import_test_vm.tsg");
-    std::fs::write(&outside_file, "print(\"leaked\")").unwrap();
-
-    let script = temp_dir.join("tsg_sandbox_import_main_vm.tsg");
-    std::fs::write(
-        &script,
-        format!(
-            "import \"{}\"",
-            outside_file.to_str().unwrap().replace('\\', "/")
-        ),
-    )
-    .unwrap();
-
-    let sandbox_path = fixtures_dir().to_str().unwrap().to_string();
-
-    let output = Command::new(tsumugi_bin())
-        .arg("--vm")
-        .arg(script.to_str().unwrap())
-        .env("TSUMUGI_SANDBOX", &sandbox_path)
-        .output()
-        .expect("tsumugi バイナリの実行に失敗");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("サンドボックス違反"),
-        "[VM] import のサンドボックスエラーが出ません: {}",
-        stderr
-    );
-    assert!(!output.status.success());
-
-    // cleanup
-    std::fs::remove_file(&outside_file).ok();
-    std::fs::remove_file(&script).ok();
+        assert!(
+            !output.status.success(),
+            "{context}: 終了コード0で終了しました\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stderr.contains("サンドボックス違反"),
+            "{context}: importのサンドボックスエラーが出ません\n--- stderr ---\n{stderr}"
+        );
+        assert_eq!(
+            stdout, "",
+            "{context}: 許可外のimport先が実行されました\n--- stdout ---\n{stdout}"
+        );
+        assert!(
+            !stderr.contains("leaked"),
+            "{context}: import先の出力が漏洩しました\n--- stderr ---\n{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -603,13 +615,16 @@ fn env_allow_list() {
     let script = dir.join("env_allow.tsg");
 
     // テスト側で制御可能な環境変数を設定して検証
-    let output = Command::new(tsumugi_bin())
-        .arg(script.to_str().unwrap())
-        .env("TSUMUGI_ENV_ALLOW", "TSG_TEST_ALLOWED,TSUMUGI_*")
-        .env("TSG_TEST_ALLOWED", "visible_value")
-        .env("SECRET_DB_PASS", "hunter2")
-        .output()
-        .expect("tsumugi バイナリの実行に失敗");
+    let output = run_script_process(
+        &script,
+        false,
+        &[
+            ("TSUMUGI_ENV_ALLOW", "TSG_TEST_ALLOWED,TSUMUGI_*"),
+            ("TSG_TEST_ALLOWED", "visible_value"),
+            ("SECRET_DB_PASS", "hunter2"),
+        ],
+        "env allow list",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
     assert!(
@@ -708,532 +723,8 @@ fn windows_protected_env_keys_vm() {
 }
 
 // =============================================================
-// エラー系テスト（VM）
-// =============================================================
-
-#[test]
-fn vm_error_undefined_var() {
-    run_error_test_vm("error_undefined_var");
-}
-
-#[test]
-fn vm_error_assign_undefined() {
-    run_error_test_vm("error_assign_undefined");
-}
-
-#[test]
-fn vm_error_parse() {
-    let dir = fixtures_dir();
-    let script = dir.join("error_parse.tsg");
-
-    let output = Command::new(tsumugi_bin())
-        .arg("--vm")
-        .arg(script.to_str().unwrap())
-        .output()
-        .expect("tsumugi バイナリの実行に失敗");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("2行目"),
-        "[VM] parse error should mention line 2: {}",
-        stderr
-    );
-    assert!(!output.status.success());
-}
-
-#[test]
-fn vm_error_parse_multi() {
-    run_error_test_vm("error_parse_multi");
-}
-
-#[test]
-fn vm_error_type() {
-    let dir = fixtures_dir();
-    let script = dir.join("error_type.tsg");
-
-    let output = Command::new(tsumugi_bin())
-        .arg("--vm")
-        .arg(script.to_str().unwrap())
-        .output()
-        .expect("tsumugi バイナリの実行に失敗");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("型エラー"),
-        "[VM] should contain type error: {}",
-        stderr
-    );
-    assert!(!output.status.success());
-}
-
-#[test]
-fn vm_error_zero_division() {
-    run_error_test_vm("error_zero_division");
-}
-
-#[test]
-fn vm_error_wrong_arg_count() {
-    run_error_test_vm("error_wrong_arg_count");
-}
-
-#[test]
-fn vm_error_undefined_fn() {
-    run_error_test_vm("error_undefined_fn");
-}
-
-#[test]
-fn vm_error_break_outside_loop() {
-    run_error_test_vm("error_break_outside_loop");
-}
-
-#[test]
-fn vm_error_continue_outside_loop() {
-    run_error_test_vm("error_continue_outside_loop");
-}
-
-#[test]
-fn vm_error_index_out_of_bounds() {
-    run_error_test_vm("error_index_out_of_bounds");
-}
-
-#[test]
-fn vm_error_dict_key_type() {
-    run_error_test_vm("error_dict_key_type");
-}
-
-#[test]
-fn vm_error_unknown_char() {
-    run_error_test_vm("error_unknown_char");
-}
-
-#[test]
-fn vm_error_stack_trace() {
-    run_error_test_vm("error_stack_trace");
-}
-
-// =============================================================
-// import テスト（ツリーウォーク）
-// =============================================================
-
-#[test]
-fn golden_import_basic() {
-    run_golden_test("import_basic");
-}
-
-#[test]
-fn golden_import_nested() {
-    run_golden_test("import_nested");
-}
-
-#[test]
-fn golden_import_circular() {
-    run_golden_test("import_circular");
-}
-
-#[test]
-fn error_import_not_found() {
-    run_error_test("error_import_not_found");
-}
-
-// =============================================================
-// import テスト（VM）
-// =============================================================
-
-#[test]
-fn vm_golden_import_basic() {
-    run_golden_test_vm("import_basic");
-}
-
-#[test]
-fn vm_golden_import_nested() {
-    run_golden_test_vm("import_nested");
-}
-
-#[test]
-fn vm_golden_import_circular() {
-    run_golden_test_vm("import_circular");
-}
-
-#[test]
-fn vm_error_import_not_found() {
-    run_error_test_vm("error_import_not_found");
-}
-
-// =============================================================
-// try/catch テスト
-// =============================================================
-
-#[test]
-fn golden_try_catch() {
-    run_golden_test("try_catch");
-}
-
-#[test]
-fn vm_golden_try_catch() {
-    run_golden_test_vm("try_catch");
-}
-
-// =============================================================
-// クロージャ × try/catch 複合テスト
-// =============================================================
-
-#[test]
-fn golden_closure_try_catch() {
-    run_golden_test("closure_try_catch");
-}
-
-#[test]
-fn vm_golden_closure_try_catch() {
-    run_golden_test_vm("closure_try_catch");
-}
-
-// =============================================================
-// sort() 数値ソート挙動テスト
-// =============================================================
-
-#[test]
-fn golden_sort_numeric() {
-    run_golden_test("sort_numeric");
-}
-
-#[test]
-fn vm_golden_sort_numeric() {
-    run_golden_test_vm("sort_numeric");
-}
-
-// =============================================================
-// 浮動小数点特殊値テスト
-// =============================================================
-
-#[test]
-fn golden_float_special() {
-    run_golden_test("float_special");
-}
-
-#[test]
-fn vm_golden_float_special() {
-    run_golden_test_vm("float_special");
-}
-
-// =============================================================
-// f-string テスト
-// =============================================================
-
-#[test]
-fn golden_fstring() {
-    run_golden_test("fstring");
-}
-
-#[test]
-fn vm_golden_fstring() {
-    run_golden_test_vm("fstring");
-}
-
-// =============================================================
-// 整数オーバーフロー テスト
-// =============================================================
-
-#[test]
-fn error_integer_overflow() {
-    run_error_test("error_integer_overflow");
-}
-
-#[test]
-fn vm_error_integer_overflow() {
-    run_error_test_vm("error_integer_overflow");
-}
-
-// =============================================================
-// 未閉じ文字列テスト
-// =============================================================
-
-#[test]
-fn error_unclosed_string() {
-    run_error_test("error_unclosed_string");
-}
-
-#[test]
-fn vm_error_unclosed_string() {
-    run_error_test_vm("error_unclosed_string");
-}
-
-#[test]
-fn error_unclosed_string_eof() {
-    run_error_test("error_unclosed_string_eof");
-}
-
-#[test]
-fn vm_error_unclosed_string_eof() {
-    run_error_test_vm("error_unclosed_string_eof");
-}
-
-// =============================================================
-// 構造化エラーテスト
-// =============================================================
-
-#[test]
-fn golden_error_structured() {
-    run_golden_test("error_structured");
-}
-
-#[test]
-fn vm_golden_error_structured() {
-    run_golden_test_vm("error_structured");
-}
-
-// =============================================================
-// クロージャ参照キャプチャ（カウンタパターン）テスト
-// =============================================================
-
-#[test]
-fn golden_closure_counter() {
-    run_golden_test("closure_counter");
-}
-
-#[test]
-fn vm_golden_closure_counter() {
-    run_golden_test_vm("closure_counter");
-}
-
-// =============================================================
-// リグレッションテスト: slice 境界値
-// =============================================================
-
-#[test]
-fn golden_slice_edge() {
-    run_golden_test("slice_edge");
-}
-
-#[test]
-fn vm_golden_slice_edge() {
-    run_golden_test_vm("slice_edge");
-}
-
-// =============================================================
-// リグレッションテスト: try 内 break/continue/return
-// =============================================================
-
-#[test]
-fn golden_try_break_continue() {
-    run_golden_test("try_break_continue");
-}
-
-#[test]
-fn vm_golden_try_break_continue() {
-    run_golden_test_vm("try_break_continue");
-}
-
-// =============================================================
-// リグレッションテスト: abs/range オーバーフロー境界値
-// =============================================================
-
-#[test]
-fn golden_overflow_edge() {
-    run_golden_test("overflow_edge");
-}
-
-#[test]
-fn vm_golden_overflow_edge() {
-    run_golden_test_vm("overflow_edge");
-}
-
-// =============================================================
-// リグレッションテスト: and/or 値返し + ループブロックスコープ
-// =============================================================
-
-#[test]
-fn golden_and_or_scope() {
-    run_golden_test("and_or_scope");
-}
-
-#[test]
-fn vm_golden_and_or_scope() {
-    run_golden_test_vm("and_or_scope");
-}
-
-// =============================================================
-// リグレッションテスト: 多段クロージャキャプチャ
-// =============================================================
-
-#[test]
-fn golden_deep_closure() {
-    run_golden_test("deep_closure");
-}
-
-#[test]
-fn vm_golden_deep_closure() {
-    run_golden_test_vm("deep_closure");
-}
-
-// =============================================================
-// リグレッションテスト: map/filter 経由の再帰制限
-// =============================================================
-
-#[test]
-fn golden_map_recursion_limit() {
-    run_golden_test("map_recursion_limit");
-}
-
-#[test]
-fn vm_golden_map_recursion_limit() {
-    run_golden_test_vm("map_recursion_limit");
-}
-
-// =============================================================
-// リグレッションテスト: エッジケース（0回for, 負時刻, f-string正常系）
-// =============================================================
-
-#[test]
-fn golden_edge_cases() {
-    run_golden_test("edge_cases");
-}
-
-#[test]
-fn vm_golden_edge_cases() {
-    run_golden_test_vm("edge_cases");
-}
-
-// =============================================================
-// リグレッションテスト: format_time の極端なtimestampで停止しない
-// =============================================================
-
-#[test]
-fn format_time_extreme_timestamps_complete_in_both_engines() {
-    fn wait_with_timeout(
-        mut child: std::process::Child,
-        timeout: std::time::Duration,
-    ) -> Result<std::process::Output, String> {
-        let deadline = std::time::Instant::now() + timeout;
-
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    return child
-                        .wait_with_output()
-                        .map_err(|error| format!("プロセスの出力取得に失敗: {error}"));
-                }
-                Ok(None) if std::time::Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("{}秒以内に完了しませんでした", timeout.as_secs()));
-                }
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("プロセス状態の取得に失敗: {error}"));
-                }
-            }
-        }
-    }
-
-    let dir = fixtures_dir();
-    let script = dir.join("format_time_extreme.tsg");
-    let expected = std::fs::read_to_string(dir.join("format_time_extreme.expected"))
-        .expect("期待出力ファイルが読めません")
-        .replace("\r\n", "\n");
-
-    for use_vm in [false, true] {
-        let mode = if use_vm { "VM" } else { "tree-walk" };
-        let mut command = Command::new(tsumugi_bin());
-        if use_vm {
-            command.arg("--vm");
-        }
-        let child = command
-            .arg(&script)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|error| panic!("{mode}プロセスの起動に失敗: {error}"));
-        let output = wait_with_timeout(child, std::time::Duration::from_secs(2))
-            .unwrap_or_else(|error| panic!("{mode}のformat_timeが停止: {error}"));
-        let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
-        let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
-
-        assert!(
-            output.status.success(),
-            "{mode}が異常終了しました: {stderr}"
-        );
-        assert_eq!(
-            stdout.trim_end(),
-            expected.trim_end(),
-            "{mode}の極端なtimestamp変換結果が不正"
-        );
-        assert!(
-            !stderr.contains("panicked at"),
-            "{mode}でhost panic: {stderr}"
-        );
-    }
-}
-
-// =============================================================
-// リグレッションテスト: f-string 余剰トークンエラー
-// =============================================================
-
-#[test]
-fn error_fstring_extra() {
-    run_error_test("error_fstring_extra");
-}
-
-#[test]
-fn vm_error_fstring_extra() {
-    run_error_test_vm("error_fstring_extra");
-}
-
-// =============================================================
-// リグレッションテスト: import はトップレベル限定
-// =============================================================
-
-#[test]
-fn error_import_non_top_level_is_identical_in_both_engines() {
-    let dir = fixtures_dir();
-    let script = dir.join("error_import_non_top_level.tsg");
-    let expected = std::fs::read_to_string(dir.join("error_import_non_top_level.expected_err"))
-        .expect("期待エラーファイルが読めません")
-        .replace("\r\n", "\n");
-    let mut actual_errors = Vec::new();
-
-    for use_vm in [false, true] {
-        let mut cmd = Command::new(tsumugi_bin());
-        if use_vm {
-            cmd.arg("--vm");
-        }
-        let output = cmd
-            .arg(&script)
-            .output()
-            .expect("tsumugi バイナリの実行に失敗");
-        let mode = if use_vm { "VM" } else { "tree-walk" };
-        let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
-        let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
-
-        assert!(!output.status.success(), "{mode}が終了コード0を返しました");
-        assert_eq!(stdout, "", "{mode}がパースエラー後に実行されました");
-        assert_eq!(
-            stderr, expected,
-            "{mode}のエラーが完全一致しないか、import先へI/Oしました"
-        );
-        actual_errors.push(stderr);
-    }
-
-    assert_eq!(
-        actual_errors[0], actual_errors[1],
-        "tree-walkとVMのエラーが一致しません"
-    );
-}
-
-// =============================================================
 // リグレッションテスト: user function call validation順序
 // =============================================================
-
-#[test]
-fn golden_call_validation_order() {
-    run_golden_test("call_validation_order");
-}
-
-#[test]
-fn vm_golden_call_validation_order() {
-    run_golden_test_vm("call_validation_order");
-}
 
 #[test]
 fn call_budget_is_checked_before_callee_in_both_engines() {
@@ -1337,42 +828,8 @@ fn invalid_call_repl_recovers_without_argument_effects() {
 }
 
 // =============================================================
-// リグレッションテスト: index assignment の対象binding / 評価順 / in-place更新
-// =============================================================
-
-#[test]
-fn golden_index_assign_binding() {
-    run_golden_test("index_assign_binding");
-}
-
-#[test]
-fn vm_golden_index_assign_binding() {
-    run_golden_test_vm("index_assign_binding");
-}
-
-// =============================================================
 // リグレッションテスト: runtime global name visibility
 // =============================================================
-
-#[test]
-fn golden_runtime_global_name_resolution() {
-    run_golden_test("runtime_global_name_resolution");
-}
-
-#[test]
-fn vm_golden_runtime_global_name_resolution() {
-    run_golden_test_vm("runtime_global_name_resolution");
-}
-
-#[test]
-fn golden_runtime_global_import() {
-    run_golden_test("runtime_global_import");
-}
-
-#[test]
-fn vm_golden_runtime_global_import() {
-    run_golden_test_vm("runtime_global_import");
-}
 
 #[test]
 fn runtime_globals_resolve_across_repl_submissions() {
@@ -1407,15 +864,7 @@ fn runtime_globals_resolve_across_repl_submissions() {
         let output = run_repl_process(source, use_vm, &[]);
         let (stdout, stderr) = output_text(&output);
         let mode = if use_vm { "VM" } else { "tree" };
-        let prompt = if use_vm { "tsumugi:vm> " } else { "tsumugi> " };
-        let visible_output: Vec<_> = stdout
-            .lines()
-            .filter_map(|line| {
-                line.rsplit_once(prompt)
-                    .map(|(_, value)| value)
-                    .filter(|value| !value.is_empty())
-            })
-            .collect();
+        let visible_output = repl_visible_lines(&stdout, use_vm);
 
         assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
         assert!(stderr.is_empty(), "{mode} REPLで予期しない診断: {stderr}");
@@ -1467,36 +916,6 @@ fn vm_repl_rolls_back_runtime_global_registry_after_error() {
 // =============================================================
 
 #[test]
-fn golden_scope_isolation() {
-    run_golden_test("scope_isolation");
-}
-
-#[test]
-fn vm_golden_scope_isolation() {
-    run_golden_test_vm("scope_isolation");
-}
-
-#[test]
-fn golden_block_scope_semantics() {
-    run_golden_test("block_scope_semantics");
-}
-
-#[test]
-fn vm_golden_block_scope_semantics() {
-    run_golden_test_vm("block_scope_semantics");
-}
-
-#[test]
-fn golden_for_closure_binding() {
-    run_golden_test("for_closure_binding");
-}
-
-#[test]
-fn vm_golden_for_closure_binding() {
-    run_golden_test_vm("for_closure_binding");
-}
-
-#[test]
 fn vm_repl_for_closure_cells_survive_slot_reuse() {
     let source = concat!(
         "let saved = []\n",
@@ -1519,14 +938,7 @@ fn vm_repl_for_closure_cells_survive_slot_reuse() {
     );
     let output = run_repl_process(source, true, &[]);
     let (stdout, stderr) = output_text(&output);
-    let visible_output: Vec<_> = stdout
-        .lines()
-        .filter_map(|line| {
-            line.rsplit_once("tsumugi:vm> ")
-                .map(|(_, value)| value)
-                .filter(|value| !value.is_empty())
-        })
-        .collect();
+    let visible_output = repl_visible_lines(&stdout, true);
 
     assert!(output.status.success(), "VM REPLが異常終了: {stderr}");
     assert!(stderr.is_empty(), "VM REPLで予期しない診断: {stderr}");
@@ -1553,14 +965,7 @@ fn vm_repl_recovers_structure_after_for_closure_error() {
     );
     let output = run_repl_process(source, true, &[]);
     let (stdout, stderr) = output_text(&output);
-    let visible_output: Vec<_> = stdout
-        .lines()
-        .filter_map(|line| {
-            line.rsplit_once("tsumugi:vm> ")
-                .map(|(_, value)| value)
-                .filter(|value| !value.is_empty())
-        })
-        .collect();
+    let visible_output = repl_visible_lines(&stdout, true);
 
     assert!(output.status.success(), "VM REPLが異常終了: {stderr}");
     assert_eq!(
@@ -1617,15 +1022,7 @@ fn repl_control_flow_block_locals_do_not_leak() {
         let output = run_repl_process(source, use_vm, &[]);
         let (stdout, stderr) = output_text(&output);
         let mode = if use_vm { "VM" } else { "tree" };
-        let prompt = if use_vm { "tsumugi:vm> " } else { "tsumugi> " };
-        let visible_output: Vec<_> = stdout
-            .lines()
-            .filter_map(|line| {
-                line.rsplit_once(prompt)
-                    .map(|(_, value)| value)
-                    .filter(|value| !value.is_empty())
-            })
-            .collect();
+        let visible_output = repl_visible_lines(&stdout, use_vm);
         let diagnostics: Vec<_> = stderr
             .lines()
             .filter(|line| !line.trim().is_empty())
@@ -1690,7 +1087,23 @@ fn run_repl_process(source: &str, use_vm: bool, envs: &[(&str, &str)]) -> std::p
         .expect("REPL stdinへの書き込みに失敗");
     drop(stdin); // EOFを送り、REPLを終了させる
 
-    child.wait_with_output().expect("REPLプロセスの待機に失敗")
+    let mode = if use_vm { "VM" } else { "tree-walk" };
+    wait_with_timeout(child, DEFAULT_TIMEOUT, &format!("REPL [{mode}]"))
+}
+
+/// REPLのstdoutからプロンプトを除いた出力行だけを取り出す。
+///
+/// tree/VMでプロンプト文字列が異なるため、行の比較にはこの正規化を使う。
+fn repl_visible_lines(stdout: &str, use_vm: bool) -> Vec<&str> {
+    let prompt = if use_vm { "tsumugi:vm> " } else { "tsumugi> " };
+    stdout
+        .lines()
+        .filter_map(|line| {
+            line.rsplit_once(prompt)
+                .map(|(_, value)| value)
+                .filter(|value| !value.is_empty())
+        })
+        .collect()
 }
 
 fn output_text(output: &std::process::Output) -> (String, String) {

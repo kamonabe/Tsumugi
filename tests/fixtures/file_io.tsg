@@ -1,20 +1,24 @@
+# テスト専用ディレクトリを使う（tree/VM・実行ごとに別パスなので競合しない）
+let dir = env("TSG_TEST_DIR")
+let target = path_join(dir, "file_io.txt")
+
 # ファイル書き込み
-let ok = write_file("/tmp/tsumugi_golden_test.txt", "line1\nline2\nline3")
+let ok = write_file(target, "line1\nline2\nline3")
 print(ok)
 
 # ファイル読み込み
-let content = read_file("/tmp/tsumugi_golden_test.txt")
+let content = read_file(target)
 print(contains(content, "line2"))
 
 # 行ごとに読み込み
-let lines = read_lines("/tmp/tsumugi_golden_test.txt")
+let lines = read_lines(target)
 print(len(lines))
 
 # 追記
-append_file("/tmp/tsumugi_golden_test.txt", "\nline4")
-let updated = read_lines("/tmp/tsumugi_golden_test.txt")
+append_file(target, "\nline4")
+let updated = read_lines(target)
 print(len(updated))
 
 # 存在しないファイル
-let missing = read_file("/tmp/no_such_tsumugi_file.txt")
+let missing = read_file(path_join(dir, "no_such_file.txt"))
 print(missing)
