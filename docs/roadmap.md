@@ -1,10 +1,12 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-08-26
+最終更新: 2026-08-27
 
 ## 2026-08-26 深層監査バックログ
 
 ツリーウォーク版とVM版を、REPL継続実行・失敗時状態・スコープ・クロージャ・import・全組み込み関数・資源上限・既存仕様の観点で横断監査した。既存テストは全件成功したが、REPL入力間の状態回復や実行系差を検出できない空白がある。優先度は、ホストプロセス停止／メモリ枯渇につながるものを **P0**、誤実行・状態漏洩・主要仕様差を **P1**、診断性・境界値・文書不整合を **P2** とする。
+
+追加監査では `cargo fmt --check`、`cargo clippy -- -D warnings`、`cargo build`、`cargo test` がすべて成功した状態から、隔離した最小入力で既存テスト外の不具合を再現した。再現済み項目は状態欄に明記し、Windows固有挙動やsymlink操作など実環境確認が必要な項目はコード監査結果として区別する。
 
 ### P0 — Critical
 
@@ -13,6 +15,9 @@
 | AUD-001 | VM REPLのコンパイル失敗をtransactionalにする | ブロック内でlocal追加後に未解決index assignment target等のcompile errorを置くと、Compilerだけが更新され、次入力の`GetLocal`でRustの範囲外panic。stale loopから`Jump(0)`生成にも到達可能 | ✅ 完了（REPL回帰テスト追加） |
 | AUD-002 | VM REPLの未捕捉runtime error後にstack/frame/handler/compilerを復元する | 一時値・callee frame・未実行bindingが次入力へ残り、誤値参照、古い関数の再開、二次panicを起こす | ✅ 完了（REPL回帰テスト追加） |
 | AUD-003 | コレクション上限を全生成経路へ一貫適用する | VMのlist/dict literal、`push`、`map`/`filter`、keys/values等で`TSUMUGI_MAX_COLLECTION_SIZE`を迂回でき、メモリDoS防止の完了記載と矛盾 | ✅ 言語から到達する生成・拡張経路を修正。総heap quotaは対象外 |
+| AUD-026 | `format_time`の極端なtimestampを定数時間で処理する | `format_time(9223372036854775807, "%Y")`は1970年から1年ずつ進むため実用上停止せず、step予算も消費しない。tree/VMとも2秒以内に完了せず、timeout（終了124）で強制停止 | ✅ 完了（400年周期化・両engineのi64極値timeout回帰テスト追加） |
+| AUD-027 | parser・compiler・evaluatorの全再帰経路へ深度制限を適用する | 10万個の`not`連鎖で`MAX_PARSE_DEPTH`を迂回し、Rust stack overflowでabort（終了134）。`elif`直再帰や左深BinOp ASTにも同種の経路がある | ⬜ 未着手（host abort再現済み） |
+| AUD-028 | 非循環import chainの深度を制限する | treeはimport実行を、VMはinline compileを再帰するがimport深度・step上限がなく、長い非循環chainでhost stack overflowに到達し得る | ⬜ 未着手（上限設計・回帰テストが必要） |
 
 ### P1 — High
 
@@ -26,9 +31,13 @@
 | AUD-009 | tree REPLのstep予算を入力単位でresetする | step数がセッション全体で累積し、一度上限に達すると以後の入力も失敗。VMと不一致 | ✅ 完了（入力間回帰テスト追加） |
 | AUD-010 | for変数のclosure bindingを反復単位で統一する | `[1,2,3]`で作ったclosureがtreeは`1,2,3`、VMは全て`3` | ✅ 反復ごとのfresh cellへ統一（closure・control-flow・REPL slot再利用回帰テスト追加） |
 | AUD-011 | VMのcompile-time name resolution差を仕様化／縮小する | dead branchの未定義名、global forward reference、引数評価順がtreeと異なる | ✅ call validation順とruntime global fallbackを統一（dead code・forward read/write・mutual recursion・REPL/import回帰テスト追加） |
-| AUD-012 | context依存builtinの契約を統一する | `exit`/`args`/`input`、`push`/`pop` upvalue、map/filter/each self-binding・error kind・CRLF処理に差 | 🟡 `exit`/`args`/`input`・callback self-binding完了。push/pop upvalue等は継続 |
+| AUD-012 | context依存builtinの契約を統一する | `input(side())`等の不正arityでtreeは引数を評価せず、VMは副作用後に拒否する。`push`/`pop`はupvalue・一時List・error kindにも差がある | 🟡 callback self-binding・通常I/O処理は完了。不正arity評価順、push/pop upvalue・一時値、error kindは継続 |
 | AUD-013 | VM index assignmentのupvalue対応と評価順を統一する | captured listへ代入不可。object取得順の違いで副作用後に古いlistを書き戻す | ⬜ 未着手 |
 | AUD-014 | equality / relational comparisonの対象型を統一する | List/Dict/Function/Error、Int×Floatでtreeはtype error、VMはboolを返す場合がある | ⬜ 仕様確定待ち |
+| AUD-029 | 複数行lambdaの終端`end`を必須検証する | `let f = fn(x)\n return x`をtree/VMとも構文エラーにせず終了コード0で受理する。EOFを`end`として無条件消費している | ⬜ 未着手（両engineで再現済み） |
+| AUD-030 | top-level importの評価時点を統一／仕様化する | `print("BEFORE")`後の失敗importでtreeだけ先行出力する。実行中に生成したmoduleもtreeだけimport可能で、VMのcompile-time inlineと観測可能な差がある | ⬜ 仕様確定待ち（両engine差を再現済み） |
+| AUD-031 | Windowsで`TSUMUGI_*`環境変数保護をcase-insensitiveにする | Windowsの環境変数検索は大文字小文字を区別しないがprefix検査は区別するため、`env("tsumugi_sandbox")`等で保護値を読める可能性がある | ⬜ 未着手（Windows実機回帰が必要） |
+| AUD-032 | 破壊的ファイル操作のfinal symlink意味論を修正する | `check_path`が最終symlinkまでcanonicalizeし、`remove`/`remove_dir`/`rename`がlink自体ではなくlink先を削除・移動する。意図しないデータ破壊につながる | ⬜ 未着手（隔離symlink回帰が必要） |
 
 ### P2 — Medium / Quality
 
@@ -39,16 +48,26 @@
 | AUD-017 | call-depth境界を統一する | 上限128にtop-level frameを含めるVMだけ、許容user frame数が1少ない | ⬜ 未着手 |
 | AUD-018 | CLIからscript引数を渡せるようにする | `args()`を公開しているがCLIが2個目以降の非flag引数をusage errorにする | ⬜ 未着手 |
 | AUD-019 | engine固有error kind/messageを統一する | iteration/index/push/pop/map等で`runtime`/`type`/`builtin_type`が異なる | ⬜ 未着手 |
-| AUD-020 | sandboxの脅威モデルとTOCTOU制約を明記する | canonicalize後のcheckとI/Oは別system callであり、外部processによるsymlink raceは残る | ⬜ 未着手 |
-| AUD-021 | language-spec / LANG_GUIDE / designのdriftを解消する | closureが値capture表記、catchが文字列表記、call depthが256/128併記、engine parity断言などが現実装と矛盾 | 🟡 closure/catch/depth/import/block scope/name visibilityを更新。残る意味論確定後に継続 |
-| AUD-022 | REPL・differential・limit境界・defensive VMテストを追加する | 現行golden testはREPL継続、stdin/argv/exit、collection上限、panic/hang、厳密なstderr/stdout副作用を検査しない | 🟡 REPL transaction・limit・builtin・block scope回帰を追加。網羅matrix/fuzzは継続 |
+| AUD-020 | sandboxの脅威モデルとTOCTOU制約を明記する | checkとI/O間のsymlink raceに加え、sandbox検査前のcanonicalizeによる許可外path存在oracle、空設定のfail-open意味論が未整理 | ⬜ 未着手 |
+| AUD-021 | language-spec / LANG_GUIDE / designのdriftを解消する | engine parity・Float完全一致・全module unit test・coverage/benchmark gate等の記載が現実装やAUD残件と矛盾する | 🟡 closure/catch/depth/import/block scope/name visibilityを更新。追加driftと意味論確定後の更新は継続 |
+| AUD-022 | REPL・differential・limit境界・defensive VMテストを追加する | subprocess timeoutなし、error goldenが部分一致、fixture登録が手動、tree/VMが固定`/tmp`を共有して並列raceする。厳密なstderr/stdout副作用比較も不足 | 🟡 REPL transaction・limit・builtin・block scope回帰を追加。harness改善・網羅matrix・fuzzは継続 |
 | AUD-023 | VMのunchecked index/`unwrap()`を構造化internal errorへ置換する | compiler/VM invariantが崩れるとhost panic。AUD-001/002でユーザー入力から到達可能だった | ⬜ transaction修正後も防御的に継続 |
 | AUD-024 | import・REPLの状態commit方針を明文化する | 未捕捉error前の代入/list mutation/upvalue更新を保持するかrollbackするか未定義。外部I/Oはrollback不能 | ⬜ 設計判断が必要 |
 | AUD-025 | VM REPL checkpointの複製コストを削減する | 入力ごとの`stack.clone()`が保持中List/Dictをdeep cloneし、時間・一時メモリがREPL状態量に比例する | ⬜ 計測後にCOW/mutation logを検討 |
+| AUD-033 | 未完結REPL入力のEOFを診断する | `if true`等の継続入力中にEOFを送ると、tree/VMとも構文エラーを出さずbufferを破棄して終了コード0になる | ⬜ 未着手（両engineで再現済み） |
+| AUD-034 | `path_join`の引数型契約を厳格化する | `path_join("a", 123, "b")`が型エラーにならず`a/b`を返し、非文字列argumentを無言で欠落させる | ⬜ 仕様確定待ち（両engine共通で再現済み） |
+| AUD-035 | CLI・標準I/Oのhost panic経路を構造化する | REPLのthread spawn・stdout flush・stdin readに`unwrap()`があり、broken pipe/I/O障害でpanicする。Unixの非UTF-8 argvは`std::env::args()`でもpanicし得る | ⬜ 未着手 |
+| AUD-036 | lossyな数値・OS境界変換を検証する | `exit`のi64→i32、`file_size`のu64→i64、NaN/Infを含む`to_int`/`floor`/`ceil`/`round`がwrap・飽和・0化し得る | ⬜ 仕様確定待ち（境界回帰テストが必要） |
 
-### 今回の改修境界
+### 追加監査後の推奨改修順
 
-まず、ユーザー入力だけでホストpanic／状態破損へ到達する **AUD-001 / AUD-002** を最優先で解消する。同じ状態境界に属する **AUD-004 / AUD-006**、独立して安全に修正できる **AUD-003（主要生成経路）/ AUD-005 / AUD-009 / AUD-012（一部）/ AUD-015 / AUD-022** までを回帰テスト付きで扱う。言語仕様の選択を伴う項目は、誤った互換性変更を避けるためバックログに残す。
+1. **停止性:** AUD-026 / AUD-027 / AUD-028を先行し、timeout・深度制限・host abortなしを回帰テストで固定する。
+2. **誤実行・安全境界:** 独立修正しやすいAUD-029 / AUD-031 / AUD-032を処理し、意味論選択が必要なAUD-012 / AUD-013 / AUD-014 / AUD-030は仕様決定後に実装する。
+3. **品質基盤:** AUD-022でtimeout・一時directory分離・厳密differential harnessを整備してから、P2境界とfuzzを拡充する。
+
+### 初回監査の改修境界（記録）
+
+ユーザー入力だけでホストpanic／状態破損へ到達していた **AUD-001 / AUD-002** を最優先で解消した。同じ状態境界に属する **AUD-004 / AUD-006**、独立して安全に修正できた **AUD-003（主要生成経路）/ AUD-005 / AUD-009 / AUD-012（一部）/ AUD-015 / AUD-022** までを回帰テスト付きで扱い、言語仕様の選択を伴う項目はバックログに残した。
 
 ## 実装済み
 

@@ -1012,6 +1012,79 @@ fn vm_golden_edge_cases() {
 }
 
 // =============================================================
+// リグレッションテスト: format_time の極端なtimestampで停止しない
+// =============================================================
+
+#[test]
+fn format_time_extreme_timestamps_complete_in_both_engines() {
+    fn wait_with_timeout(
+        mut child: std::process::Child,
+        timeout: std::time::Duration,
+    ) -> Result<std::process::Output, String> {
+        let deadline = std::time::Instant::now() + timeout;
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    return child
+                        .wait_with_output()
+                        .map_err(|error| format!("プロセスの出力取得に失敗: {error}"));
+                }
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("{}秒以内に完了しませんでした", timeout.as_secs()));
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("プロセス状態の取得に失敗: {error}"));
+                }
+            }
+        }
+    }
+
+    let dir = fixtures_dir();
+    let script = dir.join("format_time_extreme.tsg");
+    let expected = std::fs::read_to_string(dir.join("format_time_extreme.expected"))
+        .expect("期待出力ファイルが読めません")
+        .replace("\r\n", "\n");
+
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree-walk" };
+        let mut command = Command::new(tsumugi_bin());
+        if use_vm {
+            command.arg("--vm");
+        }
+        let child = command
+            .arg(&script)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("{mode}プロセスの起動に失敗: {error}"));
+        let output = wait_with_timeout(child, std::time::Duration::from_secs(2))
+            .unwrap_or_else(|error| panic!("{mode}のformat_timeが停止: {error}"));
+        let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+        let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
+
+        assert!(
+            output.status.success(),
+            "{mode}が異常終了しました: {stderr}"
+        );
+        assert_eq!(
+            stdout.trim_end(),
+            expected.trim_end(),
+            "{mode}の極端なtimestamp変換結果が不正"
+        );
+        assert!(
+            !stderr.contains("panicked at"),
+            "{mode}でhost panic: {stderr}"
+        );
+    }
+}
+
+// =============================================================
 // リグレッションテスト: f-string 余剰トークンエラー
 // =============================================================
 
