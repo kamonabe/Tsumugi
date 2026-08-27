@@ -97,6 +97,10 @@ pub enum OpCode {
     MakeClosure(usize),
 
     // --- 組み込み関数呼び出し ---
+    /// context依存builtinのarityと破壊対象構文を引数評価前に検査する
+    /// operand: (関数名, 引数の数, 第1引数が識別子か)
+    ValidateBuiltinCall(String, usize, bool),
+
     /// print: 引数の数を operand で指定
     Print(usize),
 

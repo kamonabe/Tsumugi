@@ -565,9 +565,11 @@ builtin_core.rs
 ```
 
 設計方針:
-- **引数は評価済み `&[Value]`** — 引数の評価方法がエンジンで異なるため（ツリーウォーク: `&[Expr]` を `eval_expr` で評価、VM: スタックから pop 済み）、共通モジュールは評価済みの値だけ受け取る
-- **エンジン固有のビルトインは各モジュールに残す** — `push`/`pop`（ツリーウォークは変数を直接変更）、`map`/`filter`/`each`（クロージャ呼び出しがエンジン依存）、`print`/`input`/`exit`/`args`（I/O・プロセス操作）
-- **user bindingをbuiltinより優先する** — `print`以外の識別子calleeはlocal/upvalue/runtime globalを先に探し、bindingがない場合だけbuiltinへfallbackする。VMは`JumpIfGlobalDefined`で実行時のglobal登録状態を分岐し、builtin branchとuser-call branchの評価順を混在させない。builtin `push`/`pop`が選ばれた場合だけ、更新後のListをlocal/upvalue/runtime globalの元bindingへ書き戻す
+- **引数は評価済み `&[Value]`** — 引数評価自体は各engineが担当し、共通モジュールは評価済みの値だけ受け取る
+- **context builtinは評価前に共通検証** — `input` / `args` / `exit` / `push` / `pop` / `map` / `filter` / `each`は共通validatorでarityを検査する。`push` / `pop`は第1引数が識別子かも検査し、失敗時は引数を評価しない。VMはbuiltin branch内の`ValidateBuiltinCall` opcodeで実行時に検査する
+- **エンジン固有のビルトインは各モジュールに残す** — `push`/`pop`（binding更新）、`map`/`filter`/`each`（クロージャ呼び出し）、`print`/`input`/`exit`/`args`（I/O・プロセス操作）
+- **user bindingをbuiltinより優先する** — `print`以外の識別子calleeはlocal/upvalue/runtime globalを先に探し、bindingがない場合だけbuiltinへfallbackする。VMは`JumpIfGlobalDefined`で実行時のglobal登録状態を分岐し、builtin branchとuser-call branchの評価順を混在させない
+- **破壊的List操作はbindingへ書き戻す** — builtin `push`/`pop`が選ばれた場合、第1引数はlocal/upvalue/runtime globalの識別子bindingに限定する。第1引数の値を先にsnapshotし、更新後のListを同じbindingへ書き戻す。一時Listは永続化先がないため拒否する
 - **新規ビルトイン追加は `builtin_core.rs` + dispatch テーブルへの登録のみ** — 両エンジンに自動的に反映される
 
 ### 設計判断
@@ -674,6 +676,20 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 ## 変更履歴
 
+### 2026-08-27: context依存builtin契約の統一（AUD-012）
+
+**問題:** `input`等の不正arityでVMだけ引数の副作用を実行し、`push` / `pop`は一時ListをVMだけ受理していた。さらにtreeは`push`の第2引数を評価してからtargetを読み、VMはtargetを先にsnapshotするため、引数内で同じbindingを再代入した場合の書戻し結果が異なった。collection系の型・空Listエラーも`runtime`と`builtin_type`に分かれていた。
+
+**決定:** context builtinはuser/builtin選択後、arityを引数評価前に検査する。`push` / `pop`は第1引数のsource式が識別子かも事前検査し、local・captured・runtime globalのList bindingだけを破壊的更新対象とする。正当な引数は左から右へ評価し、`push`は第1引数の値を先にsnapshotして第2引数評価後に同じbindingへ書き戻す。`map` / `filter` / `each`は外側の両引数を評価してからList型を検査する。
+
+**実装:** `builtin_core`へ共通validatorを追加し、treeはbuiltin dispatch直後に呼び出す。Compilerはruntime globalのuser bindingが存在しないbuiltin branch内だけに`ValidateBuiltinCall`を生成し、VMは引数bytecodeより前に実行する。treeの`push` / `pop`も共通coreで更新値・戻り値・`builtin_type`を生成し、local/upvalue/runtime globalへ同じsnapshot/writeback規則を適用する。
+
+**不採用案:** 一時Listを許可すると、永続化先のない破壊的操作となり、identifier版では`null`、旧VMのtemporary版では更新済みListという二重の戻り値契約が残るため不採用とした。Compilerで静的エラーにするとdead branchでも失敗し、`try` / `catch`可能なruntime validationを壊すため、専用opcodeで到達時に検査する。
+
+**互換性と境界:** VMで不正context builtinの引数副作用やtemporary `push` / `pop`に依存したコードは変化する。treeで`push`の第2引数から同じtargetを変更していた場合も、先に読んだsnapshotを書き戻す結果へ変わる。callbackのnon-callable・arity messageや他のengine固有診断の完全一致はAUD-019で継続する。
+
+**検証:** arity副作用抑止、temporary拒否、target再代入、higher-order builtinの評価順・error kindをtree/VMの同一smoke入力で比較し、既存の全target test・lint・buildを実行する。
+
 ### 2026-08-26: runtime global name resolutionの導入（AUD-011 後半）
 
 **問題:** VM Compilerは全ASTを実行前に走査し、識別子をその時点で既知のlocal/upvalue slotへだけ解決していた。そのため、dead branch・短絡された式・未呼出し関数内の未定義名もcompile errorとなり、先行I/Oを実行せず、`try` / `catch`でも捕捉できなかった。また、関数定義後に宣言されるtop-level globalや後続関数をfunction bodyから参照できず、tree evaluatorが持つlive global scopeと不一致だった。
@@ -686,7 +702,7 @@ VMのregistryは`HashMap<String, usize>`として**名前からtop-level slotだ
 
 **不採用案:** tree evaluatorへ全面static resolverを追加する案はdead code、catch可能なName error、live globalを破壊する。top-level名を事前登録する案は未初期化状態を導入し、宣言到達前の可視性とAUD-016を巻き込む。全名前をdynamic化する案は既存local/upvalue slotの性能とlexical bindingを不要に変える。globalごとに別cellを作る案はtop-level slot・upvalueとのidentityを二重化し、AUD-004で修正したclosure共有とAUD-024のrollback境界を壊すため採用しない。
 
-**互換性と境界:** VMでcompile errorだった未定義名は、実際に到達した場合だけruntime Name errorになる。このためエラー前のprint/I/Oは実行され、同一実行内の`try` / `catch`で捕捉可能になる。これはtree semanticsへの意図的な統一である。同一scopeの`let`再宣言identityはAUD-016、未捕捉REPL入力の値mutation commit/rollbackはAUD-024、error message/traceの完全一致はAUD-019として維持する。`push` / `pop`の識別子更新はAUD-012、index assignmentのupvalue・評価順はAUD-013の特殊mutation loweringとして本変更の対象外とする。
+**互換性と境界:** VMでcompile errorだった未定義名は、実際に到達した場合だけruntime Name errorになる。このためエラー前のprint/I/Oは実行され、同一実行内の`try` / `catch`で捕捉可能になる。これはtree semanticsへの意図的な統一である。同一scopeの`let`再宣言identityはAUD-016、未捕捉REPL入力の値mutation commit/rollbackはAUD-024、error message/traceの完全一致はAUD-019として維持する。`push` / `pop`の識別子更新はAUD-012で統一済みであり、index assignmentのupvalue・評価順はAUD-013の特殊mutation loweringとして継続する。
 
 **回帰テスト:** paired golden testでdead `if` / loop / catch、short-circuit、未呼出しfunction/lambda、`return`後、catch可能なName error、未定義calleeの引数非評価、invalid call validation優先、forward global read/write、nested closure、後続cell化、top-level mutual recursion、block-local非公開を検証する。import fixtureではimport内の後続関数とcaller側の後続globalを、両engineのREPLテストでは入力間forward referenceを検証する。VM REPLでは失敗import後にregistry entryとslotがrollbackされ、同名globalを安全に再定義できることも検証する。
 
@@ -700,7 +716,7 @@ VMのregistryは`HashMap<String, usize>`として**名前からtop-level slotだ
 
 **不採用案:** treeをVM旧仕様のargs-firstへ合わせる案は、invalid callで新たに外部副作用を発生させ、既存treeコードのerror precedenceを壊すため不採用。Compilerで静的にarityを検査するだけの案はfirst-class functionやcallee式を扱えず、non-callableも解決しない。
 
-**互換性と境界:** VMでinvalid callの引数副作用に依存していたコードは変化する。必要な副作用はcall引数の外で明示的に実行する。builtin固有の引数・callback契約はAUD-012、non-callableを含むerror messageの完全一致はAUD-019で扱う。dead codeの未定義名、global forward reference、未定義argの実行前拒否はcall validationとは別のname resolution問題であり、AUD-011後半（前節）のruntime global fallbackで対応する。
+**互換性と境界:** VMでinvalid callの引数副作用に依存していたコードは変化する。必要な副作用はcall引数の外で明示的に実行する。builtin固有の引数・callback契約はAUD-012で統一済みであり、non-callableを含むerror messageの完全一致はAUD-019で扱う。dead codeの未定義名、global forward reference、未定義argの実行前拒否はcall validationとは別のname resolution問題であり、AUD-011後半（前節）のruntime global fallbackで対応する。
 
 **回帰テスト:** paired golden testで成功時のcallee→arg1→arg2→body、wrong arity/non-callable時の引数非評価、callee runtime errorの優先、引数の左から右評価とarg error時のbody非実行を検証する。tree/VM REPLテストではstep上限をcallee評価前に検査し、caught `limit` error後もcallee副作用が発生しないことを検証する。
 

@@ -375,6 +375,8 @@ my_string.upper()       # ERROR
 my_list.map { ... }     # ERROR
 ```
 
+`push` and `pop` require a named List variable as their first argument. Temporary Lists such as `push([1], 2)` are rejected. `push` updates the variable and returns `null`; `pop` updates the variable and returns the removed value.
+
 ### Index Access and Assignment
 
 ```tsg

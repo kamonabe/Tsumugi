@@ -825,6 +825,17 @@ impl Compiler {
         args: &[Expr],
         line: usize,
     ) -> Result<(), TsumugiError> {
+        if crate::builtin_core::is_context_builtin(name) {
+            self.chunk.emit(
+                OpCode::ValidateBuiltinCall(
+                    name.to_string(),
+                    args.len(),
+                    matches!(args.first(), Some(Expr::Ident(_))),
+                ),
+                line,
+            );
+        }
+
         // push/pop は第一引数のリストを破壊的に変更する
         // → 実行後に元の変数スロットを更新する
         if (name == "push" || name == "pop")

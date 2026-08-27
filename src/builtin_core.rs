@@ -55,25 +55,77 @@ pub fn check_collection_size_public(size: usize, line: usize) -> Result<(), Tsum
 // ユーティリティ
 // =============================================================================
 
+pub fn check_arity_count(
+    name: &str,
+    actual: usize,
+    expected: usize,
+    line: usize,
+) -> Result<(), TsumugiError> {
+    if actual != expected {
+        Err(TsumugiError::runtime_with_kind(
+            line,
+            crate::error::ErrorKind::Argument,
+            format!(
+                "{}: 引数の数が合いません: {}個必要ですが{}個渡されました",
+                name, expected, actual
+            ),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub fn check_arity(
     name: &str,
     args: &[Value],
     expected: usize,
     line: usize,
 ) -> Result<(), TsumugiError> {
-    if args.len() != expected {
-        Err(TsumugiError::runtime_with_kind(
-            line,
-            crate::error::ErrorKind::Argument,
-            format!(
-                "{}: 引数の数が合いません: {}個必要ですが{}個渡されました",
-                name,
-                expected,
-                args.len()
-            ),
-        ))
-    } else {
-        Ok(())
+    check_arity_count(name, args.len(), expected, line)
+}
+
+pub fn is_context_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "input" | "args" | "exit" | "push" | "pop" | "map" | "filter" | "each"
+    )
+}
+
+pub fn validate_context_builtin_call(
+    name: &str,
+    arg_count: usize,
+    first_arg_is_identifier: bool,
+    line: usize,
+) -> Result<(), TsumugiError> {
+    match name {
+        "input" | "args" => check_arity_count(name, arg_count, 0, line),
+        "exit" => {
+            if arg_count > 1 {
+                Err(TsumugiError::runtime_with_kind(
+                    line,
+                    crate::error::ErrorKind::Argument,
+                    format!("exit() は引数0〜1個ですが、{}個渡されました", arg_count),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        "push" | "pop" => {
+            let expected = if name == "push" { 2 } else { 1 };
+            check_arity_count(name, arg_count, expected, line)?;
+            if first_arg_is_identifier {
+                Ok(())
+            } else {
+                let message = if name == "push" {
+                    "push() の第1引数はリスト変数である必要があります"
+                } else {
+                    "pop() の第1引数はリスト変数である必要があります"
+                };
+                Err(type_error(line, message))
+            }
+        }
+        "map" | "filter" | "each" => check_arity_count(name, arg_count, 2, line),
+        _ => Ok(()),
     }
 }
 

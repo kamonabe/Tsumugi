@@ -127,6 +127,13 @@ impl Evaluator {
         args: &[Expr],
         line: usize,
     ) -> Result<Option<Value>, TsumugiError> {
+        crate::builtin_core::validate_context_builtin_call(
+            name,
+            args.len(),
+            matches!(args.first(), Some(Expr::Ident(_))),
+            line,
+        )?;
+
         match name {
             // --- コンテキスト依存（ツリーウォーク固有の実装が必要） ---
             "print" | "input" | "args" | "exit" => self.builtin_io(name, args, line),
@@ -249,97 +256,46 @@ impl Evaluator {
     ) -> Result<Option<Value>, TsumugiError> {
         match name {
             "push" => {
-                if args.len() != 2 {
-                    return Err(TsumugiError::runtime(
-                        line,
-                        format!("push() は引数2個ですが、{}個渡されました", args.len()),
-                    ));
-                }
-                let var_name = match &args[0] {
-                    Expr::Ident(name) => name.clone(),
-                    _ => {
-                        return Err(TsumugiError::runtime(
-                            line,
-                            "push() の第1引数はリスト変数である必要があります",
-                        ));
-                    }
+                let Expr::Ident(var_name) = &args[0] else {
+                    unreachable!("push target was validated before argument evaluation")
                 };
-                let val = self.eval_expr(&args[1], line)?;
-                let cell = self.env.get_cell(&var_name).ok_or_else(|| {
+                let cell = self.env.get_cell(var_name).ok_or_else(|| {
                     TsumugiError::runtime(line, format!("未定義の変数: {}", var_name))
                 })?;
-                let mut target = cell.borrow_mut();
-                match &mut *target {
-                    Value::List(list) => {
-                        crate::builtin_core::check_collection_size_public(
-                            list.len().saturating_add(1),
-                            line,
-                        )?;
-                        list.push(val);
-                    }
-                    _ => {
-                        return Err(TsumugiError::runtime(
-                            line,
-                            "push() はリストにのみ使用できます",
-                        ));
-                    }
-                }
+
+                // 第1引数を先にsnapshotし、第2引数の評価後に同じbindingへ書き戻す。
+                let target_value = cell.borrow().clone();
+                let value = self.eval_expr(&args[1], line)?;
+                let updated = crate::builtin_core::builtin_push(&[target_value, value], line)?;
+                *cell.borrow_mut() = updated;
                 Ok(Some(Value::Null))
             }
             "pop" => {
-                if args.len() != 1 {
-                    return Err(TsumugiError::runtime(
-                        line,
-                        format!("pop() は引数1個ですが、{}個渡されました", args.len()),
-                    ));
-                }
-                let var_name = match &args[0] {
-                    Expr::Ident(name) => name.clone(),
-                    _ => {
-                        return Err(TsumugiError::runtime(
-                            line,
-                            "pop() の引数はリスト変数である必要があります",
-                        ));
-                    }
+                let Expr::Ident(var_name) = &args[0] else {
+                    unreachable!("pop target was validated before argument evaluation")
                 };
-                let cell = self.env.get_cell(&var_name).ok_or_else(|| {
+                let cell = self.env.get_cell(var_name).ok_or_else(|| {
                     TsumugiError::runtime(line, format!("未定義の変数: {}", var_name))
                 })?;
-                let mut target = cell.borrow_mut();
-                match &mut *target {
-                    Value::List(list) => {
-                        if list.is_empty() {
-                            return Err(TsumugiError::runtime(
-                                line,
-                                "空のリストから pop できません",
-                            ));
-                        }
-                        let val = list.pop().unwrap();
-                        Ok(Some(val))
-                    }
-                    _ => Err(TsumugiError::runtime(
-                        line,
-                        "pop() はリストにのみ使用できます",
-                    )),
-                }
+                let target_value = cell.borrow().clone();
+                let value =
+                    crate::builtin_core::builtin_pop(std::slice::from_ref(&target_value), line)?;
+                let updated = crate::builtin_core::builtin_pop_update(&[target_value], line)?;
+                *cell.borrow_mut() = updated;
+                Ok(Some(value))
             }
             "map" => {
-                if args.len() != 2 {
-                    return Err(TsumugiError::runtime(
-                        line,
-                        format!("map() は引数2個ですが、{}個渡されました", args.len()),
-                    ));
-                }
-                let list = match self.eval_expr(&args[0], line)? {
+                let list_value = self.eval_expr(&args[0], line)?;
+                let func = self.eval_expr(&args[1], line)?;
+                let list = match list_value {
                     Value::List(v) => v,
                     _ => {
-                        return Err(TsumugiError::runtime(
+                        return Err(crate::builtin_core::type_error(
                             line,
-                            "map() の第1引数はリストである必要があります",
+                            "map(list, fn) の形式で使います",
                         ));
                     }
                 };
-                let func = self.eval_expr(&args[1], line)?;
                 let mut result = Vec::new();
                 for item in list {
                     let val = self.call_fn_value(&func, vec![item], line)?;
@@ -352,22 +308,17 @@ impl Evaluator {
                 Ok(Some(Value::List(result)))
             }
             "filter" => {
-                if args.len() != 2 {
-                    return Err(TsumugiError::runtime(
-                        line,
-                        format!("filter() は引数2個ですが、{}個渡されました", args.len()),
-                    ));
-                }
-                let list = match self.eval_expr(&args[0], line)? {
+                let list_value = self.eval_expr(&args[0], line)?;
+                let func = self.eval_expr(&args[1], line)?;
+                let list = match list_value {
                     Value::List(v) => v,
                     _ => {
-                        return Err(TsumugiError::runtime(
+                        return Err(crate::builtin_core::type_error(
                             line,
-                            "filter() の第1引数はリストである必要があります",
+                            "filter(list, fn) の形式で使います",
                         ));
                     }
                 };
-                let func = self.eval_expr(&args[1], line)?;
                 let mut result = Vec::new();
                 for item in list {
                     let val = self.call_fn_value(&func, vec![item.clone()], line)?;
@@ -382,22 +333,17 @@ impl Evaluator {
                 Ok(Some(Value::List(result)))
             }
             "each" => {
-                if args.len() != 2 {
-                    return Err(TsumugiError::runtime(
-                        line,
-                        format!("each() は引数2個ですが、{}個渡されました", args.len()),
-                    ));
-                }
-                let list = match self.eval_expr(&args[0], line)? {
+                let list_value = self.eval_expr(&args[0], line)?;
+                let func = self.eval_expr(&args[1], line)?;
+                let list = match list_value {
                     Value::List(v) => v,
                     _ => {
-                        return Err(TsumugiError::runtime(
+                        return Err(crate::builtin_core::type_error(
                             line,
-                            "each() の第1引数はリストである必要があります",
+                            "each(list, fn) の形式で使います",
                         ));
                     }
                 };
-                let func = self.eval_expr(&args[1], line)?;
                 for item in list {
                     self.call_fn_value(&func, vec![item], line)?;
                 }
