@@ -46,44 +46,71 @@ fn allowed_paths() -> &'static Option<Vec<PathBuf>> {
 /// 指定パスがサンドボックスの許可範囲内かチェックする。
 /// サンドボックスが無効（環境変数未設定）の場合は正規化パスを返す。
 /// 範囲外の場合はランタイムエラーを返す。
-/// 戻り値の PathBuf を実際のファイル操作に使うことで TOCTOU を防止する。
+/// 戻り値を実際のファイル操作に使い、検査対象と操作対象を一致させる。
+/// ただし、検査後にsymlinkを差し替えるcheck/use raceまでは防止しない。
 pub fn check_path(path_str: &str, line: usize) -> Result<PathBuf, TsumugiError> {
-    // 対象パスを絶対パスに正規化
-    let target = normalize_path(path_str);
+    authorize_path(normalize_path(path_str), path_str, line)
+}
 
+/// directory entry自体を変更する操作向けのサンドボックス検査。
+/// 中間componentは解決するが、final componentはsymlink targetへ展開しない。
+pub fn check_entry_path(path_str: &str, line: usize) -> Result<PathBuf, TsumugiError> {
+    authorize_path(normalize_entry_path(path_str), path_str, line)
+}
+
+/// 正規化済みpathを許可リストと照合する。
+fn authorize_path(target: PathBuf, original: &str, line: usize) -> Result<PathBuf, TsumugiError> {
     let Some(allowed) = allowed_paths() else {
-        // サンドボックス無効: 正規化パスをそのまま返す
         return Ok(target);
     };
 
-    // 許可パスのいずれかのプレフィックスに合致するか
-    for allowed_path in allowed {
-        if target.starts_with(allowed_path) {
-            return Ok(target);
-        }
+    if allowed
+        .iter()
+        .any(|allowed_path| target.starts_with(allowed_path))
+    {
+        return Ok(target);
     }
 
     Err(TsumugiError::runtime_with_kind(
         line,
         crate::error::ErrorKind::Sandbox,
-        format!("サンドボックス違反: パス \"{}\" は許可範囲外です", path_str),
+        format!("サンドボックス違反: パス \"{}\" は許可範囲外です", original),
     ))
 }
 
-/// パスを絶対パスに正規化する。
-/// 存在しないパスでも動作するように canonicalize ではなく手動で処理する。
-/// 中間ディレクトリのシンボリックリンク迂回を防ぐため、
-/// 存在する最も近い祖先ディレクトリまで遡って canonicalize する。
-fn normalize_path(path_str: &str) -> PathBuf {
-    let p = Path::new(path_str);
-    let absolute = if p.is_absolute() {
-        p.to_path_buf()
+/// パスを絶対化する。
+fn absolutize_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
     } else {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("/"))
-            .join(p)
+            .join(path)
+    }
+}
+
+/// targetを読み書きする操作向けに、final componentを含むpath全体を正規化する。
+fn normalize_path(path_str: &str) -> PathBuf {
+    normalize_absolute_path(&absolutize_path(Path::new(path_str)))
+}
+
+/// unlink/rename対象のdirectory entry向けに、中間componentだけを正規化する。
+fn normalize_entry_path(path_str: &str) -> PathBuf {
+    let absolute = absolutize_path(Path::new(path_str));
+    let Some(file_name) = absolute.file_name() else {
+        return normalize_absolute_path(&absolute);
+    };
+    let Some(parent) = absolute.parent() else {
+        return normalize_absolute_path(&absolute);
     };
 
+    normalize_absolute_path(parent).join(file_name)
+}
+
+/// 絶対パスを正規化する。
+/// 存在しないパスでも動作し、中間symlinkを解決するために
+/// 存在する最も近い祖先まで遡ってcanonicalizeする。
+fn normalize_absolute_path(absolute: &Path) -> PathBuf {
     // 最終パス全体が canonicalize できればそれを使う（シンボリックリンク解決 + .. 解決）
     if let Ok(resolved) = absolute.canonicalize() {
         return resolved;
@@ -91,7 +118,7 @@ fn normalize_path(path_str: &str) -> PathBuf {
 
     // 存在する最も近い祖先まで遡って canonicalize し、残りを join する
     // これにより中間のシンボリックリンクが解決される
-    let mut ancestor = absolute.as_path();
+    let mut ancestor = absolute;
     let mut tail_parts: Vec<&std::ffi::OsStr> = Vec::new();
 
     while let Some(parent) = ancestor.parent() {
@@ -110,7 +137,7 @@ fn normalize_path(path_str: &str) -> PathBuf {
     }
 
     // どの祖先も canonicalize できない場合は手動で .. を解決する
-    resolve_dots(&absolute)
+    resolve_dots(absolute)
 }
 
 /// パス中の `.` と `..` を手動で解決する（パスが存在しなくても動作する）

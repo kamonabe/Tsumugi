@@ -685,9 +685,9 @@ end
 | `path_exists(path)` | パスが存在すれば true |
 | `path_join(parts...)` | パーツを結合してパス文字列を返す |
 | `mkdir(path)` | ディレクトリを再帰的に作成。成功で true |
-| `remove(path)` | ファイルまたは空ディレクトリを削除。成功で true |
-| `remove_dir(path)` | ディレクトリを中身ごと再帰削除。成功で true |
-| `rename(from, to)` | ファイル/ディレクトリを移動・リネーム。成功で true |
+| `remove(path)` | ファイルまたは空ディレクトリを削除。final symlinkはlink自体だけを削除する。成功で true |
+| `remove_dir(path)` | ディレクトリを中身ごと再帰削除。final symlinkはlink自体だけを削除し、targetをたどらない。成功で true |
+| `rename(from, to)` | ファイル/ディレクトリを移動・リネーム。from/toのfinal symlinkはtargetでなくdirectory entry自体として扱う。成功で true |
 | `list_dir(path)` | ディレクトリ内のエントリ名をリストで返す。失敗で null |
 | `file_size(path)` | ファイルサイズ（バイト）を整数で返す。失敗で null |
 | `trim(str)` | 前後の空白を除去 |
@@ -784,6 +784,10 @@ end
 
 - カンマ区切りで複数パスを許可可能
 - 許可パスのプレフィックスに合致しないアクセスはサンドボックス違反エラー
+- 読み書き・metadataは、解決可能なfinal symlinkではtargetを認可対象とする。importは既存pathをcanonicalizeしてから認可する
+- `remove` / `remove_dir` / `rename`は中間symlinkを解決したうえでfinal directory entryを認可対象とし、final symlinkのtargetは操作しない
+- targetが未作成のdangling final symlinkを通じた`write_file` / `append_file`は、targetの場所を認可できない既知の制約がある（AUD-020）
+- 検査と実I/Oの間のsymlink差し替えraceまでは防止しない
 - 未設定時は制限なし（全パス許可）
 - 例: `TSUMUGI_SANDBOX=/home/user/scripts,/tmp`
 
