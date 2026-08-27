@@ -12,7 +12,7 @@
 
 | ID | 項目 | 再現・影響 | 状態 |
 |---|---|---|---|
-| AUD-001 | VM REPLのコンパイル失敗をtransactionalにする | ブロック内でlocal追加後に未解決index assignment target等のcompile errorを置くと、Compilerだけが更新され、次入力の`GetLocal`でRustの範囲外panic。stale loopから`Jump(0)`生成にも到達可能 | ✅ 完了（REPL回帰テスト追加） |
+| AUD-001 | VM REPLのコンパイル失敗をtransactionalにする | ブロック内でlocal追加後にcompile error（当時は未解決index assignment target、現在はループ外`break`等）を置くと、Compilerだけが更新され、次入力の`GetLocal`でRustの範囲外panic。stale loopから`Jump(0)`生成にも到達可能 | ✅ 完了（REPL回帰テスト追加） |
 | AUD-002 | VM REPLの未捕捉runtime error後にstack/frame/handler/compilerを復元する | 一時値・callee frame・未実行bindingが次入力へ残り、誤値参照、古い関数の再開、二次panicを起こす | ✅ 完了（REPL回帰テスト追加） |
 | AUD-003 | コレクション上限を全生成経路へ一貫適用する | VMのlist/dict literal、`push`、`map`/`filter`、keys/values等で`TSUMUGI_MAX_COLLECTION_SIZE`を迂回でき、メモリDoS防止の完了記載と矛盾 | ✅ 言語から到達する生成・拡張経路を修正。総heap quotaは対象外 |
 | AUD-026 | `format_time`の極端なtimestampを定数時間で処理する | `format_time(9223372036854775807, "%Y")`は1970年から1年ずつ進むため実用上停止せず、step予算も消費しない。tree/VMとも2秒以内に完了せず、timeout（終了124）で強制停止 | ✅ 完了（400年周期化・両engineのi64極値timeout回帰テスト追加） |
@@ -32,7 +32,7 @@
 | AUD-010 | for変数のclosure bindingを反復単位で統一する | `[1,2,3]`で作ったclosureがtreeは`1,2,3`、VMは全て`3` | ✅ 反復ごとのfresh cellへ統一（closure・control-flow・REPL slot再利用回帰テスト追加） |
 | AUD-011 | VMのcompile-time name resolution差を仕様化／縮小する | dead branchの未定義名、global forward reference、引数評価順がtreeと異なる | ✅ call validation順とruntime global fallbackを統一（dead code・forward read/write・mutual recursion・REPL/import回帰テスト追加） |
 | AUD-012 | context依存builtinの契約を統一する | `input(side())`等の不正arityでtreeは引数を評価せず、VMは副作用後に拒否する。`push`/`pop`はupvalue・一時List・error kindにも差がある | ✅ builtin選択後のarity・破壊対象を引数評価前に検査。一時List拒否、left-to-right snapshot/writeback、local/upvalue/runtime global更新、collection error kindをtree/VMで統一 |
-| AUD-013 | VM index assignmentのupvalue対応と評価順を統一する | captured listへ代入不可。object取得順の違いで副作用後に古いlistを書き戻す | ⬜ 未着手 |
+| AUD-013 | VM index assignmentのupvalue対応と評価順を統一する | captured listへ代入不可。object取得順の違いで副作用後に古いlistを書き戻す | ✅ target解決→index→value→in-place更新へ統一。local/upvalue/runtime global対応、未定義targetの先行報告、共有`assign_index`によるメッセージ・境界判定一致（golden pair・両engine REPL回帰テスト追加） |
 | AUD-014 | equality / relational comparisonの対象型を統一する | List/Dict/Function/Error、Int×Floatでtreeはtype error、VMはboolを返す場合がある | ⬜ 仕様確定待ち |
 | AUD-029 | 複数行lambdaの終端`end`を必須検証する | `let f = fn(x)\n return x`をtree/VMとも構文エラーにせず終了コード0で受理する。EOFを`end`として無条件消費している | ✅ Parserで`End`を必須検証し、tree/VM共通でEOFを構文エラー化 |
 | AUD-030 | top-level importの評価時点を統一／仕様化する | `print("BEFORE")`後の失敗importでtreeだけ先行出力する。実行中に生成したmoduleもtreeだけimport可能で、VMのcompile-time inlineと観測可能な差がある | ⬜ 仕様確定待ち（両engine差を再現済み） |
@@ -79,7 +79,7 @@ Criterionの平均値は次のとおり。各iterationにparseを含み、VMはc
 ### 追加監査後の推奨改修順
 
 1. **停止性:** AUD-026 / AUD-027 / AUD-028は完了。timeout・深度境界・host abortなしを継続検証する。
-2. **誤実行・安全境界:** AUD-012 / AUD-029 / AUD-031 / AUD-037は完了。意味論選択が必要なAUD-013 / AUD-014 / AUD-030は仕様決定後に実装する。
+2. **誤実行・安全境界:** AUD-012 / AUD-013 / AUD-029 / AUD-031 / AUD-037は完了。意味論選択が必要なAUD-014 / AUD-030は仕様決定後に実装する。
 3. **品質基盤:** AUD-022でtimeout・一時directory分離・厳密differential harnessを整備し、AUD-038でbenchmarkを分解してVM loop退行をprofileしてから、P2境界とfuzzを拡充する。
 
 ### 初回監査の改修境界（記録）

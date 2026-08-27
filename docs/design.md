@@ -84,7 +84,7 @@
 - 辞書は `BTreeMap<String, Value>` で実装。キーを文字列に限定することでシンプルさを維持
 - `HashMap` ではなく `BTreeMap` を採用した理由: `print()` 時の出力がキー順で安定し、テストが書きやすい
 - インデックスアクセスは `expr[expr]` 構文でリスト・辞書・文字列に統一的に使える
-- インデックス代入は `Stmt::IndexAssign` で表現。`Env::get_mut()` で変数を可変参照で取得し直接更新する方式
+- インデックス代入は `Stmt::IndexAssign` で表現。対象は識別子に固定し、変数セルを直接更新する方式（AUD-013）
 - 負のインデックス対応（Python 風）: `-1` で末尾要素にアクセス可能
 - 辞書の存在しないキーへのアクセスは `null` を返す（エラーにしない）— 存在チェックは `== null` で判定する想定
 
@@ -213,7 +213,7 @@ let result = filter(test, fn(item) item != "kani" end)
 - 変数検索は内側 → 外側の順
 - `set()` は現在のスコープに変数を新規定義
 - `update()` は内側→外側へ探索し、既存変数を更新（見つからなければエラー）
-- `get_mut()` は可変参照で変数を取得（インデックス代入・push で使用）
+- `get_cell()` は変数の `Rc<RefCell<Value>>` セルを返す（インデックス代入・push の破壊的更新で使用）
 - 関数定義はグローバルな HashMap で管理
 
 ### エラー型 (error.rs)
@@ -676,6 +676,22 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 ## 変更履歴
 
+### 2026-08-27: index assignmentの対象bindingと評価順の統一（AUD-013）
+
+**問題:** VM Compilerは`xs[i] = v`の対象を`resolve_local`だけで解決していたため、closureがキャプチャした変数やfunction内から見たtop-level変数への代入がcompile errorになり、プログラム全体が実行されなかった。さらにVMは対象の値を`GetLocal`でsnapshotしてからindex/valueを評価し、更新結果を`SetLocal`でbinding全体へ書き戻すため、index/valueの評価中に同じbindingへ加えられた変更を消していた。treeはindex/valueを評価してから対象を解決するため、未定義変数の報告時点も異なった。`set_index`の型エラーメッセージもtreeの3種に対しVMは1種だった。
+
+**決定:** `target[index] = value`を「target binding解決 → index評価 → value評価 → in-place更新」の左から右の順に統一する。targetはlocal・upvalue・runtime globalのいずれでもよく、未定義bindingはindex/valueの副作用より前にruntime Name errorとして報告する。更新はbinding全体の書き戻しではなくコレクションへの直接代入とし、index/valueの評価中に生じた変更を上書きしない。境界判定も更新時点の最新状態に対して行う。targetの事前検証はAUD-012の`push` / `pop`と同じleft-to-right規範に揃える。
+
+**実装:** `Stmt::IndexAssign`の対象を`Expr`から識別子名へ変更し、Parserが`ident[...] =`の形だけを受理する事実をASTへ反映した。これにより両engineにあった到達不能な分岐（treeのruntime error、VMの「ネストされたインデックス代入」compile error）を削除した。境界判定・コレクション上限・エラーメッセージは`builtin_core::assign_index`へ集約し、tree evaluatorとVMが同じ関数を呼ぶ。
+
+Compilerは`MutationTarget`（`opcode`へ移動し`push` / `pop`と共有）で対象を解決し、runtime globalの場合だけ`RequireGlobal(name)`をindex/valueより前に生成する。`SetIndex`は`SetIndex(MutationTarget)`となり、popした`[index, value]`だけを受け取る。VMは`resolve_binding_storage`でcell化済みなら`Rc<RefCell<Value>>`、未cell化ならstack slotを特定し、そこへ直接代入する。storage解決はindex/valueの評価後に行うため、評価中にcell昇格が起きても書き込み先を誤らない。
+
+**不採用案:** VM旧仕様のsnapshot/writebackにtreeを合わせる案は、`xs[f()] = g()`で`f` / `g`が同じbindingを更新した場合にlost updateを仕様化することになるため不採用とした。対象解決をindex/value評価後に遅延する案は、未定義bindingの報告がAUD-012の「破壊対象を引数評価前に検査」と非対称になる。`GetGlobal`で存在確認する案は検証のためだけにコレクション全体をcloneするため、値を積まない`RequireGlobal`を追加した。ネストしたインデックス代入（`xs[0][1] = val`）のサポートは言語機能の追加であり本変更の対象外とする。
+
+**互換性と境界:** VMでcompile errorだったcaptured/global targetへの代入は実行可能になり、未定義targetは`try` / `catch`可能なruntime errorになる。VMでindex/value評価中の同一binding更新が消えていた挙動は、変更が保持される側へ変わる。VMの型エラーメッセージはtreeの3種（リストのインデックス型、辞書のキー型、非コレクション）に統一される。エラーkindは`runtime` / `index`のまま維持し、`type`への再分類はAUD-019で扱う。ネストindex代入の構文エラーは両engineで従来どおり同一である。
+
+**回帰テスト:** paired golden testでcaptured list/dict、多段クロージャ、逃げたclosureの独立状態、function内からのglobal代入、宣言前targetのcatch可能なName error、関数引数・forループ変数、負index、新規キー追加、target解決がindex/valueの副作用に先行すること、index/valueの左から右評価、value評価中の変更保持、index評価でのlist伸張、value評価でのlist縮小後の境界判定、型・境界エラーメッセージを検証する。両engineのREPLテストでは失敗入力後の回復と入力をまたいだ同一bindingへの書き込みを検証する。ParserのunitテストでAST上のtargetが識別子であることと、識別子以外の左辺を受理しないことを固定する。
+
 ### 2026-08-27: context依存builtin契約の統一（AUD-012）
 
 **問題:** `input`等の不正arityでVMだけ引数の副作用を実行し、`push` / `pop`は一時ListをVMだけ受理していた。さらにtreeは`push`の第2引数を評価してからtargetを読み、VMはtargetを先にsnapshotするため、引数内で同じbindingを再代入した場合の書戻し結果が異なった。collection系の型・空Listエラーも`runtime`と`builtin_type`に分かれていた。
@@ -702,7 +718,7 @@ VMのregistryは`HashMap<String, usize>`として**名前からtop-level slotだ
 
 **不採用案:** tree evaluatorへ全面static resolverを追加する案はdead code、catch可能なName error、live globalを破壊する。top-level名を事前登録する案は未初期化状態を導入し、宣言到達前の可視性とAUD-016を巻き込む。全名前をdynamic化する案は既存local/upvalue slotの性能とlexical bindingを不要に変える。globalごとに別cellを作る案はtop-level slot・upvalueとのidentityを二重化し、AUD-004で修正したclosure共有とAUD-024のrollback境界を壊すため採用しない。
 
-**互換性と境界:** VMでcompile errorだった未定義名は、実際に到達した場合だけruntime Name errorになる。このためエラー前のprint/I/Oは実行され、同一実行内の`try` / `catch`で捕捉可能になる。これはtree semanticsへの意図的な統一である。同一scopeの`let`再宣言identityはAUD-016、未捕捉REPL入力の値mutation commit/rollbackはAUD-024、error message/traceの完全一致はAUD-019として維持する。`push` / `pop`の識別子更新はAUD-012で統一済みであり、index assignmentのupvalue・評価順はAUD-013の特殊mutation loweringとして継続する。
+**互換性と境界:** VMでcompile errorだった未定義名は、実際に到達した場合だけruntime Name errorになる。このためエラー前のprint/I/Oは実行され、同一実行内の`try` / `catch`で捕捉可能になる。これはtree semanticsへの意図的な統一である。同一scopeの`let`再宣言identityはAUD-016、未捕捉REPL入力の値mutation commit/rollbackはAUD-024、error message/traceの完全一致はAUD-019として維持する。`push` / `pop`の識別子更新はAUD-012、index assignmentのupvalue・評価順はAUD-013でそれぞれ統一済みである。
 
 **回帰テスト:** paired golden testでdead `if` / loop / catch、short-circuit、未呼出しfunction/lambda、`return`後、catch可能なName error、未定義calleeの引数非評価、invalid call validation優先、forward global read/write、nested closure、後続cell化、top-level mutual recursion、block-local非公開を検証する。import fixtureではimport内の後続関数とcaller側の後続globalを、両engineのREPLテストでは入力間forward referenceを検証する。VM REPLでは失敗import後にregistry entryとslotがrollbackされ、同名globalを安全に再定義できることも検証する。
 

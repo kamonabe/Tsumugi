@@ -237,28 +237,26 @@ impl Parser {
     }
 
     /// ident[expr] = expr（インデックス代入）
+    ///
+    /// `is_index_assign_stmt()` が `ident[...] =` の形だけを通すため、
+    /// 対象は必ず識別子である。名前を直接読み取り、AST にも識別子として残す。
     fn parse_index_assign(&mut self) -> Result<Stmt, TsumugiError> {
         let line = self.current_line();
-        // パースは式として左辺を読み取り、Index ノードを得る
-        let object_expr = self.parse_expr()?;
-
-        // object_expr が Expr::Index であることを期待
-        let (object, index) = match object_expr {
-            Expr::Index { object, index } => (*object, *index),
-            _ => {
-                return Err(TsumugiError::parse(
-                    line,
-                    "インデックス代入の左辺が不正です",
-                ));
-            }
+        let spanned = self.advance_spanned();
+        let name = match spanned.token {
+            Token::Ident(s) => s,
+            _ => unreachable!(),
         };
 
+        self.expect(Token::LBracket)?;
+        let index = self.parse_expr()?;
+        self.expect(Token::RBracket)?;
         self.expect(Token::Assign)?;
         let value = self.parse_expr()?;
         self.expect_newline_or_eof()?;
 
         Ok(Stmt::IndexAssign {
-            object,
+            name,
             index,
             value,
             line,
@@ -1282,8 +1280,29 @@ mod tests {
         let program = parse("let xs = [1]\nxs[0] = 99").unwrap();
         assert_eq!(program.len(), 2);
         match &program[1] {
-            Stmt::IndexAssign { .. } => {}
+            Stmt::IndexAssign {
+                name, index, line, ..
+            } => {
+                assert_eq!(name, "xs");
+                assert_eq!(*line, 2);
+                match index {
+                    Expr::Int(0) => {}
+                    other => panic!("expected Int(0), got {:?}", other),
+                }
+            }
             other => panic!("expected IndexAssign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_index_assign_requires_identifier_target() {
+        // 変数以外を左辺に置いた形はインデックス代入として受理しない
+        for source in ["xs[0][1] = 1", "[1, 2][0] = 1", "f()[0] = 1"] {
+            assert!(
+                parse(source).is_err(),
+                "識別子以外のインデックス代入が受理された: {}",
+                source
+            );
         }
     }
 
