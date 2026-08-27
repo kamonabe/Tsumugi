@@ -1,0 +1,9 @@
+# AUD-031: Windowsのcase-insensitiveな環境変数検索を通じたTSUMUGI_*漏洩を防ぐ
+# テスト側で各キーへsecret markerを設定し、env()がすべてnullを返すことを確認する
+
+print("uppercase: " + to_str(env("TSUMUGI_AUD031_SECRET")))
+print("lowercase: " + to_str(env("tsumugi_aud031_secret")))
+print("mixed_case: " + to_str(env("TsUmUgI_AuD031_SeCrEt")))
+print("long_s: " + to_str(env("TſUMUGI_AUD031_SECRET")))
+print("dotless_i: " + to_str(env("TSUMUGı_AUD031_SECRET")))
+print("sandbox_lowercase: " + to_str(env("tsumugi_sandbox")))

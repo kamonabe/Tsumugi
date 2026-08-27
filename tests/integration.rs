@@ -625,6 +625,88 @@ fn env_allow_list() {
     assert!(output.status.success());
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
+fn run_windows_protected_env_keys(use_vm: bool) {
+    const SECRET_MARKER: &str = "AUD031_WINDOWS_SECRET_MUST_NOT_LEAK";
+
+    let dir = fixtures_dir();
+    let script = dir.join("env_protected_windows.tsg");
+    let expected = [
+        "uppercase: null",
+        "lowercase: null",
+        "mixed_case: null",
+        "long_s: null",
+        "dotless_i: null",
+        "sandbox_lowercase: null",
+    ]
+    .join("\n");
+
+    for allow_all in [false, true] {
+        let mut cmd = Command::new(tsumugi_bin());
+        if use_vm {
+            cmd.arg("--vm");
+        }
+        cmd.arg(script.to_str().unwrap())
+            .env("TSUMUGI_SANDBOX", &dir);
+
+        for key in [
+            "TSUMUGI_AUD031_SECRET",
+            "tsumugi_aud031_secret",
+            "TsUmUgI_AuD031_SeCrEt",
+            "TſUMUGI_AUD031_SECRET",
+            "TSUMUGı_AUD031_SECRET",
+        ] {
+            cmd.env(key, SECRET_MARKER);
+        }
+
+        if allow_all {
+            cmd.env("TSUMUGI_ENV_ALLOW", "*");
+        } else {
+            cmd.env_remove("TSUMUGI_ENV_ALLOW");
+        }
+
+        let output = cmd.output().expect("tsumugi バイナリの実行に失敗");
+        let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+        let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
+        let mode = if use_vm { "VM" } else { "tree-walk" };
+        let allow_mode = if allow_all {
+            "allow-list=*"
+        } else {
+            "allow-list未設定"
+        };
+
+        assert!(
+            output.status.success(),
+            "Windows環境変数保護テストが異常終了しました [{mode}, {allow_mode}]\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            !stdout.contains(SECRET_MARKER),
+            "保護対象の環境変数値がstdoutへ漏洩しました [{mode}, {allow_mode}]"
+        );
+        assert!(
+            !stderr.contains(SECRET_MARKER),
+            "保護対象の環境変数値がstderrへ漏洩しました [{mode}, {allow_mode}]"
+        );
+        assert_eq!(
+            stdout.trim_end(),
+            expected,
+            "Windows環境変数保護テスト失敗 [{mode}, {allow_mode}]\n--- stdout ---\n{stdout}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_protected_env_keys_tree_walk() {
+    run_windows_protected_env_keys(false);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_protected_env_keys_vm() {
+    run_windows_protected_env_keys(true);
+}
+
 // =============================================================
 // エラー系テスト（VM）
 // =============================================================
