@@ -10,9 +10,9 @@
 
 ### 現在の既知非適合
 
-現行実装には、比較対象型、ローカル名前付き関数の再帰、同一scopeでの再宣言、captured collectionへのindex代入、context依存builtinの評価順、top-level importの評価時点、未捕捉REPLエラー後の状態に両engine差がある。また、複数行lambdaの`end`欠落受理と`path_join`の非文字列argument無視は、両engine共通の仕様違反である。これらの挙動へ依存するコードは移植可能とみなさない。
+現行実装には、比較対象型、同一scopeでの再宣言、captured collectionへのindex代入、context依存builtinの評価順、top-level importの評価時点、未捕捉REPLエラー後の状態に両engine差がある。また、`path_join`の非文字列argument無視は両engine共通の仕様違反である。これらの挙動へ依存するコードは移植可能とみなさない。
 
-特に本書の文法どおり、複数行lambdaの終端`end`は必須である。偶発的に受理される入力を正しい構文として扱わない。
+本書の文法どおり、複数行lambdaの終端`end`は必須である。
 
 ## コメント
 
@@ -400,7 +400,9 @@ let result = add(3, 4)
 
 ステップ予算・call depthの検査に失敗した場合、callee式と引数は評価しない。callee式の評価に失敗した場合も引数は評価しない。calleeが関数ではない場合、または引数の個数が一致しない場合、引数と関数bodyは評価しない。引数の評価中にエラーが発生した場合は、その時点で残りの引数と関数bodyを実行しない。
 
-この順序はユーザー定義関数に対する契約である。組み込み関数は、破壊的更新やcallbackなど各関数固有の契約に従う。
+識別子をcalleeとして呼ぶ場合、`print`を除いて、現在のlocal・parameter・self-binding、captured binding、runtime globalの順でユーザーbindingを探す。bindingが存在するときはbuiltinと同名でもその値をcalleeとし、関数でなければbuiltinへfallbackせずエラーにする。bindingが存在せず、識別子がbuiltin名である場合だけbuiltinとして呼び出す。`print`は予約tokenであり、常にbuiltinとして扱う。
+
+上記のユーザー関数呼び出し順序は、builtinとユーザーbindingの選択後にユーザー関数が選ばれた場合の契約である。組み込み関数は、破壊的更新やcallbackなど各関数固有の契約に従う。
 
 ### 第一級関数
 
@@ -415,6 +417,27 @@ let f = double
 print(f(3))       # 6
 print(type(f))    # fn
 ```
+
+### 名前付き関数のself-binding
+
+名前付き関数のbodyでは、宣言名を現在呼び出している関数値へ束縛する。トップレベルかローカルかに関係なく、関数を別名へ代入した場合や外側の関数から返した場合も、body内の宣言名で自身を再帰呼び出しできる。
+
+```
+fn outer()
+    fn factorial(n)
+        if n <= 1
+            return 1
+        end
+        return n * factorial(n - 1)
+    end
+    return factorial
+end
+
+let fact = outer()
+print(fact(5))  # 120
+```
+
+self-bindingはcaptured bindingより優先し、同名のparameterがある場合はparameterがself-bindingをshadowする。無名関数には暗黙のself名を導入しない。
 
 ### 無名関数（ラムダ）
 
@@ -830,3 +853,5 @@ end
 ### TSUMUGI_* 環境変数の保護
 
 `env()` 関数は `TSUMUGI_` で始まるキーへのアクセスを常に `null` で返す。ランタイム制御用環境変数（`TSUMUGI_SANDBOX`, `TSUMUGI_MAX_STEPS` 等）の値がスクリプトに漏洩することを防ぐ。
+
+prefix照合はOSの環境変数名規則に合わせる。WindowsではキーをUnicode uppercaseへ変換してから照合し、ASCIIの大小文字違いに加えてASCII名へ別名解決され得るUnicode case variantも保護する。その他のOSではcase-sensitiveに照合する。いずれの場合も、この保護は`TSUMUGI_ENV_ALLOW`の許可判定より先に適用する。

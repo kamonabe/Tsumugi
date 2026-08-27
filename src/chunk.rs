@@ -66,7 +66,8 @@ impl Chunk {
             OpCode::Jump(addr)
             | OpCode::JumpIfFalse(addr)
             | OpCode::JumpIfFalseKeep(addr)
-            | OpCode::JumpIfTrueKeep(addr) => {
+            | OpCode::JumpIfTrueKeep(addr)
+            | OpCode::JumpIfGlobalDefined(_, addr) => {
                 *addr = target;
             }
             _ => panic!("patch_jump: ジャンプ命令ではないオフセットが指定されました"),

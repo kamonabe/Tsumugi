@@ -605,6 +605,11 @@ impl Vm {
             OpCode::RegisterGlobal(name, slot) => {
                 self.register_global(name, slot, line)?;
             }
+            OpCode::JumpIfGlobalDefined(name, target) => {
+                if self.globals.contains_key(&name) {
+                    self.frames.last_mut().unwrap().ip = target;
+                }
+            }
             OpCode::Jump(target) => {
                 self.frames.last_mut().unwrap().ip = target;
             }

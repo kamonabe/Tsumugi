@@ -785,8 +785,10 @@ impl Evaluator {
         args: &[Expr],
         line: usize,
     ) -> Result<Value, TsumugiError> {
-        // callee が識別子の場合、組み込み関数を先に試行
+        // 識別子calleeはuser bindingを優先し、未定義の場合だけbuiltinへfallbackする。
+        // printは予約tokenのため、通常どおりbindingなしでbuiltinへ到達する。
         if let Expr::Ident(name) = callee
+            && self.env.get_cell(name).is_none()
             && let Some(value) = self.eval_builtin(name, args, line)?
         {
             return Ok(value);
@@ -805,47 +807,27 @@ impl Evaluator {
         }
 
         // callee を評価して関数値を取得
-        // 識別子の場合: 変数 → 関数テーブルの順で検索
-        let (func_name, params, body, captured) = if let Expr::Ident(name) = callee {
-            // 変数として検索
-            if let Some(val) = self.env.get(name) {
-                match val {
-                    Value::Fn {
-                        name: fn_name,
-                        params,
-                        body,
-                        captured,
-                    } => (fn_name, params, body, captured),
-                    _ => {
-                        return Err(TsumugiError::runtime(
-                            line,
-                            format!("関数ではない値を呼び出そうとしました: {}", val),
-                        ));
-                    }
-                }
-            } else {
-                return Err(TsumugiError::runtime(
-                    line,
-                    format!("未定義の関数: {}", name),
-                ));
-            }
+        // 識別子の場合: 変数として検索
+        let func_value = if let Expr::Ident(name) = callee {
+            self.env
+                .get(name)
+                .ok_or_else(|| TsumugiError::runtime(line, format!("未定義の関数: {}", name)))?
         } else {
             // 識別子以外（式の評価結果を呼び出す）
-            let func_value = self.eval_expr(callee, line)?;
-            match func_value {
-                Value::Fn {
-                    name,
-                    params,
-                    body,
-                    captured,
-                } => (name, params, body, captured),
-                _ => {
-                    return Err(TsumugiError::runtime(
-                        line,
-                        format!("関数ではない値を呼び出そうとしました: {}", func_value),
-                    ));
-                }
-            }
+            self.eval_expr(callee, line)?
+        };
+
+        let Value::Fn {
+            name: func_name,
+            params,
+            body,
+            captured,
+        } = &func_value
+        else {
+            return Err(TsumugiError::runtime(
+                line,
+                format!("関数ではない値を呼び出そうとしました: {}", func_value),
+            ));
         };
 
         if args.len() != params.len() {
@@ -868,9 +850,15 @@ impl Evaluator {
 
         // レキシカルスコープ: 呼び出し元のスコープを退避し、独立環境で実行
         let saved_scopes = self.env.push_call_frame();
-        for (k, cell) in &captured {
+        for (k, cell) in captured {
             self.env.set_shared(k, cell.clone());
         }
+        // 名前付き関数は呼び出し時の関数値を宣言名へ束縛する。
+        // 定義時captureへ自身を入れず、Rc cycleを避ける。
+        if func_name != "<lambda>" {
+            self.env.set(func_name, func_value.clone());
+        }
+        // parameterはself-bindingと同名ならshadowする。
         for (param, val) in params.iter().zip(arg_values) {
             self.env.set(param, val);
         }
@@ -883,7 +871,7 @@ impl Evaluator {
 
         // 関数本体を実行
         let mut result = Value::Null;
-        for stmt in &body {
+        for stmt in body {
             match self.exec_stmt(stmt) {
                 Ok(EvalResult::Return(v)) => {
                     result = v;

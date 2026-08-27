@@ -54,6 +54,11 @@ impl Evaluator {
                 for (k, cell) in captured {
                     self.env.set_shared(k, cell.clone());
                 }
+                // 通常callと同じく、名前付き関数を宣言名へself-bindする。
+                if name != "<lambda>" {
+                    self.env.set(name, func.clone());
+                }
+                // parameterはself-bindingと同名ならshadowする。
                 for (param, val) in params.iter().zip(arg_values) {
                     self.env.set(param, val);
                 }

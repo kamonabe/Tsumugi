@@ -729,7 +729,7 @@ let fn return if elif else end while for in
 break continue import try catch true false null and or not print
 ```
 
-These cannot be used as variable or function names. `print` is tokenized specially and cannot be shadowed or captured as a first-class function value; call it directly as `print(...)`.
+These cannot be used as variable or function names. `print` is tokenized specially and cannot be shadowed or captured as a first-class function value; call it directly as `print(...)`. Other builtin names remain ordinary identifiers: an existing user binding takes precedence in call position, and the builtin is used only when no binding exists.
 
 ---
 
@@ -739,7 +739,6 @@ This guide and `docs/language-spec.md` describe the normative language. Both exe
 
 When generating portable `.tsg` code:
 
-- Always close multi-line lambdas with `end`. The current parser may accidentally accept EOF without it; that input is invalid.
 - Use string literals or expressions that evaluate to strings for Dict keys. The parser may accept another expression form, but runtime semantics require a String key.
-- Do not depend on equality for List, Dict, Function, or Error values, mixed Int/Float comparison, local named-function recursion, same-scope redeclaration cell identity, captured collection index assignment, or import side-effect timing until the engine-parity issues are resolved.
+- Do not depend on equality for List, Dict, Function, or Error values, mixed Int/Float comparison, same-scope redeclaration cell identity, captured collection index assignment, or import side-effect timing until the engine-parity issues are resolved.
 - Treat `TSUMUGI_SANDBOX` and resource limits as defense-in-depth, not as isolation for untrusted code.

@@ -344,9 +344,13 @@ Expr::Lambda { params: Vec<String>, body: Vec<Stmt> }
 - `Env` の各スコープが `HashMap<String, Rc<RefCell<Value>>>` で変数を保持
 - 関数定義時（`FnDef` / `Lambda`）に `env.capture_all()` で全変数の `Rc` を共有コピー
 - クロージャ呼び出し時は `set_shared()` でセルを新スコープに注入し、書き込みがセル経由で定義元に伝播
+- 名前付き関数は呼び出しframe構築時に宣言名へ現在の関数値をself-bindする。定義時captureへ自身を含めないため、全関数に恒久的な`cell → function → captured → cell`循環を作らない
+- self-bindingはcaptured bindingの後、parameterの前に設定する。同名parameterはself-bindingをshadowする
 
 **VM版:**
 - `CallFrame` に `locals_cells: Vec<Option<SharedValue>>` を追加
+- 名前付き関数のlocal slot 0にcallee自身を置き、ツリーウォーク版と同じself-bindingを実現
+- 無名lambdaもstack layout用にslot 0を持つが、resolver上の名前はsource identifierにならない`<lambda>`とし、暗黙self名として公開しない
 - `MakeClosure` 時に対象ローカル変数を `Rc<RefCell<Value>>` セルに昇格（`ensure_local_cell`）
 - `GetLocal` / `SetLocal` はセル経由の読み書きにフォールバック（非キャプチャ変数は従来通りスタック直接）
 - `SetUpvalue` オペコードを追加し、クロージャ内から外部変数への書き込みをサポート
@@ -441,7 +445,7 @@ Parserはプログラム直下とblock内の文を区別し、block内のimport�
 ### 概要
 
 ツリーウォークインタプリタに加え、バイトコードコンパイラ + スタックVMを並行実装する。
-`--vm`フラグで実行方式を切り替え可能。Lexer・Parser・ASTは共有し、両方式が同じ規範仕様を満たすことを目標とする。ただし、意味解析以降は別実装であり、比較、ローカル再帰、index代入、builtin、importなどに既知の差が残る。現時点のVMは互換性・性能ともに実験的backendとして扱い、非適合は`roadmap.md`で管理する。
+`--vm`フラグで実行方式を切り替え可能。Lexer・Parser・ASTは共有し、両方式が同じ規範仕様を満たすことを目標とする。ただし、意味解析以降は別実装であり、比較、index代入、builtin、importなどに既知の差が残る。現時点のVMは互換性・性能ともに実験的backendとして扱い、非適合は`roadmap.md`で管理する。
 
 ### 動機
 
@@ -563,6 +567,7 @@ builtin_core.rs
 設計方針:
 - **引数は評価済み `&[Value]`** — 引数の評価方法がエンジンで異なるため（ツリーウォーク: `&[Expr]` を `eval_expr` で評価、VM: スタックから pop 済み）、共通モジュールは評価済みの値だけ受け取る
 - **エンジン固有のビルトインは各モジュールに残す** — `push`/`pop`（ツリーウォークは変数を直接変更）、`map`/`filter`/`each`（クロージャ呼び出しがエンジン依存）、`print`/`input`/`exit`/`args`（I/O・プロセス操作）
+- **user bindingをbuiltinより優先する** — `print`以外の識別子calleeはlocal/upvalue/runtime globalを先に探し、bindingがない場合だけbuiltinへfallbackする。VMは`JumpIfGlobalDefined`で実行時のglobal登録状態を分岐し、builtin branchとuser-call branchの評価順を混在させない。builtin `push`/`pop`が選ばれた場合だけ、更新後のListをlocal/upvalue/runtime globalの元bindingへ書き戻す
 - **新規ビルトイン追加は `builtin_core.rs` + dispatch テーブルへの登録のみ** — 両エンジンに自動的に反映される
 
 ### 設計判断
@@ -625,7 +630,7 @@ builtin_core.rs
 
 ### TSUMUGI_* 環境変数の保護
 
-`env()` 組み込み関数は `TSUMUGI_` プレフィックスで始まるキーへのアクセスを常に `null` で返す。`TSUMUGI_ENV_ALLOW` 許可リストの設定に関わらず適用される。
+`env()` 組み込み関数は `TSUMUGI_` プレフィックスで始まるキーへのアクセスを常に `null` で返す。`TSUMUGI_ENV_ALLOW` 許可リストの設定に関わらず適用される。WindowsではキーをUnicode uppercaseへ変換してからprefixを照合し、ASCII大小文字違いとASCII名へ別名解決され得るUnicode case variantを保護する。その他のOSではcase-sensitiveに照合する。
 
 理由: `TSUMUGI_SANDBOX`, `TSUMUGI_MAX_STEPS`, `TSUMUGI_ENV_ALLOW` 等のランタイム制御用環境変数の値がスクリプトに漏洩すると、サンドボックスの許可パスリストや実行上限が攻撃者に見えてしまう。
 
@@ -663,7 +668,6 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 - **caller所有ASTの破棄**: 公開AST APIのpreflightはCompiler/Evaluator自身の再帰走査を防ぐが、借用元がParserを使わず任意深度の再帰ASTを構築した場合、そのASTの通常Dropはcaller側のhost stackを使用する
 - **シンボリックリンクとsandbox制約**: 破壊的操作がfinal symlinkを決定論的にtargetへ置換する問題はAUD-032で修正した。ただしtargetが未作成のdangling final symlinkを通じた`write_file` / `append_file`は、fallback正規化がlink entryを許可範囲内と判定した後にOSが許可範囲外のtargetを作成し得る。またcheckと実I/Oの間のsymlink差し替えraceは防げず、許可外pathの存在情報がcanonicalize結果から観測できる場合もある（AUD-020）
-- **Windows環境変数**: OS側はkeyの大文字小文字を区別しないが、`TSUMUGI_` prefix保護はcase-sensitiveである（AUD-031）
 - **総ヒープメモリ制限なし**: List/Dictの要素数上限はあるが、巨大文字列、要素自身のサイズ、全コレクション合計量にはglobal quotaがなくOOMの可能性が残る
 - **input() の無制限読み込み**: 改行なしの巨大入力でOOM、入力なしで無限ブロック
 

@@ -627,11 +627,27 @@ fn is_env_key_allowed(key: &str) -> bool {
     false
 }
 
+fn is_protected_env_key(key: &str) -> bool {
+    const PREFIX: &str = "TSUMUGI_";
+
+    #[cfg(windows)]
+    {
+        // Windowsのcase-insensitive lookupでASCII名へ別名解決され得る
+        // Unicode文字（long s、dotless i等）も保護側へ倒す。
+        key.to_uppercase().starts_with(PREFIX)
+    }
+
+    #[cfg(not(windows))]
+    {
+        key.starts_with(PREFIX)
+    }
+}
+
 pub fn builtin_env(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("env", args, 1, line)?;
     if let Value::Str(key) = &args[0] {
         // ランタイム制御用の環境変数はスクリプトからアクセス不可
-        if key.starts_with("TSUMUGI_") {
+        if is_protected_env_key(key) {
             return Ok(Value::Null);
         }
         if !is_env_key_allowed(key) {
