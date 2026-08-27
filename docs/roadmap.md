@@ -38,6 +38,7 @@
 | AUD-030 | top-level importの評価時点を統一／仕様化する | `print("BEFORE")`後の失敗importでtreeだけ先行出力する。実行中に生成したmoduleもtreeだけimport可能で、VMのcompile-time inlineと観測可能な差がある | ⬜ 仕様確定待ち（両engine差を再現済み） |
 | AUD-031 | Windowsで`TSUMUGI_*`環境変数保護をcase-insensitiveにする | Windowsの環境変数検索は大文字小文字を区別しないがprefix検査は区別するため、`env("tsumugi_sandbox")`等で保護値を読める可能性がある | ⬜ 未着手（Windows実機回帰が必要） |
 | AUD-032 | 破壊的ファイル操作のfinal symlink意味論を修正する | `check_path`が最終symlinkまでcanonicalizeし、`remove`/`remove_dir`/`rename`がlink自体ではなくlink先を削除・移動する。意図しないデータ破壊につながる | ⬜ 未着手（隔離symlink回帰が必要） |
+| AUD-037 | ローカル名前付き関数のself-bindingを両engineで統一する | 関数内で定義した再帰関数がtreeでは自身を捕捉できず`未定義の関数`、VMでは正常完了する。`factorial(5)`相当でtree失敗／VM `120`を再現 | ⬜ 未着手（両engine差を再現済み） |
 
 ### P2 — Medium / Quality
 
@@ -48,8 +49,8 @@
 | AUD-017 | call-depth境界を統一する | 上限128にtop-level frameを含めるVMだけ、許容user frame数が1少ない | ⬜ 未着手 |
 | AUD-018 | CLIからscript引数を渡せるようにする | `args()`を公開しているがCLIが2個目以降の非flag引数をusage errorにする | ⬜ 未着手 |
 | AUD-019 | engine固有error kind/messageを統一する | iteration/index/push/pop/map等で`runtime`/`type`/`builtin_type`が異なる | ⬜ 未着手 |
-| AUD-020 | sandboxの脅威モデルとTOCTOU制約を明記する | checkとI/O間のsymlink raceに加え、sandbox検査前のcanonicalizeによる許可外path存在oracle、空設定のfail-open意味論が未整理 | ⬜ 未着手 |
-| AUD-021 | language-spec / LANG_GUIDE / designのdriftを解消する | engine parity・Float完全一致・全module unit test・coverage/benchmark gate等の記載が現実装やAUD残件と矛盾する | 🟡 closure/catch/depth/import/block scope/name visibilityを更新。追加driftと意味論確定後の更新は継続 |
+| AUD-020 | sandboxの脅威モデルとTOCTOU制約を明記する | checkとI/O間のsymlink raceに加え、sandbox検査前のcanonicalizeによる許可外path存在oracle、空設定のfail-open意味論が未整理 | 🟡 security boundaryではないこと、fail-open、未保護資源、symlink/TOCTOU制約を文書化。実装修正と隔離環境ガイドは継続 |
+| AUD-021 | language-spec / LANG_GUIDE / designのdriftを解消する | engine parity・Float完全一致・全module unit test・coverage/benchmark gate等の記載が現実装やAUD残件と矛盾する | 🟡 規範仕様と既知非適合、VMの実験的位置付け、sandbox制約、予約語、循環参照を更新。意味論確定後の更新は継続 |
 | AUD-022 | REPL・differential・limit境界・defensive VMテストを追加する | subprocess timeoutなし、error goldenが部分一致、fixture登録が手動、tree/VMが固定`/tmp`を共有して並列raceする。厳密なstderr/stdout副作用比較も不足 | 🟡 REPL transaction・limit・builtin・block scope回帰を追加。harness改善・網羅matrix・fuzzは継続 |
 | AUD-023 | VMのunchecked index/`unwrap()`を構造化internal errorへ置換する | compiler/VM invariantが崩れるとhost panic。AUD-001/002でユーザー入力から到達可能だった | ⬜ transaction修正後も防御的に継続 |
 | AUD-024 | import・REPLの状態commit方針を明文化する | 未捕捉error前の代入/list mutation/upvalue更新を保持するかrollbackするか未定義。外部I/Oはrollback不能 | ⬜ 設計判断が必要 |
@@ -58,12 +59,28 @@
 | AUD-034 | `path_join`の引数型契約を厳格化する | `path_join("a", 123, "b")`が型エラーにならず`a/b`を返し、非文字列argumentを無言で欠落させる | ⬜ 仕様確定待ち（両engine共通で再現済み） |
 | AUD-035 | CLI・標準I/Oのhost panic経路を構造化する | REPLのthread spawn・stdout flush・stdin readに`unwrap()`があり、broken pipe/I/O障害でpanicする。Unixの非UTF-8 argvは`std::env::args()`でもpanicし得る | ⬜ 未着手 |
 | AUD-036 | lossyな数値・OS境界変換を検証する | `exit`のi64→i32、`file_size`のu64→i64、NaN/Infを含む`to_int`/`floor`/`ceil`/`round`がwrap・飽和・0化し得る | ⬜ 仕様確定待ち（境界回帰テストが必要） |
+| AUD-038 | benchmarkをparse / compile / executeへ分離しVM退行を調査する | 現行Criterionは毎回parseし、VMはcompileも含む。aarch64 release実測でVMはfibが約2.77倍高速な一方、loop 5000回は約358倍低速で、単純な「VMは高速」という説明が成立しない | ⬜ workload別profile・測定分離・回帰gateが必要 |
+| AUD-039 | binaryからlibrary moduleを利用して二重コンパイルを解消する | `main.rs`がlibraryと同じmoduleを再宣言し、同一単体テスト138件がlib/binで重複実行される。ビルド時間・テスト件数の解釈を歪める | ⬜ 未着手 |
+
+### 2026-08-27 検証スナップショット
+
+対象はcommit `feb1cbd940b0243faaec91b1eb7cf017c43283ae`、aarch64 Linux、`rustc 1.97.1`。`cargo fmt --check`、Clippy `-D warnings`、全targetテスト、release build、tree/VMのhello smoke testはすべて成功した。単体テスト138件はlib/binで重複実行され、統合テストは150件。`cargo llvm-cov`のline coverageは全体83.55%、`vm.rs` 71.23%、`builtin.rs` 56.54%だった。
+
+Criterionの平均値は次のとおり。各iterationにparseを含み、VMはcompileも含むため、一回実行のend-to-end latencyであり純粋なdispatch速度ではない。
+
+| workload | tree | VM | 相対結果 |
+|---|---:|---:|---|
+| `fib_20` | 14.982 ms | 5.408 ms | VMが約2.77倍高速 |
+| `dict_500` | 9.410 ms | 34.350 ms | VMが約3.65倍低速 |
+| `fstr_300` | 89.535 µs | 1.047 ms | VMが約11.7倍低速 |
+| `loop_5000` | 762.89 µs | 272.94 ms | VMが約358倍低速 |
+| `higher_order_200` | 110.71 µs | 78.633 µs | VMが約1.41倍高速 |
 
 ### 追加監査後の推奨改修順
 
 1. **停止性:** AUD-026 / AUD-027 / AUD-028を先行し、timeout・深度制限・host abortなしを回帰テストで固定する。
-2. **誤実行・安全境界:** 独立修正しやすいAUD-029 / AUD-031 / AUD-032を処理し、意味論選択が必要なAUD-012 / AUD-013 / AUD-014 / AUD-030は仕様決定後に実装する。
-3. **品質基盤:** AUD-022でtimeout・一時directory分離・厳密differential harnessを整備してから、P2境界とfuzzを拡充する。
+2. **誤実行・安全境界:** AUD-029 / AUD-031 / AUD-032 / AUD-037を処理し、意味論選択が必要なAUD-012 / AUD-013 / AUD-014 / AUD-030は仕様決定後に実装する。
+3. **品質基盤:** AUD-022でtimeout・一時directory分離・厳密differential harnessを整備し、AUD-038でbenchmarkを分解してVM loop退行をprofileしてから、P2境界とfuzzを拡充する。
 
 ### 初回監査の改修境界（記録）
 
@@ -110,7 +127,7 @@
 - [x] `From<String>` 廃止（全エラー生成箇所を `TsumugiError::runtime()` に統一、文字列再パース除去）
 - [x] import のサンドボックス対応（`TSUMUGI_SANDBOX` 設定時に import 先パスも検証、ツリーウォーク版/VM版両対応）
 - [x] 環境変数アクセス制御（`TSUMUGI_ENV_ALLOW` で env() の読み取り可能キーを許可リスト制限）
-- [x] 浮動小数点 IEEE 754 統一（VM の Float ゼロ除算を inf/NaN に修正、ツリーウォークに Float 比較 arm 追加、両エンジン完全一致）
+- [x] 浮動小数点 IEEE 754 の基本挙動（VMのFloatゼロ除算をinf/NaNに修正、ツリーウォークにFloat比較armを追加。異種型・複合値を含む比較parityはAUD-014で継続）
 - [x] セキュリティ強化（コールフレーム深度制限 MAX_CALL_DEPTH=128、map/filter/each ステップカウント修正、TSUMUGI_* 環境変数ブロック）
 - [x] f-string（文字列補間）— `f"hello, {expr}"` 構文。レキサー/パーサー/評価器/VM全対応
 - [x] 構造化エラー — try/catch で `Value::Error` を返す。`e["type"]` / `e["message"]` / `e["line"]` でアクセス可能。既存の文字列結合との互換性を維持
@@ -333,7 +350,7 @@ Tsumugi にはファイルI/O やサンドボックス機能が既に実装さ�
 
 | 項目 | 詳細 | 状態 |
 |---|---|---|
-| スタック深度制限 | Rust 実スタックがオーバーフローする前にエラー化 | ✅ 完了 |
+| ユーザー関数のコール深度制限 | 関数再帰をRust実stack overflow前にエラー化。parser/compiler/evaluator/importの未保護経路はAUD-027 / AUD-028で継続 | 🟡 関数callは完了 |
 | サンドボックスの `OnceLock` テスタビリティ | テスト時に環境変数を切り替え可能な設計にする | 未着手 |
 | サンドボックスの中間シンボリックリンク迂回修正 | 新規書き込み時に親ディレクトリを `canonicalize()` してからチェック | ✅ 完了 |
 | 整数オーバーフローのエラー化 | `checked_add` 等に置き換え、release ビルドでもサイレントラップを防止 | ✅ 完了 |
