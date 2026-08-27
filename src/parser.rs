@@ -1,9 +1,7 @@
 use crate::ast::*;
 use crate::error::TsumugiError;
+use crate::limits::MAX_AST_DEPTH;
 use crate::token::{FStrPart, Spanned, Token};
-
-/// 式のネスト深度上限（パーサーの再帰スタックオーバーフロー防止）
-const MAX_PARSE_DEPTH: usize = 256;
 
 /// トークン列をASTに変換するパーサー
 pub struct Parser {
@@ -16,12 +14,60 @@ pub struct Parser {
 
 impl Parser {
     pub fn new(tokens: Vec<Spanned>) -> Self {
+        Self::new_with_depth(tokens, 0)
+    }
+
+    /// f-string内の式を読む子Parserへ、親の再帰深度を引き継ぐ。
+    fn new_with_depth(tokens: Vec<Spanned>, depth: usize) -> Self {
         Self {
             tokens,
             pos: 0,
             errors: Vec::new(),
-            depth: 0,
+            depth,
         }
+    }
+
+    /// 再帰する構文経路を共通の深度上限で囲み、エラー時も必ず深度を戻す。
+    fn with_parse_depth<T>(
+        &mut self,
+        expression: bool,
+        parse: impl FnOnce(&mut Self) -> Result<T, TsumugiError>,
+    ) -> Result<T, TsumugiError> {
+        if self.depth >= MAX_AST_DEPTH {
+            let message = if expression {
+                format!("式のネストが深すぎます (上限: {})", MAX_AST_DEPTH)
+            } else {
+                format!("ネストが深すぎます (上限: {})", MAX_AST_DEPTH)
+            };
+            return Err(TsumugiError::parse(self.current_line(), message));
+        }
+
+        self.depth += 1;
+        let result = parse(self);
+        self.depth -= 1;
+        result
+    }
+
+    /// 複合式を作るたびに実AST深度を検証し、左深の反復生成も早期に止める。
+    fn check_expr_depth(&self, expr: Expr, line: usize) -> Result<Expr, TsumugiError> {
+        if expr_depth_exceeds_limit(&expr) {
+            return Err(TsumugiError::parse(
+                line,
+                format!("式のネストが深すぎます (上限: {})", MAX_AST_DEPTH),
+            ));
+        }
+        Ok(expr)
+    }
+
+    /// 文・block・lambdaを含む実AST深度を、文が完成した時点で検証する。
+    fn check_stmt_depth(&self, stmt: Stmt) -> Result<Stmt, TsumugiError> {
+        if stmt_depth_exceeds_limit(&stmt) {
+            return Err(TsumugiError::parse(
+                stmt.line(),
+                format!("ネストが深すぎます (上限: {})", MAX_AST_DEPTH),
+            ));
+        }
+        Ok(stmt)
     }
 
     /// プログラム全体をパースする
@@ -99,18 +145,8 @@ impl Parser {
     // --- 文のパース ---
 
     fn parse_stmt(&mut self, is_top_level: bool) -> Result<Stmt, TsumugiError> {
-        // ブロックを持つ文のネストも深度制限の対象
-        self.depth += 1;
-        if self.depth > MAX_PARSE_DEPTH {
-            self.depth -= 1;
-            return Err(TsumugiError::parse(
-                self.current_line(),
-                format!("ネストが深すぎます (上限: {})", MAX_PARSE_DEPTH),
-            ));
-        }
-        let result = self.parse_stmt_inner(is_top_level);
-        self.depth -= 1;
-        result
+        let stmt = self.with_parse_depth(false, |parser| parser.parse_stmt_inner(is_top_level))?;
+        self.check_stmt_depth(stmt)
     }
 
     fn parse_stmt_inner(&mut self, is_top_level: bool) -> Result<Stmt, TsumugiError> {
@@ -275,7 +311,7 @@ impl Parser {
 
         let else_body = if self.peek_token() == Token::Elif {
             // elif を再帰的に if 文としてパース（end は最後の1つだけ必要）
-            let elif_stmt = self.parse_if()?; // elif を if として再帰パース
+            let elif_stmt = self.with_parse_depth(false, |parser| parser.parse_if())?; // elif を if として再帰パース
             vec![elif_stmt]
         } else if self.peek_token() == Token::Else {
             self.advance(); // consume 'else'
@@ -549,17 +585,9 @@ impl Parser {
     //   関数呼び出し・リテラル・括弧
 
     fn parse_expr(&mut self) -> Result<Expr, TsumugiError> {
-        self.depth += 1;
-        if self.depth > MAX_PARSE_DEPTH {
-            self.depth -= 1;
-            return Err(TsumugiError::parse(
-                self.current_line(),
-                format!("式のネストが深すぎます (上限: {})", MAX_PARSE_DEPTH),
-            ));
-        }
-        let result = self.parse_or();
-        self.depth -= 1;
-        result
+        let line = self.current_line();
+        let expr = self.with_parse_depth(true, |parser| parser.parse_or())?;
+        self.check_expr_depth(expr, line)
     }
 
     /// or
@@ -569,11 +597,14 @@ impl Parser {
         while self.peek_token() == Token::Or {
             self.advance();
             let right = self.parse_and()?;
-            left = Expr::BinOp {
-                left: Box::new(left),
-                op: BinOpKind::Or,
-                right: Box::new(right),
-            };
+            left = self.check_expr_depth(
+                Expr::BinOp {
+                    left: Box::new(left),
+                    op: BinOpKind::Or,
+                    right: Box::new(right),
+                },
+                self.current_line(),
+            )?;
         }
 
         Ok(left)
@@ -586,11 +617,14 @@ impl Parser {
         while self.peek_token() == Token::And {
             self.advance();
             let right = self.parse_comparison()?;
-            left = Expr::BinOp {
-                left: Box::new(left),
-                op: BinOpKind::And,
-                right: Box::new(right),
-            };
+            left = self.check_expr_depth(
+                Expr::BinOp {
+                    left: Box::new(left),
+                    op: BinOpKind::And,
+                    right: Box::new(right),
+                },
+                self.current_line(),
+            )?;
         }
 
         Ok(left)
@@ -612,11 +646,14 @@ impl Parser {
             };
             self.advance();
             let right = self.parse_add_sub()?;
-            left = Expr::BinOp {
-                left: Box::new(left),
-                op,
-                right: Box::new(right),
-            };
+            left = self.check_expr_depth(
+                Expr::BinOp {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                },
+                self.current_line(),
+            )?;
         }
 
         Ok(left)
@@ -634,11 +671,14 @@ impl Parser {
             };
             self.advance();
             let right = self.parse_mul_div()?;
-            left = Expr::BinOp {
-                left: Box::new(left),
-                op,
-                right: Box::new(right),
-            };
+            left = self.check_expr_depth(
+                Expr::BinOp {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                },
+                self.current_line(),
+            )?;
         }
 
         Ok(left)
@@ -657,11 +697,14 @@ impl Parser {
             };
             self.advance();
             let right = self.parse_unary()?;
-            left = Expr::BinOp {
-                left: Box::new(left),
-                op,
-                right: Box::new(right),
-            };
+            left = self.check_expr_depth(
+                Expr::BinOp {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                },
+                self.current_line(),
+            )?;
         }
 
         Ok(left)
@@ -669,22 +712,29 @@ impl Parser {
 
     /// 単項: not, -
     fn parse_unary(&mut self) -> Result<Expr, TsumugiError> {
+        let line = self.current_line();
         match self.peek_token() {
             Token::Not => {
                 self.advance();
-                let expr = self.parse_unary()?;
-                Ok(Expr::UnaryOp {
-                    op: UnaryOpKind::Not,
-                    expr: Box::new(expr),
-                })
+                let expr = self.with_parse_depth(true, |parser| parser.parse_unary())?;
+                self.check_expr_depth(
+                    Expr::UnaryOp {
+                        op: UnaryOpKind::Not,
+                        expr: Box::new(expr),
+                    },
+                    line,
+                )
             }
             Token::Minus => {
                 self.advance();
-                let expr = self.parse_unary()?;
-                Ok(Expr::UnaryOp {
-                    op: UnaryOpKind::Neg,
-                    expr: Box::new(expr),
-                })
+                let expr = self.with_parse_depth(true, |parser| parser.parse_unary())?;
+                self.check_expr_depth(
+                    Expr::UnaryOp {
+                        op: UnaryOpKind::Neg,
+                        expr: Box::new(expr),
+                    },
+                    line,
+                )
             }
             _ => self.parse_call(),
         }
@@ -696,21 +746,29 @@ impl Parser {
 
         loop {
             if self.peek_token() == Token::LParen {
+                let line = self.current_line();
                 self.advance(); // consume '('
                 let args = self.parse_args()?;
                 self.expect(Token::RParen)?;
-                expr = Expr::Call {
-                    callee: Box::new(expr),
-                    args,
-                };
+                expr = self.check_expr_depth(
+                    Expr::Call {
+                        callee: Box::new(expr),
+                        args,
+                    },
+                    line,
+                )?;
             } else if self.peek_token() == Token::LBracket {
+                let line = self.current_line();
                 self.advance(); // consume '['
                 let index = self.parse_expr()?;
                 self.expect(Token::RBracket)?;
-                expr = Expr::Index {
-                    object: Box::new(expr),
-                    index: Box::new(index),
-                };
+                expr = self.check_expr_depth(
+                    Expr::Index {
+                        object: Box::new(expr),
+                        index: Box::new(index),
+                    },
+                    line,
+                )?;
             } else {
                 break;
             }
@@ -799,10 +857,13 @@ impl Parser {
                 self.expect(Token::LParen)?;
                 let args = self.parse_args()?;
                 self.expect(Token::RParen)?;
-                Ok(Expr::Call {
-                    callee: Box::new(Expr::Ident("print".to_string())),
-                    args,
-                })
+                self.check_expr_depth(
+                    Expr::Call {
+                        callee: Box::new(Expr::Ident("print".to_string())),
+                        args,
+                    },
+                    spanned.line,
+                )
             }
             Token::LParen => {
                 self.advance(); // consume '('
@@ -856,7 +917,7 @@ impl Parser {
         }
 
         self.expect(Token::RBracket)?;
-        Ok(Expr::List(items))
+        self.check_expr_depth(Expr::List(items), self.current_line())
     }
 
     /// 辞書リテラル: {expr: expr, ...}
@@ -887,13 +948,14 @@ impl Parser {
         }
 
         self.expect(Token::RBrace)?;
-        Ok(Expr::Dict(pairs))
+        self.check_expr_depth(Expr::Dict(pairs), self.current_line())
     }
 
     /// 無名関数式: fn(params) body end
     /// 複数行: fn(params)\n body \n end
     /// 1行:    fn(params) expr end
     fn parse_anonymous_fn(&mut self) -> Result<Expr, TsumugiError> {
+        let lambda_line = self.current_line();
         self.advance(); // consume 'fn'
         self.expect(Token::LParen)?;
         let params = self.parse_params()?;
@@ -904,7 +966,7 @@ impl Parser {
             self.advance(); // consume newline
             let body = self.parse_block(&[Token::End])?;
             self.advance(); // consume 'end'
-            Ok(Expr::Lambda { params, body })
+            self.check_expr_depth(Expr::Lambda { params, body }, lambda_line)
         } else {
             // 1行ラムダ: fn(x) expr end → 暗黙的に return 扱い
             let line = self.current_line();
@@ -914,10 +976,13 @@ impl Parser {
             }
             let expr = self.parse_expr()?;
             self.expect(Token::End)?;
-            Ok(Expr::Lambda {
-                params,
-                body: vec![Stmt::Return { value: expr, line }],
-            })
+            self.check_expr_depth(
+                Expr::Lambda {
+                    params,
+                    body: vec![Stmt::Return { value: expr, line }],
+                },
+                lambda_line,
+            )
         }
     }
 
@@ -937,7 +1002,7 @@ impl Parser {
                     let eof_line = expr_tokens.last().map_or(line, |t| t.line);
                     expr_tokens.push(Spanned::new(Token::Eof, eof_line));
 
-                    let mut sub_parser = Parser::new(expr_tokens);
+                    let mut sub_parser = Parser::new_with_depth(expr_tokens, self.depth);
                     let expr = sub_parser.parse_expr().map_err(|e| {
                         // サブパーサーのエラーに f-string のコンテキストを付加
                         TsumugiError::parse(line, format!("f-string内の式のパースに失敗: {}", e))
@@ -954,7 +1019,7 @@ impl Parser {
             }
         }
 
-        Ok(Expr::FStr(ast_parts))
+        self.check_expr_depth(Expr::FStr(ast_parts), line)
     }
 
     // --- ユーティリティ ---
@@ -1369,15 +1434,15 @@ mod tests {
 
     #[test]
     fn parse_import_at_max_block_depth_makes_progress() {
-        let mut source = "fn nested()\n".repeat(MAX_PARSE_DEPTH);
+        let mut source = "fn nested()\n".repeat(MAX_AST_DEPTH);
         source.push_str("import 123\n");
-        source.push_str(&"end\n".repeat(MAX_PARSE_DEPTH));
+        source.push_str(&"end\n".repeat(MAX_AST_DEPTH));
 
         let errors = parse(&source).expect_err("nested import must be rejected without hanging");
         assert_eq!(
             errors,
             vec![TsumugiError::parse(
-                MAX_PARSE_DEPTH + 1,
+                MAX_AST_DEPTH + 1,
                 "import はトップレベルでのみ使用できます"
             )]
         );

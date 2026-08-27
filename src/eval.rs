@@ -4,6 +4,7 @@ mod builtin;
 use crate::ast::*;
 use crate::env::Env;
 use crate::error::{TraceFrame, TsumugiError};
+use crate::limits::MAX_IMPORT_DEPTH;
 use crate::value::Value;
 
 use std::collections::BTreeMap;
@@ -44,6 +45,8 @@ pub struct Evaluator {
     base_dir: PathBuf,
     /// import 済みファイルの正規パス集合（循環 import 防止）
     imported: HashSet<PathBuf>,
+    /// 現在処理中のactive import chain深度（root scriptは0）。
+    import_depth: usize,
 }
 
 impl Evaluator {
@@ -55,6 +58,7 @@ impl Evaluator {
             max_steps: resolve_max_steps(),
             base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             imported: HashSet::new(),
+            import_depth: 0,
         }
     }
 
@@ -96,6 +100,7 @@ impl Evaluator {
 
     /// プログラム全体を実行
     pub fn run(&mut self, program: &Program) -> Result<(), TsumugiError> {
+        validate_program_depth(program)?;
         for stmt in program {
             match self.exec_stmt(stmt)? {
                 EvalResult::Return(_) => break,
@@ -135,46 +140,49 @@ impl Evaluator {
         // サンドボックスチェック: import 先が許可範囲内か検証
         let _ = crate::sandbox::check_path(canonical.to_str().unwrap_or(""), line)?;
 
-        // 循環 import チェック
+        // 循環 import は従来どおり成功扱いにし、active chainの深度を消費しない。
         if self.imported.contains(&canonical) {
-            // 既に import 済み → スキップ（エラーにしない）
             return Ok(());
+        }
+        if self.import_depth >= MAX_IMPORT_DEPTH {
+            return Err(TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Import,
+                format!(
+                    "import 失敗: ネストが深すぎます (上限: {})",
+                    MAX_IMPORT_DEPTH
+                ),
+            ));
         }
         self.imported.insert(canonical.clone());
 
-        // ファイル読み込み。失敗したimportはloaded扱いにせず、同一pathを再試行可能にする。
-        let source = match std::fs::read_to_string(&canonical) {
-            Ok(source) => source,
-            Err(error) => {
-                self.imported.remove(&canonical);
-                return Err(TsumugiError::runtime_with_kind(
+        let previous_depth = self.import_depth;
+        let previous_base_dir = self.base_dir.clone();
+        self.import_depth += 1;
+
+        let result = (|| -> Result<(), TsumugiError> {
+            let source = std::fs::read_to_string(&canonical).map_err(|error| {
+                TsumugiError::runtime_with_kind(
                     line,
                     crate::error::ErrorKind::Import,
                     format!(
                         "import 失敗: ファイルを読み込めません: {} ({})",
                         path, error
                     ),
-                ));
+                )
+            })?;
+
+            // base_dir を一時的に import 先のディレクトリに切り替え（ネスト import 対応）
+            if let Some(parent) = canonical.parent() {
+                self.base_dir = parent.to_path_buf();
             }
-        };
 
-        // base_dir を一時的に import 先のディレクトリに切り替え（ネスト import 対応）
-        let prev_base_dir = self.base_dir.clone();
-        if let Some(parent) = canonical.parent() {
-            self.base_dir = parent.to_path_buf();
-        }
-
-        // パース & 実行
-        let mut lexer = Lexer::new(&source);
-        let tokens = lexer.tokenize();
-        let mut parser = Parser::new(tokens);
-        let program = match parser.parse() {
-            Ok(p) => p,
-            Err(errors) => {
-                // base_dirとimport markerを復元してからエラーを返す
-                self.base_dir = prev_base_dir;
-                self.imported.remove(&canonical);
-                return Err(TsumugiError::runtime_with_kind(
+            // パース & 実行
+            let mut lexer = Lexer::new(&source);
+            let tokens = lexer.tokenize();
+            let mut parser = Parser::new(tokens);
+            let program = parser.parse().map_err(|errors| {
+                TsumugiError::runtime_with_kind(
                     line,
                     crate::error::ErrorKind::Import,
                     format!(
@@ -186,14 +194,15 @@ impl Evaluator {
                             .collect::<Vec<_>>()
                             .join("; ")
                     ),
-                ));
-            }
-        };
+                )
+            })?;
 
-        let result = self.run(&program);
+            self.run(&program)
+        })();
 
-        // base_dir を復元
-        self.base_dir = prev_base_dir;
+        // 成否にかかわらずactive chainの状態を呼び出し元へ戻す。
+        self.base_dir = previous_base_dir;
+        self.import_depth = previous_depth;
         if result.is_err() {
             // runtime errorで完了しなかったmoduleもloaded扱いにしない。
             // 既に発生した代入や外部I/OのrollbackはAUD-024で別途仕様化する。
