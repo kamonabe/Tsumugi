@@ -126,11 +126,16 @@ pub enum OpCode {
     PopN(usize),
 
     // --- コレクション操作 ---
-    /// スタックトップのコレクションの長さを取得
-    Len,
+    /// ローカルslotのコレクションの長さを push する。
+    /// コレクションをスタックへ複製しないため、長さ取得が要素数に依存しない。
+    LenLocal(usize),
 
     /// collection[index]: スタックから index, collection の順に pop → 要素を push
     Index,
+
+    /// スタックトップの index で、ローカルslotのコレクションから要素を push する。
+    /// コレクションをスタックへ複製しないため、反復ごとの複製が発生しない。
+    IndexLocal(usize),
 
     /// リストビルド用: スタックの [list, value] → list に value を push → list を残す
     ListPush,

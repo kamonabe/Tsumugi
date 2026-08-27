@@ -534,9 +534,10 @@ impl Compiler {
         });
 
         // 条件: index < len(collection)
+        // コレクションはslotから直接参照する。スタックへ複製すると
+        // 反復ごとに全要素をコピーし、ループ全体がO(n^2)になる。
         self.chunk.emit(OpCode::GetLocal(index_slot), line);
-        self.chunk.emit(OpCode::GetLocal(collection_slot), line);
-        self.chunk.emit(OpCode::Len, line);
+        self.chunk.emit(OpCode::LenLocal(collection_slot), line);
         self.chunk.emit(OpCode::Lt, line);
         let exit_jump = self.chunk.emit_jump(OpCode::JumpIfFalse(0), line);
 
@@ -544,9 +545,8 @@ impl Compiler {
         // 前回値をpopするとlocals_cellsの対応も解除され、escaping closureが
         // 保持する旧cellと次の反復で作られるcellが分離される。
         self.chunk.emit(OpCode::Pop, line);
-        self.chunk.emit(OpCode::GetLocal(collection_slot), line);
         self.chunk.emit(OpCode::GetLocal(index_slot), line);
-        self.chunk.emit(OpCode::Index, line);
+        self.chunk.emit(OpCode::IndexLocal(collection_slot), line);
 
         // ループ本体（ブロックスコープあり）
         self.begin_scope();

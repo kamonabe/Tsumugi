@@ -173,6 +173,7 @@ cargo test parser::
 |---|---|---|
 | ユニットテスト | `src/*.rs` 内 `#[cfg(test)]` | 各モジュールの個別ロジック検証 |
 | 統合テスト | `tests/integration.rs` | ファイル実行のゴールデンテスト + stdin駆動REPLの状態回復・資源上限テスト |
+| スケーリングテスト | `tests/scaling.rs` | 確保バイト数で計算量オーダー（`for` の線形性）を固定 |
 | テストデータ | `tests/fixtures/` | 正常系 `.tsg` + `.expected` / エラー系 `.tsg` + `.expected_err` |
 
 fixture は `fixture_tests!` へ1行宣言するとツリーウォーク版 / VM版の両方のテストが生成される。判定は完全一致で、子プロセスは制限時間付きで実行する。詳細は `docs/design.md` の「統合テスト」を参照。
@@ -212,7 +213,11 @@ src/
 
 tests/
 ├── integration.rs    # 統合テスト（ゴールデンテスト）
+├── scaling.rs        # 計算量オーダーの回帰テスト
 └── fixtures/         # テスト用 .tsg + 期待出力ファイル
+
+benches/
+└── interpreter.rs    # parse / compile / execute / end_to_end のフェーズ別計測
 
 docs/
 ├── design.md         # 設計ドキュメント

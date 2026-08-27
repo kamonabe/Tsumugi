@@ -1,33 +1,50 @@
-//! ベンチマーク: ツリーウォーク版とVM版の代表的なワークロードを計測する
+//! ベンチマーク: ツリーウォーク版とVM版を、フェーズごとに分けて計測する
+//!
+//! 1回のend-to-end実行は parse → (compile) → execute の合計であり、
+//! フェーズをまとめて測るとどこが効いているのか分からない。そのため
+//! 次の4グループに分ける。
+//!
+//! - `parse/<workload>`: 字句解析 + 構文解析（両engine共通）
+//! - `compile/<workload>`: AST → Chunk（VMのみ）
+//! - `execute/<workload>`: 実行のみ（parse・compile済みを再利用）
+//! - `end_to_end/<workload>`: 実際の1回実行に相当する合計
+//!
+//! `execute` は `iter_batched` を使い、`Evaluator::new()` や `Chunk` の複製を
+//! セットアップとして測定対象から外す。engine間の比較は同じフェーズ同士で行う。
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 
+use tsumugi::ast::Program;
+use tsumugi::chunk::Chunk;
 use tsumugi::compiler::Compiler;
 use tsumugi::eval::Evaluator;
 use tsumugi::lexer::Lexer;
 use tsumugi::parser::Parser;
 use tsumugi::vm::Vm;
 
-/// ソースコードをパースしてASTを返すヘルパー
-fn parse(source: &str) -> tsumugi::ast::Program {
+// ---------------------------------------------------------------------------
+// ヘルパー
+// ---------------------------------------------------------------------------
+
+fn parse(source: &str) -> Program {
     let tokens = Lexer::new(source).tokenize();
-    Parser::new(tokens).parse().unwrap()
+    Parser::new(tokens).parse().expect("ベンチのパースに失敗")
 }
 
-/// ツリーウォーク版で実行
-fn run_tree_walk(source: &str) {
-    let program = parse(source);
-    let mut eval = Evaluator::new();
-    eval.run(&program).unwrap();
+fn compile(program: &Program) -> Chunk {
+    Compiler::new()
+        .compile(program)
+        .expect("ベンチのコンパイルに失敗")
 }
 
-/// VM版で実行
-fn run_vm(source: &str) {
-    let program = parse(source);
-    let compiler = Compiler::new();
-    let chunk = compiler.compile(&program).unwrap();
+fn execute_tree_walk(program: &Program) {
+    let mut evaluator = Evaluator::new();
+    evaluator.run(program).expect("ベンチのtree実行に失敗");
+}
+
+fn execute_vm(chunk: Chunk) {
     let mut vm = Vm::new(chunk);
-    vm.run().unwrap();
+    vm.run().expect("ベンチのVM実行に失敗");
 }
 
 // ---------------------------------------------------------------------------
@@ -65,11 +82,22 @@ for i in range(0, 300)
 end
 "#;
 
-/// ループ + 算術 — 基本的なループ性能の計測
+/// for ループ + 算術 — コレクション反復の計測
 const LOOP_SCRIPT: &str = r#"
 let sum = 0
 for i in range(0, 5000)
   sum = sum + i
+end
+"#;
+
+/// while ループ + 算術 — コレクションを介さないループの計測
+/// （`loop_5000` との差がイテレーション処理のコストになる）
+const WHILE_SCRIPT: &str = r#"
+let sum = 0
+let i = 0
+while i < 5000
+  sum = sum + i
+  i = i + 1
 end
 "#;
 
@@ -80,61 +108,86 @@ let doubled = map(nums, fn(x) return x * 2 end)
 let evens = filter(doubled, fn(x) return x % 4 == 0 end)
 "#;
 
+/// 計測対象のワークロード一覧
+const WORKLOADS: &[(&str, &str)] = &[
+    ("fib_20", FIB_SCRIPT),
+    ("dict_500", DICT_SCRIPT),
+    ("fstr_300", FSTR_SCRIPT),
+    ("loop_5000", LOOP_SCRIPT),
+    ("while_5000", WHILE_SCRIPT),
+    ("higher_order_200", HIGHER_ORDER_SCRIPT),
+];
+
 // ---------------------------------------------------------------------------
-// ベンチマーク定義
+// フェーズ別ベンチマーク
 // ---------------------------------------------------------------------------
 
-fn bench_fib(c: &mut Criterion) {
-    let mut group = c.benchmark_group("fib_20");
-    group.bench_function("tree_walk", |b| {
-        b.iter(|| run_tree_walk(black_box(FIB_SCRIPT)))
-    });
-    group.bench_function("vm", |b| b.iter(|| run_vm(black_box(FIB_SCRIPT))));
+/// parse: 字句解析 + 構文解析（両engine共通のコスト）
+fn bench_parse(c: &mut Criterion) {
+    let mut group = c.benchmark_group("parse");
+    for (name, source) in WORKLOADS {
+        group.bench_function(*name, |b| b.iter(|| parse(black_box(source))));
+    }
     group.finish();
 }
 
-fn bench_dict(c: &mut Criterion) {
-    let mut group = c.benchmark_group("dict_500");
-    group.bench_function("tree_walk", |b| {
-        b.iter(|| run_tree_walk(black_box(DICT_SCRIPT)))
-    });
-    group.bench_function("vm", |b| b.iter(|| run_vm(black_box(DICT_SCRIPT))));
+/// compile: AST → Chunk（VMのみが払うコスト）
+fn bench_compile(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compile");
+    for (name, source) in WORKLOADS {
+        let program = parse(source);
+        group.bench_function(*name, |b| b.iter(|| compile(black_box(&program))));
+    }
     group.finish();
 }
 
-fn bench_fstr(c: &mut Criterion) {
-    let mut group = c.benchmark_group("fstr_300");
-    group.bench_function("tree_walk", |b| {
-        b.iter(|| run_tree_walk(black_box(FSTR_SCRIPT)))
-    });
-    group.bench_function("vm", |b| b.iter(|| run_vm(black_box(FSTR_SCRIPT))));
-    group.finish();
+/// execute: 実行のみ。parse・compile と初期化コストは測定対象から外す
+fn bench_execute(c: &mut Criterion) {
+    for (name, source) in WORKLOADS {
+        let mut group = c.benchmark_group(format!("execute/{}", name));
+        let program = parse(source);
+        let chunk = compile(&program);
+
+        group.bench_function("tree_walk", |b| {
+            b.iter(|| execute_tree_walk(black_box(&program)))
+        });
+        group.bench_function("vm", |b| {
+            b.iter_batched(
+                || chunk.clone(),
+                |chunk| execute_vm(black_box(chunk)),
+                BatchSize::SmallInput,
+            )
+        });
+        group.finish();
+    }
 }
 
-fn bench_loop(c: &mut Criterion) {
-    let mut group = c.benchmark_group("loop_5000");
-    group.bench_function("tree_walk", |b| {
-        b.iter(|| run_tree_walk(black_box(LOOP_SCRIPT)))
-    });
-    group.bench_function("vm", |b| b.iter(|| run_vm(black_box(LOOP_SCRIPT))));
-    group.finish();
-}
+/// end_to_end: 実際の1回実行に相当する合計（parse + compile + execute）
+fn bench_end_to_end(c: &mut Criterion) {
+    for (name, source) in WORKLOADS {
+        let mut group = c.benchmark_group(format!("end_to_end/{}", name));
 
-fn bench_higher_order(c: &mut Criterion) {
-    let mut group = c.benchmark_group("higher_order_200");
-    group.bench_function("tree_walk", |b| {
-        b.iter(|| run_tree_walk(black_box(HIGHER_ORDER_SCRIPT)))
-    });
-    group.bench_function("vm", |b| b.iter(|| run_vm(black_box(HIGHER_ORDER_SCRIPT))));
-    group.finish();
+        group.bench_function("tree_walk", |b| {
+            b.iter(|| {
+                let program = parse(black_box(source));
+                execute_tree_walk(&program);
+            })
+        });
+        group.bench_function("vm", |b| {
+            b.iter(|| {
+                let program = parse(black_box(source));
+                execute_vm(compile(&program));
+            })
+        });
+        group.finish();
+    }
 }
 
 criterion_group!(
     benches,
-    bench_fib,
-    bench_dict,
-    bench_fstr,
-    bench_loop,
-    bench_higher_order
+    bench_parse,
+    bench_compile,
+    bench_execute,
+    bench_end_to_end
 );
 criterion_main!(benches);

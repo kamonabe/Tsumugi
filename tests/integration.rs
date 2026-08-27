@@ -346,6 +346,7 @@ fixture_tests!(
         fizzbuzz,
         float_special,
         for_closure_binding,
+        for_iteration_snapshot,
         for_loop,
         format_time_extreme,
         fstring,

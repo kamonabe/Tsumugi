@@ -1,0 +1,75 @@
+# for のイテレーション対象はループ開始時のスナップショット。
+# VMはコレクションをslotから参照で読むため、この意味論が変わらないことを固定する。
+
+# list / dict / str / 空コレクション
+for x in [1, 2, 3]
+    print(x)
+end
+for k in {"b": 2, "a": 1}
+    print(k)
+end
+for ch in "abc"
+    print(ch)
+end
+for never in []
+    print("never")
+end
+
+# ネストしたループ（内側の反復が外側のスナップショットを壊さない）
+for i in [1, 2]
+    for j in ["x", "y"]
+        print(f"{i}{j}")
+    end
+end
+
+# break / continue
+for i in [1, 2, 3, 4, 5]
+    if i == 2
+        continue
+    end
+    if i == 4
+        break
+    end
+    print(i)
+end
+
+# 反復中に変数へ別のlistを再代入してもスナップショットは変わらない
+let rebound = [1, 2, 3]
+for x in rebound
+    rebound = []
+    push(rebound, 99)
+    print(x)
+end
+print(rebound)
+
+# 反復中に元のlistを破壊的に縮めてもスナップショットは変わらない
+let shrunk = [1, 2, 3]
+for y in shrunk
+    pop(shrunk)
+    print(y)
+end
+print(shrunk)
+
+# ループ変数は反復ごとに新しいcellへbindされる
+let saved = []
+for i in [1, 2, 3]
+    push(saved, fn() return i end)
+end
+for f in saved
+    print(f())
+end
+
+# ループ変数をclosureがキャプチャするとlocalがcell化される経路
+for z in [7, 8]
+    let capture = fn() return z end
+    print(capture())
+end
+
+# 負のインデックスと範囲外（インデックスアクセス経路の確認）
+let arr = [10, 20, 30]
+print(arr[-2])
+try
+    print(arr[9])
+catch e
+    print(e["type"] + ": " + e["message"])
+end
