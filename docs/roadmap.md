@@ -59,14 +59,16 @@
 | AUD-034 | `path_join`の引数型契約を厳格化する | `path_join("a", 123, "b")`が型エラーにならず`a/b`を返し、非文字列argumentを無言で欠落させる | ⬜ 仕様確定待ち（両engine共通で再現済み） |
 | AUD-035 | CLI・標準I/Oのhost panic経路を構造化する | REPLのthread spawn・stdout flush・stdin readに`unwrap()`があり、broken pipe/I/O障害でpanicする。Unixの非UTF-8 argvは`std::env::args()`でもpanicし得る | ⬜ 未着手 |
 | AUD-036 | lossyな数値・OS境界変換を検証する | `exit`のi64→i32、`file_size`のu64→i64、NaN/Infを含む`to_int`/`floor`/`ceil`/`round`がwrap・飽和・0化し得る | ⬜ 仕様確定待ち（境界回帰テストが必要） |
-| AUD-038 | benchmarkをparse / compile / executeへ分離しVM退行を調査する | 現行Criterionは毎回parseし、VMはcompileも含む。aarch64 release実測でVMはfibが約2.77倍高速な一方、loop 5000回は約358倍低速で、単純な「VMは高速」という説明が成立しない | ⬜ workload別profile・測定分離・回帰gateが必要 |
-| AUD-039 | binaryからlibrary moduleを利用して二重コンパイルを解消する | `main.rs`がlibraryと同じmoduleを再宣言し、同一単体テスト138件がlib/binで重複実行される。ビルド時間・テスト件数の解釈を歪める | ⬜ 未着手 |
+| AUD-038 | benchmarkをparse / compile / executeへ分離しVM退行を調査する | 現行Criterionは毎回parseし、VMはcompileも含む。aarch64 release実測でVMはfibが約2.77倍高速な一方、loop 5000回は約358倍低速で、単純な「VMは高速」という説明が成立しない | ✅ 4フェーズへ分離し退行の原因を特定・修正（VMのforが反復ごとにコレクションを複製しO(n^2)だった）。確保量ベースのスケーリングゲートを追加。副産物としてAUD-040 / AUD-041を検出 |
+| AUD-039 | binaryからlibrary moduleを利用して二重コンパイルを解消する | `main.rs`がlibraryと同じmoduleを再宣言し、同一単体テスト139件がlib/binで重複実行される。ビルド時間・テスト件数の解釈を歪める | ⬜ 未着手 |
+| AUD-040 | treeの名前付き関数self-bindingで`Value::Fn`の複製を避ける | AUD-037の呼び出し時self-bindingが毎回`Value::Fn`（body AST含む）をcloneし、呼び出しコストが関数body長に比例する。`fib(22)`で67.0ms（該当行を無効化すると42.2ms、約1.6倍）。bodyを`Rc`共有にするか、binding cellを再利用するかの設計判断が必要 | ⬜ 未着手（AUD-038で計測・再現済み） |
+| AUD-041 | VMのコレクション読み取りで全体複製を避ける | `GetLocal`が値を複製するため、ループ内の`d[k]` / `xs[i]`読み取りがコレクション全体をコピーする。forループの反復自体はAUD-038で解消したが、一般のindex読み取り経路は残る。参照読みへ寄せるとindex式の副作用に対する評価順がAUD-013と同種の仕様判断になる | ⬜ 未着手 |
 
 ### 2026-08-27 検証スナップショット
 
 対象はcommit `feb1cbd940b0243faaec91b1eb7cf017c43283ae`、aarch64 Linux、`rustc 1.97.1`。`cargo fmt --check`、Clippy `-D warnings`、全targetテスト、release build、tree/VMのhello smoke testはすべて成功した。単体テスト138件はlib/binで重複実行され、統合テストは150件。`cargo llvm-cov`のline coverageは全体83.55%、`vm.rs` 71.23%、`builtin.rs` 56.54%だった。
 
-Criterionの平均値は次のとおり。各iterationにparseを含み、VMはcompileも含むため、一回実行のend-to-end latencyであり純粋なdispatch速度ではない。
+Criterionの平均値は次のとおり。各iterationにparseを含み、VMはcompileも含むため、一回実行のend-to-end latencyであり純粋なdispatch速度ではない。最新の測定値は次節「フェーズ別ベンチマーク」を参照する（この表はAUD-038前の記録として残す）。
 
 | workload | tree | VM | 相対結果 |
 |---|---:|---:|---|
@@ -76,11 +78,38 @@ Criterionの平均値は次のとおり。各iterationにparseを含み、VMはc
 | `loop_5000` | 762.89 µs | 272.94 ms | VMが約358倍低速 |
 | `higher_order_200` | 110.71 µs | 78.633 µs | VMが約1.41倍高速 |
 
+### 2026-08-27 フェーズ別ベンチマーク（AUD-038）
+
+対象はcommit `c0fd91f`＋AUD-038の変更、aarch64 Linux、`rustc 1.97.1`、Criterionの中央値。
+
+`parse` は 1.85–4.19 µs、`compile` は 0.72–2.73 µs で、いずれも実行時間より3桁小さい。したがって旧スナップショットのend-to-end値は実質的に実行フェーズの値であり、engine差の原因はparse/compileではない。
+
+| workload（execute） | tree | VM | 相対結果 |
+|---|---:|---:|---|
+| `fib_20` | 29.130 ms | 6.158 ms | VMが約4.7倍高速 |
+| `dict_500` | 11.185 ms | 10.759 ms | ほぼ同等 |
+| `fstr_300` | 99.77 µs | 155.21 µs | VMが約1.6倍低速 |
+| `loop_5000` | 870.22 µs | 1.490 ms | VMが約1.7倍低速 |
+| `while_5000` | 1.032 ms | 1.159 ms | VMが約1.1倍低速 |
+| `higher_order_200` | 112.72 µs | 81.49 µs | VMが約1.4倍高速 |
+
+`loop_5000`（コレクション反復）と `while_5000`（コレクションを介さない反復）を並べると、イテレーション処理の追加コストが分離できる。
+
+旧スナップショットからのVM側の変化は次のとおり。原因はいずれもforループの反復ごとのコレクション複製で、AUD-038で解消した。
+
+| workload | 旧VM | 新VM |
+|---|---:|---:|
+| `loop_5000` | 272.94 ms | 1.392 ms |
+| `dict_500` | 34.350 ms | 10.587 ms |
+| `fstr_300` | 1.047 ms | 154.20 µs |
+
+tree側は旧スナップショットより遅くなっている（`fib_20` 14.982 ms → 28.349 ms）。原因はAUD-037の呼び出し時self-bindingによる`Value::Fn`の複製で、AUD-040として追跡する。
+
 ### 追加監査後の推奨改修順
 
 1. **停止性:** AUD-026 / AUD-027 / AUD-028は完了。timeout・深度境界・host abortなしを継続検証する。
 2. **誤実行・安全境界:** AUD-012 / AUD-013 / AUD-029 / AUD-031 / AUD-037は完了。意味論選択が必要なAUD-014 / AUD-030は仕様決定後に実装する。
-3. **品質基盤:** AUD-022でtimeout・一時directory分離・厳密differential harnessを整備し、AUD-038でbenchmarkを分解してVM loop退行をprofileしてから、P2境界とfuzzを拡充する。
+3. **品質基盤:** AUD-022のharness整備とAUD-038の測定分離は完了。次はAUD-040（tree呼び出しコスト）とAUD-041（VMのコレクション読み取り）を扱い、その後にP2境界とfuzzを拡充する。
 
 ### 初回監査の改修境界（記録）
 
@@ -337,7 +366,8 @@ Tsumugi にはファイルI/O やサンドボックス機能が既に実装さ�
 | 項目 | 詳細 | 状態 |
 |---|---|---|
 | カバレッジ可視化 | `cargo llvm-cov` で未到達パスを特定しテスト拡充 | ✅ 完了 |
-| ベンチマーク | `criterion` でリグレッション検出 | ✅ 完了 |
+| ベンチマーク | `criterion` で parse / compile / execute / end_to_end を分離計測 | ✅ 完了（AUD-038） |
+| 計算量オーダーの回帰ゲート | `tests/scaling.rs` が確保バイト数で `for` の線形性を検査（実時間に依存しない） | ✅ 完了（AUD-038） |
 
 ### コード構造
 

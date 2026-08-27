@@ -257,6 +257,12 @@ fixture 追加手順は、`.tsg` と期待ファイルを置き、`fixture_tests
 - ファイルを触る fixture は `env("TSG_TEST_DIR")` で実行ごとの一時ディレクトリを受け取る（固定パスを共有しない）
 - 子プロセスは必ず制限時間付きで待つため、停止しないコードは失敗として検出される
 
+### スケーリングテスト
+
+`tests/scaling.rs` は計算量オーダーを固定する。実時間はCIランナーの負荷で揺れるため、カウントアロケータで**確保バイト数**を測り、入力を2倍にしたときの伸びが線形（約2倍）に収まることを両engineで検証する。二次なら約4倍になるため、O(n^2)への退行を決定的に検出できる。
+
+グローバルアロケータでプロセス全体の確保量を数えるため、このテストバイナリには計測を行うテストを1つだけ置く（並列実行による相互汚染を避ける）。
+
 ### CI
 
 GitHub Actions (`.github/workflows/ci.yml`) で push / PR 時に自動実行:
@@ -381,7 +387,7 @@ let f = fn(x) x * 2 end
 - 循環参照: `Rc<RefCell>`にはcycle collectorがなく、捕捉変数のListへその変数を捕捉したclosureを`push`すると、`cell → List → closure → cell`の循環を言語コードから構成できる。短命なscriptでは影響が限定的でも、REPLや長時間実行では解放されないメモリが累積し得る
 - 捕捉範囲: treeは定義時に見える全bindingを共有し、VMは自由変数だけをupvalue化する。treeではclosure生成コストと不要な値の生存期間が可視binding数に比例する
 - 意味論の重複: 共通Resolver/HIRはなく、scope・名前解決・call・比較・mutation・importの規則をEvaluatorとCompiler/VMが別々に実装する。拡張時はdifferential testで両engineの観測可能な挙動を固定する必要がある
-- パフォーマンス: `RefCell`の実行時借用チェックに加え、値cloneやVMのstack/cell管理コストがある。VMが常に高速とは限らず、現行Criterionではworkloadごとに優劣が大きく異なる
+- パフォーマンス: `RefCell`の実行時借用チェックに加え、値cloneやVMのstack/cell管理コストがある。VMが常に高速とは限らず、workloadごとに優劣が異なる。判断はフェーズ別ベンチマーク（`parse` / `compile` / `execute` / `end_to_end`）の実測に基づき、最新値は `docs/roadmap.md` のスナップショットに記録する
 
 ## モジュール / import の設計
 
@@ -681,6 +687,22 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 
 ## 変更履歴
+
+### 2026-08-27: ベンチマークのフェーズ分離とVM forループの計算量修正（AUD-038）
+
+**問題:** Criterionが1 iterationごとにparseし、VMはcompileも含めていたため、測定値はend-to-end latencyであり、engine差がどのフェーズに由来するのか分からなかった。実測ではVMの`loop_5000`がtreeの約358倍低速で、「VMは高速」という説明が成立していなかった。
+
+**調査:** `while`ループはtree/VMがほぼ同速（比1.0〜1.1）で、入力を倍にしても線形に伸びる。一方`for i in range(0, n)`はVMだけ入力を倍にすると時間が4倍になり、O(n^2)だった。原因はCompilerのforループloweringで、反復ごとに`GetLocal(collection_slot)`を2回発行していた点にある（条件の`Len`と要素取得の`Index`）。`get_local`は値を複製するため、反復ごとにコレクション全体をコピーしていた。確保バイト数で見るとn=2000で960 MB、n=4000で3.84 GBだった。
+
+**決定:** ベンチマークを`parse` / `compile` / `execute` / `end_to_end`の4グループへ分ける。`execute`は`iter_batched`で初期化とChunk複製をセットアップへ追い出し、engine比較は同じフェーズ同士で行う。コレクションを介さない`while_5000`を追加し、イテレーション処理の追加コストを分離できるようにする。forループのコレクションはスタックへ複製せず、slotから参照で読む。
+
+**実装:** `OpCode::Len`を`LenLocal(usize)`へ置き換え、`IndexLocal(usize)`を追加した。どちらもVMの`with_local_ref`でcell化済みならcell、未cell化ならstack slotを参照し、長さまたは要素だけをpushする。`eval_index`はコレクションを参照で受け取る形に変え、`value_len`を共通ヘルパーへ切り出した。イテレーション対象は`ToIterList`が開始時にスナップショットする既存仕様のままで、意味論は変わらない。
+
+**不採用案:** `Value::List` / `Dict`の内部を`Rc`共有にする案は、複製が安くなる一方で値意味論とエイリアシングを変えるため、言語仕様の変更になる。一般の`xs[i]`読み取りまで参照読みへ広げる案は、index式が同じbindingを変更した場合の評価順がtreeと変わるため、AUD-013と同種の仕様判断としてAUD-041へ分離した。実時間で回帰ゲートを組む案はCIランナーの負荷で揺れるため採用しない。
+
+**互換性と境界:** 言語の観測可能な挙動は変わらない。ベンチマークのグループ名が変わるため、既存のCriterionベースラインとは比較できない。`for`の反復コストは要素数に線形になったが、ループ内での`d[k]`のような読み取りは依然コレクションを複製する（AUD-041）。tree側の呼び出しコストはAUD-037のself-bindingによる`Value::Fn`複製で増えており、AUD-040として追跡する。
+
+**回帰テスト:** `tests/scaling.rs`がカウントアロケータで確保バイト数を測り、入力を2倍にしたときの伸びが3倍未満であることを両engineで検証する（線形なら約2倍、二次なら約4倍）。実時間に依存しないため決定的で、旧loweringへ戻すと比4.00で失敗することを確認した。paired golden fixture `for_iteration_snapshot`では、list/dict/str/空コレクションの反復、ネスト、break/continue、反復中の再代入と破壊的更新に対するスナップショット維持、反復ごとのfresh cell、ループ変数のcell昇格経路、負index・範囲外を検証する。
 
 ### 2026-08-27: 統合テストharnessの整備（AUD-022 harness分）
 

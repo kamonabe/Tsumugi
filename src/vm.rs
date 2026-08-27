@@ -338,6 +338,45 @@ impl Vm {
         self.stack[frame.base + slot].clone()
     }
 
+    /// ローカル変数を参照のまま読む。
+    ///
+    /// `get_local` は値を複製するため、コレクションでは要素数に比例したコストになる。
+    /// 長さ取得やインデックスアクセスのように結果だけが必要な場合はこちらを使う。
+    fn with_local_ref<R>(
+        &self,
+        slot: usize,
+        line: usize,
+        read: impl FnOnce(&Value) -> Result<R, TsumugiError>,
+    ) -> Result<R, TsumugiError> {
+        let frame = self.frames.last().ok_or_else(|| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Internal,
+                "local参照用のframeがありません",
+            )
+        })?;
+        // cell化済みならcell、未cell化ならstack slotをそのまま参照する
+        if let Some(Some(cell)) = frame.locals_cells.get(slot) {
+            let cell = Rc::clone(cell);
+            return read(&cell.borrow());
+        }
+        let at = frame.base.checked_add(slot).ok_or_else(|| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Internal,
+                "local slotの計算がオーバーフローしました",
+            )
+        })?;
+        let value = self.stack.get(at).ok_or_else(|| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Internal,
+                "local slotが不正です",
+            )
+        })?;
+        read(value)
+    }
+
     /// ローカル変数を書き込む（セル経由の場合はセルに書く）
     fn set_local(&mut self, slot: usize, value: Value) {
         let frame = self.frames.last().unwrap();
@@ -945,25 +984,21 @@ impl Vm {
                     self.pop(line)?;
                 }
             }
-            OpCode::Len => {
-                let value = self.pop(line)?;
-                let length = match &value {
-                    Value::List(v) => v.len() as i64,
-                    Value::Str(s) => s.chars().count() as i64,
-                    Value::Dict(m) => m.len() as i64,
-                    _ => {
-                        return Err(TsumugiError::runtime(
-                            line,
-                            format!("型エラー: {} の長さは取得できません", type_name(&value)),
-                        ));
-                    }
-                };
+            OpCode::LenLocal(slot) => {
+                let length = self.with_local_ref(slot, line, |value| value_len(value, line))?;
                 self.stack.push(Value::Int(length));
             }
             OpCode::Index => {
                 let index = self.pop(line)?;
                 let collection = self.pop(line)?;
-                let result = self.eval_index(collection, index, line)?;
+                let result = self.eval_index(&collection, &index, line)?;
+                self.stack.push(result);
+            }
+            OpCode::IndexLocal(slot) => {
+                let index = self.pop(line)?;
+                let result = self.with_local_ref(slot, line, |collection| {
+                    self.eval_index(collection, &index, line)
+                })?;
                 self.stack.push(result);
             }
             OpCode::ListPush => {
@@ -1099,14 +1134,14 @@ impl Vm {
             .ok_or_else(|| TsumugiError::runtime(line, "内部エラー: スタックが空です"))
     }
 
-    /// インデックスアクセス
+    /// インデックスアクセス（コレクションは参照で受け取り複製しない）
     fn eval_index(
         &self,
-        collection: Value,
-        index: Value,
+        collection: &Value,
+        index: &Value,
         line: usize,
     ) -> Result<Value, TsumugiError> {
-        match (&collection, &index) {
+        match (collection, index) {
             (Value::List(list), Value::Int(i)) => {
                 let idx = if *i < 0 {
                     (list.len() as i64 + i) as usize
@@ -1525,6 +1560,19 @@ impl Vm {
                 format!("型エラー: {:?} >= {:?} は比較できません", left, right),
             )),
         }
+    }
+}
+
+/// コレクションの長さを返す（値は複製しない）
+fn value_len(value: &Value, line: usize) -> Result<i64, TsumugiError> {
+    match value {
+        Value::List(v) => Ok(v.len() as i64),
+        Value::Str(s) => Ok(s.chars().count() as i64),
+        Value::Dict(m) => Ok(m.len() as i64),
+        _ => Err(TsumugiError::runtime(
+            line,
+            format!("型エラー: {} の長さは取得できません", type_name(value)),
+        )),
     }
 }
 
