@@ -848,29 +848,21 @@ pub fn format_unix_timestamp(timestamp: i64, format: &str) -> String {
     let minutes = (day_secs % 3600) / 60;
     let seconds = day_secs % 60;
 
-    // 日数から年月日を計算（負の days = 1970年以前に対応）
-    let mut year: i64 = 1970;
+    // Gregorian暦は400年ごとに曜日・うるう年の並びが繰り返される。
+    // 先に周期分を移動しておくことで、年ごとの反復をtimestampによらず最大399回に制限する。
+    const YEARS_PER_GREGORIAN_CYCLE: i64 = 400;
+    const DAYS_PER_GREGORIAN_CYCLE: i64 = 146_097;
+    let cycles = days.div_euclid(DAYS_PER_GREGORIAN_CYCLE);
+    days = days.rem_euclid(DAYS_PER_GREGORIAN_CYCLE);
+    let mut year = 1970 + cycles * YEARS_PER_GREGORIAN_CYCLE;
 
-    if days >= 0 {
-        // 1970年以降
-        loop {
-            let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-            if days < days_in_year {
-                break;
-            }
-            days -= days_in_year;
-            year += 1;
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
         }
-    } else {
-        // 1970年以前
-        loop {
-            year -= 1;
-            let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-            days += days_in_year;
-            if days >= 0 {
-                break;
-            }
-        }
+        days -= days_in_year;
+        year += 1;
     }
 
     let month_days = if is_leap_year(year) {

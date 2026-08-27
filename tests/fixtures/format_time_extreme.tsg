@@ -1,0 +1,4 @@
+# i64の最大・最小Unix timestampが停止せず正確に変換されること
+print(format_time(9223372036854775807, "%Y-%m-%d %H:%M:%S"))
+let min_timestamp = -9223372036854775807 - 1
+print(format_time(min_timestamp, "%Y-%m-%d %H:%M:%S"))
