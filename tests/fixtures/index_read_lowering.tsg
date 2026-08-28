@@ -1,0 +1,111 @@
+# コレクション読み取りのlowering（AUD-041）
+# 副作用のないindex式では、コレクションを複製せず参照で読む。
+# 観測結果は複製していた頃と同じであることを固定する。
+
+# --- 基本: list / dict / str ---
+let xs = [10, 20, 30]
+let d = {"a": 1, "b": 2}
+let s = "hello"
+let i = 1
+print(xs[i])
+print(xs[0])
+print(xs[-1])
+print(d["b"])
+print(s[1])
+print(s[-1])
+
+# --- index式は演算・ネストでも参照読みになる ---
+print(xs[i + 1])
+print(xs[len(xs) - 1])
+let idx = [2, 0]
+print(xs[idx[0]])
+
+# --- 存在しないキーはnull、範囲外はエラー ---
+print(d["missing"])
+try
+    print(xs[99])
+catch e
+    print(e["type"] + ": " + e["message"])
+end
+try
+    print(s[99])
+catch e
+    print(e["type"])
+end
+
+# --- コレクション以外へのindexは型エラー ---
+let n = 42
+try
+    print(n[0])
+catch e
+    print(e["type"])
+end
+
+# --- index式が副作用を持つ場合は、評価前のコレクションを読む ---
+# 参照読みへ寄せると結果が変わるため、この形は従来のloweringを維持する
+let grown = [1]
+fn grow()
+    push(grown, 42)
+    return 1
+end
+try
+    print(grown[grow()])
+catch e
+    print("call-index: " + e["type"])
+end
+print(grown)
+
+# --- 関数内: parameter・global・captured ---
+let shared = [7, 8, 9]
+fn read_param(list, at)
+    return list[at]
+end
+fn read_global(at)
+    return shared[at]
+end
+fn make_reader()
+    let inner = [100, 200]
+    return fn(at)
+        return inner[at]
+    end
+end
+print(read_param(xs, 2))
+print(read_global(1))
+let reader = make_reader()
+print(reader(0))
+print(reader(1))
+
+# --- shadowing: 内側のbindingを読む ---
+let target = ["outer"]
+if true
+    let target = ["inner"]
+    print(target[0])
+end
+print(target[0])
+
+# --- 変更が後続の読み取りへ反映される ---
+let live = [1, 2]
+push(live, 3)
+print(live[2])
+live[0] = 99
+print(live[0])
+
+# --- len も参照で読む ---
+print(len(xs))
+print(len(d))
+print(len(s))
+print(len([1, 2, 3, 4]))
+fn len_of_captured()
+    let items = [1, 2, 3]
+    let count = fn()
+        return len(items)
+    end
+    push(items, 4)
+    return count()
+end
+print(len_of_captured())
+try
+    print(len(n))
+catch e
+    print(e["type"] + ": " + e["message"])
+end

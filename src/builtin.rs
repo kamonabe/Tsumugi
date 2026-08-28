@@ -147,6 +147,21 @@ impl Evaluator {
 
             // --- 共通モジュールに委譲可能なビルトイン ---
             // 引数を評価してから builtin_core::dispatch に委譲
+            // len(識別子) はコレクションを複製せず長さだけ読む（AUD-041）
+            "len"
+                if args.len() == 1
+                    && matches!(args.first(), Some(Expr::Ident(name)) if self.env.get_cell(name).is_some()) =>
+            {
+                let Some(Expr::Ident(name)) = args.first() else {
+                    return Ok(None);
+                };
+                let Some(cell) = self.env.get_cell(name) else {
+                    return Ok(None);
+                };
+                let collection = cell.borrow();
+                crate::builtin_core::builtin_len(std::slice::from_ref(&collection), line).map(Some)
+            }
+
             "len" | "keys" | "values" | "has_key" | "type" | "slice" | "contains" | "sort"
             | "reverse" | "range" | "split" | "join" | "trim" | "starts_with" | "ends_with"
             | "replace" | "upper" | "lower" | "to_int" | "to_str" | "to_float" | "abs" | "min"

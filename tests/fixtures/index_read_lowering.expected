@@ -1,0 +1,29 @@
+20
+10
+30
+2
+e
+o
+30
+30
+30
+null
+index: インデックス範囲外: 99 (長さ: 3)
+index
+runtime
+call-index: index
+[1, 42]
+30
+8
+100
+200
+inner
+outer
+3
+99
+3
+2
+5
+4
+4
+builtin_type: len は List/Str/Dict に対してのみ使えます

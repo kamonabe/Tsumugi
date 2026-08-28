@@ -710,6 +710,28 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 ## 変更履歴
 
+### 2026-08-28: コレクション読み取りの複製を除去（AUD-041）
+
+**問題:** `xs[i]` / `d[k]` / `len(xs)` は、読み取りのたびにコレクション全体を複製していた。VMは`GetLocal`が値をcloneし、treeも`Env::get`が`cell.borrow().clone()`するため、ループ内の読み取りがO(n^2)になる。確保量で測ると、n=500とn=1000の比が両engineとも約4.0だった。AUD-041はVMの課題として記録していたが、実測ではtreeも同じ欠陥を持っていた。`len`も同じ経路で全体を複製していた。
+
+**決定:** index式が副作用を持たない場合に限り、コレクションを複製せず参照で読む。副作用のない式（リテラル・識別子・それらの演算・それらのindex参照）では、読み取りの時点でコレクションが変化しないため、複製しても参照でも観測結果は同じである。関数呼び出しを含むindex式は、評価前のコレクションを読む現行の意味論を保つため従来のloweringを維持する。treeも同じ規則で最適化し、engine間で観測結果が分かれないようにする。
+
+**実装:** `ast.rs`に`is_side_effect_free`を追加し、両engineで同じ判定を共有する。VMのCompilerは`Expr::Index`のobjectが識別子でローカルに解決でき、index式が副作用なしなら`IndexLocal(slot)`へloweringする（indexを積んでからローカルを参照読みする既存opcode）。`len(識別子)`も同様に`LenLocal(slot)`へ落とす。treeは`Expr::Index`で変数セルを取得し、index式を評価してからセルを`borrow()`して読む。`len`も同じく識別子ならセルを参照して長さだけ取る。`LenLocal`の判定とエラーは`builtin_core::builtin_len`へ委譲し、VM専用だった`value_len`を削除した。これで`len(42)`のエラーは両engineで従来どおり`builtin_type`のまま一致する。
+
+**不採用案:** index式の種類を問わず参照読みへ寄せる案は、`xs[grow()]`のようにindex式がコレクションを変更する場合に読む対象が変わるため不採用。コレクションを`Rc<Vec>` / `Rc<BTreeMap>`のcopy-on-writeにする案は、関数呼び出しを含むindex式も含めて構造的に複製を減らせるが、`Value`の表現と破壊的更新の実装に広く影響するため、AUD-047として分離した。upvalue経由の読み取り（`GetUpvalue`のclone）は今回の対象外で、専用opcodeが必要になる。
+
+**互換性と境界:** 観測可能な挙動は変わらない。goldenフィクスチャで、list/dict/strの読み取り、負index、範囲外・型エラー、shadowing、変更の反映、captured collection、parameter・global経由の読み取り、副作用を持つindex式の順序、`len`の各型とエラーを両engineで固定した。`n[0]`のようにコレクション以外へindexした場合のerror kindは、tree（`runtime`）とVM（`type`）で以前から異なる。本変更の前後で同一であることを確認し、期待値ファイルを分けて明示した。解消はAUD-019で扱う。
+
+**測定:** n=500とn=1000の確保量比（`tests/scaling.rs`のアロケータ）。
+
+| workload | tree 修正前 | tree 修正後 | VM 修正前 | VM 修正後 |
+|---|---:|---:|---:|---:|
+| `xs[i]` | 3.98 | 1.99 | 3.99 | 1.79 |
+| `d[k]` | 4.00 | 2.00 | 4.01 | 1.95 |
+| `len(xs)` | 3.97 | 1.99 | 3.98 | 1.79 |
+
+n=1000の絶対値では、`xs[i]`がtree 88,518,619→518,619バイト、VM 88,199,231→199,231バイト。`d[k]`はtree 199,894,216→1,452,216バイト、VM 199,245,586→803,586バイト。関数呼び出しを含む`d[to_str(i)]`は設計どおり比4.00のままである。
+
 ### 2026-08-28: VMの内部不変条件をinternal errorへ置換（AUD-023）
 
 **問題:** VMは`self.frames.last().unwrap()`や`chunk.constants[idx]`のように、compilerが正しい命令列を作ることを前提とした無検査アクセスを多く持っていた。公開APIの`Vm::new` / `Vm::run_repl_chunk`は任意の`Chunk`を受け取るため、library利用者が手組みしたbytecodeではこれらがRustのindex panicやunwrap panicになり、ホストプロセスが落ちた。実測では、範囲外のlocal slot・定数index・upvalue index、行番号表が命令列より短いChunk、関数先頭の`MakeClosure`によるoperand計算のunderflowが、それぞれ`src/vm.rs`のindexアクセスでpanicした。`dispatch`の`unreachable!()`も同種の到達点だった。

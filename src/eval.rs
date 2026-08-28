@@ -532,6 +532,16 @@ impl Evaluator {
             }
 
             Expr::Index { object, index } => {
+                // 副作用のないindex式なら、コレクションを複製せず
+                // 変数セルから参照で読む（AUD-041）。
+                if let Expr::Ident(name) = object.as_ref()
+                    && crate::ast::is_side_effect_free(index)
+                    && let Some(cell) = self.env.get_cell(name)
+                {
+                    let idx = self.eval_expr(index, line)?;
+                    let collection = cell.borrow();
+                    return self.eval_index(&collection, &idx, line);
+                }
                 let obj = self.eval_expr(object, line)?;
                 let idx = self.eval_expr(index, line)?;
                 self.eval_index(&obj, &idx, line)

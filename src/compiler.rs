@@ -781,9 +781,19 @@ impl Compiler {
                 }
             }
             Expr::Index { object, index } => {
-                self.compile_expr(object, line)?;
-                self.compile_expr(index, line)?;
-                self.chunk.emit(OpCode::Index, line);
+                // 副作用のないindex式なら、コレクションをスタックへ複製せず
+                // ローカルslotから参照で読む（AUD-041）。
+                if let Expr::Ident(name) = object.as_ref()
+                    && crate::ast::is_side_effect_free(index)
+                    && let Ok(slot) = self.resolve_local(name, line)
+                {
+                    self.compile_expr(index, line)?;
+                    self.chunk.emit(OpCode::IndexLocal(slot), line);
+                } else {
+                    self.compile_expr(object, line)?;
+                    self.compile_expr(index, line)?;
+                    self.chunk.emit(OpCode::Index, line);
+                }
             }
             Expr::Lambda { params, body } => {
                 self.compile_lambda(params, body, line)?;
@@ -822,6 +832,16 @@ impl Compiler {
                 ),
                 line,
             );
+        }
+
+        // len(識別子) はコレクションを複製せず長さだけ読む（AUD-041）
+        if name == "len"
+            && args.len() == 1
+            && let Expr::Ident(var_name) = &args[0]
+            && let Ok(slot) = self.resolve_local(var_name, line)
+        {
+            self.chunk.emit(OpCode::LenLocal(slot), line);
+            return Ok(());
         }
 
         // push/pop は第一引数のリストを破壊的に変更する
