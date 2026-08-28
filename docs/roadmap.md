@@ -59,7 +59,7 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 | AUD-013 | VM index assignmentのupvalue対応と評価順を統一する | captured listへ代入不可。object取得順の違いで副作用後に古いlistを書き戻す | ✅ target解決→index→value→in-place更新へ統一。local/upvalue/runtime global対応、未定義targetの先行報告、共有`assign_index`によるメッセージ・境界判定一致（golden pair・両engine REPL回帰テスト追加） |
 | AUD-014 | equality / relational comparisonの対象型を統一する | List/Dict/Function/Error、Int×Floatでtreeはtype error、VMはboolを返す場合がある。486ケース（9型×9型×6演算子）の網羅比較で128件の差分を確認した | ✅ 完了（等価比較を全型で成立させ、Int×Floatを数値比較、List/Dict/Errorを構造比較、関数値を`Rc::ptr_eq`の同一性比較へ統一。大小比較は数値のみ（混在可）。判定を`Value::PartialEq`へ集約し、486ケースの差分が0件。付随して型エラーの種別をkind明示へ変え、被演算子の値による誤分類も解消。仕様revisionを0.9へ） |
 | AUD-029 | 複数行lambdaの終端`end`を必須検証する | `let f = fn(x)\n return x`をtree/VMとも構文エラーにせず終了コード0で受理する。EOFを`end`として無条件消費している | ✅ Parserで`End`を必須検証し、tree/VM共通でEOFを構文エラー化 |
-| AUD-030 | top-level importの評価時点を統一／仕様化する | `print("BEFORE")`後の失敗importでtreeだけ先行出力する。実行中に生成したmoduleもtreeだけimport可能で、VMのcompile-time inlineと観測可能な差がある | ⬜ 仕様確定待ち（両engine差を再現済み） |
+| AUD-030 | top-level importの評価時点を統一／仕様化する | `print("BEFORE")`後の失敗importでtreeだけ先行出力する。実行中に生成したmoduleもtreeだけimport可能で、VMのcompile-time inlineと観測可能な差がある。9ケースの検証で4つの観測差を確認した（失敗import前の副作用、構文エラーmodule、import前の実行時エラー、実行中に生成／削除したmodule） | ✅ 完了（実行前解決へ統一。`src/module.rs`の`ModuleLoader`へ解決処理を集約し、treeは`run`でリンク、VMはリンク済みプログラムをcompileする。`exec_import` / `compile_import`を削除し、9ケースすべてで両engine一致。仕様revisionを0.10へ） |
 | AUD-031 | Windowsで`TSUMUGI_*`環境変数保護をcase-insensitiveにする | Windowsの環境変数検索は大文字小文字を区別しないがprefix検査は区別するため、`env("tsumugi_sandbox")`等で保護値を読める可能性がある | ✅ Unicode uppercase後のprefix保護を実装。tree/VM、allow-list未設定/全許可、ASCII大小文字・Unicode case alias・secret非漏洩をWindows実OS CIで確認 |
 | AUD-032 | 破壊的ファイル操作のfinal symlink意味論を修正する | 旧`check_path`は最終symlinkまでcanonicalizeし、`remove`/`remove_dir`/`rename`がlink自体ではなくlink先を削除・移動していた | ✅ 完了（中間componentのみ解決し、final directory entryを操作） |
 | AUD-037 | ローカル名前付き関数のself-bindingを両engineで統一する | 関数内で定義した再帰関数がtreeでは自身を捕捉できず`未定義の関数`、VMでは正常完了する。`factorial(5)`相当でtree失敗／VM `120`を再現 | ✅ 呼び出し時self-bindingとuser binding優先のbuiltin fallbackをtree/VMで統一。匿名lambdaの内部slot名も非公開化 |
@@ -202,7 +202,7 @@ tree側は旧スナップショットより遅くなっている（`fib_20` 14.9
 ### 追加監査後の推奨改修順
 
 1. **停止性・ホスト安定性:** AUD-023 / AUD-026 / AUD-027 / AUD-028 / AUD-035 / AUD-043は完了。timeout・深度境界・host abortなしを継続検証する。`Chunk::patch_jump`は不正なoffsetでpanicするビルダーAPIとして残るため、compiler側の不変条件として扱う。
-2. **誤実行・安全境界:** AUD-012 / AUD-013 / AUD-014 / AUD-029 / AUD-031 / AUD-037は完了。意味論選択が必要な残件はAUD-030（top-level importの評価時点）で、仕様決定後に実装する。AUD-043はトップレベル`return`をパースエラーへ統一し、panic・無言終了・import時のengine差を同時に解消した。
+2. **誤実行・安全境界:** AUD-012 / AUD-013 / AUD-014 / AUD-029 / AUD-030 / AUD-031 / AUD-037は完了。P1の意味論選択はすべて決着した。残るengine差はAUD-016（同一scope再宣言のcell identity）、AUD-017（call-depth境界）、AUD-019（error kind / message）で、いずれもP2として扱う。
 3. **品質基盤:** AUD-022のharness整備、AUD-038の測定分離、AUD-040のtree呼び出しコスト、AUD-041のコレクション読み取り、AUD-042のclosure捕捉範囲、AUD-046のglobal複製は完了。次はAUD-025（VM REPL checkpointの複製）とAUD-047（コレクションのcopy-on-write）を検討し、その後にP2境界とfuzzを拡充する。
 4. **文書・配布:** AUD-021に続き、AUD-044でREADMEと規範仕様の古い記述を除き、AUD-045で実行手順とtoolchain下限を明示する。
 
@@ -246,7 +246,7 @@ tree側は旧スナップショットより遅くなっている（`fib_20` 14.9
 - [x] スタックトレース（関数呼び出し経路のエラー表示、ツリーウォーク版/VM版両対応）
 - [x] ステップ予算（ループ反復 + 関数呼び出しのカウント制限、無限ループ/無限再帰を防止）
 - [x] ファイルI/Oサンドボックス（環境変数 `TSUMUGI_SANDBOX` でアクセス許可パスを制限）
-- [x] モジュール / import（ファイル分割、循環import検出、ネストimport対応、ツリーウォーク版/VM版両対応）
+- [x] モジュール / import（ファイル分割、循環import検出、ネストimport対応、実行前解決の共有ローダーでツリーウォーク版/VM版を統一）
 - [x] エラー処理 / try/catch（ランタイムエラーの捕捉、ネスト対応、ツリーウォーク版/VM版両対応）
 - [x] `From<String>` 廃止（全エラー生成箇所を `TsumugiError::runtime()` に統一、文字列再パース除去）
 - [x] import のサンドボックス対応（`TSUMUGI_SANDBOX` 設定時に import 先パスも検証、ツリーウォーク版/VM版両対応）

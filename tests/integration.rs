@@ -357,6 +357,7 @@ fixture_tests!(
         import_basic,
         import_circular,
         import_nested,
+        import_static_resolution,
         index_assign_binding,
         index_read_lowering,
         list_dict,
@@ -385,6 +386,7 @@ fixture_tests!(
         error_continue_outside_loop,
         error_dict_key_type,
         error_fstring_extra,
+        error_import_before_side_effects,
         error_import_non_top_level,
         error_import_not_found,
         error_index_out_of_bounds,
@@ -1533,5 +1535,57 @@ fn rejects_non_utf8_argument_without_host_panic() {
     assert!(
         stderr.contains("UTF-8"),
         "UTF-8でないことを説明する診断がありません: {stderr}"
+    );
+}
+
+// =============================================================
+// リグレッションテスト: import の評価時点（AUD-030）
+// =============================================================
+
+/// 実行前に解決するため、失敗した import の手前で副作用が起きない。
+/// また、実行が完了しなかったモジュールは未解決へ戻り、再度 import できる。
+#[test]
+fn repl_resolves_imports_before_execution_in_both_engines() {
+    let dir = TestDir::new("import-timing");
+    let module = std::path::Path::new(dir.as_str()).join("boom.tsg");
+    std::fs::write(&module, "print(\"MOD-TOP\")\nlet boom = 1 / 0\n")
+        .unwrap_or_else(|error| panic!("モジュールを書けません: {error}"));
+    let module_path = module
+        .to_str()
+        .unwrap_or_else(|| panic!("パスがUTF-8ではありません"))
+        .replace('\\', "/");
+
+    let source = format!(
+        "print(\"BEFORE\")\nimport \"{module_path}\"\nimport \"{module_path}\"\nprint(\"AFTER\")\n"
+    );
+
+    let mut outputs = Vec::new();
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let output = run_repl_process(&source, use_vm, &[]);
+        let (stdout, stderr) = output_text(&output);
+        let visible = repl_visible_lines(&stdout, use_vm);
+
+        assert!(
+            !stderr.contains("panicked at"),
+            "{mode}: host panicが発生: {stderr}"
+        );
+        // 失敗したimportは未解決へ戻るため、2回目のimportで再実行される
+        assert_eq!(
+            visible.iter().filter(|line| **line == "MOD-TOP").count(),
+            2,
+            "{mode}: 実行が完了しなかったmoduleを再importできていません: {stdout}"
+        );
+        assert_eq!(
+            stderr.matches("ゼロ除算").count(),
+            2,
+            "{mode}: 2回目のimportでmoduleが再実行されていません: {stderr}"
+        );
+        outputs.push(visible.join("\n"));
+    }
+
+    assert_eq!(
+        outputs[0], outputs[1],
+        "treeとVMでimportの観測結果が異なります"
     );
 }

@@ -293,7 +293,7 @@ GitHub Actions (`.github/workflows/ci.yml`) で push / PR 時に自動実行:
 
 ## 設計時の文法スナップショット（revision v0.3）
 
-この番号は設計履歴上の文法revisionであり、規範となる最新仕様は[`language-spec.md`](language-spec.md)のversion 0.9、実装packageは0.1.0である。構文を変更する場合は、まず規範仕様と`LANG_GUIDE.md`を更新し、この節は設計履歴として扱う。
+この番号は設計履歴上の文法revisionであり、規範となる最新仕様は[`language-spec.md`](language-spec.md)のversion 0.10、実装packageは0.1.0である。構文を変更する場合は、まず規範仕様と`LANG_GUIDE.md`を更新し、この節は設計履歴として扱う。
 
 ```
 program        = top_level_stmt*
@@ -709,6 +709,22 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 
 ## 変更履歴
+
+### 2026-08-28: import を実行前解決へ統一（AUD-030）
+
+**問題:** treeは`import`文に到達した時点で読み込み、VMはコンパイル時にインライン展開していたため、9ケースの検証で4つの観測差が出た。存在しないモジュールや構文エラーのあるモジュールでは、treeだけ手前の`print`を出力してから失敗した。importより前に実行時エラーがある場合、treeはその実行時エラー、VMはimportエラーを報告した。実行中に`write_file`で生成したモジュールはtreeだけimportでき、逆に実行中に削除したモジュールはVMだけ成功した。副作用の順序、sandbox違反、深度上限、循環importは既に一致していた。
+
+**決定:** VM側の「実行前解決」を規範とする。importはプログラム開始前にすべて解決し、読み込み・パース・sandbox検査・深度検査を実行前に終える。モジュールのトップレベル文は`import`文があった位置で実行するため、正常系の観測結果は変わらない。実行中に生成したファイルのimportは使えなくなる。
+
+根拠は3つある。失敗が副作用より前に必ず出るため、途中まで出力してから落ちる状態がなくなる。実行前にモジュールグラフが確定するため、Phase 5で計画しているhost注入のmodule resolverの受け皿になる。そして自己書き換え的なimportは、`import`がトップレベル限定である制約と合わせて、予測可能性を優先する方針に反する。
+
+**実装:** `src/module.rs`に`ModuleLoader`を追加し、canonicalize・sandbox検査・読み込み・パース・循環と深度の判定を1か所へ集約した。`link`は`import`文をモジュールの文へ置き換えた「リンク済みプログラム」を返す。importが無ければ`None`を返し、AST全体を複製しない。treeの`Evaluator::run`はリンクしてから実行し、VMは`main`がリンク済みプログラムをCompilerへ渡す。これに伴い、treeの`exec_import`とCompilerの`compile_import`、Compilerの`base_dir` / `imported` / `import_depth`を削除した。両engineの`Stmt::Import`は到達しない経路になったため、internal errorを返す。実行が完了しなかったモジュールは`forget`で未解決へ戻し、同じパスを再importできる状態を保つ（AUD-006）。VM REPLではloaderもcompilerと同じcheckpointでrollbackする。
+
+**不採用案:** tree側に合わせてVMも実行時解決にする案は、VMがimport先を現在のchunkへインライン展開してローカルslotを割り当てているため、実行中のslot割り当てとglobal登録が必要になり、AUD-001で整えたREPLのtransaction境界にも影響する。差を仕様として許容する案は、engine間で観測結果が変わる状態を残すため、規範仕様を一つに定める方針と両立しない。
+
+**互換性と境界:** デフォルトのtreeで観測挙動が変わる。実行中にモジュールを生成してimportしていたコードは動かなくなるため、生成が必要な場合は将来のhost resolverで扱う。エラーメッセージと行番号は従来と同じ（`5行目: import 失敗: ...`）である。importより前の実行時エラーは、importの解決が先に走るためimportエラーとして報告される。
+
+**回帰テスト:** golden fixture `import_static_resolution`で正常系の順序・二重importのスキップ・ネスト解決・importした定義の可視性を両engineで固定した。error fixture `error_import_before_side_effects`は、失敗時に手前の`print`とファイル作成が起きないことを固定する。REPLテストでは、実行が完了しなかったモジュールを再importするとtree/VMとも再実行され、観測結果が一致することを検証した。9ケースの手動検証でも全て一致を確認した。
 
 ### 2026-08-28: 比較演算の対象型を統一（AUD-014）
 

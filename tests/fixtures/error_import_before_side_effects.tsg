@@ -1,0 +1,6 @@
+# import は実行前に解決するため、失敗しても手前の副作用は起きない（AUD-030）
+# 旧ツリーウォーク版は "BEFORE" を出力してから失敗していた。
+print("must-not-run")
+write_file("must-not-be-created.txt", "x")
+import "nonexistent_module.tsg"
+print("must-not-run-either")

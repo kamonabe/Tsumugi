@@ -4,12 +4,10 @@ mod builtin;
 use crate::ast::*;
 use crate::env::Env;
 use crate::error::{TraceFrame, TsumugiError};
-use crate::limits::MAX_IMPORT_DEPTH;
 use crate::value::{FnDef, Value};
 
 use std::collections::BTreeMap;
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 /// 評価器の戻り値（通常の値 or return / break / continue による制御フロー）
 enum EvalResult {
@@ -42,12 +40,8 @@ pub struct Evaluator {
     steps: u64,
     /// ステップ上限
     max_steps: u64,
-    /// 現在のスクリプトの基準ディレクトリ（import のパス解決に使用）
-    base_dir: PathBuf,
-    /// import 済みファイルの正規パス集合（循環 import 防止）
-    imported: HashSet<PathBuf>,
-    /// 現在処理中のactive import chain深度（root scriptは0）。
-    import_depth: usize,
+    /// import の解決状態（実行前にリンクする。AUD-030）
+    loader: crate::module::ModuleLoader,
 }
 
 impl Evaluator {
@@ -57,21 +51,13 @@ impl Evaluator {
             call_stack: Vec::new(),
             steps: 0,
             max_steps: resolve_max_steps(),
-            base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            imported: HashSet::new(),
-            import_depth: 0,
+            loader: crate::module::ModuleLoader::new(),
         }
     }
 
     /// 基準ディレクトリを設定する（ファイル実行時に呼ばれる）
     pub fn set_base_dir(&mut self, path: &Path) {
-        if let Some(parent) = path.parent() {
-            self.base_dir = parent.to_path_buf();
-        }
-        // 実行されたファイル自体も imported に追加（自分自身の import を防ぐ）
-        if let Ok(canonical) = std::fs::canonicalize(path) {
-            self.imported.insert(canonical);
-        }
+        self.loader.set_base_dir(path);
     }
 
     /// ステップカウンタを進め、上限チェックする
@@ -94,13 +80,26 @@ impl Evaluator {
     }
 
     /// REPLの新しい入力を開始する前にステップ予算をリセットする。
-    /// importは同じ`run`を再帰利用するため、`run`自身ではリセットしない。
     pub fn reset_step_budget(&mut self) {
         self.steps = 0;
     }
 
     /// プログラム全体を実行
+    ///
+    /// import は実行前にリンクして解決する（AUD-030）。読み込み・パース・サンドボックス・
+    /// 深度の失敗は、最初の文を実行する前に報告される。
     pub fn run(&mut self, program: &Program) -> Result<(), TsumugiError> {
+        let (linked, newly_loaded) = self.loader.link(program)?;
+        let target = linked.as_ref().unwrap_or(program);
+        let result = self.exec_program(target);
+        if result.is_err() {
+            // 実行が完了しなかったmoduleは解決済みにしない（同じパスを再試行できる）
+            self.loader.forget(&newly_loaded);
+        }
+        result
+    }
+
+    fn exec_program(&mut self, program: &Program) -> Result<(), TsumugiError> {
         validate_program_depth(program)?;
         for stmt in program {
             match self.exec_stmt(stmt)? {
@@ -121,96 +120,6 @@ impl Evaluator {
             }
         }
         Ok(())
-    }
-
-    /// import 文を実行する
-    fn exec_import(&mut self, path: &str, line: usize) -> Result<(), TsumugiError> {
-        use crate::lexer::Lexer;
-        use crate::parser::Parser;
-
-        // パス解決: base_dir からの相対パス
-        let resolved = self.base_dir.join(path);
-        let canonical = std::fs::canonicalize(&resolved).map_err(|e| {
-            TsumugiError::runtime_with_kind(
-                line,
-                crate::error::ErrorKind::Import,
-                format!("import 失敗: ファイルが見つかりません: {} ({})", path, e),
-            )
-        })?;
-
-        // サンドボックスチェック: import 先が許可範囲内か検証
-        let _ = crate::sandbox::check_path(canonical.to_str().unwrap_or(""), line)?;
-
-        // 循環 import は従来どおり成功扱いにし、active chainの深度を消費しない。
-        if self.imported.contains(&canonical) {
-            return Ok(());
-        }
-        if self.import_depth >= MAX_IMPORT_DEPTH {
-            return Err(TsumugiError::runtime_with_kind(
-                line,
-                crate::error::ErrorKind::Import,
-                format!(
-                    "import 失敗: ネストが深すぎます (上限: {})",
-                    MAX_IMPORT_DEPTH
-                ),
-            ));
-        }
-        self.imported.insert(canonical.clone());
-
-        let previous_depth = self.import_depth;
-        let previous_base_dir = self.base_dir.clone();
-        self.import_depth += 1;
-
-        let result = (|| -> Result<(), TsumugiError> {
-            let source = std::fs::read_to_string(&canonical).map_err(|error| {
-                TsumugiError::runtime_with_kind(
-                    line,
-                    crate::error::ErrorKind::Import,
-                    format!(
-                        "import 失敗: ファイルを読み込めません: {} ({})",
-                        path, error
-                    ),
-                )
-            })?;
-
-            // base_dir を一時的に import 先のディレクトリに切り替え（ネスト import 対応）
-            if let Some(parent) = canonical.parent() {
-                self.base_dir = parent.to_path_buf();
-            }
-
-            // パース & 実行
-            let mut lexer = Lexer::new(&source);
-            let tokens = lexer.tokenize();
-            let mut parser = Parser::new(tokens);
-            let program = parser.parse().map_err(|errors| {
-                TsumugiError::runtime_with_kind(
-                    line,
-                    crate::error::ErrorKind::Import,
-                    format!(
-                        "import 失敗 ({}): {}",
-                        path,
-                        errors
-                            .iter()
-                            .map(|e| e.to_string())
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    ),
-                )
-            })?;
-
-            self.run(&program)
-        })();
-
-        // 成否にかかわらずactive chainの状態を呼び出し元へ戻す。
-        self.base_dir = previous_base_dir;
-        self.import_depth = previous_depth;
-        if result.is_err() {
-            // runtime errorで完了しなかったmoduleもloaded扱いにしない。
-            // 既に発生した代入や外部I/OのrollbackはAUD-024で別途仕様化する。
-            self.imported.remove(&canonical);
-        }
-
-        result
     }
 
     /// 文を実行
@@ -374,10 +283,12 @@ impl Evaluator {
 
             Stmt::Continue { .. } => Ok(EvalResult::Continue),
 
-            Stmt::Import { path, line } => {
-                self.exec_import(path, *line)?;
-                Ok(EvalResult::Val)
-            }
+            // import はリンク時に解決済みなので、ここへは到達しない
+            Stmt::Import { line, .. } => Err(TsumugiError::runtime_with_kind(
+                *line,
+                crate::error::ErrorKind::Internal,
+                "内部エラー: import がリンクされていません",
+            )),
 
             Stmt::TryCatch {
                 try_body,
