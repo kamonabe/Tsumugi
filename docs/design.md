@@ -269,7 +269,7 @@ let result = filter(test, fn(item) item != "kani" end)
 fixture 追加手順は、`.tsg` と期待ファイルを置き、`fixture_tests!` へ名前を1行宣言する。宣言から tree / VM 両方のテスト（`<name>::tree` / `<name>::vm`）が生成されるため、片側の登録漏れが起きない。`fixture_declarations_match_directory` が宣言とディレクトリの整合を検査するので、未宣言の fixture はテスト失敗として検出される。
 
 - OS・ロケール依存の文字列は期待ファイル側で `{*}` に逃がす（それ以外は完全一致）
-- engine 間で意図的に差が残る箇所は `<name>.expected_err.vm` で明示する
+- engine 間に差が残る箇所は、期待ファイルを `<name>.<ext>.vm` で上書きして明示する（`<name>.expected.vm` / `<name>.expected_err.vm`）。`.vm` が無ければ共通の期待ファイルを使うため、差がある fixture だけが `.vm` を持つ。現在は `index_read_lowering`（AUD-019）と `comparison_semantics`（AUD-048）が該当する
 - 期待ファイルを持たず専用テストから実行する fixture は `CUSTOM_FIXTURES`、import 先の補助ファイルは `HELPER_FIXTURES` に分類する
 - ファイルを触る fixture は `env("TSG_TEST_DIR")` で実行ごとの一時ディレクトリを受け取る（固定パスを共有しない）
 - 子プロセスは必ず制限時間付きで待つため、停止しないコードは失敗として検出される
@@ -403,7 +403,8 @@ let f = fn(x) x * 2 end
 
 ### 既知のトレードオフ
 
-- 関数値の等価性は仕様上常に`false`とする方針だが、現行treeは型エラー、VMは`false`となるためAUD-014で統一する
+- 関数値の等価性は同一性比較（`Rc::ptr_eq`）とし、反射律（`f == f`が`true`）を保つ。同じ`fn`から別々に作ったクロージャは等しくない。構造比較や呼び出し結果の比較は行わない（AUD-014で確定）
+- 同一性の粒度がengine間で揃っていない: treeは`Value::Fn`の`def: Rc<FnDef>`を定義式の評価ごとに作るため別インスタンスは常に不等になる。一方VMの`Value::VmFn`はcompile時に共有される`Rc<Chunk>`とupvalue cellで比較するため、upvalueを持たない関数値では同じ`fn`式から生成した別インスタンスが等しくなる（AUD-048）
 - 循環参照: `Rc<RefCell>`にはcycle collectorがなく、捕捉変数のListへその変数を捕捉したclosureを`push`すると、`cell → List → closure → cell`の循環を言語コードから構成できる。短命なscriptでは影響が限定的でも、REPLや長時間実行では解放されないメモリが累積し得る
 - 捕捉範囲: treeは定義時に見える全bindingを共有し、VMは自由変数だけをupvalue化する。treeではclosure生成コストと不要な値の生存期間が可視binding数に比例する。さらにクロージャを保持するコンテナまで捕捉すると参照循環になりメモリが解放されない（AUD-042）
 - 意味論の重複: 共通Resolver/HIRはなく、scope・名前解決・call・比較・mutation・importの規則をEvaluatorとCompiler/VMが別々に実装する。拡張時はdifferential testで両engineの観測可能な挙動を固定する必要がある
@@ -477,7 +478,7 @@ Parserはプログラム直下とblock内の文を区別し、block内のimport�
 ### 概要
 
 ツリーウォークインタプリタに加え、バイトコードコンパイラ + スタックVMを並行実装する。
-`--vm`フラグで実行方式を切り替え可能。Lexer・Parser・ASTは共有し、両方式が同じ規範仕様を満たすことを目標とする。ただし、意味解析以降は別実装であり、比較、index代入、builtin、importなどに既知の差が残る。現時点のVMは互換性・性能ともに実験的backendとして扱い、非適合は`roadmap.md`で管理する。
+`--vm`フラグで実行方式を切り替え可能。Lexer・Parser・ASTは共有し、両方式が同じ規範仕様を満たすことを目標とする。比較（AUD-014）、index代入（AUD-013）、context依存builtin（AUD-012）、import解決時点（AUD-030）はいずれも統一済みである。ただし意味解析以降は別実装のため、同一scopeの`let`再宣言でのcell identity（AUD-016）、捕捉のない関数値の同一性（AUD-048）、call frame深度の境界（AUD-017）、error kind・message（AUD-019）、未捕捉エラー後のREPL状態（AUD-024）に既知の差が残る。現時点のVMは互換性・性能ともに実験的backendとして扱い、非適合は`roadmap.md`で管理する。
 
 ### 動機
 
