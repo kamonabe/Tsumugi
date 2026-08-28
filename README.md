@@ -1,12 +1,23 @@
 # Tsumugi（紡ぎ）
 
-Rust で作るミニプログラミング言語。言語処理系の学習を目的としたプロジェクト。
+Rustで実装する、制御可能な組み込みスクリプト言語を目指すプロジェクト。
+
+## プロジェクトの方向性
+
+Tsumugiは、プログラミング言語処理系への理解を深めるための個人プロジェクトとして始まった。その学びを継続しながら、実運用を見据えた組み込みスクリプト言語の研究・開発へ進む。
+
+> Tsumugiは、サーバーアプリケーションや業務システムに組み込み、ホストが明示的に付与した権限と実行予算の範囲内で、業務ルールや拡張ロジックを予測可能かつ監査可能に実行するためのスクリプト言語を目指す。
+
+瞬間的な実行速度よりもホストの安定性を優先し、制御された負荷の中で処理を着実に進める。設計上の原則と非目標は[Tsumugi Manifesto](docs/manifesto.md)を参照すること。
+
+> [!IMPORTANT]
+> マニフェストはTsumugiが目指す方向を示すものであり、現在の実装がすべての性質を保証していることを意味しない。
 
 ## 概要
 
-Tsumugi はRuby風の文法を持つ、言語処理系の学習を目的とした動的型付け言語。Lexer・Parser・ASTを共有し、デフォルトのツリーウォーク評価器、またはバイトコードコンパイラ + スタックVM（`--vm`）で実行する。
+現在のTsumugiはRuby風の文法を持つ動的型付け言語である。Lexer・Parser・ASTを共有し、デフォルトのツリーウォーク評価器、またはバイトコードコンパイラ + スタックVM（`--vm`）で実行する。
 
-現在は**教育・実験用途のalpha版**であり、言語仕様・埋め込みAPI・CLIの後方互換性は保証していない。`--vm`は処理系比較のための実験的backendで、比較、index代入、builtin、importなど一部の境界動作はデフォルト実行系と一致していない。既知の差異と修正状況は[ロードマップ](docs/roadmap.md)を参照すること。
+現在は**教育・実験用途のalpha版**であり、言語仕様・組み込みAPI・CLIの後方互換性は保証していない。安定した組み込みAPI、実行単位のdeny-by-default capability、包括的な実行予算、実行時audit eventは今後の設計・実装対象である。`--vm`は処理系比較のための実験的backendで、比較、index代入、builtin、importなど一部の境界動作はデフォルト実行系と一致していない。現在地と修正状況は[ロードマップ](docs/roadmap.md)を参照すること。
 
 組み込みのステップ上限やfilesystem制限はdefense-in-depthであり、非信頼コードを隔離するsecurity sandboxではない。また、現行CLIは`--help` / `--version`とスクリプトへの追加引数に未対応である。Cargo package / REPLの`0.1.0`と[言語仕様](docs/language-spec.md)の`0.5`は、それぞれ実装版と仕様revisionを表す独立した番号として管理している。
 
@@ -161,11 +172,16 @@ $ tsumugi trace.tsg
 # 全テスト実行（ユニットテスト + 統合テスト）
 cargo test
 
+# 資源の限られた環境でbuild・testの並列度を抑える
+cargo test -j 1 -- --test-threads=1
+
 # 特定モジュールのみ
 cargo test lexer::
 cargo test eval::
 cargo test parser::
 ```
+
+低並列実行は瞬間的なCPU・メモリ負荷を抑えるが、hard limitを設定するものではない。必要に応じてcgroupやコンテナの資源制限と組み合わせる。
 
 ### テスト構成
 
@@ -220,6 +236,7 @@ benches/
 └── interpreter.rs    # parse / compile / execute / end_to_end のフェーズ別計測
 
 docs/
+├── manifesto.md      # プロジェクトの方向性・設計原則・非目標
 ├── design.md         # 設計ドキュメント
 ├── language-spec.md  # 言語仕様
 └── roadmap.md        # ロードマップ・設計方針
@@ -233,6 +250,7 @@ examples/
 
 ## ドキュメント
 
+- [Tsumugi Manifesto](docs/manifesto.md) — プロジェクトの方向性・設計原則・非目標
 - [設計ドキュメント](docs/design.md) — 設計判断の経緯・アーキテクチャ・今後の候補
 - [言語仕様](docs/language-spec.md) — 文法・データ型・演算子の一覧
 - [ロードマップ](docs/roadmap.md) — 実装済み機能・設計方針・今後の検討事項
