@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::value::{SharedValue, Value};
@@ -75,13 +75,16 @@ impl Env {
         None
     }
 
-    /// 現在の全スコープの変数セルを取得する（クロージャ定義時のキャプチャ用）
-    /// 内側のスコープが外側を上書きする
-    pub fn capture_all(&self) -> HashMap<String, SharedValue> {
-        let mut captured = HashMap::new();
-        for scope in &self.scopes {
-            for (k, cell) in scope {
-                captured.insert(k.clone(), Rc::clone(cell));
+    /// 指定した名前のうち、現在見えている変数セルだけを取得する（クロージャ定義時のキャプチャ用）
+    ///
+    /// `get_cell` と同じく内側のスコープを優先するため、shadowingはそのまま保たれる。
+    /// 本体で言及されない名前を捕捉しないことで、クロージャを保持するコンテナまで
+    /// 抱え込んで参照循環を作るのを避ける（AUD-042）。
+    pub fn capture_referenced(&self, names: &HashSet<String>) -> HashMap<String, SharedValue> {
+        let mut captured = HashMap::with_capacity(names.len());
+        for name in names {
+            if let Some(cell) = self.get_cell(name) {
+                captured.insert(name.clone(), cell);
             }
         }
         captured
@@ -168,6 +171,37 @@ mod tests {
         assert!(env.update("x", Value::Int(99)).is_ok());
         env.pop_scope();
         assert_eq!(env.get("x"), Some(Value::Int(99)));
+    }
+
+    #[test]
+    fn capture_referenced_takes_only_named_cells() {
+        // 言及されない名前は捕捉しない（AUD-042の参照循環対策）
+        let mut env = Env::new();
+        env.set("wanted", Value::Int(1));
+        env.set("container", Value::Int(2));
+
+        let names = HashSet::from(["wanted".to_string(), "missing".to_string()]);
+        let captured = env.capture_referenced(&names);
+
+        assert_eq!(captured.len(), 1);
+        assert_eq!(*captured["wanted"].borrow(), Value::Int(1));
+        assert!(!captured.contains_key("container"));
+        assert!(!captured.contains_key("missing"));
+    }
+
+    #[test]
+    fn capture_referenced_prefers_inner_scope_and_shares_cells() {
+        let mut env = Env::new();
+        env.set("x", Value::Int(1));
+        env.push_scope();
+        env.set("x", Value::Int(2));
+
+        let captured = env.capture_referenced(&HashSet::from(["x".to_string()]));
+        assert_eq!(*captured["x"].borrow(), Value::Int(2));
+
+        // 捕捉したセルは共有されるため、後の更新が見える
+        env.update("x", Value::Int(3)).unwrap();
+        assert_eq!(*captured["x"].borrow(), Value::Int(3));
     }
 
     #[test]

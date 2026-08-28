@@ -710,6 +710,22 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 ## 変更履歴
 
+### 2026-08-28: treeのclosure捕捉範囲を本体の参照名へ限定（AUD-042）
+
+**問題:** treeは`Env::capture_all()`で定義時に見えるbindingを全部捕捉していた。そのため、クロージャを保持するコレクション自体（`push(saved, fn() i end)`の`saved`）まで捕捉し、cell→list→closure→captured→cellの参照循環になった。`Rc`にcycle collectorはないため、`saved`がスコープから消えても解放されない。関数ローカルのリストへクロージャを溜めて関数を抜けるスクリプトで、実行後の生存量が200個で173,596バイト、400個で345,796バイトとクロージャ数に比例して残った。VMは自由変数だけをupvalue化するため0バイトで、engine間の差にもなっていた。捕捉が広いことは定義コストにも出ており、可視binding 100個の環境でクロージャを2,000回定義すると19,640,166バイトを確保していた（binding 5個なら2,774,064バイト、比7.08）。
+
+**決定:** 捕捉対象を「本体で言及される名前」に限定する。厳密な自由変数解析ではなく保守的な近似を使い、`let`で束縛される名前、parameter、`for`変数、`catch`変数も集める。treeでは`let`より前の参照が外側のbindingを読むため、束縛名を機械的に除くと観測挙動が変わる。近似に留めることで、AUD-042の目的（参照循環の解消と定義コストの削減）を満たしながら意味論を一切動かさない。
+
+**実装:** `ast.rs`に非再帰の`referenced_names(body)`を追加し、既存の深度検査と同じworklist方式でStmt/Exprを辿る。ネストした関数・ラムダの本体も辿るため、内側のクロージャが必要とする名前は外側の関数値が保持する。callee側の識別子も集めるので、builtinと同名のユーザーbindingを呼ぶ場合の優先順位も保たれる。`env.rs`の`capture_all`は`capture_referenced(&HashSet<String>)`へ置き換え、`get_cell`と同じ内側優先の探索で名前ごとにセルを取る。`eval.rs`の`Stmt::FnDef`と`Expr::Lambda`はこの2つを組み合わせて捕捉する。
+
+**不採用案:** 厳密な自由変数解析（束縛名をスコープ単位で除去する）案は、`let`前の外側参照とblock scopeの相互作用を再現する必要があり、VMのcompile時解決と同じ複雑さをtreeへ持ち込む。`Weak`参照で循環を切る案は、クロージャが正当にコレクションを参照するケースで値が消える。cycle collectorの導入は処理系全体の所有権設計に影響するため、この課題の範囲を超える。
+
+**互換性と境界:** 観測可能な挙動は変わらない。本体で言及されない名前はそもそも本体から読めないため、捕捉しなくても差が出ない。top-level bindingは`push_call_frame`がglobal scopeを保持するため、捕捉の有無に関わらず関数内から見える。クロージャが本体で実際にコレクションを参照する場合（`fn() push(saved, 1) end`）の循環は残る。これはVMのupvalue方式でも同じで、`Rc`の性質上避けられない。
+
+**回帰テスト:** golden fixture `closure_capture_scope`をtree/VM両方で実行し、`let`前の外側参照、builtin同名bindingの呼び出し、最内クロージャだけが参照する名前、カウンターの参照共有、捕捉コレクションへのindex代入、f-string、`for` / `catch`変数、コンテナへ溜めたクロージャの後からの呼び出しを固定する。`tests/scaling.rs`には生存量（確保 - 解放）ベースのゲートを追加し、クロージャを溜めたコレクションが解放されること（400個で16KiB未満）と、定義コストが可視bindingの数に比例しないこと（binding 5個と100個の比が2.0未満）を検証する。修正前は前者が345,796バイト、後者が比7.08で両方とも失敗する。
+
+**測定:** 生存量は200個で173,596→0バイト、400個で345,796→0バイト。定義コストは可視binding 100個で19,640,166→2,560,166バイト、binding 5個との比は7.08→1.01になった。一方、関数呼び出しの確保量はglobal数への比が7.66→3.71に下がっただけで比例が残る。原因は捕捉ではなく`push_call_frame`がglobal scopeのHashMapを呼び出しごとに複製することで、AUD-046として分離した。
+
 ### 2026-08-28: 関数外`return`の構文エラー化（AUD-043）
 
 **問題:** Parserが関数の外の`return`を無条件に受理していた。`import`は配置をパース時に検査し、`break` / `continue`はループ外で実行時エラーになるのに対し、`return`だけ文脈検査がなかった。結果として3つの症状が出ていた。(1) VM REPLでtop-level変数がある状態の`return`は、`ReturnValue`がtop-level frameをpopしstackを`base`まで捨てる一方でCompilerの`locals`が残り、次入力の`GetLocal`が空stackを読んでhost panicになった（`try`内・`for`内でも再現）。(2) file実行では両engineとも後続文を実行せず、診断なしで終了コード0になった。(3) import先のトップレベル`return`は、treeがmodule実行だけ打ち切って呼び出し元を継続する一方、VMはinline展開された`ReturnValue`がroot script全体を終了させた。
