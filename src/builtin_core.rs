@@ -1,10 +1,21 @@
 //! 組み込み関数の共通ロジック
 //!
 //! ツリーウォーク評価器 (builtin.rs) と VM (vm.rs) の両方から呼び出される。
-//! 引数は評価済みの `&[Value]` で受け取り、副作用のない純粋な値変換を行う。
+//! 引数は評価済みの `&[Value]` で受け取るため、引数評価の順序と副作用は各engineの責務。
 //!
-//! 注意: I/O・クロージャ呼び出し（map/filter/each）・ファイル操作など
-//! 実行コンテキストに依存するビルトインは各エンジン側に残す。
+//! `builtin_*` は47個ある。うち32個は副作用のない値変換で、残り15個は
+//! filesystem・環境変数・clockに触る（`read_file` / `write_file` / `mkdir` /
+//! `remove` / `rename` / `list_dir` / `env` / `now` など）。これらは
+//! `sandbox` の認可を通すロジックも両engineで共有したいため、ここに置く。
+//!
+//! 各engine側に残すのは、実行コンテキストそのものを必要とするものだけ:
+//! - `print` / `input` / `exit` / `args` — process の stdio・argv・終了
+//! - `push` / `pop` — 変数bindingへの書き戻し
+//! - `map` / `filter` / `each` — クロージャ呼び出し
+//!
+//! 名前一覧は本モジュールの `dispatch`、`builtin.rs` の `match name`、
+//! `compiler.rs` の `is_builtin()` の3か所にある。追加時は3か所すべてへ登録する
+//! （AUD-049）。
 
 use crate::error::TsumugiError;
 use crate::value::Value;

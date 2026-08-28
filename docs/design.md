@@ -161,7 +161,7 @@ let result = filter(test, fn(item) item != "kani" end)
 ### 組み込み関数の拡充
 
 - `print` に加えて `len` / `push` / `keys` / `type` を追加
-- `push` は破壊的操作として設計（`Env::get_mut()` で直接リストを変更）
+- `push` は破壊的操作として設計。当初は `Env::get_mut()` で直接リストを変更していたが、現在は `Env::get_cell()` で変数セルを取り、値をsnapshotしてから第2引数を評価し、更新後のListを同じセルへ書き戻す（AUD-012で評価順を規範化）
 - 関数的スタイル（新しいリストを返す `append`）も検討したが、入門レベルでは破壊的操作の方が直感的と判断
 - `type()` はデバッグや型チェック用途。動的型付け言語では実行時に型を確認したい場面が多い
 
@@ -226,12 +226,15 @@ let result = filter(test, fn(item) item != "kani" end)
 
 ### 環境 (env.rs)
 
-- スコープのスタック（Vec<HashMap>）
-- 変数検索は内側 → 外側の順
-- `set()` は現在のスコープに変数を新規定義
-- `update()` は内側→外側へ探索し、既存変数を更新（見つからなければエラー）
-- `get_cell()` は変数の `Rc<RefCell<Value>>` セルを返す（インデックス代入・push の破壊的更新で使用）
-- 関数定義はグローバルな HashMap で管理
+- スコープのスタック（`Vec<HashMap<String, SharedValue>>`）。値はすべて `Rc<RefCell<Value>>` セルで保持し、クロージャと共有できる
+- 関数専用のテーブルは持たない。関数は `Value::Fn` として通常の変数と同じスコープに入る（`Env::functions` はロードマップの「`Env::functions` の廃止」で削除済み）
+- `frame_base` が現在の call frame の開始位置を持ち、`visible_scopes()` が「フレーム内のスコープを内側から」→「グローバルスコープ（index 0）」の順に返す。間にある呼び出し元のローカルスコープは見えない（AUD-046）
+- `push_call_frame()` は関数用スコープを積んで `frame_base` をそこへ移し、復元情報 `CallFrame { previous_base, scope_len }` を返す。`pop_call_frame()` は `truncate` と `frame_base` の復帰だけを行う。グローバルスコープは複製せず共有する
+- `set()` は現在のスコープに新しいセルを作って変数を定義
+- `set_shared()` は既存のセルを現在のスコープへ直接挿入（クロージャの参照共有用）
+- `update()` は `get_cell()` で解決してからセルへ書くため、共有しているクロージャにも反映される。見つからなければ `Err`
+- `get()` / `get_cell()` は `visible_scopes()` を辿る。`get_cell()` はセルそのものを返す（インデックス代入・push の破壊的更新で使用）
+- `capture_referenced(&HashSet<String>)` は、指定された名前のうち現在見えているセルだけを取る。本体で言及されない名前を捕捉しないことで参照循環を避ける（AUD-042）
 
 ### エラー型 (error.rs)
 
@@ -254,10 +257,17 @@ let result = filter(test, fn(item) item != "kani" end)
 | モジュール | テスト観点 |
 |---|---|
 | `value.rs` | `is_truthy` 判定（List/Dict含む）、`Display` 表示 |
-| `env.rs` | 変数 set/get/get_mut、スコープ shadowing、外側スコープ参照、update（再代入） |
+| `env.rs` | 変数 set/get/get_cell、スコープ shadowing、外側スコープ参照、update（再代入）、call frameの可視性（呼び出し元ローカルの非可視・globalの可視・多段frameの分離・frame内block scope）、`capture_referenced` の対象選択と内側優先 |
+| `ast.rs` | `referenced_names` が読み・書き・calleeを集めること、ネストした関数・ラムダ本体も辿ること |
 | `lexer.rs` | トークン化、行番号付与、エスケープ、演算子、キーワード、コメント |
-| `parser.rs` | 各文のAST生成、リスト/辞書リテラル、インデックスアクセス/代入、エラー時の行番号含有 |
+| `parser.rs` | 各文のAST生成、リスト/辞書リテラル、インデックスアクセス、インデックス代入の対象が識別子であること、非トップレベル`import`の拒否、関数外`return`の拒否と全件報告、エラー回復と行番号含有 |
 | `eval.rs` | 算術・比較・論理、関数呼び出し、リスト/辞書操作、組み込み関数、エラーケース全般 |
+| `vm.rs` | 内部不変条件の破れをinternal errorとして返すこと（範囲外local slot、stack不足の`Call`、operand overflow、`PrepareCall`を経由しない呼び出しでの深度上限） |
+| `sandbox.rs` | `.` / `..` を含むパスの正規化 |
+
+`vm.rs` の単体テストは内部実装と一緒に読める最小ケースだけを置き、公開APIだけで書いた網羅ケースは `tests/defensive_vm.rs` に分ける（AUD-023）。
+
+`src/lib.rs` と `src/main.rs` が同じモジュールを別々に宣言しているため、これらの単体テストは lib target と bin target の両方でコンパイルされ、`cargo test` では同じテストが2回実行される（AUD-039）。
 
 ### 統合テスト（ゴールデンテスト）
 
@@ -276,63 +286,58 @@ fixture 追加手順は、`.tsg` と期待ファイルを置き、`fixture_tests
 
 ### スケーリングテスト
 
-`tests/scaling.rs` は計算量オーダーを固定する。実時間はCIランナーの負荷で揺れるため、カウントアロケータで**確保バイト数**を測る。検証している性質は次の2つで、いずれも両engineで確認する。
+`tests/scaling.rs` は計算量オーダーを固定する。実時間はCIランナーの負荷で揺れるため、カウントアロケータで**確保バイト数**を測る。解放漏れの検出だけは確保量ではなく生存量（確保 - 解放）を使う。検証している性質は次の6つで、いずれも両engineで確認する。
 
-- `for` の反復コストが要素数に線形であること（入力2倍で確保量が約2倍。二次なら約4倍になる）
-- 関数呼び出しのコストが関数body長に依存しないこと（到達しない文でbodyだけを膨らませ、同じ回数呼び出して比較する）
+| 性質 | 測り方 | 由来 |
+|---|---|---|
+| `for` の反復コストが要素数に線形 | 入力2倍で確保量が約2倍（二次なら約4倍） | AUD-038 |
+| コレクション読み取りのコストが要素数に線形 | `xs[i]` / `d[k]` / `len(xs)` を n=500 と n=1000 で比較 | AUD-041 |
+| 関数呼び出しのコストが関数body長に依存しない | 到達しない文でbodyだけを膨らませ、同じ回数呼び出して比較 | AUD-040 |
+| 関数呼び出しのコストがtop-level bindingの数に依存しない | global 5個と100個で同じ関数を2,000回呼んで比較 | AUD-046 |
+| クロージャ定義のコストが可視bindingの数に依存しない | 可視binding 5個と100個でクロージャを2,000回定義して比較 | AUD-042 |
+| コレクションへ溜めたクロージャが解放される | 関数を抜けた後の生存量を見る（参照循環の検出） | AUD-042 |
 
 グローバルアロケータでプロセス全体の確保量を数えるため、測定中は `MEASURE_LOCK` を保持して直列化する。ロックのpoisonは無視し、ある測定が失敗しても他の測定が続行できるようにする。
 
+### 防御的テスト
+
+`tests/defensive_vm.rs` は、library利用者が不正な `Chunk` を公開APIへ渡してもホストプロセスが落ちないことを検証する（AUD-023）。`tsumugi::` の公開APIだけを使い、`Vm::new` / `Vm::run_repl_chunk` に手組みのbytecodeを渡す。
+
+固定しているのは、範囲外のlocal slot読み書き・定数参照・upvalue参照、stackが足りない `FStrConcat` / `PopN` / `Print` / `CallBuiltin`、関数先頭の `MakeClosure`、行番号表が空のChunk、`dispatch` へ到達する `try` 命令の8ケース。いずれも`internal`種別の構造化エラーになることを期待値とし、VM実装を修正前へ戻すと `index out of bounds` のpanicで失敗する。
+
 ### CI
 
-GitHub Actions (`.github/workflows/ci.yml`) で push / PR 時に自動実行:
+GitHub Actions (`.github/workflows/ci.yml`) が `main` への push と PR で3つのジョブを実行する。
 
-1. `cargo fmt --check` — フォーマット整合性
-2. `cargo clippy -- -D warnings` — 静的解析
-3. `cargo test` — 全テスト実行
+| ジョブ | 実行環境 | 内容 |
+|---|---|---|
+| `lint` | ubuntu-latest | `cargo fmt --check`（フォーマット整合性）、`cargo clippy -- -D warnings`（静的解析） |
+| `test` | ubuntu-latest / macos-latest / windows-latest | `cargo test`。`fail-fast: false` で1つのOSが落ちても他の結果を得る |
+| `coverage` | ubuntu-latest | `cargo llvm-cov --all-features --lcov` で `lcov.info` を生成し、artifact `lcov-report` として保存する |
 
-## 設計時の文法スナップショット（revision v0.3）
+3 OS matrixを持つ理由は、filesystemとsymlinkの意味論、および `TSUMUGI_*` 環境変数のcase-insensitive保護（AUD-031）がOSごとに異なるためである。これらは実OSで動かさないと検証できない。
 
-この番号は設計履歴上の文法revisionであり、規範となる最新仕様は[`language-spec.md`](language-spec.md)のversion 0.10、実装packageは0.1.0である。構文を変更する場合は、まず規範仕様と`LANG_GUIDE.md`を更新し、この節は設計履歴として扱う。
+toolchainは全ジョブで `dtolnay/rust-toolchain@stable` を使う。`Cargo.toml` に `rust-version` がなく `rust-toolchain.toml` も置いていないため、CIはstableに追従し、compiler版の下限は検証していない（AUD-045）。`clippy` はデフォルトターゲットだけを検査するため、テスト・ベンチを含む `--all-targets` はCIの対象外である。
 
-```
-program        = top_level_stmt*
-top_level_stmt = import_stmt | stmt
-stmt           = let_stmt | assign_stmt | index_assign | return_stmt
-               | if_stmt | while_stmt | for_stmt | break_stmt | continue_stmt
-               | fn_def | try_catch_stmt | expr_stmt
-let_stmt       = "let" IDENT "=" expr NEWLINE
-assign_stmt    = IDENT "=" expr NEWLINE
-index_assign   = postfix "[" expr "]" "=" expr NEWLINE
-return_stmt    = "return" expr NEWLINE
-if_stmt        = "if" expr NEWLINE block ("elif" expr NEWLINE block)* ("else" NEWLINE block)? "end" NEWLINE
-while_stmt     = "while" expr NEWLINE block "end" NEWLINE
-for_stmt       = "for" IDENT "in" expr NEWLINE block "end" NEWLINE
-break_stmt     = "break" NEWLINE
-continue_stmt  = "continue" NEWLINE
-import_stmt    = "import" STRING NEWLINE
-try_catch_stmt = "try" NEWLINE block "catch" IDENT NEWLINE block "end" NEWLINE
-fn_def         = "fn" IDENT "(" params? ")" NEWLINE block "end" NEWLINE
-expr_stmt      = expr NEWLINE
-block          = stmt*
-params         = IDENT ("," IDENT)*
-expr           = or_expr
-or_expr        = and_expr ("or" and_expr)*
-and_expr       = cmp_expr ("and" cmp_expr)*
-cmp_expr       = add_expr (("==" | "!=" | "<" | ">" | "<=" | ">=") add_expr)*
-add_expr       = mul_expr (("+" | "-") mul_expr)*
-mul_expr       = unary_expr (("*" | "/" | "%") unary_expr)*
-unary_expr     = ("not" | "-") unary_expr | postfix
-postfix        = primary ( "(" args? ")" | "[" expr "]" )*
-primary        = INT | FLOAT | STRING | "true" | "false" | "null"
-               | IDENT | "(" expr ")" | list_literal | dict_literal
-               | lambda
-list_literal   = "[" (expr ("," expr)* ","?)? "]"
-dict_literal   = "{" (expr ":" expr ("," expr ":" expr)* ","?)? "}"
-lambda         = "fn" "(" params? ")" NEWLINE block "end"
-               | "fn" "(" params? ")" expr "end"
-args           = expr ("," expr)*
-```
+## 文法定義の置き場所
+
+形式文法は `LANG_GUIDE.md` の「Grammar (Formal)」に1つだけ置く。規範となる意味論は[`language-spec.md`](language-spec.md)（version 0.11）、実装packageは0.1.0である。構文を変更する場合は、規範仕様と`LANG_GUIDE.md`を更新する。
+
+本書はかつて「設計時の文法スナップショット（revision v0.3）」として文法を複製していたが、2つの複製が別々に古くなり、`index_assign` と `dict_literal` で互いに食い違う状態になった。複製をやめ、v0.3から現在までの構文上の変更点だけを設計履歴として残す。v0.3時点の全文はgit履歴で参照できる。
+
+### v0.3 からの構文変更
+
+| 変更 | 内容 | 由来 |
+|---|---|---|
+| f-string | `primary` に `FSTRING` を追加。`f"...{expr}..."` を補間付き文字列リテラルとして扱う | — |
+| `index_assign` の対象 | `postfix "[" expr "]"` から `IDENT "[" expr "]"` へ狭めた。`xs[0][1] = v` や `g()[0] = v` はパースエラー | AUD-013 |
+| `import` の位置 | `top_level_stmt` だけが `import_stmt` を含む。block内はファイルI/O前にパースエラー | AUD-007 |
+| `return` の文脈 | 文法上は `stmt` だが、関数定義と複数行lambdaの本体でのみ受理する。それ以外はパースエラー。式は省略できない（`return` 単体は不可） | AUD-043 |
+| 複数行lambdaの終端 | `end` を必須検証する。EOFを`end`として消費しない | AUD-029 |
+| `try` / `catch` | v0.3以降に追加。`try_catch_stmt = "try" NEWLINE block "catch" IDENT NEWLINE block "end" NEWLINE` | — |
+| ネスト深度 | 文法では表現しないが、Parserが `MAX_AST_DEPTH = 256` を再帰edgeへ適用する | AUD-027 |
+
+`dict_literal` のキーは文法上は任意の式（`expr ":" expr`）で、Strへ評価されない場合は実行時エラーになる。この非対称は当時から変わっていない。
 
 ## 今後の候補
 
@@ -374,7 +379,7 @@ Expr::Lambda { params: Vec<String>, body: Vec<Stmt> }
 
 **ツリーウォーク版:**
 - `Env` の各スコープが `HashMap<String, Rc<RefCell<Value>>>` で変数を保持
-- 関数定義時（`FnDef` / `Lambda`）に `env.capture_all()` で全変数の `Rc` を共有コピー
+- 関数定義時（`FnDef` / `Lambda`）に `ast::referenced_names()` で本体が言及する名前を集め、`env.capture_referenced()` でその名前のセルだけ `Rc` を共有コピーする（AUD-042。以前は `capture_all()` で可視binding全部を捕捉していた）
 - クロージャ呼び出し時は `set_shared()` でセルを新スコープに注入し、書き込みがセル経由で定義元に伝播
 - 名前付き関数は呼び出しframe構築時に宣言名へ現在の関数値をself-bindする。定義時captureへ自身を含めないため、全関数に恒久的な`cell → function → captured → cell`循環を作らない
 - self-bindingはcaptured bindingの後、parameterの前に設定する。同名parameterはself-bindingをshadowする
@@ -406,7 +411,7 @@ let f = fn(x) x * 2 end
 - 関数値の等価性は同一性比較（`Rc::ptr_eq`）とし、反射律（`f == f`が`true`）を保つ。同じ`fn`から別々に作ったクロージャは等しくない。構造比較や呼び出し結果の比較は行わない（AUD-014で確定）
 - 同一性の粒度がengine間で揃っていない: treeは`Value::Fn`の`def: Rc<FnDef>`を定義式の評価ごとに作るため別インスタンスは常に不等になる。一方VMの`Value::VmFn`はcompile時に共有される`Rc<Chunk>`とupvalue cellで比較するため、upvalueを持たない関数値では同じ`fn`式から生成した別インスタンスが等しくなる（AUD-048）
 - 循環参照: `Rc<RefCell>`にはcycle collectorがなく、捕捉変数のListへその変数を捕捉したclosureを`push`すると、`cell → List → closure → cell`の循環を言語コードから構成できる。短命なscriptでは影響が限定的でも、REPLや長時間実行では解放されないメモリが累積し得る
-- 捕捉範囲: treeは定義時に見える全bindingを共有し、VMは自由変数だけをupvalue化する。treeではclosure生成コストと不要な値の生存期間が可視binding数に比例する。さらにクロージャを保持するコンテナまで捕捉すると参照循環になりメモリが解放されない（AUD-042）
+- 捕捉範囲: treeは本体が言及する名前のセルを共有し、VMは自由変数だけをupvalue化する（AUD-042で可視binding全捕捉から変更）。treeの判定は厳密な自由変数解析ではなく保守的な近似で、`let`・parameter・`for`変数・`catch`変数のように本体で束縛される名前も集める。そのため同名の外側bindingがある場合、本体がそれを読まなくてもセルを保持し、VMのupvalue集合より広くなることがある。観測可能な挙動は変わらないが、生存量ではこの差が残る
 - 意味論の重複: 共通Resolver/HIRはなく、scope・名前解決・call・比較・mutation・importの規則をEvaluatorとCompiler/VMが別々に実装する。拡張時はdifferential testで両engineの観測可能な挙動を固定する必要がある
 - パフォーマンス: `RefCell`の実行時借用チェックに加え、値cloneやVMのstack/cell管理コストがある。VMが常に高速とは限らず、workloadごとに優劣が異なる。判断はフェーズ別ベンチマーク（`parse` / `compile` / `execute` / `end_to_end`）の実測に基づき、最新値は `docs/roadmap.md` のスナップショットに記録する
 
@@ -483,7 +488,7 @@ Parserはプログラム直下とblock内の文を区別し、block内のimport�
 ### 動機
 
 - ツリーウォークは「AST → 再帰で直接実行」で、言語意味論と実装の対応を追いやすい
-- バイトコードVMは「AST → 一次元の命令列 → dispatch loop」という別方式を学べる。再帰関数や高階関数で高速な場合がある一方、辞書、f-string、単純loopではtreeより遅い現行workloadもあり、一律の高速化を保証しない
+- バイトコードVMは「AST → 一次元の命令列 → dispatch loop」という別方式を学べる。ただし一律の高速化は保証しない。AUD-040後の`execute`フェーズ実測では、再帰（`fib_20`）と高階関数・クロージャ生成でVMが速く、f-stringとループでtreeが速く、辞書操作はほぼ同等である。最新値は`docs/roadmap.md`のスナップショットを参照する
 - 言語処理系の学習として、コード生成、stack frame、upvalue、例外unwind、VM実行loopはツリーウォークとは異なる知見を得られる
 - 共通Resolver/HIRがないため、既存テストの流用だけでなく、stdout・stderr・終了コード・副作用順を比較する厳密なdifferential testを互換性条件とする
 
@@ -592,9 +597,16 @@ VmFn {
 
 ```
 builtin_core.rs
-├── dispatch(name, &[Value], line) → Result<Option<Value>>
-├── builtin_len, builtin_push, ...（~45個の純粋関数）
-└── format_unix_timestamp, is_leap_year（ヘルパー）
+├── dispatch(name, &[Value], line) → Result<Option<Value>>   # 47アーム
+├── builtin_len, builtin_push, ...（builtin_* が47個）
+│   ├── 副作用なしの値変換: 32個
+│   └── filesystem / env / clock に触るもの: 15個
+│       （read_file, read_lines, write_file, append_file, path_exists,
+│         mkdir, remove, remove_dir, rename, list_dir, file_size,
+│         is_file, is_dir, env, now）
+├── check_arity, check_arity_count, check_collection_size_public,
+│   is_context_builtin, type_error, assign_index, write_stdout_line（共通検査・共有処理）
+└── format_unix_timestamp, is_leap_year, remove_symlink_entry（ヘルパー）
 ```
 
 設計方針:
@@ -603,7 +615,7 @@ builtin_core.rs
 - **エンジン固有のビルトインは各モジュールに残す** — `push`/`pop`（binding更新）、`map`/`filter`/`each`（クロージャ呼び出し）、`print`/`input`/`exit`/`args`（I/O・プロセス操作）
 - **user bindingをbuiltinより優先する** — `print`以外の識別子calleeはlocal/upvalue/runtime globalを先に探し、bindingがない場合だけbuiltinへfallbackする。VMは`JumpIfGlobalDefined`で実行時のglobal登録状態を分岐し、builtin branchとuser-call branchの評価順を混在させない
 - **破壊的List操作はbindingへ書き戻す** — builtin `push`/`pop`が選ばれた場合、第1引数はlocal/upvalue/runtime globalの識別子bindingに限定する。第1引数の値を先にsnapshotし、更新後のListを同じbindingへ書き戻す。一時Listは永続化先がないため拒否する
-- **新規ビルトイン追加は `builtin_core.rs` + dispatch テーブルへの登録のみ** — 両エンジンに自動的に反映される
+- **新規ビルトイン追加は3か所への登録が必要** — 実装と `dispatch` アームを `builtin_core.rs` へ、委譲名を `builtin.rs` の `match name` へ、VM側の名前判定を `compiler.rs` の `is_builtin()` へ登録する。`builtin.rs` の `match` は `_ => Ok(None)` で終わるため、`builtin_core.rs` だけに足しても両engineから呼べない。名前一覧が3か所に分散していることは既知の構造的リスクで、片側だけ足すと「treeでは呼べるがVMでは呼べない」状態になる（AUD-049）
 
 ### 設計判断
 
