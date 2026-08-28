@@ -86,6 +86,8 @@ end
 fn add(a, b)
     a + b           # This does NOT return; it's just a discarded expression
 end
+
+return 1            # ERROR: return is only valid inside a function body
 ```
 
 ### Anonymous Functions (Lambda)

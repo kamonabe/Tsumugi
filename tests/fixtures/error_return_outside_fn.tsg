@@ -1,0 +1,11 @@
+# 関数外の return は構文エラーとして拒否する（AUD-043）
+# トップレベルで受理すると、VMでは次のREPL入力がhost panicへ進み、
+# file実行では後続文を無言で飛ばし、import先ではengine間で挙動が変わる。
+print("must-not-run")
+return 0
+
+# トップレベルのblock内も関数の外なので同じく拒否し、複数エラーを報告する
+if true
+    return 1
+end
+print("must-not-run-either")

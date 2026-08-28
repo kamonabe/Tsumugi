@@ -293,7 +293,7 @@ GitHub Actions (`.github/workflows/ci.yml`) で push / PR 時に自動実行:
 
 ## 設計時の文法スナップショット（revision v0.3）
 
-この番号は設計履歴上の文法revisionであり、規範となる最新仕様は[`language-spec.md`](language-spec.md)のversion 0.5、実装packageは0.1.0である。構文を変更する場合は、まず規範仕様と`LANG_GUIDE.md`を更新し、この節は設計履歴として扱う。
+この番号は設計履歴上の文法revisionであり、規範となる最新仕様は[`language-spec.md`](language-spec.md)のversion 0.7、実装packageは0.1.0である。構文を変更する場合は、まず規範仕様と`LANG_GUIDE.md`を更新し、この節は設計履歴として扱う。
 
 ```
 program        = top_level_stmt*
@@ -709,6 +709,20 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 
 ## 変更履歴
+
+### 2026-08-28: 関数外`return`の構文エラー化（AUD-043）
+
+**問題:** Parserが関数の外の`return`を無条件に受理していた。`import`は配置をパース時に検査し、`break` / `continue`はループ外で実行時エラーになるのに対し、`return`だけ文脈検査がなかった。結果として3つの症状が出ていた。(1) VM REPLでtop-level変数がある状態の`return`は、`ReturnValue`がtop-level frameをpopしstackを`base`まで捨てる一方でCompilerの`locals`が残り、次入力の`GetLocal`が空stackを読んでhost panicになった（`try`内・`for`内でも再現）。(2) file実行では両engineとも後続文を実行せず、診断なしで終了コード0になった。(3) import先のトップレベル`return`は、treeがmodule実行だけ打ち切って呼び出し元を継続する一方、VMはinline展開された`ReturnValue`がroot script全体を終了させた。
+
+**決定:** `return`は関数定義と複数行ラムダの本体でのみ有効とし、それ以外の位置はパースエラーにする。Lexer・Parser・ASTは両engineで共有するため、パース時に拒否すれば実行系を触らずにengine差ごと解消できる。`break` / `continue`と同じ「文脈が違えばエラー」という既存の直感に合わせ、メッセージも同じ形にする。
+
+**実装:** Parserに関数本体のネスト深度`fn_depth`を持たせ、`with_fn_context`で`parse_fn_def`と複数行ラムダの本体パースだけ深度を上げる。`parse_stmt_inner`は`fn_depth > 0`のときだけ`return`を文として受理し、それ以外は`reject_non_function_return`でエラーにする。`parse_block`でも`fn_depth == 0`の`return`を`import`と同じ方式で先に処理し、行を捨ててから回復するため、囲みの構文を巻き込まず1件だけ報告して停止もしない。1行ラムダの明示`return`は`parse_anonymous_fn`が直接消費するため従来どおり通る。
+
+**不採用案:** 実行時エラーにする案は、tree（`EvalResult::Return`をtop-levelで無視）とVM（frameを畳む）の両方に別々の対処が必要で、REPLのrollback契約にも手が入る。Parserを触らずVMの`get_local`だけ構造化エラーへ変える案は、panicは避けられても無言終了とimport時のengine差が残る。トップレベル`return`をscript終了として仕様化する案は、`exit()`と役割が重なり、import先で「どこまで終了するか」を新たに定義する必要がある。
+
+**互換性と境界:** 関数外の`return`に依存したスクリプトはパースエラーになる。早期終了が目的なら`exit()`、値を返すなら関数にまとめる。既存fixtureとexamplesに該当箇所はなかった。import先の`return`は両engineで同じ`import`エラーになるが、tree側だけ失敗より前のtop-level出力が残る点は評価時点の差（AUD-030）であり、本変更の対象外である。library利用者が不正な`Chunk`を直接VMへ渡す経路のpanic面はAUD-023として残る。
+
+**回帰テスト:** Parserの単体テストで、トップレベル・`if` / `elif` / `else` / `while` / `for` / `try` / `catch`の各ブロックでの拒否、関数・多段ネスト・複数行ラムダ・1行ラムダ・関数内関数での受理、関数本体を抜けた後の再拒否（`fn_depth`の戻し漏れ検出）、複数箇所の全件報告と進行保証を検証する。統合テストではfixture `error_return_outside_fn`をtree/VM両方で実行し、2件のパースエラーとstdout副作用なしを完全一致で固定する。REPLテストは`bare` / `try`内 / `for`内の3形をtree/VM双方で流し、host panicが出ないこと、配置エラーが1件であること、失敗入力の後もtop-level bindingを読めることを検証する。
 
 ### 2026-08-27: tree関数値のRc共有化（AUD-040）
 
