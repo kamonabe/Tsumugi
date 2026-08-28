@@ -1116,8 +1116,11 @@ impl Vm {
                 }
             }
             OpCode::LenLocal(slot) => {
-                let length = self.with_local_ref(slot, line, |value| value_len(value, line))?;
-                self.stack.push(Value::Int(length));
+                // 判定とエラーは `len` builtin と共有し、engine間で差が出ないようにする
+                let length = self.with_local_ref(slot, line, |value| {
+                    crate::builtin_core::builtin_len(std::slice::from_ref(value), line)
+                })?;
+                self.stack.push(length);
             }
             OpCode::Index => {
                 let index = self.pop(line)?;
@@ -1701,19 +1704,6 @@ impl Vm {
                 format!("型エラー: {:?} >= {:?} は比較できません", left, right),
             )),
         }
-    }
-}
-
-/// コレクションの長さを返す（値は複製しない）
-fn value_len(value: &Value, line: usize) -> Result<i64, TsumugiError> {
-    match value {
-        Value::List(v) => Ok(v.len() as i64),
-        Value::Str(s) => Ok(s.chars().count() as i64),
-        Value::Dict(m) => Ok(m.len() as i64),
-        _ => Err(TsumugiError::runtime(
-            line,
-            format!("型エラー: {} の長さは取得できません", type_name(value)),
-        )),
     }
 }
 

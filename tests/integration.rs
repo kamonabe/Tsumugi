@@ -357,6 +357,7 @@ fixture_tests!(
         import_circular,
         import_nested,
         index_assign_binding,
+        index_read_lowering,
         list_dict,
         local_utils,
         logic,

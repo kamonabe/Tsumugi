@@ -332,3 +332,63 @@ fn call_allocation_is_independent_of_global_count_in_both_engines() {
         );
     }
 }
+
+/// ループ内でコレクションを読み取るスクリプト（AUD-041）
+///
+/// 読み取りのたびにコレクション全体を複製すると、確保量がO(n^2)になる。
+/// index式は副作用のない形（識別子・演算）にしてある。
+fn collection_read_sources(n: usize) -> [(&'static str, String); 3] {
+    [
+        (
+            "list-index",
+            format!(
+                "let xs = range(0, {n})\nlet total = 0\nfor i in range(0, {n})\n    total = total + xs[i]\nend\n"
+            ),
+        ),
+        (
+            "dict-index",
+            format!(
+                "let d = {{}}\nfor i in range(0, {n})\n    d[to_str(i)] = i\nend\nlet ks = keys(d)\nlet total = 0\nfor k in ks\n    total = total + d[k]\nend\n"
+            ),
+        ),
+        (
+            "len",
+            format!(
+                "let xs = range(0, {n})\nlet total = 0\nfor i in range(0, {n})\n    total = total + len(xs)\nend\n"
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn collection_read_allocation_stays_linear_in_both_engines() {
+    // 入力を2倍にしたときの確保量の伸び。線形なら約2倍、二次なら約4倍になる。
+    const LIMIT: f64 = 3.0;
+    const SMALL: usize = 500;
+    const LARGE: usize = 1_000;
+
+    // 他の測定が失敗してもロックを使い続けられるようにpoisonは無視する
+    let _guard = MEASURE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let small_sources = collection_read_sources(SMALL);
+    let large_sources = collection_read_sources(LARGE);
+
+    for ((label, small_source), (_, large_source)) in small_sources.iter().zip(large_sources.iter())
+    {
+        for use_vm in [false, true] {
+            let mode = if use_vm { "VM" } else { "tree-walk" };
+            let small = execute_bytes(small_source, use_vm);
+            let large = execute_bytes(large_source, use_vm);
+            assert!(small > 0, "{mode}/{label}: 確保量が計測できていません");
+
+            let ratio = large as f64 / small as f64;
+            assert!(
+                ratio < LIMIT,
+                "{mode}/{label}: コレクション読み取りの確保量が線形を超えて増えています。\
+                 n={SMALL}で{small}バイト, n={LARGE}で{large}バイト（比 {ratio:.2} >= {LIMIT}）。\
+                 読み取りのたびにコレクション全体を複製していないか確認してください"
+            );
+        }
+    }
+}

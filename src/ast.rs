@@ -328,6 +328,32 @@ fn excessive_depth_line(mut worklist: Vec<(AstNode<'_>, usize, usize)>) -> Optio
     None
 }
 
+/// 副作用のない式か判定する（AUD-041のコレクション読み取り最適化に使う）。
+///
+/// リテラル、識別子、それらの演算、およびそれらのindex参照だけを「副作用なし」とみなす。
+/// 関数呼び出し・ラムダ・f-string・コレクションリテラルは含めない。判定がtrueなら、
+/// 式の評価がコレクションを変更しないため、コレクションを後から参照で読んでも
+/// 観測結果は変わらない。識別子の未定義エラーは評価順に関係なく同じになる。
+///
+/// AST深度は`MAX_AST_DEPTH`で制限されているため再帰で走査する。
+pub(crate) fn is_side_effect_free(expr: &Expr) -> bool {
+    match expr {
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Ident(_) => true,
+        Expr::BinOp { left, right, .. } => is_side_effect_free(left) && is_side_effect_free(right),
+        Expr::UnaryOp { expr, .. } => is_side_effect_free(expr),
+        Expr::Index { object, index } => is_side_effect_free(object) && is_side_effect_free(index),
+        // 呼び出しは任意の副作用を持つ。他は評価コストが読み取り最適化の対象外。
+        Expr::Call { .. } | Expr::Lambda { .. } | Expr::List(_) | Expr::Dict(_) | Expr::FStr(_) => {
+            false
+        }
+    }
+}
+
 /// クロージャ捕捉用に、本体で言及される識別子名を集める（非再帰）。
 ///
 /// 自由変数の保守的な近似である。`let`で束縛される名前、parameter、`for`変数、
