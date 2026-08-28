@@ -41,7 +41,7 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 | AUD-026 | `format_time`の極端なtimestampを定数時間で処理する | `format_time(9223372036854775807, "%Y")`は1970年から1年ずつ進むため実用上停止せず、step予算も消費しない。tree/VMとも2秒以内に完了せず、timeout（終了124）で強制停止 | ✅ 完了（400年周期化・両engineのi64極値timeout回帰テスト追加） |
 | AUD-027 | parser・compiler・evaluatorの全再帰経路へ深度制限を適用する | 10万個の`not`連鎖で旧`MAX_PARSE_DEPTH`を迂回し、Rust stack overflowでabort（終了134）。`elif`直再帰や左深BinOp ASTにも同種の経路があった | ✅ 完了（`MAX_AST_DEPTH=256`、生成時検査・子f-string深度継承・実行前の非再帰preflight） |
 | AUD-028 | 非循環import chainの深度を制限する | treeのimport実行とVMのinline compileが、旧実装では深い非循環chainでhost stack overflowに到達し得た | ✅ 完了（rootを除くactive chainを128に制限、tree/VM共通エラー） |
-| AUD-043 | トップレベル`return`の文脈を検証する | Parserが関数外の`return`を無条件に受理するため3つの症状になる。(1) VM REPLでtop-level変数がある状態で`return`を実行すると、`ReturnValue`がroot frameをpopしstackを`base`まで捨てる一方Compilerの`locals`は残るため、次入力の`GetLocal`が空stackを読み`src/vm.rs`の範囲外panicでhost abort（終了1）。`try`内・`for`内の`return`でも再現し、tree REPLは同入力で正常継続する。(2) file実行では両engineとも後続文を実行せず、エラーなしで終了コード0になる。(3) import先のトップレベル`return`は、treeがmodule実行だけ打ち切って呼び出し元を継続する一方、VMはinline展開された`ReturnValue`がroot script全体を終了させる。`break` / `continue`は両engineでエラー化されるが`return`だけ検査がない | ⬜ 未着手（tree/VM × REPL/file/importで再現済み。AUD-001 / AUD-002と同じ状態境界の残穴） |
+| AUD-043 | トップレベル`return`の文脈を検証する | Parserが関数外の`return`を無条件に受理するため3つの症状になる。(1) VM REPLでtop-level変数がある状態で`return`を実行すると、`ReturnValue`がroot frameをpopしstackを`base`まで捨てる一方Compilerの`locals`は残るため、次入力の`GetLocal`が空stackを読み`src/vm.rs`の範囲外panicでhost abort（終了1）。`try`内・`for`内の`return`でも再現し、tree REPLは同入力で正常継続する。(2) file実行では両engineとも後続文を実行せず、エラーなしで終了コード0になる。(3) import先のトップレベル`return`は、treeがmodule実行だけ打ち切って呼び出し元を継続する一方、VMはinline展開された`ReturnValue`がroot script全体を終了させる。`break` / `continue`は両engineでエラー化されるが`return`だけ検査がない | ✅ 完了（Parserに関数本体の深度を持たせ、関数外の`return`を両engine共通のパースエラーへ。parser単体・error fixture・tree/VM REPLの回帰テスト追加） |
 
 ### P1 — High
 
@@ -88,7 +88,7 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 | AUD-040 | treeの名前付き関数self-bindingで`Value::Fn`の複製を避ける | AUD-037の呼び出し時self-bindingが毎回`Value::Fn`（body AST含む）をcloneし、呼び出しコストが関数body長に比例する。`fib(22)`で67.0ms（該当行を無効化すると42.2ms、約1.6倍） | ✅ `Value::Fn`を`Rc<FnDef>` + `Rc<captured>`へ変更（VmFnの`Rc<Chunk>`と同じ方針）。同一条件A/Bで`fib(22)` 64.5ms→21.2ms、確保量の比 15.89→1.06。確保量ベースの回帰ゲートを追加 |
 | AUD-041 | VMのコレクション読み取りで全体複製を避ける | `GetLocal`が値を複製するため、ループ内の`d[k]` / `xs[i]`読み取りがコレクション全体をコピーする。forループの反復自体はAUD-038で解消したが、一般のindex読み取り経路は残る | ⬜ 未着手。index式を副作用のないもの（literal・識別子・それらの演算）に限れば、コレクションを後から参照で読んでも観測結果は同じで仕様判断は不要。global targetの未定義エラー順序はAUD-013の`RequireGlobal`をindexより前に置けば保てる。関数呼び出しを含むindex式は現行loweringを維持する |
 | AUD-042 | treeのclosure捕捉範囲を自由変数へ絞る | treeは`capture_all()`で定義時に見える全bindingを捕捉するため、クロージャを保持するコンテナ（`push(saved, fn ...)`の`saved`等）まで捕捉し、cell→list→closure→captured→cellの参照循環でメモリが解放されない。200回×200個で51.8MB（循環しない書き方では2.19MB）。VMは自由変数だけをupvalue化するため発生しない。捕捉範囲の統一は生成コストの削減にもなる | ⬜ 未着手（AUD-040で計測・再現済み。commit `93b7606`でも同一なので既存の問題） |
-| AUD-044 | 完了済み非適合と古い記述をREADME・規範仕様から除く | `README.md`は仕様revisionを`0.5`と書くが`language-spec.md`は0.6である。captured collectionへのindex代入はAUD-013で完了し、tree/VMとも`[99, 2]`で一致するのに、両文書の「既知非適合」に残る。構成図は`lib.rs` / `builtin_core.rs` / `limits.rs` / `sandbox.rs`を欠き、`env.rs`を「関数テーブル」と説明し、examplesを3件中1件しか挙げない。CI手順は矢印区切りでコピー実行できず、`cargo clippy`の`--`が欠け、3 OS matrixとcoverage jobを記載していない。組み込み関数53個とLICENSE(MIT)の記載は実測と一致する | ⬜ 未着手（AUD-021のspec / LANG_GUIDE / design driftに続くREADME側の残件） |
+| AUD-044 | 完了済み非適合と古い記述をREADME・規範仕様から除く | `README.md`は仕様revisionを`0.5`と書くが`language-spec.md`は0.6である。captured collectionへのindex代入はAUD-013で完了し、tree/VMとも`[99, 2]`で一致するのに、両文書の「既知非適合」に残る。構成図は`lib.rs` / `builtin_core.rs` / `limits.rs` / `sandbox.rs`を欠き、`env.rs`を「関数テーブル」と説明し、examplesを3件中1件しか挙げない。CI手順は矢印区切りでコピー実行できず、`cargo clippy`の`--`が欠け、3 OS matrixとcoverage jobを記載していない。組み込み関数53個とLICENSE(MIT)の記載は実測と一致する | 🟡 仕様revision表記はAUD-043で0.7へ揃えた（`README.md` / `design.md`）。完了済み非適合の掲載、構成図、CI手順は未着手 |
 | AUD-045 | 配布・実行手順とtoolchainの下限を明示する | READMEのクイックスタートは`cargo build` / `cargo run`だけだが、エラーメッセージの例は`$ tsumugi file.tsg`を使う。`cargo install --path .`やPATH設定、再導入手順の記載がない。`Cargo.toml`はedition 2024を要求しながら`rust-version`を宣言せず、`rust-toolchain.toml`もないためCIはstable追従で、compiler版の下限を検証できない。release / install workflowとcommit SHA固定のaction参照もない | ⬜ 未着手 |
 
 ### 2026-08-27 検証スナップショット
@@ -166,8 +166,8 @@ tree側は旧スナップショットより遅くなっている（`fib_20` 14.9
 
 ### 追加監査後の推奨改修順
 
-1. **停止性・ホスト安定性:** AUD-026 / AUD-027 / AUD-028は完了。ユーザー入力だけでhost panicへ到達するAUD-043を次に扱い、timeout・深度境界・host abortなしを継続検証する。
-2. **誤実行・安全境界:** AUD-012 / AUD-013 / AUD-029 / AUD-031 / AUD-037は完了。意味論選択が必要なAUD-014 / AUD-030は仕様決定後に実装する。AUD-043はトップレベル`return`をtree/VM共通でエラー化すれば、panic・無言終了・import時のengine差を同時に解消できる。
+1. **停止性・ホスト安定性:** AUD-026 / AUD-027 / AUD-028 / AUD-043は完了。timeout・深度境界・host abortなしを継続検証する。library利用者が不正な`Chunk`をVMへ渡す経路の防御はAUD-023で続ける。
+2. **誤実行・安全境界:** AUD-012 / AUD-013 / AUD-029 / AUD-031 / AUD-037は完了。意味論選択が必要なAUD-014 / AUD-030は仕様決定後に実装する。AUD-043はトップレベル`return`をパースエラーへ統一し、panic・無言終了・import時のengine差を同時に解消した。
 3. **品質基盤:** AUD-022のharness整備、AUD-038の測定分離、AUD-040のtree呼び出しコストは完了。次はAUD-042（closure捕捉範囲と参照循環）とAUD-041（VMのコレクション読み取り）を扱い、その後にP2境界とfuzzを拡充する。
 4. **文書・配布:** AUD-021に続き、AUD-044でREADMEと規範仕様の古い記述を除き、AUD-045で実行手順とtoolchain下限を明示する。
 
@@ -440,6 +440,7 @@ Tsumugi にはファイルI/O やサンドボックス機能が既に実装さ�
 | 項目 | 詳細 | 状態 |
 |---|---|---|
 | ユーザー関数のコール深度制限 | 関数再帰を128フレームでRust実stack overflow前にエラー化 | ✅ 完了（境界差はAUD-017で継続） |
+| 関数外 `return` の拒否 | 関数本体の外の`return`をパース時にエラー化し、VM REPLのhost panicと無言終了を防止 | ✅ 完了（AUD-043） |
 | 構文・AST深度制限 | Parser生成時とCompiler/Evaluator入口でAST深度256を検査。nested f-stringにも親深度を継承 | ✅ 完了（AUD-027） |
 | import chain深度制限 | rootを除くactive import chainをtree/VMとも128に制限 | ✅ 完了（AUD-028） |
 | サンドボックスの `OnceLock` テスタビリティ | テスト時に環境変数を切り替え可能な設計にする | 未着手 |

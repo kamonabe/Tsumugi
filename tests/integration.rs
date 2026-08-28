@@ -388,6 +388,7 @@ fixture_tests!(
         error_integer_overflow,
         error_parse,
         error_parse_multi,
+        error_return_outside_fn,
         error_sandbox,
         error_stack_trace,
         error_step_limit,
@@ -1143,6 +1144,54 @@ fn vm_repl_recovers_after_compile_error() {
         !stderr.contains("panicked at"),
         "host panicが再発: {stderr}"
     );
+}
+
+/// AUD-043: トップレベル`return`を構文エラーとして拒否し、次入力の状態を壊さない。
+///
+/// 旧実装のVMでは`ReturnValue`がtop-level frameをpopしstackを`base`まで捨てる一方、
+/// Compilerの`locals`が残るため、次入力の`GetLocal`が空stackを読みhost panicへ到達した。
+/// treeは同じ入力で継続していたため、engine間の挙動差も併せて固定する。
+#[test]
+fn repl_rejects_top_level_return_without_host_panic() {
+    let cases = [
+        ("bare", "let x = 1\nreturn 0\nprint(x)\n"),
+        (
+            "in-try",
+            "let x = 1\ntry\n    return 0\ncatch e\n    print(e[\"type\"])\nend\nprint(x)\n",
+        ),
+        (
+            "in-for",
+            "let x = 1\nfor i in [1, 2]\n    return 0\nend\nprint(x)\n",
+        ),
+    ];
+
+    for (label, source) in cases {
+        for use_vm in [false, true] {
+            let output = run_repl_process(source, use_vm, &[]);
+            let (stdout, stderr) = output_text(&output);
+            let mode = if use_vm { "VM" } else { "tree" };
+
+            assert!(
+                !stderr.contains("panicked at"),
+                "{mode}/{label}でhost panicが発生: {stderr}"
+            );
+            assert!(
+                output.status.success(),
+                "{mode}/{label}でREPLが異常終了: {stderr}"
+            );
+            assert_eq!(
+                stderr
+                    .matches("return は関数の中でのみ使用できます")
+                    .count(),
+                1,
+                "{mode}/{label}でreturnの配置エラーが1件報告されていない: {stderr}"
+            );
+            assert!(
+                repl_visible_lines(&stdout, use_vm).contains(&"1"),
+                "{mode}/{label}で失敗入力後にtop-level bindingを読めない: {stdout}"
+            );
+        }
+    }
 }
 
 #[test]

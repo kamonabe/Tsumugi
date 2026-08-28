@@ -10,6 +10,8 @@ pub struct Parser {
     errors: Vec<TsumugiError>,
     /// 式パースの再帰深度（スタックオーバーフロー防止）
     depth: usize,
+    /// 関数・ラムダ本体のネスト深度（`return`の配置検証に使う）
+    fn_depth: usize,
 }
 
 impl Parser {
@@ -24,6 +26,7 @@ impl Parser {
             pos: 0,
             errors: Vec::new(),
             depth,
+            fn_depth: 0,
         }
     }
 
@@ -45,6 +48,17 @@ impl Parser {
         self.depth += 1;
         let result = parse(self);
         self.depth -= 1;
+        result
+    }
+
+    /// 関数・ラムダ本体のパース中だけ`return`を許可する。エラー時も深度を戻す。
+    fn with_fn_context<T>(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Result<T, TsumugiError>,
+    ) -> Result<T, TsumugiError> {
+        self.fn_depth += 1;
+        let result = parse(self);
+        self.fn_depth -= 1;
         result
     }
 
@@ -142,6 +156,17 @@ impl Parser {
         TsumugiError::parse(line, "import はトップレベルでのみ使用できます")
     }
 
+    /// 関数外の`return`を、operandの妥当性に関係なく配置エラーとして消費する。
+    ///
+    /// トップレベルの`return`を受理すると、VMでは`ReturnValue`がtop-level frameを
+    /// 畳んでREPLの次入力をhost panicへ導き、file実行では後続文を無言で飛ばし、
+    /// import先ではengine間で呼び出し元の継続可否が変わる（AUD-043）。
+    fn reject_non_function_return(&mut self) -> TsumugiError {
+        let line = self.current_line();
+        self.discard_current_line();
+        TsumugiError::parse(line, "return は関数の中でのみ使用できます")
+    }
+
     // --- 文のパース ---
 
     fn parse_stmt(&mut self, is_top_level: bool) -> Result<Stmt, TsumugiError> {
@@ -152,7 +177,8 @@ impl Parser {
     fn parse_stmt_inner(&mut self, is_top_level: bool) -> Result<Stmt, TsumugiError> {
         match self.peek_token() {
             Token::Let => self.parse_let(),
-            Token::Return => self.parse_return(),
+            Token::Return if self.fn_depth > 0 => self.parse_return(),
+            Token::Return => Err(self.reject_non_function_return()),
             Token::If => self.parse_if(),
             Token::While => self.parse_while(),
             Token::For => self.parse_for(),
@@ -493,7 +519,7 @@ impl Parser {
         self.expect_newline()?;
         self.skip_newlines();
 
-        let body = self.parse_block(&[Token::End])?;
+        let body = self.with_fn_context(|parser| parser.parse_block(&[Token::End]))?;
 
         self.expect(Token::End)?;
         self.expect_newline_or_eof()?;
@@ -558,6 +584,14 @@ impl Parser {
             // parse_stmtの深度ガードより先に処理し、必ずtokenを進めてから回復する。
             if self.peek_token() == Token::Import {
                 let error = self.reject_non_top_level_import();
+                self.errors.push(error);
+                self.skip_newlines();
+                continue;
+            }
+
+            // 関数外のblock内`return`も同じ方式で回復し、囲みの構文を巻き込まない。
+            if self.fn_depth == 0 && self.peek_token() == Token::Return {
+                let error = self.reject_non_function_return();
                 self.errors.push(error);
                 self.skip_newlines();
                 continue;
@@ -962,7 +996,7 @@ impl Parser {
         // 改行があれば複数行、なければ1行（暗黙 return）
         if self.peek_token() == Token::Newline {
             self.advance(); // consume newline
-            let body = self.parse_block(&[Token::End])?;
+            let body = self.with_fn_context(|parser| parser.parse_block(&[Token::End]))?;
             self.expect(Token::End)?;
             self.check_expr_depth(Expr::Lambda { params, body }, lambda_line)
         } else {
@@ -1464,6 +1498,87 @@ mod tests {
                 MAX_AST_DEPTH + 1,
                 "import はトップレベルでのみ使用できます"
             )]
+        );
+    }
+
+    /// AUD-043: 関数外の`return`は構文エラーにする。
+    #[test]
+    fn parse_return_rejects_non_function_contexts() {
+        let cases = [
+            ("return 0", 1),
+            ("if true\n  return 0\nend", 2),
+            ("if false\n  print(0)\nelif true\n  return 0\nend", 4),
+            ("if false\n  print(0)\nelse\n  return 0\nend", 4),
+            ("while true\n  return 0\nend", 2),
+            ("for x in [1]\n  return 0\nend", 2),
+            ("try\n  return 0\ncatch e\n  print(e)\nend", 2),
+            ("try\n  print(1)\ncatch e\n  return 0\nend", 4),
+        ];
+
+        for (source, line) in cases {
+            let errors = parse(source).expect_err("return outside a function must be rejected");
+            assert_eq!(
+                errors,
+                vec![TsumugiError::parse(
+                    line,
+                    "return は関数の中でのみ使用できます"
+                )],
+                "unexpected errors for {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_return_allows_function_and_lambda_bodies() {
+        let sources = [
+            "fn f()\n  return 1\nend",
+            "fn f(n)\n  if n > 0\n    return 1\n  end\n  while true\n    return 2\n  end\n  for x in [1]\n    return 3\n  end\n  try\n    return 4\n  catch e\n    return 5\n  end\n  return 6\nend",
+            "let f = fn()\n  return 1\nend",
+            "let f = fn(x) return x end",
+            "fn outer()\n  fn inner()\n    return 1\n  end\n  return inner()\nend",
+            "fn outer()\n  let f = fn()\n    return 1\n  end\n  return f()\nend",
+        ];
+
+        for source in sources {
+            parse(source).unwrap_or_else(|errors| panic!("must parse {source:?}: {errors:?}"));
+        }
+    }
+
+    /// 関数本体を抜けた後は再び拒否する（`fn_depth`の戻し漏れ検出）
+    #[test]
+    fn parse_return_restores_function_context_after_body() {
+        let cases = [
+            ("fn f()\n  return 1\nend\nreturn 2", 4),
+            ("let f = fn()\n  return 1\nend\nreturn 2", 4),
+            ("let f = fn(x) return x end\nreturn 2", 2),
+        ];
+
+        for (source, line) in cases {
+            let errors = parse(source).expect_err("return after a function body must be rejected");
+            assert_eq!(
+                errors,
+                vec![TsumugiError::parse(
+                    line,
+                    "return は関数の中でのみ使用できます"
+                )],
+                "unexpected errors for {source:?}"
+            );
+        }
+    }
+
+    /// 回復して全件報告し、同じtokenで停止しない（進行保証）
+    #[test]
+    fn parse_return_recovers_and_reports_every_occurrence() {
+        let source = "return 0\nif true\n  return 1\nend\nlet x = 1\nreturn 2";
+        let errors = parse(source).expect_err("every misplaced return must be rejected");
+
+        assert_eq!(
+            errors,
+            vec![
+                TsumugiError::parse(1, "return は関数の中でのみ使用できます"),
+                TsumugiError::parse(3, "return は関数の中でのみ使用できます"),
+                TsumugiError::parse(6, "return は関数の中でのみ使用できます"),
+            ]
         );
     }
 }
