@@ -333,6 +333,7 @@ fixture_tests!(
         builtins,
         call_validation_order,
         closure,
+        closure_capture_scope,
         closure_counter,
         closure_try_catch,
         control_flow,

@@ -1,0 +1,94 @@
+# クロージャの捕捉範囲（AUD-042）
+# treeは本体で言及される名前だけを捕捉する。捕捉を絞っても、
+# 実行時に必要な binding がすべて見えることを固定する。
+
+# --- 本体のletより前に外側の同名bindingを読む ---
+# letで束縛される名前も捕捉対象に含めるため、let前の参照は外側の値を読む
+let shadowed = "outer"
+fn read_before_local()
+    let seen = shadowed
+    let shadowed = "inner"
+    return seen + "/" + shadowed
+end
+print(read_before_local())
+print(shadowed)
+
+# --- builtinと同名のユーザーbindingをクロージャ内から呼ぶ ---
+# calleeの名前も捕捉しなければ、builtinへ誤ってfallbackする
+let len = fn(v)
+    return "user-len"
+end
+let call_len = fn()
+    return len([1, 2])
+end
+print(call_len())
+
+# --- 最内のクロージャだけが参照する名前 ---
+# ネストした本体まで辿らないと、外側の関数値がセルを保持できない
+fn triple_nest(a)
+    return fn()
+        return fn()
+            return a
+        end
+    end
+end
+print(triple_nest("deep")()())
+
+# --- 外側変数への代入（参照キャプチャの共有） ---
+fn make_counter()
+    let count = 0
+    return fn()
+        count = count + 1
+        return count
+    end
+end
+let tick = make_counter()
+print(tick())
+print(tick())
+
+# --- 捕捉したコレクションへのインデックス代入 ---
+fn make_writer()
+    let store = {"key": "before"}
+    let write = fn(v)
+        store["key"] = v
+    end
+    let read = fn()
+        return store["key"]
+    end
+    write("after")
+    return read()
+end
+print(make_writer())
+
+# --- f-string内の参照 ---
+let label = "tag"
+let show = fn(v)
+    return f"{label}:{v}"
+end
+print(show(7))
+
+# --- for変数・catch変数を本体に持つクロージャ ---
+let collect = fn(items)
+    let out = []
+    for it in items
+        try
+            push(out, 10 / it)
+        catch e
+            push(out, e["type"])
+        end
+    end
+    return out
+end
+print(collect([2, 0, 5]))
+
+# --- クロージャを保持するコンテナ自体は捕捉しないが、後から呼べる ---
+fn build(n)
+    let saved = []
+    for i in range(0, n)
+        push(saved, fn() return i end)
+    end
+    return saved
+end
+let fns = build(3)
+print(fns[0]())
+print(fns[2]())

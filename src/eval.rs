@@ -350,8 +350,12 @@ impl Evaluator {
             } => {
                 // 関数を値として環境にセット
                 // ネストされた関数定義の場合、定義時のスコープをキャプチャする
+                // 捕捉するのは本体で言及される名前だけ（AUD-042）
                 // 本体ASTの複製は定義時の一度だけで、以降の呼び出しはRcを共有する
-                let captured = Rc::new(self.env.capture_all());
+                let captured = Rc::new(
+                    self.env
+                        .capture_referenced(&crate::ast::referenced_names(body)),
+                );
                 self.env.set(
                     name,
                     Value::Fn {
@@ -512,7 +516,11 @@ impl Evaluator {
 
             Expr::Lambda { params, body } => {
                 // 無名関数: 定義時のスコープの変数セルを共有してキャプチャ
-                let captured = Rc::new(self.env.capture_all());
+                // 捕捉するのは本体で言及される名前だけ（AUD-042）
+                let captured = Rc::new(
+                    self.env
+                        .capture_referenced(&crate::ast::referenced_names(body)),
+                );
                 Ok(Value::Fn {
                     def: Rc::new(FnDef {
                         name: "<lambda>".to_string(),

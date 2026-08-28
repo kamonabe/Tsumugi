@@ -328,6 +328,119 @@ fn excessive_depth_line(mut worklist: Vec<(AstNode<'_>, usize, usize)>) -> Optio
     None
 }
 
+/// クロージャ捕捉用に、本体で言及される識別子名を集める（非再帰）。
+///
+/// 自由変数の保守的な近似である。`let`で束縛される名前、parameter、`for`変数、
+/// `catch`変数も含めるため、「`let`より前で外側の同名bindingを読む」といった
+/// 既存の観測挙動を変えない。本体で一度も言及されない名前だけを捕捉対象から外す。
+/// ネストした関数・ラムダの本体も辿るので、内側のクロージャが必要とする名前は
+/// 外側の関数値が保持する。
+pub(crate) fn referenced_names(body: &[Stmt]) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let mut worklist: Vec<AstNode<'_>> = body.iter().map(AstNode::Stmt).collect();
+
+    while let Some(node) = worklist.pop() {
+        match node {
+            AstNode::Stmt(stmt) => match stmt {
+                Stmt::Let { name, value, .. } | Stmt::Assign { name, value, .. } => {
+                    names.insert(name.clone());
+                    worklist.push(AstNode::Expr(value));
+                }
+                Stmt::IndexAssign {
+                    name, index, value, ..
+                } => {
+                    names.insert(name.clone());
+                    worklist.push(AstNode::Expr(index));
+                    worklist.push(AstNode::Expr(value));
+                }
+                Stmt::Return { value: expr, .. } | Stmt::ExprStmt { expr, .. } => {
+                    worklist.push(AstNode::Expr(expr));
+                }
+                Stmt::If {
+                    condition,
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    worklist.push(AstNode::Expr(condition));
+                    worklist.extend(then_body.iter().map(AstNode::Stmt));
+                    worklist.extend(else_body.iter().map(AstNode::Stmt));
+                }
+                Stmt::While {
+                    condition, body, ..
+                } => {
+                    worklist.push(AstNode::Expr(condition));
+                    worklist.extend(body.iter().map(AstNode::Stmt));
+                }
+                Stmt::For {
+                    var, iter, body, ..
+                } => {
+                    names.insert(var.clone());
+                    worklist.push(AstNode::Expr(iter));
+                    worklist.extend(body.iter().map(AstNode::Stmt));
+                }
+                Stmt::FnDef {
+                    name, params, body, ..
+                } => {
+                    names.insert(name.clone());
+                    names.extend(params.iter().cloned());
+                    worklist.extend(body.iter().map(AstNode::Stmt));
+                }
+                Stmt::TryCatch {
+                    try_body,
+                    var,
+                    catch_body,
+                    ..
+                } => {
+                    names.insert(var.clone());
+                    worklist.extend(try_body.iter().map(AstNode::Stmt));
+                    worklist.extend(catch_body.iter().map(AstNode::Stmt));
+                }
+                Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Import { .. } => {}
+            },
+            AstNode::Expr(expr) => match expr {
+                Expr::Ident(name) => {
+                    names.insert(name.clone());
+                }
+                Expr::List(items) => worklist.extend(items.iter().map(AstNode::Expr)),
+                Expr::Dict(pairs) => {
+                    for (key, value) in pairs {
+                        worklist.push(AstNode::Expr(key));
+                        worklist.push(AstNode::Expr(value));
+                    }
+                }
+                Expr::BinOp { left, right, .. } => {
+                    worklist.push(AstNode::Expr(left));
+                    worklist.push(AstNode::Expr(right));
+                }
+                Expr::UnaryOp { expr, .. } => worklist.push(AstNode::Expr(expr)),
+                Expr::Call { callee, args } => {
+                    worklist.push(AstNode::Expr(callee));
+                    worklist.extend(args.iter().map(AstNode::Expr));
+                }
+                Expr::Lambda { params, body } => {
+                    names.extend(params.iter().cloned());
+                    worklist.extend(body.iter().map(AstNode::Stmt));
+                }
+                Expr::Index { object, index } => {
+                    worklist.push(AstNode::Expr(object));
+                    worklist.push(AstNode::Expr(index));
+                }
+                Expr::FStr(parts) => {
+                    for part in parts {
+                        if let FStrExprPart::Expr(child) = part {
+                            worklist.push(AstNode::Expr(child));
+                        }
+                    }
+                }
+                Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => {}
+            },
+        }
+    }
+
+    names
+}
+
 /// Parserが複合式を構築するたびに、危険な深さへ到達していないか確認する。
 pub(crate) fn expr_depth_exceeds_limit(expr: &Expr) -> bool {
     excessive_depth_line(vec![(AstNode::Expr(expr), 1, 0)]).is_some()
@@ -358,4 +471,54 @@ pub(crate) fn validate_program_depth(program: &Program) -> Result<(), crate::err
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// sourceの最初の関数定義の本体から、捕捉対象の名前を集める
+    fn names_of_first_fn_body(source: &str) -> std::collections::HashSet<String> {
+        let tokens = crate::lexer::Lexer::new(source).tokenize();
+        let program = crate::parser::Parser::new(tokens)
+            .parse()
+            .expect("パースに失敗");
+        for stmt in &program {
+            if let Stmt::FnDef { body, .. } = stmt {
+                return referenced_names(body);
+            }
+        }
+        panic!("関数定義が見つかりません");
+    }
+
+    #[test]
+    fn referenced_names_collects_reads_writes_and_callees() {
+        let names = names_of_first_fn_body(
+            "fn f(p)\n  let local = outer + p\n  assigned = local\n  target[0] = 1\n  let shown = helper(local)\n  return f\"{shown}\"\nend",
+        );
+
+        for expected in [
+            "p", "local", "outer", "assigned", "target", "helper", "shown",
+        ] {
+            assert!(
+                names.contains(expected),
+                "{expected} が集められていない: {names:?}"
+            );
+        }
+        assert!(!names.contains("unrelated"));
+    }
+
+    #[test]
+    fn referenced_names_includes_nested_bodies() {
+        let names = names_of_first_fn_body(
+            "fn f()\n  let g = fn()\n    return fn() deep end\n  end\n  for item in items\n    try\n      let doubled = item\n    catch err\n      let kind = err\n    end\n  end\n  return 1 + 2\nend",
+        );
+
+        for expected in ["g", "deep", "item", "items", "err"] {
+            assert!(
+                names.contains(expected),
+                "{expected} が集められていない: {names:?}"
+            );
+        }
+    }
 }
