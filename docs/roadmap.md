@@ -88,7 +88,7 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 | AUD-040 | treeの名前付き関数self-bindingで`Value::Fn`の複製を避ける | AUD-037の呼び出し時self-bindingが毎回`Value::Fn`（body AST含む）をcloneし、呼び出しコストが関数body長に比例する。`fib(22)`で67.0ms（該当行を無効化すると42.2ms、約1.6倍） | ✅ `Value::Fn`を`Rc<FnDef>` + `Rc<captured>`へ変更（VmFnの`Rc<Chunk>`と同じ方針）。同一条件A/Bで`fib(22)` 64.5ms→21.2ms、確保量の比 15.89→1.06。確保量ベースの回帰ゲートを追加 |
 | AUD-041 | VMのコレクション読み取りで全体複製を避ける | `GetLocal`が値を複製するため、ループ内の`d[k]` / `xs[i]`読み取りがコレクション全体をコピーする。forループの反復自体はAUD-038で解消したが、一般のindex読み取り経路は残る | ⬜ 未着手。index式を副作用のないもの（literal・識別子・それらの演算）に限れば、コレクションを後から参照で読んでも観測結果は同じで仕様判断は不要。global targetの未定義エラー順序はAUD-013の`RequireGlobal`をindexより前に置けば保てる。関数呼び出しを含むindex式は現行loweringを維持する |
 | AUD-042 | treeのclosure捕捉範囲を自由変数へ絞る | treeは`capture_all()`で定義時に見える全bindingを捕捉するため、クロージャを保持するコンテナ（`push(saved, fn ...)`の`saved`等）まで捕捉し、cell→list→closure→captured→cellの参照循環でメモリが解放されない。200回×200個で51.8MB（循環しない書き方では2.19MB）。VMは自由変数だけをupvalue化するため発生しない。捕捉範囲の統一は生成コストの削減にもなる | ✅ 完了（本体で言及される名前だけを捕捉。生存量は400個で345,796→0バイト、定義コストは可視binding 100個で19,640,166→2,560,166バイト。生存量ベースと定義コストのscalingゲート、tree/VM両engineのfixtureを追加） |
-| AUD-046 | treeの関数呼び出しでglobal scopeの複製を避ける | `push_call_frame`が`self.scopes[0].clone()`でglobal scopeのHashMapを呼び出しごとに複製するため、呼び出しコストがtop-level bindingの数に比例する。global 5個と100個で同じ関数を2,000回呼ぶと確保量の比が3.71（AUD-042前は7.66で、捕捉範囲の修正で下がったが比例は残る）。VMは同条件で1.03。cellは`Rc`共有なので値は複製されないが、entry数ぶんのRc複製とHashMap確保が毎回発生する | ⬜ 未着手（AUD-042の測定で分離。global scopeを複製せず参照で保持する構造へ変えるか、frame側でglobalを探索する方式を検討する） |
+| AUD-046 | treeの関数呼び出しでglobal scopeの複製を避ける | `push_call_frame`が`self.scopes[0].clone()`でglobal scopeのHashMapを呼び出しごとに複製するため、呼び出しコストがtop-level bindingの数に比例していた。global 5個と100個で同じ関数を2,000回呼ぶと確保量の比が3.67（AUD-042前は7.66）。VMは同条件で1.03。cellは`Rc`共有なので値は複製されないが、entry数ぶんのRc複製とHashMap確保が毎回発生していた | ✅ 完了（スコープスタックを差し替えず`frame_base`で探索範囲を限定。確保量は2,000回の呼び出しでglobal 100個のとき12,203,174→2,349,174バイト、比3.67→1.01。releaseの実時間は`fib(22)` 22→17 ms、global 100個×20,000回 56→8 ms。可視性の単体テストとscalingゲートを追加） |
 | AUD-044 | 完了済み非適合と古い記述をREADME・規範仕様から除く | `README.md`は仕様revisionを`0.5`と書くが`language-spec.md`は0.6である。captured collectionへのindex代入はAUD-013で完了し、tree/VMとも`[99, 2]`で一致するのに、両文書の「既知非適合」に残る。構成図は`lib.rs` / `builtin_core.rs` / `limits.rs` / `sandbox.rs`を欠き、`env.rs`を「関数テーブル」と説明し、examplesを3件中1件しか挙げない。CI手順は矢印区切りでコピー実行できず、`cargo clippy`の`--`が欠け、3 OS matrixとcoverage jobを記載していない。組み込み関数53個とLICENSE(MIT)の記載は実測と一致する | 🟡 仕様revision表記はAUD-043で0.7へ揃えた（`README.md` / `design.md`）。完了済み非適合の掲載、構成図、CI手順は未着手 |
 | AUD-045 | 配布・実行手順とtoolchainの下限を明示する | READMEのクイックスタートは`cargo build` / `cargo run`だけだが、エラーメッセージの例は`$ tsumugi file.tsg`を使う。`cargo install --path .`やPATH設定、再導入手順の記載がない。`Cargo.toml`はedition 2024を要求しながら`rust-version`を宣言せず、`rust-toolchain.toml`もないためCIはstable追従で、compiler版の下限を検証できない。release / install workflowとcommit SHA固定のaction参照もない | ⬜ 未着手 |
 
@@ -184,13 +184,25 @@ tree側は旧スナップショットより遅くなっている（`fib_20` 14.9
 | 100個 | 19,640,166 バイト | 2,560,166 バイト |
 | 比 | 7.08 | 1.01 |
 
-同じ関数を2,000回呼ぶ際の確保量は、global 5個と100個の比が7.66→3.71へ下がったが比例は残る。捕捉範囲ではなく`push_call_frame`のglobal複製が原因で、AUD-046として分離した。VMは同条件で1.02〜1.03と影響を受けない。
+同じ関数を2,000回呼ぶ際の確保量は、global 5個と100個の比が7.66→3.67へ下がったが比例は残った。捕捉範囲ではなく`push_call_frame`のglobal複製が原因で、AUD-046として分離し別途修正した（次節）。VMは同条件で1.02〜1.03と影響を受けない。
+
+### 2026-08-28 AUD-046の測定
+
+同条件での、同じ関数を2,000回呼ぶ際の確保量。
+
+| top-level binding | 修正前 | 修正後 |
+|---|---:|---:|
+| 5個 | 3,321,072 バイト | 2,327,072 バイト |
+| 100個 | 12,203,174 バイト | 2,349,174 バイト |
+| 比 | 3.67 | 1.01 |
+
+`fib(20)`の確保量は23,164,422→15,832,425バイト。releaseビルドの実時間（3回の最小値）は`fib(22)`が22→17 ms、global 100個で20,000回呼ぶ例が56→8 msだった。VMは確保量・比とも変化しない。
 
 ### 追加監査後の推奨改修順
 
 1. **停止性・ホスト安定性:** AUD-026 / AUD-027 / AUD-028 / AUD-043は完了。timeout・深度境界・host abortなしを継続検証する。library利用者が不正な`Chunk`をVMへ渡す経路の防御はAUD-023で続ける。
 2. **誤実行・安全境界:** AUD-012 / AUD-013 / AUD-029 / AUD-031 / AUD-037は完了。意味論選択が必要なAUD-014 / AUD-030は仕様決定後に実装する。AUD-043はトップレベル`return`をパースエラーへ統一し、panic・無言終了・import時のengine差を同時に解消した。
-3. **品質基盤:** AUD-022のharness整備、AUD-038の測定分離、AUD-040のtree呼び出しコスト、AUD-042のclosure捕捉範囲は完了。次はAUD-046（tree呼び出し時のglobal複製）とAUD-041（VMのコレクション読み取り）を扱い、その後にP2境界とfuzzを拡充する。
+3. **品質基盤:** AUD-022のharness整備、AUD-038の測定分離、AUD-040のtree呼び出しコスト、AUD-042のclosure捕捉範囲、AUD-046のglobal複製は完了。次はAUD-041（VMのコレクション読み取り）を扱い、その後にP2境界とfuzzを拡充する。
 4. **文書・配布:** AUD-021に続き、AUD-044でREADMEと規範仕様の古い記述を除き、AUD-045で実行手順とtoolchain下限を明示する。
 
 ### 初回監査の改修境界（記録）
@@ -448,7 +460,7 @@ Tsumugi にはファイルI/O やサンドボックス機能が既に実装さ�
 |---|---|---|
 | カバレッジ可視化 | `cargo llvm-cov` で未到達パスを特定しテスト拡充 | ✅ 完了 |
 | ベンチマーク | `criterion` で parse / compile / execute / end_to_end を分離計測 | ✅ 完了（AUD-038） |
-| 計算量オーダーの回帰ゲート | `tests/scaling.rs` が確保バイト数で `for` の線形性（AUD-038）、呼び出しコストのbody長非依存（AUD-040）、クロージャ定義コストの可視binding非依存（AUD-042）を検査し、生存量でクロージャの解放（AUD-042）を検査（実時間に依存しない） | ✅ 完了 |
+| 計算量オーダーの回帰ゲート | `tests/scaling.rs` が確保バイト数で `for` の線形性（AUD-038）、呼び出しコストのbody長非依存（AUD-040）、クロージャ定義コストの可視binding非依存（AUD-042）、呼び出しコストのtop-level binding非依存（AUD-046）を検査し、生存量でクロージャの解放（AUD-042）を検査（実時間に依存しない） | ✅ 完了 |
 
 ### コード構造
 

@@ -8,6 +8,7 @@
 //! - 関数呼び出しのコストが関数body長に依存しないこと（AUD-040で修正した退行）
 //! - クロージャ定義のコストが可視bindingの数に依存しないこと（AUD-042）
 //! - コレクションへ溜めたクロージャが解放されること（AUD-042の参照循環）
+//! - 呼び出しのコストがtop-level bindingの数に依存しないこと（AUD-046）
 //!
 //! 解放漏れの検出には確保量ではなく生存量（確保 - 解放）を使う。
 //!
@@ -95,6 +96,21 @@ fn closure_def_source(visible_bindings: usize, defs: usize) -> String {
     // （呼び出すと、呼び出し側の固定コストが混ざる）
     source.push_str(&format!("for i in range(0, {defs})\n"));
     source.push_str("    let f = fn(x) return x + i end\nend\n");
+    source
+}
+
+/// top-level bindingを増やしながら、同じ関数を同じ回数呼ぶスクリプト
+///
+/// 関数本体は引数だけを使う。にもかかわらず呼び出しごとにglobal scopeを
+/// 複製すると、確保量がtop-level bindingの数に比例する（AUD-046）。
+fn call_with_globals_source(globals: usize, calls: usize) -> String {
+    let mut source = String::new();
+    for i in 0..globals {
+        source.push_str(&format!("let var{i} = {i}\n"));
+    }
+    source.push_str("fn identity(x)\n    return x\nend\nlet total = 0\n");
+    source.push_str(&format!("for i in range(0, {calls})\n"));
+    source.push_str("    total = total + identity(i)\nend\n");
     source
 }
 
@@ -280,6 +296,39 @@ fn closure_definition_allocation_is_independent_of_visible_bindings_in_both_engi
              binding {FEW}個で{few}バイト, {MANY}個で{many}バイト\
              （比 {ratio:.2} >= {LIMIT}）。\
              定義時に本体で言及されない binding まで捕捉していないか確認してください"
+        );
+    }
+}
+
+#[test]
+fn call_allocation_is_independent_of_global_count_in_both_engines() {
+    // top-level bindingを20倍にしても、呼び出し回数が同じなら確保量は
+    // ほぼ変わらないはず。余分なbindingのlet自体の分だけ増える。
+    const LIMIT: f64 = 2.0;
+    const FEW: usize = 5;
+    const MANY: usize = 100;
+    const CALLS: usize = 2_000;
+
+    // 他の測定が失敗してもロックを使い続けられるようにpoisonは無視する
+    let _guard = MEASURE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let few_source = call_with_globals_source(FEW, CALLS);
+    let many_source = call_with_globals_source(MANY, CALLS);
+
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree-walk" };
+        let few = execute_bytes(&few_source, use_vm);
+        let many = execute_bytes(&many_source, use_vm);
+        assert!(few > 0, "{mode}: 確保量が計測できていません");
+
+        let ratio = many as f64 / few as f64;
+        assert!(
+            ratio < LIMIT,
+            "{mode}: 呼び出しの確保量がtop-level bindingの数に比例しています。\
+             binding {FEW}個で{few}バイト, {MANY}個で{many}バイト\
+             （比 {ratio:.2} >= {LIMIT}）。\
+             呼び出しごとにglobal scopeを複製していないか確認してください"
         );
     }
 }
