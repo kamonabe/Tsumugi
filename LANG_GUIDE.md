@@ -69,6 +69,7 @@ end
 - Return is explicit: `return expr`
 - No implicit return of last expression (unlike Ruby)
 - No type annotations on parameters or return
+- `return` requires an expression. A bare `return` is a parse error, so there is no bare early exit; write `return null` instead
 - User-defined calls run in this order: step/depth check, callee evaluation, callable/arity validation, arguments left-to-right, then the function body
 - If the callee is not callable or the arity is wrong, arguments and the function body are not evaluated
 - If callee evaluation or an argument fails, later arguments and the function body are not evaluated
@@ -88,6 +89,10 @@ fn add(a, b)
 end
 
 return 1            # ERROR: return is only valid inside a function body
+
+fn f()
+    return          # ERROR: return needs an expression; use `return null`
+end
 ```
 
 ### Anonymous Functions (Lambda)
@@ -690,8 +695,8 @@ stmt           = let_stmt | assign_stmt | index_assign | return_stmt
                | fn_def | try_catch_stmt | expr_stmt
 let_stmt       = "let" IDENT "=" expr NEWLINE
 assign_stmt    = IDENT "=" expr NEWLINE
-index_assign   = postfix "[" expr "]" "=" expr NEWLINE
-return_stmt    = "return" expr NEWLINE
+index_assign   = IDENT "[" expr "]" "=" expr NEWLINE
+return_stmt    = "return" expr NEWLINE          # only inside a function body; expr is required
 if_stmt        = "if" expr NEWLINE block ("elif" expr NEWLINE block)* ("else" NEWLINE block)? "end" NEWLINE
 while_stmt     = "while" expr NEWLINE block "end" NEWLINE
 for_stmt       = "for" IDENT "in" expr NEWLINE block "end" NEWLINE
@@ -714,7 +719,7 @@ postfix        = primary ( "(" args? ")" | "[" expr "]" )*
 primary        = INT | FLOAT | STRING | FSTRING | "true" | "false" | "null"
                | IDENT | "(" expr ")" | list_literal | dict_literal | lambda
 list_literal   = "[" (expr ("," expr)* ","?)? "]"
-dict_literal   = "{" (STRING ":" expr ("," STRING ":" expr)* ","?)? "}"
+dict_literal   = "{" (expr ":" expr ("," expr ":" expr)* ","?)? "}"   # keys must evaluate to Str
 lambda         = "fn" "(" params? ")" NEWLINE block "end"
                | "fn" "(" params? ")" expr "end"
 args           = expr ("," expr)*

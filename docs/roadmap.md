@@ -84,15 +84,17 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 | AUD-035 | CLI・標準I/Oのhost panic経路を構造化する | REPLのthread spawn・stdout flush・stdin readに`unwrap()`があり、broken pipe/I/O障害でpanicする。`print`も`println!`のため`tsumugi script.tsg \| head -1`でpanicした。Unixの非UTF-8 argvは`std::env::args()`でもpanicし得る | ✅ 完了（`ErrorKind::Io`を追加し`print`の出力失敗を構造化エラーへ。CLIのbanner・prompt・stdin・spawn・argv検証は診断＋終了コード1へ。パイプ切断と非UTF-8 argvの回帰テストを追加） |
 | AUD-036 | lossyな数値・OS境界変換を検証する | `exit`のi64→i32、`file_size`のu64→i64、NaN/Infを含む`to_int`/`floor`/`ceil`/`round`がwrap・飽和・0化し得る | ⬜ 仕様確定待ち（境界回帰テストが必要） |
 | AUD-038 | benchmarkをparse / compile / executeへ分離しVM退行を調査する | 現行Criterionは毎回parseし、VMはcompileも含む。aarch64 release実測でVMはfibが約2.77倍高速な一方、loop 5000回は約358倍低速で、単純な「VMは高速」という説明が成立しない | ✅ 4フェーズへ分離し退行の原因を特定・修正（VMのforが反復ごとにコレクションを複製しO(n^2)だった）。確保量ベースのスケーリングゲートを追加。副産物としてAUD-040 / AUD-041を検出 |
-| AUD-039 | binaryからlibrary moduleを利用して二重コンパイルを解消する | `main.rs`がlibraryと同じmoduleを再宣言し、同一単体テスト139件がlib/binで重複実行される。ビルド時間・テスト件数の解釈を歪める | ⬜ 未着手 |
+| AUD-039 | binaryからlibrary moduleを利用して二重コンパイルを解消する | `main.rs`が`lib.rs`と同じ16モジュールを再宣言し、`use tsumugi::`を一切使わないため、同一ソースがlib targetとbin targetで2回コンパイルされる。単体テストも両方に取り込まれ、`cargo test`が同じテストを2回実行する（2026-08-28時点で各152件）。ビルド時間・テスト件数の解釈を歪める | ⬜ 未着手 |
 | AUD-040 | treeの名前付き関数self-bindingで`Value::Fn`の複製を避ける | AUD-037の呼び出し時self-bindingが毎回`Value::Fn`（body AST含む）をcloneし、呼び出しコストが関数body長に比例する。`fib(22)`で67.0ms（該当行を無効化すると42.2ms、約1.6倍） | ✅ `Value::Fn`を`Rc<FnDef>` + `Rc<captured>`へ変更（VmFnの`Rc<Chunk>`と同じ方針）。同一条件A/Bで`fib(22)` 64.5ms→21.2ms、確保量の比 15.89→1.06。確保量ベースの回帰ゲートを追加 |
 | AUD-041 | コレクション読み取りで全体複製を避ける | `GetLocal`が値を複製するため、ループ内の`d[k]` / `xs[i]`読み取りがコレクション全体をコピーする。forループの反復自体はAUD-038で解消したが、一般のindex読み取り経路は残っていた。実測ではtreeの`Env::get`も同じく全体を複製し、`len`も同じ経路だった（確保量の比は両engineとも約4.0） | ✅ 完了（副作用のないindex式に限り参照読みへ。VMは`IndexLocal` / `LenLocal`へlowering、treeは変数セルを`borrow()`して読む。比は`xs[i]`が3.98→1.99（tree）/3.99→1.79（VM）、`d[k]`が4.00→2.00/4.01→1.95、`len(xs)`が3.97→1.99/3.98→1.79。goldenフィクスチャとscalingゲートを追加） |
 | AUD-047 | コレクションをcopy-on-writeにして複製コストを構造的に下げる | AUD-041は副作用のないindex式だけを参照読みにしたため、`d[to_str(i)]`のように関数呼び出しを含むindex式は評価前のコレクションを読む意味論を保つために複製が残る（確保量の比4.00）。`Value::List` / `Value::Dict`を`Rc<Vec>` / `Rc<BTreeMap>`にして書き込み時に複製すれば、意味論を変えずに複製を減らせる。upvalue経由の読み取り（`GetUpvalue`のclone）も同時に解消できる | ⬜ 未着手（`Value`の表現・破壊的更新・`assign_index`・push/popの書き戻しに広く影響するため、影響範囲を洗い出してから着手する） |
 | AUD-042 | treeのclosure捕捉範囲を自由変数へ絞る | treeは`capture_all()`で定義時に見える全bindingを捕捉するため、クロージャを保持するコンテナ（`push(saved, fn ...)`の`saved`等）まで捕捉し、cell→list→closure→captured→cellの参照循環でメモリが解放されない。200回×200個で51.8MB（循環しない書き方では2.19MB）。VMは自由変数だけをupvalue化するため発生しない。捕捉範囲の統一は生成コストの削減にもなる | ✅ 完了（本体で言及される名前だけを捕捉。生存量は400個で345,796→0バイト、定義コストは可視binding 100個で19,640,166→2,560,166バイト。生存量ベースと定義コストのscalingゲート、tree/VM両engineのfixtureを追加） |
 | AUD-046 | treeの関数呼び出しでglobal scopeの複製を避ける | `push_call_frame`が`self.scopes[0].clone()`でglobal scopeのHashMapを呼び出しごとに複製するため、呼び出しコストがtop-level bindingの数に比例していた。global 5個と100個で同じ関数を2,000回呼ぶと確保量の比が3.67（AUD-042前は7.66）。VMは同条件で1.03。cellは`Rc`共有なので値は複製されないが、entry数ぶんのRc複製とHashMap確保が毎回発生していた | ✅ 完了（スコープスタックを差し替えず`frame_base`で探索範囲を限定。確保量は2,000回の呼び出しでglobal 100個のとき12,203,174→2,349,174バイト、比3.67→1.01。releaseの実時間は`fib(22)` 22→17 ms、global 100個×20,000回 56→8 ms。可視性の単体テストとscalingゲートを追加） |
-| AUD-044 | 完了済み非適合と古い記述をREADME・規範仕様から除く | `README.md`は仕様revisionを`0.5`と書くが`language-spec.md`は0.6である。captured collectionへのindex代入はAUD-013で完了し、tree/VMとも`[99, 2]`で一致するのに、両文書の「既知非適合」に残る。構成図は`lib.rs` / `builtin_core.rs` / `limits.rs` / `sandbox.rs`を欠き、`env.rs`を「関数テーブル」と説明し、examplesを3件中1件しか挙げない。CI手順は矢印区切りでコピー実行できず、`cargo clippy`の`--`が欠け、3 OS matrixとcoverage jobを記載していない。組み込み関数53個とLICENSE(MIT)の記載は実測と一致する | 🟡 仕様revision表記はAUD-043で0.7へ揃えた（`README.md` / `design.md`）。完了済み非適合の掲載、構成図、CI手順は未着手 |
+| AUD-044 | 完了済み非適合と古い記述をREADME・規範仕様から除く | 仕様revision表記の不一致（当時`README.md` 0.5 / `language-spec.md` 0.6）、完了済み非適合（captured collectionへのindex代入）の掲載、`README.md`の構成図が`lib.rs` / `builtin_core.rs` / `limits.rs` / `sandbox.rs` / `module.rs` / `tests/defensive_vm.rs`を欠くこと、`env.rs`を「関数テーブル」と説明すること、examplesを3件中1件しか挙げないこと、CI手順が矢印区切りでコピー実行できず`cargo clippy`の`--`を欠き3 OS matrixとcoverage jobを記載していないこと。組み込み関数53個とLICENSE(MIT)の記載は実測と一致する | ✅ 完了（revision表記はAUD-043で揃え、以後0.10まで追随。完了済み非適合は`language-spec.md`から除去しID付きの表へ置換。構成図は`src/*.rs` 19件が実ファイルと1対1で一致することを確認し、examplesも3件掲載。CI手順は3ジョブの表とコピー可能なコマンド列へ置換） |
 | AUD-045 | 配布・実行手順とtoolchainの下限を明示する | READMEのクイックスタートは`cargo build` / `cargo run`だけだが、エラーメッセージの例は`$ tsumugi file.tsg`を使う。`cargo install --path .`やPATH設定、再導入手順の記載がない。`Cargo.toml`はedition 2024を要求しながら`rust-version`を宣言せず、`rust-toolchain.toml`もないためCIはstable追従で、compiler版の下限を検証できない。release / install workflowとcommit SHA固定のaction参照もない | ⬜ 未着手 |
 | AUD-048 | 捕捉のない関数値の同一性判定を統一する | AUD-014は「関数値は同一の関数値とだけ等しい」を規範としたが、同一性の粒度がengine間で揃っていない。`fn make() return fn(x) x end end` に対する `make() == make()` がtreeで`false`、VMで`true`になる。捕捉なし名前付き関数の2回生成、ループ内で同じlambda式を2回評価した2値の比較でも同じ差が出る。原因は`src/value.rs`の`PartialEq`で、treeの`Value::Fn`は定義式の評価ごとに新しい`Rc<FnDef>`を作るのに対し、VMの`Value::VmFn`はcompile時に共有される`Rc<Chunk>`とupvalue cellで比較するため、`upvalues`が空だと`all`が真になる。upvalueを持つ関数値、および別々に書いた同形lambdaの比較は両engineで一致する。AUD-014の486ケース網羅比較は型の組み合わせを対象としたため、同一sourceから複数インスタンスを作る形を含んでおらず検出できなかった | 🟡 差分をgolden fixture `comparison_semantics` に固定し、`.expected` / `.expected.vm` で両engineの現状を明示した。統一方針は未決定（VM側にclosure生成ごとのidentity tokenを持たせる案と、treeをchunk相当の共有単位へ寄せる案があり、`Value`表現に影響するため方針決定が必要） |
+| AUD-049 | builtin名一覧の3重管理を解消する | スクリプトから呼べるbuiltin名が3か所に分散している。`builtin_core.rs`の`dispatch`（46名。`__pop_update`は内部専用）、`builtin.rs`の`match name`（53名、`_ => Ok(None)`で終わる）、`compiler.rs`の`is_builtin()`（52名。`print`は予約tokenのため別扱い）。現状は3リストが整合しているが、追加時に1か所でも漏らすと「treeでは呼べるがVMでは呼べない」状態になり、compile errorではなく実行時の`name`エラーとして現れる。`design.md`が「`builtin_core.rs` + dispatchへの登録のみで両engineに反映される」と書いていたのはこの構造と矛盾していた | 🟡 文書側を修正（`design.md`と`builtin_core.rs`冒頭に3か所登録が必要と明記）。単一の名前テーブルから3経路を導出する実装統合は未着手 |
+| AUD-050 | `MAX_CALL_DEPTH`を`limits.rs`へ集約する | 構造的上限のうち`MAX_AST_DEPTH`と`MAX_IMPORT_DEPTH`は`src/limits.rs`にあるが、`MAX_CALL_DEPTH = 128`だけ`eval.rs`と`vm.rs`に同じdoc commentで二重定義されている。値とエラー文面は一致しているが、境界の数え方が揃っておらず、tree（`call_stack`が空開始）とVM（`frames: vec![frame]`でtop-level込み）で到達できる再帰深度が1段ずれる（AUD-017）。定義が分かれていることがこのズレを見つけにくくしている | ⬜ 未着手（AUD-017の境界統一と同時に扱うのが自然） |
 
 ### 2026-08-27 検証スナップショット
 
@@ -200,12 +202,37 @@ tree側は旧スナップショットより遅くなっている（`fib_20` 14.9
 
 `fib(20)`の確保量は23,164,422→15,832,425バイト。releaseビルドの実時間（3回の最小値）は`fib(22)`が22→17 ms、global 100個で20,000回呼ぶ例が56→8 msだった。VMは確保量・比とも変化しない。
 
+### 2026-08-28 ドキュメント整合監査
+
+対象はcommit `4396ffa`、aarch64 Linux。`README.md` / `LANG_GUIDE.md` / `docs/*.md` の記述を実装と実行結果に突き合わせた。テスト件数は次のとおりで、これ以前のスナップショットの件数は当時のcommitに対する記録として残す。
+
+| 種別 | 件数 |
+|---|---:|
+| 単体テスト（lib / bin でそれぞれ実行、AUD-039） | 152 |
+| 統合テスト（`tests/integration.rs`） | 172 |
+| 防御的テスト（`tests/defensive_vm.rs`） | 8 |
+| スケーリングテスト（`tests/scaling.rs`） | 6 |
+
+検出した記述の誤りは3種類に分かれた。
+
+**規範仕様に反するもの:** `LANG_GUIDE.md`のClosures節と`design.md`の既知のトレードオフが、AUD-014で廃止した「関数値は常に等しくない」という旧方針を残していた。`LANG_GUIDE.md`は同じファイルのOperators節と矛盾していた。`README.md`と`design.md`はengine差の残存領域として「比較・index代入・builtin・import」を挙げていたが、これらはAUD-014 / AUD-013 / AUD-012 / AUD-030で統一済みで、実際に残る差を1件も挙げていなかった。`language-spec.md`の既知非適合にはAUD-017が載っていなかった。
+
+**実装に追随していないもの:** `design.md`の`env.rs`節が`Env::functions`（廃止済み）と`capture_all`（AUD-042で`capture_referenced`へ置換）を残し、`frame_base`（AUD-046）に触れていなかった。ユニットテスト表は8モジュールのうち5つしか挙げず、存在しない`get_mut`を観点に挙げていた。スケーリングテスト節は6性質のうち2つしか説明していなかった（`tests/scaling.rs`のmodule docもAUD-041の1件を欠いていた）。`builtin_core.rs`の説明は「~45個の純粋関数」だが実数は`builtin_*`が47個で、うち15個はfilesystem・env・clockに触る。CI手順は3ジョブ・3 OS matrix・coverage jobを反映していなかった。
+
+**文書間で重複し乖離したもの:** 形式文法が`LANG_GUIDE.md`と`design.md`に二重に置かれ、`index_assign`（両方がAUD-013前の`postfix`）と`dict_literal`（`LANG_GUIDE.md`だけが実装と異なる`STRING`キー）で食い違っていた。文法は`LANG_GUIDE.md`の1か所に集約し、`design.md`はv0.3からの差分だけを残した。
+
+この監査で新たに再現・記録した項目は **AUD-048**（捕捉のない関数値の同一性がengine間で異なる）、**AUD-049**（builtin名一覧の3重管理）、**AUD-050**（`MAX_CALL_DEPTH`が`limits.rs`外に二重定義）である。AUD-048はgolden fixtureで差分を固定した。
+
+仕様revisionは0.11へ上げた。0.9（AUD-014）と0.10（AUD-030）は観測挙動の変更に伴う更新だったが、今回は**観測挙動を一切変えていない**。それまで文書化していなかった制約（`return`の式必須、辞書キーの順序、`contains`の辞書での対象、`slice`の負値、`has_key`のキー型、`format_time`の型とUTC、`to_int`の文字列受付範囲）を規範仕様へ明記したため、規範として拘束する内容が増えたことを示す更新である。
+
+`language-spec.md`の組み込み関数表では、実行して確認した挙動と説明が食い違う箇所を修正した。`contains`が辞書ではキーを見ること、`keys` / `values` / `for`の辞書反復が「アルファベット順」ではなくコードポイント順（`"Z" < "a"`）であること、`slice`の負値が0クランプでindexアクセスの末尾参照とは非対称であること、`has_key`のキーがStr限定であること、`format_time`がInt限定・UTC固定であること、`to_int`が`"3.5"`や`" 42"`を受けないこと、`return`に式が必須であることを明記した。
+
 ### 追加監査後の推奨改修順
 
 1. **停止性・ホスト安定性:** AUD-023 / AUD-026 / AUD-027 / AUD-028 / AUD-035 / AUD-043は完了。timeout・深度境界・host abortなしを継続検証する。`Chunk::patch_jump`は不正なoffsetでpanicするビルダーAPIとして残るため、compiler側の不変条件として扱う。
 2. **誤実行・安全境界:** AUD-012 / AUD-013 / AUD-014 / AUD-029 / AUD-030 / AUD-031 / AUD-037は完了。P1の意味論選択はすべて決着した。残るengine差はAUD-016（同一scope再宣言のcell identity）、AUD-017（call-depth境界）、AUD-019（error kind / message）、AUD-048（捕捉のない関数値の同一性）、AUD-024（未捕捉REPLエラー後の状態）で、いずれもP2として扱う。
 3. **品質基盤:** AUD-022のharness整備、AUD-038の測定分離、AUD-040のtree呼び出しコスト、AUD-041のコレクション読み取り、AUD-042のclosure捕捉範囲、AUD-046のglobal複製は完了。次はAUD-025（VM REPL checkpointの複製）とAUD-047（コレクションのcopy-on-write）を検討し、その後にP2境界とfuzzを拡充する。
-4. **文書・配布:** AUD-021に続き、AUD-044でREADMEと規範仕様の古い記述を除き、AUD-045で実行手順とtoolchain下限を明示する。
+4. **文書・配布:** AUD-021とAUD-044は完了。残るのはAUD-045（実行手順とtoolchain下限）で、`cargo install`手順、`rust-version`の宣言、release / install workflowを扱う。文書の重複は文法定義（`LANG_GUIDE.md`へ集約）とengine差リスト（`language-spec.md`の既知非適合へ集約）で解消したが、builtin名一覧（AUD-049）と`MAX_CALL_DEPTH`（AUD-050）はコード側の重複として残る。
 
 ### 初回監査の改修境界（記録）
 

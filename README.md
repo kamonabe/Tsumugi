@@ -19,7 +19,7 @@ Tsumugiは、プログラミング言語処理系への理解を深めるため�
 
 現在は**教育・実験用途のalpha版**であり、言語仕様・組み込みAPI・CLIの後方互換性は保証していない。安定した組み込みAPI、実行単位のdeny-by-default capability、包括的な実行予算、実行時audit eventは今後の設計・実装対象である。`--vm`は処理系比較のための実験的backendで、同一スコープでの`let`再宣言、捕捉のない関数値の同一性、コールフレーム深度の境界、error種別・メッセージ、未捕捉エラー後のREPL状態にデフォルト実行系との既知の差が残る。規範となる挙動は[言語仕様](docs/language-spec.md)、差分の一覧と修正状況は[ロードマップ](docs/roadmap.md)を参照すること。
 
-組み込みのステップ上限やfilesystem制限はdefense-in-depthであり、非信頼コードを隔離するsecurity sandboxではない。また、現行CLIは`--help` / `--version`とスクリプトへの追加引数に未対応である。Cargo package / REPLの`0.1.0`と[言語仕様](docs/language-spec.md)の`0.10`は、それぞれ実装版と仕様revisionを表す独立した番号として管理している。
+組み込みのステップ上限やfilesystem制限はdefense-in-depthであり、非信頼コードを隔離するsecurity sandboxではない。また、現行CLIは`--help` / `--version`とスクリプトへの追加引数に未対応である。Cargo package / REPLの`0.1.0`と[言語仕様](docs/language-spec.md)の`0.11`は、それぞれ実装版と仕様revisionを表す独立した番号として管理している。
 
 ## クイックスタート
 
@@ -32,6 +32,9 @@ cargo run -- examples/hello.tsg
 
 # バイトコードVM モードで実行
 cargo run -- --vm examples/hello.tsg
+
+# import のデモ（examples/math.tsg を読み込む）
+cargo run -- examples/import_demo.tsg
 
 # REPL（対話モード）
 cargo run
@@ -197,40 +200,60 @@ fixture は `fixture_tests!` へ1行宣言するとツリーウォーク版 / VM
 
 ## CI
 
-GitHub Actions で push / PR 時に自動実行。
+`main` への push と PR で GitHub Actions が3つのジョブを並行実行する。設定は `.github/workflows/ci.yml`。
 
-```
-cargo fmt --check → cargo clippy -D warnings → cargo test
+| ジョブ | 実行環境 | 内容 |
+|---|---|---|
+| `lint` | ubuntu-latest | `cargo fmt --check` と `cargo clippy -- -D warnings` |
+| `test` | ubuntu-latest / macos-latest / windows-latest | `cargo test`（`fail-fast: false` で全OSの結果を得る） |
+| `coverage` | ubuntu-latest | `cargo llvm-cov` で `lcov.info` を生成し artifact `lcov-report` として保存 |
+
+ローカルで同じ検査をする場合は次を順に実行する。
+
+```bash
+cargo fmt --check
+cargo clippy -- -D warnings
+cargo test
 ```
 
-設定: `.github/workflows/ci.yml`
+Windows固有の挙動（`TSUMUGI_*` 環境変数のcase-insensitive保護など）は `test` ジョブのwindows-latestでのみ検証される。CIの `clippy` はデフォルトターゲットだけを見るため、テストやベンチも含めて検査する場合は `cargo clippy --all-targets -- -D warnings` をローカルで実行する。
 
 ## プロジェクト構成
 
 ```
 src/
-├── main.rs       # エントリポイント（REPL / ファイル実行 / --vm 切り替え）
+├── main.rs       # CLIエントリポイント（REPL / ファイル実行 / --vm 切り替え）
+├── lib.rs        # library crateのルート（各モジュールを公開）
+│
+│  --- フロントエンド（両実行系で共有） ---
 ├── token.rs      # トークン型定義（Spanned: Token + 行番号）
 ├── lexer.rs      # レキサー（ソース → トークン列、行番号追跡）
-├── ast.rs        # AST ノード定義（各 Stmt に行番号を保持）
-├── parser.rs     # パーサー（トークン列 → AST、エラーに行番号付与）
+├── ast.rs        # AST ノード定義（行番号保持・深度検査・参照名収集）
+├── parser.rs     # パーサー（トークン列 → AST、エラー回復と行番号付与）
+├── module.rs     # ModuleLoader（import を実行前に解決してリンク）
 ├── value.rs      # 実行時の値型
-├── error.rs      # エラー型（TsumugiError: Parse / Runtime）
+├── error.rs      # エラー型（TsumugiError: Parse / Runtime、ErrorKind 18種）
 │
 │  --- ツリーウォーク実行（デフォルト） ---
-├── env.rs        # 環境（変数スコープ・関数テーブル）
+├── env.rs        # 環境（変数スコープとcall frame。関数も変数として保持）
 ├── eval.rs       # 評価器（AST → 実行）
-├── builtin.rs    # 組み込み関数（ツリーウォーク版）
+├── builtin.rs    # コンテキスト依存の組み込み関数（ツリーウォーク版）
 │
 │  --- バイトコードVM実行（--vm） ---
 ├── opcode.rs     # バイトコード命令セット
 ├── chunk.rs      # 命令列 + 定数テーブル
-├── compiler.rs   # コンパイラ（AST → Chunk）
-└── vm.rs         # スタックマシン VM + 組み込み関数
+├── compiler.rs   # コンパイラ（AST → Chunk、builtin名の判定）
+├── vm.rs         # スタックマシン VM + コンテキスト依存の組み込み関数
+│
+│  --- 実行時ガードレール（両実行系で共有） ---
+├── builtin_core.rs  # 組み込み関数の共通実装（47個）
+├── limits.rs        # 構造的上限（MAX_AST_DEPTH / MAX_IMPORT_DEPTH）
+└── sandbox.rs       # ファイルI/Oと環境変数のallow-list検査
 
 tests/
-├── integration.rs    # 統合テスト（ゴールデンテスト）
-├── scaling.rs        # 計算量オーダーの回帰テスト
+├── integration.rs    # 統合テスト（ゴールデンテスト + stdin駆動REPL）
+├── scaling.rs        # 計算量オーダーと解放漏れの回帰ゲート
+├── defensive_vm.rs   # 不正な Chunk を公開APIへ渡してもホストが落ちないこと
 └── fixtures/         # テスト用 .tsg + 期待出力ファイル
 
 benches/
@@ -239,15 +262,21 @@ benches/
 docs/
 ├── manifesto.md      # プロジェクトの方向性・設計原則・非目標
 ├── design.md         # 設計ドキュメント
-├── language-spec.md  # 言語仕様
-└── roadmap.md        # ロードマップ・設計方針
+├── language-spec.md  # 言語仕様（規範）
+└── roadmap.md        # ロードマップ・監査バックログ
 
 examples/
-└── hello.tsg         # サンプルスクリプト
+├── hello.tsg         # 基本構文（変数・関数・条件分岐・ループ）
+├── math.tsg          # import される数学ユーティリティモジュール
+└── import_demo.tsg   # math.tsg を import して使うデモ
+
+LANG_GUIDE.md         # AIコード支援向けの言語ガイド（形式文法を含む）
 
 .github/workflows/
-└── ci.yml            # CI 設定
+└── ci.yml            # CI 設定（lint / test 3 OS / coverage）
 ```
+
+実行予算とcapabilityのガードレールは `limits.rs`（コンパイル時定数）と `sandbox.rs`（環境変数ベースのallow-list）に集約している。ただし `MAX_CALL_DEPTH` だけは `eval.rs` と `vm.rs` に個別定義が残っている（AUD-050）。
 
 ## ドキュメント
 
