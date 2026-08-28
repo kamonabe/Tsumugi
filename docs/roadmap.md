@@ -81,7 +81,7 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 | AUD-025 | VM REPL checkpointの複製コストを削減する | 入力ごとの`stack.clone()`が保持中List/Dictをdeep cloneし、時間・一時メモリがREPL状態量に比例する | ⬜ 計測後にCOW/mutation logを検討 |
 | AUD-033 | 未完結REPL入力のEOFを診断する | `if true`等の継続入力中にEOFを送ると、tree/VMとも構文エラーを出さずbufferを破棄して終了コード0になる | ⬜ 未着手（両engineで再現済み） |
 | AUD-034 | `path_join`の引数型契約を厳格化する | `path_join("a", 123, "b")`が型エラーにならず`a/b`を返し、非文字列argumentを無言で欠落させる | ⬜ 仕様確定待ち（両engine共通で再現済み） |
-| AUD-035 | CLI・標準I/Oのhost panic経路を構造化する | REPLのthread spawn・stdout flush・stdin readに`unwrap()`があり、broken pipe/I/O障害でpanicする。Unixの非UTF-8 argvは`std::env::args()`でもpanicし得る | ⬜ 未着手 |
+| AUD-035 | CLI・標準I/Oのhost panic経路を構造化する | REPLのthread spawn・stdout flush・stdin readに`unwrap()`があり、broken pipe/I/O障害でpanicする。`print`も`println!`のため`tsumugi script.tsg \| head -1`でpanicした。Unixの非UTF-8 argvは`std::env::args()`でもpanicし得る | ✅ 完了（`ErrorKind::Io`を追加し`print`の出力失敗を構造化エラーへ。CLIのbanner・prompt・stdin・spawn・argv検証は診断＋終了コード1へ。パイプ切断と非UTF-8 argvの回帰テストを追加） |
 | AUD-036 | lossyな数値・OS境界変換を検証する | `exit`のi64→i32、`file_size`のu64→i64、NaN/Infを含む`to_int`/`floor`/`ceil`/`round`がwrap・飽和・0化し得る | ⬜ 仕様確定待ち（境界回帰テストが必要） |
 | AUD-038 | benchmarkをparse / compile / executeへ分離しVM退行を調査する | 現行Criterionは毎回parseし、VMはcompileも含む。aarch64 release実測でVMはfibが約2.77倍高速な一方、loop 5000回は約358倍低速で、単純な「VMは高速」という説明が成立しない | ✅ 4フェーズへ分離し退行の原因を特定・修正（VMのforが反復ごとにコレクションを複製しO(n^2)だった）。確保量ベースのスケーリングゲートを追加。副産物としてAUD-040 / AUD-041を検出 |
 | AUD-039 | binaryからlibrary moduleを利用して二重コンパイルを解消する | `main.rs`がlibraryと同じmoduleを再宣言し、同一単体テスト139件がlib/binで重複実行される。ビルド時間・テスト件数の解釈を歪める | ⬜ 未着手 |
@@ -200,7 +200,7 @@ tree側は旧スナップショットより遅くなっている（`fib_20` 14.9
 
 ### 追加監査後の推奨改修順
 
-1. **停止性・ホスト安定性:** AUD-026 / AUD-027 / AUD-028 / AUD-043は完了。timeout・深度境界・host abortなしを継続検証する。library利用者が不正な`Chunk`をVMへ渡す経路の防御はAUD-023で続ける。
+1. **停止性・ホスト安定性:** AUD-026 / AUD-027 / AUD-028 / AUD-035 / AUD-043は完了。timeout・深度境界・host abortなしを継続検証する。library利用者が不正な`Chunk`をVMへ渡す経路の防御はAUD-023で続ける。
 2. **誤実行・安全境界:** AUD-012 / AUD-013 / AUD-029 / AUD-031 / AUD-037は完了。意味論選択が必要なAUD-014 / AUD-030は仕様決定後に実装する。AUD-043はトップレベル`return`をパースエラーへ統一し、panic・無言終了・import時のengine差を同時に解消した。
 3. **品質基盤:** AUD-022のharness整備、AUD-038の測定分離、AUD-040のtree呼び出しコスト、AUD-042のclosure捕捉範囲、AUD-046のglobal複製は完了。次はAUD-041（VMのコレクション読み取り）を扱い、その後にP2境界とfuzzを拡充する。
 4. **文書・配布:** AUD-021に続き、AUD-044でREADMEと規範仕様の古い記述を除き、AUD-045で実行手順とtoolchain下限を明示する。

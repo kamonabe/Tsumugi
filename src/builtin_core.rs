@@ -616,6 +616,27 @@ pub fn builtin_format_time(args: &[Value], line: usize) -> Result<Value, Tsumugi
 }
 
 // =============================================================================
+// 標準出力
+// =============================================================================
+
+/// 標準出力へ1行書き出す。
+///
+/// 失敗をpanicさせず構造化エラーへ変換する（AUD-035）。`println!`はbroken pipeで
+/// panicし、`tsumugi script.tsg | head -1`のような通常の使い方でもホストを落とす。
+pub fn write_stdout_line(text: &str, line: usize) -> Result<(), TsumugiError> {
+    use std::io::Write;
+
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{}", text).map_err(|error| {
+        TsumugiError::runtime_with_kind(
+            line,
+            crate::error::ErrorKind::Io,
+            format!("標準出力への書き込みに失敗しました: {}", error),
+        )
+    })
+}
+
+// =============================================================================
 // ファイルI/O系（サンドボックスチェック付き）
 // =============================================================================
 
