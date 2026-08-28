@@ -514,8 +514,10 @@ print(c())  # 3
 > defining scope via `Rc<RefCell<Value>>`. Mutations inside a closure are visible to
 > subsequent calls (counter pattern works).
 >
-> Function values are never equal to each other (`f == f` is always `false`).
-> Do not use `==` or `contains()` to compare functions.
+> A function value is equal only to itself: `f == f` is `true`, and so is a comparison
+> between two variables bound to the same function value. Two closures produced by
+> separate evaluations of the same `fn` are not equal. `contains()` uses the same
+> identity rule, so it can find a closure you previously stored in a list.
 
 ### Error Handling Pattern
 
@@ -752,4 +754,6 @@ When generating portable `.tsg` code:
 
 - Use string literals or expressions that evaluate to strings for Dict keys. The parser may accept another expression form, but runtime semantics require a String key.
 - Do not depend on same-scope redeclaration cell identity until the engine-parity issues are resolved.
+- Do not depend on inequality between two separately created function values that capture nothing. The default engine reports them as different, but `--vm` reports them as equal (AUD-048). Comparing a function value with itself is `true` on both engines.
+- Do not depend on the exact recursion depth at which the call-depth guard fires. The limit is 128 frames, but the default engine and `--vm` differ by one frame (AUD-017).
 - Treat `TSUMUGI_SANDBOX` and resource limits as defense-in-depth, not as isolation for untrusted code.

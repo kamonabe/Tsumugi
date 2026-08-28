@@ -77,7 +77,9 @@ impl PartialEq for Value {
             (Value::Null, Value::Null) => true,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Dict(a), Value::Dict(b)) => a == b,
-            // 関数値は同一性で比較する。同じ定義から作った別のクロージャは等しくない。
+            // 関数値は同一性で比較する（AUD-014）。
+            // treeの`def`は定義式の評価ごとに作られるため、同じ`fn`から作った別の
+            // クロージャは等しくならない。これが規範の挙動である。
             (
                 Value::Fn {
                     def: def_a,
@@ -88,6 +90,8 @@ impl PartialEq for Value {
                     captured: captured_b,
                 },
             ) => Rc::ptr_eq(def_a, def_b) && Rc::ptr_eq(captured_a, captured_b),
+            // `chunk`はcompile時に一度作って共有するため、upvalueを持たない関数値では
+            // 同じ`fn`式から生成した別インスタンスが等しくなる。treeとの既知の差（AUD-048）。
             (
                 Value::VmFn {
                     chunk: chunk_a,

@@ -152,3 +152,32 @@ try
 catch e
     print("Int < Error: " + e["type"])
 end
+
+# --- 捕捉のない関数値の同一性はengine間で差がある（AUD-048） ---
+# 規範はデフォルト実行系（別インスタンスは不等）。VMは共有Chunkとupvalueで
+# 比較するため、upvalueが空だと同じ`fn`式の別インスタンスが等しくなる。
+# 期待値は `.expected` / `.expected.vm` に分けて明示する。
+fn make_free()
+    return fn(x) return x end
+end
+print(make_free() == make_free())
+fn make_named()
+    fn inner()
+        return 1
+    end
+    return inner
+end
+print(make_named() == make_named())
+let loop_cells = []
+for i in [1, 2]
+    push(loop_cells, fn(x) return x end)
+end
+print(loop_cells[0] == loop_cells[1])
+
+# 別々に書いた同形lambdaは、sourceが違うため両engineで不等
+let lit_a = fn(x) return x end
+let lit_b = fn(x) return x end
+print(lit_a == lit_b)
+
+# upvalueを持つ関数値は両engineで不等
+print(make_counter() == make_counter())

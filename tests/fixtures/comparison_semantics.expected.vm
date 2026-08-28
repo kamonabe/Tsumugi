@@ -68,8 +68,8 @@ Int < Str: type
 Int < "ゼロ除算": type
 Int + "ゼロ除算": type
 Int < Error: type
-false
-false
-false
+true
+true
+true
 false
 false
