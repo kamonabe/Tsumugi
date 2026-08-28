@@ -336,6 +336,7 @@ fixture_tests!(
         closure_capture_scope,
         closure_counter,
         closure_try_catch,
+        comparison_semantics,
         control_flow,
         deep_closure,
         dict_utils,

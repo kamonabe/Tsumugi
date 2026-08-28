@@ -9,6 +9,14 @@ use crate::error::TsumugiError;
 use crate::opcode::{MutationTarget, OpCode};
 use crate::value::{SharedValue, Value};
 
+/// 演算・比較の型エラーを作る（AUD-014）
+///
+/// メッセージには被演算子の値を含めるため、種別をメッセージから推測させず明示する。
+/// 値の中に「ゼロ除算」等が含まれていても種別が変わらないようにするための対策。
+fn internal_type_error(line: usize, message: impl Into<String>) -> TsumugiError {
+    TsumugiError::runtime_with_kind(line, crate::error::ErrorKind::Type, message)
+}
+
 /// 内部不変条件の破れを構造化エラーにする（AUD-023）
 ///
 /// libraryから不正な`Chunk`を渡された場合でもhost panicさせず、
@@ -1573,7 +1581,7 @@ impl Vm {
             (Value::Str(a), Value::Str(b)) => Ok(Value::Str(format!("{}{}", a, b))),
             (Value::Str(a), Value::Error { .. }) => Ok(Value::Str(format!("{}{}", a, right))),
             (Value::Error { .. }, Value::Str(b)) => Ok(Value::Str(format!("{}{}", left, b))),
-            _ => Err(TsumugiError::runtime(
+            _ => Err(internal_type_error(
                 line,
                 format!("型エラー: {:?} Add {:?} は計算できません", left, right),
             )),
@@ -1589,7 +1597,7 @@ impl Vm {
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 - b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a - *b as f64)),
-            _ => Err(TsumugiError::runtime(
+            _ => Err(internal_type_error(
                 line,
                 format!("型エラー: {:?} Sub {:?} は計算できません", left, right),
             )),
@@ -1605,7 +1613,7 @@ impl Vm {
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 * b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a * *b as f64)),
-            _ => Err(TsumugiError::runtime(
+            _ => Err(internal_type_error(
                 line,
                 format!("型エラー: {:?} Mul {:?} は計算できません", left, right),
             )),
@@ -1626,7 +1634,7 @@ impl Vm {
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a / b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 / b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a / *b as f64)),
-            _ => Err(TsumugiError::runtime(
+            _ => Err(internal_type_error(
                 line,
                 format!("型エラー: {:?} Div {:?} は計算できません", left, right),
             )),
@@ -1647,7 +1655,7 @@ impl Vm {
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a % b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 % b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a % *b as f64)),
-            _ => Err(TsumugiError::runtime(
+            _ => Err(internal_type_error(
                 line,
                 format!("型エラー: {:?} Mod {:?} は計算できません", left, right),
             )),
@@ -1660,7 +1668,7 @@ impl Vm {
             (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a < b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Bool((*a as f64) < *b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a < (*b as f64))),
-            _ => Err(TsumugiError::runtime(
+            _ => Err(internal_type_error(
                 line,
                 format!("型エラー: {:?} < {:?} は比較できません", left, right),
             )),
@@ -1673,7 +1681,7 @@ impl Vm {
             (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a > b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Bool((*a as f64) > *b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a > (*b as f64))),
-            _ => Err(TsumugiError::runtime(
+            _ => Err(internal_type_error(
                 line,
                 format!("型エラー: {:?} > {:?} は比較できません", left, right),
             )),
@@ -1686,7 +1694,7 @@ impl Vm {
             (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a <= b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Bool((*a as f64) <= *b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a <= (*b as f64))),
-            _ => Err(TsumugiError::runtime(
+            _ => Err(internal_type_error(
                 line,
                 format!("型エラー: {:?} <= {:?} は比較できません", left, right),
             )),
@@ -1699,7 +1707,7 @@ impl Vm {
             (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a >= b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Bool((*a as f64) >= *b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a >= (*b as f64))),
-            _ => Err(TsumugiError::runtime(
+            _ => Err(internal_type_error(
                 line,
                 format!("型エラー: {:?} >= {:?} は比較できません", left, right),
             )),

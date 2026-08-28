@@ -293,7 +293,7 @@ GitHub Actions (`.github/workflows/ci.yml`) で push / PR 時に自動実行:
 
 ## 設計時の文法スナップショット（revision v0.3）
 
-この番号は設計履歴上の文法revisionであり、規範となる最新仕様は[`language-spec.md`](language-spec.md)のversion 0.8、実装packageは0.1.0である。構文を変更する場合は、まず規範仕様と`LANG_GUIDE.md`を更新し、この節は設計履歴として扱う。
+この番号は設計履歴上の文法revisionであり、規範となる最新仕様は[`language-spec.md`](language-spec.md)のversion 0.9、実装packageは0.1.0である。構文を変更する場合は、まず規範仕様と`LANG_GUIDE.md`を更新し、この節は設計履歴として扱う。
 
 ```
 program        = top_level_stmt*
@@ -709,6 +709,22 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 
 ## 変更履歴
+
+### 2026-08-28: 比較演算の対象型を統一（AUD-014）
+
+**問題:** 9種類の値×9種類×6演算子の486ケースを両engineで実行したところ、128ケースで結果が違った。等価比較（120ケース）は、treeが型の違う値を`type`エラーにし、同じ型でもList / Dict / Fn / Errorをエラーにする一方、VMは真偽値を返していた。大小比較（8ケース）はIntとFloatの混在でtreeだけエラーになった。`null`との比較だけは両engineが一致していた。さらに付随して、型エラーのメッセージへ被演算子の値を埋め込んでいるため、`1 < "ゼロ除算"`のように値が分類キーワードを含むと`classify_runtime_error`の部分文字列判定が誤り、`type`ではなく`zero_division`になっていた。Error値を比較したときの種別ずれも同じ原因だった。
+
+**決定:** 等価比較を全型で成立させ、大小比較は数値に限定する。`==` / `!=`は型エラーにせず、型が違えば等しくないとする。数値はIntとFloatを跨いで比較し、List / Dict / Errorは構造で、関数値は同一性で比較する。大小比較はInt / Floatだけを対象とし、混在を許す。文字列の順序比較は現状どちらのengineも提供していないため、本件では追加しない。
+
+判断の根拠は3つある。第一に、`x == null`が以前から両engineで`false`を返しており、等価比較を全型で成立させる方向が既存挙動と整合する。第二に、`if x == "done"`のような番兵比較が想定外の型で停止しないほうが予測しやすく、マニフェストの予測可能性に沿う。第三に、`min` / `max`がPhase 7でInt×Floatの混在を許しているため、比較でも数値を跨げるほうが一貫する。関数値は反射律（`f == f`が`true`）を保つため同一性比較を採用した。
+
+**実装:** 判定を`Value`の`PartialEq`へ集約した。Int×Floatの数値比較を追加し、`Value::Fn`は`def`と`captured`、`Value::VmFn`は`chunk`とupvalueセルの`Rc::ptr_eq`で同一性を見る。treeの`eval_binop`は型ごとの等価armを削除し、`(l, Eq, r) => l == r`の総称armへ置き換えた。大小比較はInt×Floatの16armを追加した。VMは`OpCode::Eq` / `NotEq`が既に`Value::eq`を使い、`compare_*`が混在を許していたため、意味論の変更は`PartialEq`経由で反映される。エラー種別は、treeの`eval_binop`とVMの算術・比較9か所を`ErrorKind::Type`明示（`internal_type_error`）へ変え、被演算子の値でぶれないようにした。
+
+**不採用案:** treeに合わせて等価比較を型制限する案は、`type(x) == "str"`のような前置きを常に書かせることになり、既にVMとREPLで動いているコードを壊す。関数値を常に`false`とする現行VM案は反射律が崩れ、`contains`でクロージャを探せない。文字列の順序比較を同時に導入する案は、engine差の解消ではなく新機能であり、`sort`の文字列変換比較との関係も含めて別途判断する。
+
+**互換性と境界:** デフォルトのtreeで観測挙動が変わる破壊的変更である。`==`の型エラーに依存して型検査を代替していたコードは、`type(x)`による明示的な判定へ移行する必要がある。VMでも`1 == 1.0`が`false`から`true`へ、`f == f`が`false`から`true`へ変わる。`contains`など等価判定を使う組み込み関数も同じ規則に従う。コレクション以外へのindex（`n[0]`）のerror kindがtreeとVMで異なる問題は本件の対象外で、AUD-019として残る。
+
+**回帰テスト:** golden fixture `comparison_semantics`をtree/VM両方で実行し、同型・異型・数値混在・NaN・ネスト構造・関数の同一性・`contains`との共有・大小比較の型エラー・被演算子による種別ぶれを固定した。加えて486ケースの網羅行列を両engineで実行し、差分が0件であること、エラー種別がすべて`type`になることを確認した。
 
 ### 2026-08-28: コレクション読み取りの複製を除去（AUD-041）
 
