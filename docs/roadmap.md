@@ -1,6 +1,29 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-08-27
+最終更新: 2026-08-28
+
+## プロジェクトの方向性
+
+Tsumugiは、学習用の言語処理系として得た知見を発展させ、実運用を見据えた、制御可能な組み込みスクリプト言語を目指す。価値基準と非目標の正本は[Tsumugi Manifesto](manifesto.md)とし、本ロードマップは現在地からその目標へ進む順序を管理する。
+
+最短の実行時間よりホストの安定性を優先する。新しい言語機能を増やす前に、組み込み境界、明示的な権限、包括的な実行予算、規範意味論、監査可能性を整える。
+
+## マニフェスト実現ロードマップ
+
+以下は目標アーキテクチャへの移行順序である。現行のstep上限、collection上限、深度制限、filesystem/env allow-list、構造化エラー、差分テストは土台として再利用するが、それだけで各phaseが完了したとはみなさない。
+
+| Phase | 目的 | 主な完了条件 | 状態 |
+|---|---|---|---|
+| 0 | 保証範囲と脅威モデル | マニフェスト、対象script作者、ホストとOS隔離の責務、用語を文書化 | 🟡 マニフェスト策定。詳細な保証境界は継続 |
+| 1 | 安定した組み込みAPI | `Engine`、compile済みscript、実行context、構造化outcomeを公開し、CLIも同じAPIを利用 | ⬜ 未着手 |
+| 2 | deny-by-default capability | filesystem、env、clock、stdin/stdout、process、host functionを実行単位で明示付与し、ambient accessを既定で禁止 | ⬜ 未着手 |
+| 3 | 包括的な実行予算 | fuel、総heap、文字列・入出力、source/import、deadline、cancellationを扱い、超過後の再開可否を規定 | 🟡 step・collection・深度上限のみ実装済み |
+| 4 | 協調実行と負荷制御 | 実行slice、yield、一時停止・再開、エンジン全体の同時実行上限、backpressureを提供 | ⬜ 未着手 |
+| 5 | 規範意味論と決定的境界 | 正式backendを一つに定め、clock・env・I/O・module resolverをhost注入し、既知のengine差を解消 | 🟡 差分監査とpaired testを継続中 |
+| 6 | 実行時監査 | script/source hash、version、capability、host call、deny、予算消費、終了理由をaudit sinkへ通知 | 🟡 構造化エラーのみ実装済み |
+| 7 | 運用保証と検証 | 資源制約下の通常テスト、opt-in stress/fuzz、capability matrix、budget境界、audit完全性を継続検証 | 🟡 timeout・scaling・golden testを実装済み |
+
+長時間処理について「確実に終わる」とは、任意のscriptの成功を保証することではない。ホストを不安定にせず、完了、停止、または失敗を観測可能な結果として扱い、有限の処理を設定された負荷の中で着実に進められることを目標とする。
 
 ## 2026-08-26 深層監査バックログ
 
@@ -187,51 +210,50 @@ tree側は旧スナップショットより遅くなっている（`fib_20` 14.9
 - [x] 構造化エラー — try/catch で `Value::Error` を返す。`e["type"]` / `e["message"]` / `e["line"]` でアクセス可能。既存の文字列結合との互換性を維持
 - [x] 参照キャプチャ — クロージャが `Rc<RefCell<Value>>` で変数セルを共有。カウンターパターン（状態を保持するクロージャ）をサポート。`Value` の `PartialEq`/`Debug` を手動実装に移行。VM版は `SetUpvalue` オペコード + `locals_cells` でローカル変数のセル昇格を実装
 
-## 設計方針: 組み込み関数の境界線
+## 設計方針: 言語中核とホスト機能の境界
 
-### 原則: 「自プロセス + OS で完結するか」で判断する
+### 目標: 小さな言語中核 + 明示的なhost capability
 
-組み込み関数としてベースに入れるもの:
-- OS の syscall 1段で完結する処理（ファイルI/O、パス操作、プロセスのメタデータ）
-- プロセス内のメモリ操作で完結する処理（文字列操作、リスト操作、型変換）
+言語中核には、文字列、数値、List/Dict、型変換など、外部状態へ触れない純粋な計算を置く。
+filesystem、環境変数、時刻、標準入出力、process、network、database、メール、業務操作などの外部効果は、原則としてホストが実行単位で明示的に付与するcapabilityまたはhost functionとして提供する。
 
-外だし（将来のモジュール/import）にすべきもの:
-- 別ノード・別プロセスとの対話が必要な処理（HTTP、DB接続、メール送信）
-- プロトコル交渉・認証・バージョン差異が絡む処理
-- 外部ネイティブライブラリ（libmysqlclient 等）への依存が発生する処理
+「自プロセス + OSで完結するか」ではなく、「外部状態を観測・変更するか」「権限、予算、監査の対象になるか」を境界の判断基準とする。
 
-### なぜこの線引きか
+### 現行実装からの移行
 
-1. **変化速度の分離** — DB プロトコルや HTTP の認証方式は言語本体より速く変わる。組み込みにすると、言語本体のリリースサイクルがボトルネックになる
-2. **選択肢の多様性** — MySQL / PostgreSQL / SQLite のように「正解が1つに定まらない」ものを1つ選んで焼き込むと、他を使う人にとって死んだ重量になる
-3. **不可逆性の回避** — 一度組み込みに入れたものは後から抜けない（Python の urllib 問題）。ユーザーが自分1人の今は自由に出し入れできるが、将来を見据えて「外だし前提」の意識を持っておく
+現行のbuiltinはCLI中心の学習用設計としてOS機能へ直接接続している。次の表は現在の挙動と目標を区別する。
 
-### 現在の組み込み関数が全てこの原則に沿っていることの確認
-
-| カテゴリ | 境界 | 判定 |
+| カテゴリ | 現在 | 目標 |
 |---|---|---|
-| 文字列操作（trim, split, replace 等） | プロセス内メモリ操作 | ✅ 組み込み |
-| リスト操作（push, sort, reverse 等） | プロセス内メモリ操作 | ✅ 組み込み |
-| 高階関数（map, filter, each） | プロセス内メモリ操作 | ✅ 組み込み |
-| ファイルI/O（read_file, write_file, mkdir 等） | OS syscall | ✅ 組み込み |
-| パス操作（path_exists, is_dir 等） | OS syscall | ✅ 組み込み |
-| 環境変数・引数（env, args） | OS プロセスのメタデータ | ✅ 組み込み |
-| 時刻（now, format_time） | OS クロック | ✅ 組み込み |
-| HTTP（http_get 等） | 外部ノードとの対話 | ❌ 外だし |
-| DB接続（query 等） | 外部ノードとの対話 | ❌ 外だし |
+| 文字列・数値・List/Dict操作 | core builtin | core builtinを維持 |
+| filesystem | `std::fs`へ直接接続 | read/write/delete等を分離した実行単位capability |
+| 環境変数・引数 | process環境・argvへ直接接続 | hostが許可した値のsnapshotを注入 |
+| 時刻 | OS clockを直接参照 | clock capabilityとして注入 |
+| stdin/stdout | processのstreamへ直接接続 | host提供のinput/outputと出力量予算を使用 |
+| `exit` | host processを終了 | processを終了せず構造化`Outcome`を返す |
+| HTTP・DB・メール | 未実装 | coreへ追加せずhost function/moduleとして提供 |
+| 業務操作 | 登録手段なし | host function registryから明示的に公開 |
 
-### グレーゾーンのケース
+この移行は、stable embedding APIと実行contextを先に設計してから行う。既存builtinをただ削除するのではなく、CLIが必要なcapabilityを明示的に付与する構造へ変え、同じengineを組み込み用途でも利用できるようにする。
 
-| 機能 | 分析 | 判定 |
-|---|---|---|
-| プロセス起動（exec） | OS syscall だが、起動先が何をするかは制御外。「外部への窓」に近い | 慎重に（入れるなら制限付き） |
-| DNS 解決 | 一見 OS のローカル処理だが、実体は外部 DNS サーバーとの通信 | 外だし寄り |
-| タイムゾーン処理 | OS クロック + tz データベース参照。データベースの更新が外部依存 | 簡易実装なら組み込み可（現在の format_time は UTC 固定で回避済み） |
+現行の`import`はTsumugi sourceを読み込む機能であり、native host moduleやhost functionを登録する拡張境界ではない。host extension APIが成立するまで、「HTTPやDBを外部moduleで提供する器が完成した」とは扱わない。
 
-### この方針を見直すタイミング
+### この境界を採用する理由
 
-- モジュール / import は実装済み。HTTP や DB を外部モジュールとして提供する「器」は整っている
-- ユーザーが増えて「組み込みで http_get が欲しい」という声が出たとき → urllib の教訓を踏まえ、本当に入れるか再検討する
+1. **最小権限** — scriptごとに必要な操作だけを付与し、ambient authorityを避けられる
+2. **資源制御** — host callの時間、入出力量、同時実行数を実行予算へ含められる
+3. **監査可能性** — 外部効果の許可、拒否、引数、結果をhost boundaryで観測できる
+4. **予測可能性** — clock、env、filesystem等を注入し、同じ入力に対する再現性を高められる
+5. **依存の分離** — HTTP clientやDB driverを言語本体へ固定せず、ホストが用途に応じて選べる
+6. **テスト容易性** — 実OSや外部serviceを使わず、fake capabilityで境界動作を検証できる
+
+### 外部機能を追加する順序
+
+1. `Engine` / `ExecutionContext` / `ExecutionOutcome`を定義する
+2. host function registryとcapability policyを定義する
+3. clock、env、stdio、filesystem、process操作をhost境界へ移す
+4. budget、deadline、cancellation、audit eventをhost callへ伝播する
+5. 具体的なユースケースができた段階で、HTTPやDB等をホスト側adapterとして実装する
 
 ## 次の候補（バイトコード VM）
 
@@ -416,31 +438,27 @@ Tsumugi にはファイルI/O やサンドボックス機能が既に実装さ�
 | VM の `unwrap()` 除去 | コンパイラバグ時にパニックではなく構造化エラーを返す | 未着手 |
 | エラー種別の enum 化 | `classify_runtime_error()` の `contains()` 判定を `ErrorKind` enum に移行 | ✅ 完了 |
 
-## 検討事項: HTTP アクセス機能
+## 検討事項: HTTPアクセス機能
 
-### 背景
+### 方針: 言語中核へ組み込まない
 
-`requests.get(url)` のような HTTP クライアント機能があれば、API呼び出しやWebスクレイピング的な処理が可能になる。
-ただし Rust の標準ライブラリには HTTP クライアントがないため、外部 crate の追加が必要。
+HTTPはnetwork access、DNS、TLS、認証、redirect、response size、timeoutなど、権限・資源・監査の境界を伴う。特定のHTTP clientをTsumugi中核へ組み込まず、host functionまたはhost moduleとして提供する。
 
-### 方針: ureq crate を使う
+例えばホストが`http_get`を公開する場合も、scriptから任意のnetwork accessを許可するのではなく、次をhost policyで制御する。
 
-- `ureq` は同期的な HTTP クライアントで依存が比較的少ない
-- curl コマンド呼び出し方式も検討したが、Windows 非対応になるため却下
-- Tsumugi の「依存ゼロ」は崩れるが、クロスプラットフォーム対応を優先する
+- 接続先scheme・host・portのallow-list
+- request/response byte上限
+- connect/read/total deadline
+- redirect回数
+- 同時実行数とrate limit
+- cancellation
+- request開始、許可・拒否、終了理由のaudit event
+- credentialとresponse bodyのredaction
 
-### 想定する組み込み関数
-
-```
-let resp = http_get("https://example.com/api")
-let resp = http_post("https://example.com/api", body)
-```
-
-- 成功時: レスポンスボディを文字列で返す
-- 失敗時: null を返す（ファイルI/O と同じ方針）
+具体的なRust HTTP clientと認証方式はホストアプリケーションが選択する。これにより、HTTP dependencyの更新周期を言語本体から分離し、Tsumugiを利用しないホストへ不要な依存を持ち込まない。
 
 ### 実装タイミング
 
-- 「HTTP が本当に必要なユースケースが明確になったとき」に入れる
-- 現時点ではファイルI/O だけで十分な範囲をカバーできている
-- 入れる場合は cargo-audit の CI 追加も同時に行う（外部依存が初めて入るため）
+- stable embedding API、host function registry、capability、budget、audit sinkの後に実装する
+- 具体的な業務ユースケースと必要な権限境界が明確になった段階でhost adapterとして追加する
+- core builtin化は既定の選択肢とせず、必要性と安全境界を改めて設計レビューする
