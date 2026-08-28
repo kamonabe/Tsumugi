@@ -1,0 +1,22 @@
+# import の評価時点（AUD-030）
+# import は実行前にすべて解決する。モジュールのトップレベル文は
+# import 文があった位置で実行されるため、正常系の順序は変わらない。
+
+print("MAIN-BEFORE")
+import "import_lib.tsg"
+print("MAIN-AFTER-FIRST")
+
+# 同じモジュールの2回目の import はスキップされる（再実行されない）
+import "import_lib.tsg"
+print("MAIN-AFTER-SECOND")
+
+# ネストした import も実行前に解決する
+import "import_nested_mid.tsg"
+print("MAIN-AFTER-NESTED")
+
+# import された定義はトップレベルのグローバルとして使える
+print(add(3, 4))
+print(greet("tsumugi"))
+print(LIB_VERSION)
+print(square(3))
+print(cube(2))

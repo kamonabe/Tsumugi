@@ -308,6 +308,9 @@ import "path/to/module.tsg"
 ```
 
 - Import statements are valid only at the program top level; using one inside any block is a parse error
+- Imports are resolved before the program starts. A failing import stops the program before any statement runs, so nothing printed earlier appears
+- The imported file's top-level statements still run at the position of the `import`, so normal execution order is unchanged
+- A module must exist when execution starts; a file created during execution cannot be imported
 - All definitions from the imported file are injected into the current scope (flat, no namespace)
 - Path is relative to the current script file
 - No `require`, no `from ... import`, no selective imports
@@ -748,5 +751,5 @@ This guide and `docs/language-spec.md` describe the normative language. Both exe
 When generating portable `.tsg` code:
 
 - Use string literals or expressions that evaluate to strings for Dict keys. The parser may accept another expression form, but runtime semantics require a String key.
-- Do not depend on same-scope redeclaration cell identity or import side-effect timing until the engine-parity issues are resolved.
+- Do not depend on same-scope redeclaration cell identity until the engine-parity issues are resolved.
 - Treat `TSUMUGI_SANDBOX` and resource limits as defense-in-depth, not as isolation for untrusted code.

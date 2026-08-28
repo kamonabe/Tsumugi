@@ -1,7 +1,5 @@
 //! コンパイラ: AST → バイトコード（Chunk）に変換
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::ast::{
@@ -9,7 +7,6 @@ use crate::ast::{
 };
 use crate::chunk::Chunk;
 use crate::error::TsumugiError;
-use crate::limits::MAX_IMPORT_DEPTH;
 use crate::opcode::{MutationTarget, OpCode};
 use crate::value::Value;
 
@@ -69,12 +66,6 @@ pub struct Compiler {
     enclosing_locals: Option<Vec<Local>>,
     /// 親コンパイラの upvalue リスト（多段キャプチャ用）
     enclosing_upvalues: Option<Vec<Upvalue>>,
-    /// 現在のスクリプトの基準ディレクトリ（import のパス解決に使用）
-    base_dir: PathBuf,
-    /// import 済みファイルの正規パス集合（循環 import 防止）
-    imported: HashSet<PathBuf>,
-    /// 現在処理中のactive import chain深度（root scriptは0）。
-    import_depth: usize,
 }
 
 impl Compiler {
@@ -87,19 +78,6 @@ impl Compiler {
             upvalues: Vec::new(),
             enclosing_locals: None,
             enclosing_upvalues: None,
-            base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            imported: HashSet::new(),
-            import_depth: 0,
-        }
-    }
-
-    /// 基準ディレクトリを設定する（ファイル実行時に呼ばれる）
-    pub fn set_base_dir(&mut self, path: &Path) {
-        if let Some(parent) = path.parent() {
-            self.base_dir = parent.to_path_buf();
-        }
-        if let Ok(canonical) = std::fs::canonicalize(path) {
-            self.imported.insert(canonical);
         }
     }
 
@@ -113,9 +91,6 @@ impl Compiler {
             upvalues: Vec::new(),
             enclosing_locals: Some(enclosing_locals),
             enclosing_upvalues: Some(enclosing_upvalues),
-            base_dir: PathBuf::from("."),
-            imported: HashSet::new(),
-            import_depth: 0,
         }
     }
 
@@ -249,8 +224,13 @@ impl Compiler {
                 self.compile_expr(value, *line)?;
                 self.chunk.emit(OpCode::ReturnValue, *line);
             }
-            Stmt::Import { path, line } => {
-                self.compile_import(path, *line)?;
+            // import はリンク時に解決済みなので、ここへは到達しない
+            Stmt::Import { line, .. } => {
+                return Err(TsumugiError::runtime_with_kind(
+                    *line,
+                    crate::error::ErrorKind::Internal,
+                    "内部エラー: import がリンクされていません",
+                ));
             }
             Stmt::TryCatch {
                 try_body,
@@ -265,93 +245,6 @@ impl Compiler {
     }
 
     // --- 制御フロー ---
-
-    /// import 文のコンパイル（ファイルを読み込んでインラインでコンパイル）
-    fn compile_import(&mut self, path: &str, line: usize) -> Result<(), TsumugiError> {
-        use crate::lexer::Lexer;
-        use crate::parser::Parser;
-
-        // パス解決
-        let resolved = self.base_dir.join(path);
-        let canonical = std::fs::canonicalize(&resolved).map_err(|e| {
-            TsumugiError::runtime_with_kind(
-                line,
-                crate::error::ErrorKind::Import,
-                format!("import 失敗: ファイルが見つかりません: {} ({})", path, e),
-            )
-        })?;
-
-        // サンドボックスチェック: import 先が許可範囲内か検証
-        let _ = crate::sandbox::check_path(canonical.to_str().unwrap_or(""), line)?;
-
-        // 循環 import は従来どおり成功扱いにし、active chainの深度を消費しない。
-        if self.imported.contains(&canonical) {
-            return Ok(());
-        }
-        if self.import_depth >= MAX_IMPORT_DEPTH {
-            return Err(TsumugiError::runtime_with_kind(
-                line,
-                crate::error::ErrorKind::Import,
-                format!(
-                    "import 失敗: ネストが深すぎます (上限: {})",
-                    MAX_IMPORT_DEPTH
-                ),
-            ));
-        }
-        self.imported.insert(canonical.clone());
-
-        let previous_depth = self.import_depth;
-        let previous_base_dir = self.base_dir.clone();
-        self.import_depth += 1;
-
-        let result = (|| -> Result<(), TsumugiError> {
-            // ファイル読み込み
-            let source = std::fs::read_to_string(&canonical).map_err(|e| {
-                TsumugiError::runtime_with_kind(
-                    line,
-                    crate::error::ErrorKind::Import,
-                    format!("import 失敗: ファイルを読み込めません: {} ({})", path, e),
-                )
-            })?;
-
-            // base_dir を一時的に切り替え
-            if let Some(parent) = canonical.parent() {
-                self.base_dir = parent.to_path_buf();
-            }
-
-            // パース
-            let mut lexer = Lexer::new(&source);
-            let tokens = lexer.tokenize();
-            let mut parser = Parser::new(tokens);
-            let program = parser.parse().map_err(|errors| {
-                TsumugiError::runtime_with_kind(
-                    line,
-                    crate::error::ErrorKind::Import,
-                    format!(
-                        "import 失敗 ({}): {}",
-                        path,
-                        errors
-                            .iter()
-                            .map(|e| e.to_string())
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    ),
-                )
-            })?;
-
-            // import 先の文をインラインでコンパイル（現在のチャンクに直接追加）
-            for stmt in &program {
-                self.compile_stmt(stmt)?;
-            }
-            Ok(())
-        })();
-
-        // 成否にかかわらずactive chainの状態を呼び出し元へ戻す。
-        self.base_dir = previous_base_dir;
-        self.import_depth = previous_depth;
-
-        result
-    }
 
     /// try / catch のコンパイル
     fn compile_try_catch(

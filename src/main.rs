@@ -7,6 +7,7 @@ mod error;
 mod eval;
 mod lexer;
 mod limits;
+mod module;
 mod opcode;
 mod parser;
 mod sandbox;
@@ -228,6 +229,7 @@ fn run_repl_vm() {
     let mut input = String::new();
     let mut compiler = Compiler::new();
     let mut vm = Vm::new_repl();
+    let mut loader = module::ModuleLoader::new();
 
     loop {
         write_stdout(if input.is_empty() {
@@ -255,20 +257,33 @@ fn run_repl_vm() {
         let mut parser = Parser::new(tokens);
         match parser.parse() {
             Ok(program) => {
-                // CompilerとVMを1つのREPL transactionとして扱う。compile成功後でも
-                // runtime errorなら、未実行のbinding/import情報をCompilerへ残さない。
+                // Compiler・VM・ModuleLoaderを1つのREPL transactionとして扱う。
+                // compile成功後でもruntime errorなら、未実行のbinding/import情報を残さない。
                 let compiler_checkpoint = compiler.clone();
-                match compiler.compile_repl_line(&program) {
-                    Ok(chunk) => {
-                        if let Err(e) = vm.run_repl_chunk(chunk) {
-                            compiler = compiler_checkpoint;
-                            eprintln!("  エラー: {}", e);
+                let loader_checkpoint = loader.clone();
+                // import は実行前に解決する（AUD-030）
+                match loader.link(&program) {
+                    Ok((linked, _)) => {
+                        let linked_program = linked.as_ref().unwrap_or(&program);
+                        match compiler.compile_repl_line(linked_program) {
+                            Ok(chunk) => {
+                                if let Err(e) = vm.run_repl_chunk(chunk) {
+                                    compiler = compiler_checkpoint;
+                                    loader = loader_checkpoint;
+                                    eprintln!("  エラー: {}", e);
+                                }
+                            }
+                            // compile_repl_line自身もrollbackするが、ここでも入力開始時の
+                            // checkpointを保持することでtransaction境界を明示する。
+                            Err(e) => {
+                                compiler = compiler_checkpoint;
+                                loader = loader_checkpoint;
+                                eprintln!("  エラー: {}", e);
+                            }
                         }
                     }
-                    // compile_repl_line自身もrollbackするが、ここでも入力開始時の
-                    // checkpointを保持することでtransaction境界を明示する。
                     Err(e) => {
-                        compiler = compiler_checkpoint;
+                        loader = loader_checkpoint;
                         eprintln!("  エラー: {}", e);
                     }
                 }
@@ -292,9 +307,14 @@ fn execute_vm_with_path(source: &str, path: &str) -> Result<(), Vec<error::Tsumu
     let mut parser = Parser::new(tokens);
     let program = parser.parse()?;
 
-    let mut compiler = Compiler::new();
-    compiler.set_base_dir(std::path::Path::new(path));
-    let chunk = compiler.compile(&program).map_err(|e| vec![e])?;
+    // import は実行前に解決する（AUD-030）
+    let mut loader = module::ModuleLoader::new();
+    loader.set_base_dir(std::path::Path::new(path));
+    let (linked, _) = loader.link(&program).map_err(|e| vec![e])?;
+    let program = linked.as_ref().unwrap_or(&program);
+
+    let compiler = Compiler::new();
+    let chunk = compiler.compile(program).map_err(|e| vec![e])?;
     let mut vm = Vm::new(chunk);
     vm.run().map_err(|e| vec![e])
 }

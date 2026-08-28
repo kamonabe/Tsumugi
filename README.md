@@ -19,7 +19,7 @@ Tsumugiは、プログラミング言語処理系への理解を深めるため�
 
 現在は**教育・実験用途のalpha版**であり、言語仕様・組み込みAPI・CLIの後方互換性は保証していない。安定した組み込みAPI、実行単位のdeny-by-default capability、包括的な実行予算、実行時audit eventは今後の設計・実装対象である。`--vm`は処理系比較のための実験的backendで、比較、index代入、builtin、importなど一部の境界動作はデフォルト実行系と一致していない。現在地と修正状況は[ロードマップ](docs/roadmap.md)を参照すること。
 
-組み込みのステップ上限やfilesystem制限はdefense-in-depthであり、非信頼コードを隔離するsecurity sandboxではない。また、現行CLIは`--help` / `--version`とスクリプトへの追加引数に未対応である。Cargo package / REPLの`0.1.0`と[言語仕様](docs/language-spec.md)の`0.9`は、それぞれ実装版と仕様revisionを表す独立した番号として管理している。
+組み込みのステップ上限やfilesystem制限はdefense-in-depthであり、非信頼コードを隔離するsecurity sandboxではない。また、現行CLIは`--help` / `--version`とスクリプトへの追加引数に未対応である。Cargo package / REPLの`0.1.0`と[言語仕様](docs/language-spec.md)の`0.10`は、それぞれ実装版と仕様revisionを表す独立した番号として管理している。
 
 ## クイックスタート
 
