@@ -61,8 +61,9 @@
 | AUD-036 | lossyな数値・OS境界変換を検証する | `exit`のi64→i32、`file_size`のu64→i64、NaN/Infを含む`to_int`/`floor`/`ceil`/`round`がwrap・飽和・0化し得る | ⬜ 仕様確定待ち（境界回帰テストが必要） |
 | AUD-038 | benchmarkをparse / compile / executeへ分離しVM退行を調査する | 現行Criterionは毎回parseし、VMはcompileも含む。aarch64 release実測でVMはfibが約2.77倍高速な一方、loop 5000回は約358倍低速で、単純な「VMは高速」という説明が成立しない | ✅ 4フェーズへ分離し退行の原因を特定・修正（VMのforが反復ごとにコレクションを複製しO(n^2)だった）。確保量ベースのスケーリングゲートを追加。副産物としてAUD-040 / AUD-041を検出 |
 | AUD-039 | binaryからlibrary moduleを利用して二重コンパイルを解消する | `main.rs`がlibraryと同じmoduleを再宣言し、同一単体テスト139件がlib/binで重複実行される。ビルド時間・テスト件数の解釈を歪める | ⬜ 未着手 |
-| AUD-040 | treeの名前付き関数self-bindingで`Value::Fn`の複製を避ける | AUD-037の呼び出し時self-bindingが毎回`Value::Fn`（body AST含む）をcloneし、呼び出しコストが関数body長に比例する。`fib(22)`で67.0ms（該当行を無効化すると42.2ms、約1.6倍）。bodyを`Rc`共有にするか、binding cellを再利用するかの設計判断が必要 | ⬜ 未着手（AUD-038で計測・再現済み） |
-| AUD-041 | VMのコレクション読み取りで全体複製を避ける | `GetLocal`が値を複製するため、ループ内の`d[k]` / `xs[i]`読み取りがコレクション全体をコピーする。forループの反復自体はAUD-038で解消したが、一般のindex読み取り経路は残る。参照読みへ寄せるとindex式の副作用に対する評価順がAUD-013と同種の仕様判断になる | ⬜ 未着手 |
+| AUD-040 | treeの名前付き関数self-bindingで`Value::Fn`の複製を避ける | AUD-037の呼び出し時self-bindingが毎回`Value::Fn`（body AST含む）をcloneし、呼び出しコストが関数body長に比例する。`fib(22)`で67.0ms（該当行を無効化すると42.2ms、約1.6倍） | ✅ `Value::Fn`を`Rc<FnDef>` + `Rc<captured>`へ変更（VmFnの`Rc<Chunk>`と同じ方針）。同一条件A/Bで`fib(22)` 64.5ms→21.2ms、確保量の比 15.89→1.06。確保量ベースの回帰ゲートを追加 |
+| AUD-041 | VMのコレクション読み取りで全体複製を避ける | `GetLocal`が値を複製するため、ループ内の`d[k]` / `xs[i]`読み取りがコレクション全体をコピーする。forループの反復自体はAUD-038で解消したが、一般のindex読み取り経路は残る | ⬜ 未着手。index式を副作用のないもの（literal・識別子・それらの演算）に限れば、コレクションを後から参照で読んでも観測結果は同じで仕様判断は不要。global targetの未定義エラー順序はAUD-013の`RequireGlobal`をindexより前に置けば保てる。関数呼び出しを含むindex式は現行loweringを維持する |
+| AUD-042 | treeのclosure捕捉範囲を自由変数へ絞る | treeは`capture_all()`で定義時に見える全bindingを捕捉するため、クロージャを保持するコンテナ（`push(saved, fn ...)`の`saved`等）まで捕捉し、cell→list→closure→captured→cellの参照循環でメモリが解放されない。200回×200個で51.8MB（循環しない書き方では2.19MB）。VMは自由変数だけをupvalue化するため発生しない。捕捉範囲の統一は生成コストの削減にもなる | ⬜ 未着手（AUD-040で計測・再現済み。commit `93b7606`でも同一なので既存の問題） |
 
 ### 2026-08-27 検証スナップショット
 
@@ -103,13 +104,37 @@ Criterionの平均値は次のとおり。各iterationにparseを含み、VMはc
 | `dict_500` | 34.350 ms | 10.587 ms |
 | `fstr_300` | 1.047 ms | 154.20 µs |
 
-tree側は旧スナップショットより遅くなっている（`fib_20` 14.982 ms → 28.349 ms）。原因はAUD-037の呼び出し時self-bindingによる`Value::Fn`の複製で、AUD-040として追跡する。
+tree側は旧スナップショットより遅くなっている（`fib_20` 14.982 ms → 28.349 ms）。原因はAUD-037の呼び出し時self-bindingによる`Value::Fn`の複製で、AUD-040で解消した（次節）。この表のtree列はAUD-040前の値である。
+
+### 2026-08-27 AUD-040後の実行フェーズ
+
+`Value::Fn`をRc共有にした後の`execute`フェーズ（`--sample-size 20 --measurement-time 2`、上の表とは測定設定・マシン状態が異なるため直接比較しない）。
+
+| workload（execute） | tree | VM |
+|---|---:|---:|
+| `fib_20` | 7.599 ms | 4.995 ms |
+| `dict_500` | 9.030 ms | 8.826 ms |
+| `fstr_300` | 84.79 µs | 127.53 µs |
+| `loop_5000` | 799.14 µs | 1.117 ms |
+| `while_5000` | 942.73 µs | 922.95 µs |
+| `higher_order_200` | 103.66 µs | 72.75 µs |
+| `closure_def_200` | 144.99 µs | 112.19 µs |
+
+修正の効果は同一マシン・連続実行のA/Bで確認した（`fib(22)`を7回実行した最小値）。
+
+| workload | `93b7606` | AUD-040後 | 比 |
+|---|---:|---:|---:|
+| tree `fib(22)` | 64.5 ms | 21.2 ms | 0.33 |
+| tree closureループ定義 | 10.0 ms | 7.8 ms | 0.78 |
+| VM `fib(22)` | 14.1 ms | 13.2 ms | 0.94（誤差。`Value::Fn`はVMでは未使用） |
+
+実時間はマシン状態に依存するため、確保バイト数も併記する。body 2文の関数を300回呼ぶと 909,821バイト → 452,645バイト、body 100文との比は 15.89 → 1.06 になった。
 
 ### 追加監査後の推奨改修順
 
 1. **停止性:** AUD-026 / AUD-027 / AUD-028は完了。timeout・深度境界・host abortなしを継続検証する。
 2. **誤実行・安全境界:** AUD-012 / AUD-013 / AUD-029 / AUD-031 / AUD-037は完了。意味論選択が必要なAUD-014 / AUD-030は仕様決定後に実装する。
-3. **品質基盤:** AUD-022のharness整備とAUD-038の測定分離は完了。次はAUD-040（tree呼び出しコスト）とAUD-041（VMのコレクション読み取り）を扱い、その後にP2境界とfuzzを拡充する。
+3. **品質基盤:** AUD-022のharness整備、AUD-038の測定分離、AUD-040のtree呼び出しコストは完了。次はAUD-042（closure捕捉範囲と参照循環）とAUD-041（VMのコレクション読み取り）を扱い、その後にP2境界とfuzzを拡充する。
 
 ### 初回監査の改修境界（記録）
 
@@ -367,7 +392,7 @@ Tsumugi にはファイルI/O やサンドボックス機能が既に実装さ�
 |---|---|---|
 | カバレッジ可視化 | `cargo llvm-cov` で未到達パスを特定しテスト拡充 | ✅ 完了 |
 | ベンチマーク | `criterion` で parse / compile / execute / end_to_end を分離計測 | ✅ 完了（AUD-038） |
-| 計算量オーダーの回帰ゲート | `tests/scaling.rs` が確保バイト数で `for` の線形性を検査（実時間に依存しない） | ✅ 完了（AUD-038） |
+| 計算量オーダーの回帰ゲート | `tests/scaling.rs` が確保バイト数で `for` の線形性（AUD-038）と呼び出しコストのbody長非依存（AUD-040）を検査（実時間に依存しない） | ✅ 完了 |
 
 ### コード構造
 

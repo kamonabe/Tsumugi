@@ -5,11 +5,12 @@ use crate::ast::*;
 use crate::env::Env;
 use crate::error::{TraceFrame, TsumugiError};
 use crate::limits::MAX_IMPORT_DEPTH;
-use crate::value::Value;
+use crate::value::{FnDef, Value};
 
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 /// 評価器の戻り値（通常の値 or return / break / continue による制御フロー）
 enum EvalResult {
     Val,
@@ -349,13 +350,16 @@ impl Evaluator {
             } => {
                 // 関数を値として環境にセット
                 // ネストされた関数定義の場合、定義時のスコープをキャプチャする
-                let captured = self.env.capture_all();
+                // 本体ASTの複製は定義時の一度だけで、以降の呼び出しはRcを共有する
+                let captured = Rc::new(self.env.capture_all());
                 self.env.set(
                     name,
                     Value::Fn {
-                        name: name.clone(),
-                        params: params.clone(),
-                        body: body.clone(),
+                        def: Rc::new(FnDef {
+                            name: name.clone(),
+                            params: params.clone(),
+                            body: body.clone(),
+                        }),
                         captured,
                     },
                 );
@@ -508,11 +512,13 @@ impl Evaluator {
 
             Expr::Lambda { params, body } => {
                 // 無名関数: 定義時のスコープの変数セルを共有してキャプチャ
-                let captured = self.env.capture_all();
+                let captured = Rc::new(self.env.capture_all());
                 Ok(Value::Fn {
-                    name: "<lambda>".to_string(),
-                    params: params.clone(),
-                    body: body.clone(),
+                    def: Rc::new(FnDef {
+                        name: "<lambda>".to_string(),
+                        params: params.clone(),
+                        body: body.clone(),
+                    }),
                     captured,
                 })
             }
@@ -763,18 +769,17 @@ impl Evaluator {
             self.eval_expr(callee, line)?
         };
 
-        let Value::Fn {
-            name: func_name,
-            params,
-            body,
-            captured,
-        } = &func_value
-        else {
+        let Value::Fn { def, captured } = &func_value else {
             return Err(TsumugiError::runtime(
                 line,
                 format!("関数ではない値を呼び出そうとしました: {}", func_value),
             ));
         };
+        // Rcを複製して以降の借用から切り離す（値の複製は起きない）
+        let def = Rc::clone(def);
+        let captured = Rc::clone(captured);
+        let func_name = def.name.as_str();
+        let params = &def.params;
 
         if args.len() != params.len() {
             return Err(TsumugiError::runtime(
@@ -796,7 +801,7 @@ impl Evaluator {
 
         // レキシカルスコープ: 呼び出し元のスコープを退避し、独立環境で実行
         let saved_scopes = self.env.push_call_frame();
-        for (k, cell) in captured {
+        for (k, cell) in captured.iter() {
             self.env.set_shared(k, cell.clone());
         }
         // 名前付き関数は呼び出し時の関数値を宣言名へ束縛する。
@@ -811,13 +816,13 @@ impl Evaluator {
 
         // コールスタックに記録
         self.call_stack.push(TraceFrame {
-            name: func_name.clone(),
+            name: func_name.to_string(),
             line,
         });
 
         // 関数本体を実行
         let mut result = Value::Null;
-        for stmt in body {
+        for stmt in &def.body {
             match self.exec_stmt(stmt) {
                 Ok(EvalResult::Return(v)) => {
                     result = v;

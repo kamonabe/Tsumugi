@@ -108,6 +108,20 @@ let doubled = map(nums, fn(x) return x * 2 end)
 let evens = filter(doubled, fn(x) return x % 4 == 0 end)
 "#;
 
+/// ループ内でのクロージャ生成 — 関数値の**定義**コストの計測
+/// （呼び出しコストは `fib_20` 側に出るため、生成側を分けて追う）
+///
+/// 生成したクロージャはリストへ溜めない。treeは定義時に見える全bindingを
+/// 捕捉するため、クロージャを保持するコンテナを捕捉して参照循環になり、
+/// 反復のたびにメモリが解放されなくなる（AUD-042）。
+const CLOSURE_DEF_SCRIPT: &str = r#"
+let total = 0
+for i in range(0, 200)
+  let f = fn(x) return x + i end
+  total = total + f(1)
+end
+"#;
+
 /// 計測対象のワークロード一覧
 const WORKLOADS: &[(&str, &str)] = &[
     ("fib_20", FIB_SCRIPT),
@@ -116,6 +130,7 @@ const WORKLOADS: &[(&str, &str)] = &[
     ("loop_5000", LOOP_SCRIPT),
     ("while_5000", WHILE_SCRIPT),
     ("higher_order_200", HIGHER_ORDER_SCRIPT),
+    ("closure_def_200", CLOSURE_DEF_SCRIPT),
 ];
 
 // ---------------------------------------------------------------------------
