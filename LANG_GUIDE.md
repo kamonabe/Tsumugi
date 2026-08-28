@@ -285,7 +285,8 @@ end
   `zero_division`, `type`, `index`, `name`, `limit`, `overflow`,
   `sandbox`, `import`, `argument`, `int_overflow`, `control_flow`,
   `collection_limit`, `conversion`, `builtin_type`, `iteration`,
-  `internal`, `runtime`
+  `io`, `internal`, `runtime`
+- `print` returns an `io` error when stdout cannot be written (for example the reader of a pipe exited)
 
 **WRONG:**
 ```

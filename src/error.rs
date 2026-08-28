@@ -39,6 +39,8 @@ pub enum ErrorKind {
     BuiltinType,
     /// イテレーション不可の値に対する for
     Iteration,
+    /// 標準出力などのI/O失敗（broken pipe等）
+    Io,
     /// VM 内部エラー（コンパイラバグ等）
     Internal,
     /// 上記に該当しないランタイムエラー
@@ -64,6 +66,7 @@ impl ErrorKind {
             Self::Conversion => "conversion",
             Self::BuiltinType => "builtin_type",
             Self::Iteration => "iteration",
+            Self::Io => "io",
             Self::Internal => "internal",
             Self::Runtime => "runtime",
         }
@@ -219,6 +222,8 @@ fn classify_runtime_error(message: &str) -> ErrorKind {
     } else if message.contains("反復できません") || message.contains("イテレートできません")
     {
         ErrorKind::Iteration
+    } else if message.contains("標準出力への書き込みに失敗") {
+        ErrorKind::Io
     } else if message.contains("内部エラー") {
         ErrorKind::Internal
     } else {

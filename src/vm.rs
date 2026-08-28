@@ -959,7 +959,7 @@ impl Vm {
                 }
                 values.reverse();
                 let output: Vec<String> = values.iter().map(|v| v.to_string()).collect();
-                println!("{}", output.join(" "));
+                crate::builtin_core::write_stdout_line(&output.join(" "), line)?;
             }
             OpCode::Pop => {
                 // 単一 pop 時もセルをクリア
@@ -1278,8 +1278,10 @@ impl Vm {
             }
             "args" => {
                 crate::builtin_core::check_arity(name, &args, 0, line)?;
-                let argv: Vec<Value> = std::env::args()
+                // 非UTF-8のargvでもpanicさせない（AUD-035）
+                let argv: Vec<Value> = std::env::args_os()
                     .skip(1)
+                    .map(|arg| arg.to_string_lossy().into_owned())
                     .filter(|a| a != "--vm")
                     .skip(1) // スクリプトパスをスキップ
                     .map(Value::Str)

@@ -1,6 +1,6 @@
 # Tsumugi 言語仕様
 
-バージョン: 0.7
+バージョン: 0.8
 
 最終更新: 2026-08-28
 
@@ -713,10 +713,20 @@ end
 - リスト/辞書以外へのインデックス代入
 - `to_int` の変換失敗
 - ステップ上限超過
+- `print` の出力失敗（`io`）— 出力先が閉じられた場合など
+
+上記は例であり、網羅ではない。`e["type"]` で得られる種別は次のとおり。
+
+`zero_division`, `type`, `index`, `name`, `limit`, `overflow`, `sandbox`, `import`, `argument`, `int_overflow`, `control_flow`, `collection_limit`, `conversion`, `builtin_type`, `iteration`, `io`, `internal`, `runtime`
 
 ### キャッチできないエラー
 
 - パースエラー（構文エラー）— プログラムの実行前に発生するため
+- import 先ファイルの構文エラー — `import` はトップレベル限定のため `try` の内側に置けない
+
+### 出力の失敗
+
+`print` は標準出力への書き込みに失敗した場合、`io` 種別のランタイムエラーになる。パイプの読み取り側が先に終了した場合（`tsumugi script.tsg | head -1` など）もこれに該当し、捕捉しなければ診断を表示して終了コード1で終わる。CLI自身のREPLプロンプトやバナーの出力に失敗した場合は、スクリプトのエラーではなくCLIの診断として報告する。
 
 ## 組み込み関数
 

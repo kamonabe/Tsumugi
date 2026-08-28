@@ -32,15 +32,53 @@ fn main() {
     let builder = std::thread::Builder::new()
         .name("tsumugi-main".to_string())
         .stack_size(8 * 1024 * 1024); // 8MB
-    let handler = builder.spawn(run).unwrap();
+    let handler = match builder.spawn(run) {
+        Ok(handler) => handler,
+        Err(error) => {
+            eprintln!("エラー: 実行スレッドを作成できません: {}", error);
+            std::process::exit(1);
+        }
+    };
     if handler.join().is_err() {
         // パニック時（スタックオーバーフロー等）はそのまま異常終了
         std::process::exit(1);
     }
 }
 
+/// 標準出力へ書き出す。書き込めない場合は診断を出して終了する（AUD-035）
+///
+/// CLI自身のbannerとpromptに使う。スクリプトの`print`は構造化エラーを返すため、
+/// この関数ではなく`builtin_core::write_stdout_line`を通る。
+fn write_stdout(text: &str) {
+    let mut out = io::stdout().lock();
+    if let Err(error) = out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        eprintln!("エラー: 標準出力へ書き込めません: {}", error);
+        std::process::exit(1);
+    }
+}
+
+/// 標準入力から1行読む。読み取れない場合は診断を出して終了する（AUD-035）
+///
+/// 戻り値は読み取ったバイト数。0はEOF（Ctrl+D）を表す。
+fn read_stdin_line(line: &mut String) -> usize {
+    match io::stdin().read_line(line) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("エラー: 標準入力から読み取れません: {}", error);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn run() {
-    let args: Vec<String> = std_env::args().collect();
+    // 非UTF-8のargvでもpanicさせず、診断して終了する（AUD-035）
+    let args: Vec<String> = match std_env::args_os().map(|arg| arg.into_string()).collect() {
+        Ok(args) => args,
+        Err(invalid) => {
+            eprintln!("エラー: 引数がUTF-8ではありません: {:?}", invalid);
+            std::process::exit(1);
+        }
+    };
 
     // --vm フラグの検出
     let use_vm = args.iter().any(|a| a == "--vm");
@@ -93,25 +131,24 @@ fn run_file(path: &str) {
 
 /// REPL（対話実行モード）
 fn run_repl() {
-    println!("Tsumugi v0.1.0 — 終了するには Ctrl+D");
+    write_stdout("Tsumugi v0.1.0 — 終了するには Ctrl+D\n");
     let mut evaluator = Evaluator::new();
     let mut input = String::new();
 
     loop {
         // プロンプト表示
-        if input.is_empty() {
-            print!("tsumugi> ");
+        write_stdout(if input.is_empty() {
+            "tsumugi> "
         } else {
-            print!("      .. ");
-        }
-        io::stdout().flush().unwrap();
+            "      .. "
+        });
 
         // 1行読み取り
         let mut line = String::new();
-        let bytes = io::stdin().read_line(&mut line).unwrap();
+        let bytes = read_stdin_line(&mut line);
         if bytes == 0 {
             // Ctrl+D (EOF)
-            println!();
+            write_stdout("\n");
             break;
         }
 
@@ -187,23 +224,22 @@ fn run_file_vm(path: &str) {
 
 /// VMモードのREPL
 fn run_repl_vm() {
-    println!("Tsumugi v0.1.0 [VM mode] — 終了するには Ctrl+D");
+    write_stdout("Tsumugi v0.1.0 [VM mode] — 終了するには Ctrl+D\n");
     let mut input = String::new();
     let mut compiler = Compiler::new();
     let mut vm = Vm::new_repl();
 
     loop {
-        if input.is_empty() {
-            print!("tsumugi:vm> ");
+        write_stdout(if input.is_empty() {
+            "tsumugi:vm> "
         } else {
-            print!("         .. ");
-        }
-        io::stdout().flush().unwrap();
+            "         .. "
+        });
 
         let mut line = String::new();
-        let bytes = io::stdin().read_line(&mut line).unwrap();
+        let bytes = read_stdin_line(&mut line);
         if bytes == 0 {
-            println!();
+            write_stdout("\n");
             break;
         }
 

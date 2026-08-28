@@ -182,7 +182,7 @@ impl Evaluator {
                     let val = self.eval_expr(arg, line)?;
                     parts.push(val.to_string());
                 }
-                println!("{}", parts.join(" "));
+                crate::builtin_core::write_stdout_line(&parts.join(" "), line)?;
                 Ok(Some(Value::Null))
             }
             "input" => {
@@ -215,7 +215,11 @@ impl Evaluator {
                         format!("args() は引数0個ですが、{}個渡されました", args.len()),
                     ));
                 }
-                let argv: Vec<Value> = std::env::args().skip(2).map(Value::Str).collect();
+                // 非UTF-8のargvでもpanicさせない（AUD-035）
+                let argv: Vec<Value> = std::env::args_os()
+                    .skip(2)
+                    .map(|arg| Value::Str(arg.to_string_lossy().into_owned()))
+                    .collect();
                 crate::builtin_core::check_collection_size_public(argv.len(), line)?;
                 Ok(Some(Value::List(argv)))
             }

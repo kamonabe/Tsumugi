@@ -1442,3 +1442,94 @@ fn vm_try_unwind_preserves_existing_local_cell_promotion() {
         "try内で初めてcell化した既存localとescape closureが分離: {stdout}"
     );
 }
+
+// =============================================================
+// リグレッションテスト: CLI・標準I/Oのhost panic経路（AUD-035）
+// =============================================================
+
+/// 出力先が閉じた状態（`tsumugi script.tsg | head -1` 相当）でも
+/// `println!`のpanicでホストを落とさず、構造化エラーとして報告する。
+#[test]
+fn print_reports_closed_output_without_host_panic() {
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let dir = TestDir::new(&format!(
+            "closed-output-{}",
+            if use_vm { "vm" } else { "tree" }
+        ));
+        let script = std::path::Path::new(dir.as_str()).join("many_prints.tsg");
+        std::fs::write(&script, "for i in range(0, 100000)\n    print(i)\nend\n")
+            .unwrap_or_else(|error| panic!("{mode}: スクリプトを書けません: {error}"));
+
+        let mut command = Command::new(tsumugi_bin());
+        if use_vm {
+            command.arg("--vm");
+        }
+        command
+            .arg(&script)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("{mode}: 起動に失敗: {error}"));
+
+        // 1行だけ読み、残りを読まずに読み取り側を閉じる（パイプ切断）
+        {
+            use std::io::BufRead as _;
+            let stdout = child
+                .stdout
+                .take()
+                .unwrap_or_else(|| panic!("{mode}: stdoutを取得できません"));
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut first_line = String::new();
+            reader.read_line(&mut first_line).ok();
+        }
+
+        let output = wait_with_timeout(child, DEFAULT_TIMEOUT, &format!("{mode} closed output"));
+        let stderr = normalize(&String::from_utf8_lossy(&output.stderr));
+
+        assert!(
+            !stderr.contains("panicked at"),
+            "{mode}: 出力先の切断でhost panicが発生: {stderr}"
+        );
+        assert!(
+            !output.status.success(),
+            "{mode}: 出力失敗が成功扱いになっています: {stderr}"
+        );
+        assert!(
+            stderr.contains("標準出力への書き込みに失敗しました"),
+            "{mode}: 構造化された出力エラーが報告されていません: {stderr}"
+        );
+    }
+}
+
+/// 非UTF-8のargvで`std::env::args()`がpanicせず、診断して終了する。
+#[cfg(unix)]
+#[test]
+fn rejects_non_utf8_argument_without_host_panic() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let invalid = std::ffi::OsStr::from_bytes(&[0xff, 0xfe]);
+    let child = Command::new(tsumugi_bin())
+        .arg(invalid)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("起動に失敗: {error}"));
+
+    let output = wait_with_timeout(child, DEFAULT_TIMEOUT, "non-utf8 argv");
+    let stderr = normalize(&String::from_utf8_lossy(&output.stderr));
+
+    assert!(
+        !stderr.contains("panicked at"),
+        "非UTF-8のargvでhost panicが発生: {stderr}"
+    );
+    assert!(
+        !output.status.success(),
+        "非UTF-8のargvが成功扱いになっています: {stderr}"
+    );
+    assert!(
+        stderr.contains("UTF-8"),
+        "UTF-8でないことを説明する診断がありません: {stderr}"
+    );
+}

@@ -238,7 +238,7 @@ let result = filter(test, fn(item) item != "kani" end)
 - `TsumugiError` enum でパースエラー（`Parse`）とランタイムエラー（`Runtime`）を構造的に区別
 - 各バリアントに `line: usize` と `message: String` を保持
 - `Runtime` バリアントには `kind: ErrorKind` フィールドを持ち、エラーの種別を構造的に表現する
-- `ErrorKind` enum（17バリアント）: `ZeroDivision`, `Type`, `Index`, `Name`, `StepLimit`, `StackOverflow`, `Sandbox`, `Import`, `Argument`, `IntOverflow`, `ControlFlow`, `CollectionLimit`, `Conversion`, `BuiltinType`, `Iteration`, `Internal`, `Runtime`
+- `ErrorKind` enum（18バリアント）: `ZeroDivision`, `Type`, `Index`, `Name`, `StepLimit`, `StackOverflow`, `Sandbox`, `Import`, `Argument`, `IntOverflow`, `ControlFlow`, `CollectionLimit`, `Conversion`, `BuiltinType`, `Iteration`, `Io`, `Internal`, `Runtime`
 - `error_type()` メソッドは `kind.as_str()` を返す — try/catch で `e["type"]` として利用される
 - `Display` 実装で「N行目: メッセージ」形式の出力を生成（従来と同じ形式を維持）
 - 全箇所で `TsumugiError::runtime(line, msg)`（メッセージから kind を自動推定）/ `TsumugiError::runtime_with_kind(line, kind, msg)`（明示指定）/ `TsumugiError::parse(line, msg)` コンストラクタを使用
@@ -293,7 +293,7 @@ GitHub Actions (`.github/workflows/ci.yml`) で push / PR 時に自動実行:
 
 ## 設計時の文法スナップショット（revision v0.3）
 
-この番号は設計履歴上の文法revisionであり、規範となる最新仕様は[`language-spec.md`](language-spec.md)のversion 0.7、実装packageは0.1.0である。構文を変更する場合は、まず規範仕様と`LANG_GUIDE.md`を更新し、この節は設計履歴として扱う。
+この番号は設計履歴上の文法revisionであり、規範となる最新仕様は[`language-spec.md`](language-spec.md)のversion 0.8、実装packageは0.1.0である。構文を変更する場合は、まず規範仕様と`LANG_GUIDE.md`を更新し、この節は設計履歴として扱う。
 
 ```
 program        = top_level_stmt*
@@ -709,6 +709,20 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 
 ## 変更履歴
+
+### 2026-08-28: CLI・標準I/Oのhost panic経路を構造化（AUD-035）
+
+**問題:** 標準I/Oの失敗がpanicへ直結していた。`print`は`println!`を使うため、`tsumugi script.tsg | head -1`のような通常のパイプ利用でbroken pipeになり、tree/VMとも`failed printing to stdout`でpanicした。REPLも`io::stdout().flush().unwrap()`と`io::stdin().read_line().unwrap()`を持ち、出力先が閉じた状態で起動するだけでpanicした。さらにUnixの非UTF-8 argvは`std::env::args()`が内部でunwrapするため、`tsumugi $'\xff'`でpanicした。実行スレッドの`spawn().unwrap()`も同様である。いずれもscriptの結果ではなくホストの異常終了になり、「失敗を観測可能な結果として扱う」というマニフェストの方針と衝突していた。
+
+**決定:** 失敗の扱いを層で分ける。scriptの`print`はランタイムエラー（`io`種別）として返し、`try` / `catch`で捕捉でき、捕捉しなければ通常のエラー表示と終了コード1になる。CLI自身のbanner・prompt・stdin読み取り・スレッド生成・argv検証はscriptのエラーではないため、stderrへ診断を出して終了コード1で終える。broken pipeを終了コード0の暗黙成功にはしない。パイプ切断は観測できる失敗として扱う方が、監査可能性を優先する方針と整合する。
+
+**実装:** `ErrorKind::Io`（`e["type"]`は`io`）を追加し、`builtin_core::write_stdout_line`でロック済みstdoutへ`writeln!`して失敗を構造化エラーへ変換する。tree版`print`（`builtin.rs`）とVMの`OpCode::Print`（`vm.rs`）はこの関数を共有する。`main.rs`には`write_stdout` / `read_stdin_line`を置き、両REPLのbanner・prompt・EOF改行・行読み取りをこれらに置き換えた。argvは`args_os()`で受けて`into_string()`で検証し、非UTF-8なら診断して終了する。`args()` builtinも`args_os()`＋lossy変換にしてlibrary利用時のpanicを避けた。
+
+**不採用案:** broken pipeを静かに終了コード0で終わらせる案はUnixの慣習に近いが、出力が途中で失われたことをホストから観測できない。SIGPIPEを既定動作へ戻す案（`signal(SIGPIPE, SIG_DFL)`）はプロセス全体の挙動を変え、組み込み用途でホストの設定を壊す。`print`の失敗を無視して`null`を返す案は、書き込み失敗を検知できないまま処理が進む。
+
+**互換性と境界:** 出力先が正常なら挙動は変わらない。パイプ切断時は、panic出力の代わりに`N行目: 標準出力への書き込みに失敗しました: ...`が出て終了コード1になる。`io`種別が増えたため、`e["type"]`を網羅的に分岐しているscriptは追従が必要である。`input()`は従来どおり読み取り失敗を`null`にする。スクリプトが`io`エラーを捕捉して`print`を繰り返す場合は失敗し続けるが、ステップ予算で停止する。
+
+**回帰テスト:** 統合テストで、100,000行を出力するscriptの1行目だけ読んでからパイプを閉じ、tree/VM双方でhost panicが出ないこと、終了コードが非0であること、構造化された出力エラーが報告されることを検証する。Unixでは非UTF-8 argvを渡し、panicせず終了コード1でUTF-8に関する診断が出ることを検証する。修正前のコードでは両テストがpanic検出で失敗する。
 
 ### 2026-08-28: tree呼び出し時のglobal scope複製を除去（AUD-046）
 
