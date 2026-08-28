@@ -259,9 +259,12 @@ fixture 追加手順は、`.tsg` と期待ファイルを置き、`fixture_tests
 
 ### スケーリングテスト
 
-`tests/scaling.rs` は計算量オーダーを固定する。実時間はCIランナーの負荷で揺れるため、カウントアロケータで**確保バイト数**を測り、入力を2倍にしたときの伸びが線形（約2倍）に収まることを両engineで検証する。二次なら約4倍になるため、O(n^2)への退行を決定的に検出できる。
+`tests/scaling.rs` は計算量オーダーを固定する。実時間はCIランナーの負荷で揺れるため、カウントアロケータで**確保バイト数**を測る。検証している性質は次の2つで、いずれも両engineで確認する。
 
-グローバルアロケータでプロセス全体の確保量を数えるため、このテストバイナリには計測を行うテストを1つだけ置く（並列実行による相互汚染を避ける）。
+- `for` の反復コストが要素数に線形であること（入力2倍で確保量が約2倍。二次なら約4倍になる）
+- 関数呼び出しのコストが関数body長に依存しないこと（到達しない文でbodyだけを膨らませ、同じ回数呼び出して比較する）
+
+グローバルアロケータでプロセス全体の確保量を数えるため、測定中は `MEASURE_LOCK` を保持して直列化する。ロックのpoisonは無視し、ある測定が失敗しても他の測定が続行できるようにする。
 
 ### CI
 
@@ -385,7 +388,7 @@ let f = fn(x) x * 2 end
 
 - 関数値の等価性は仕様上常に`false`とする方針だが、現行treeは型エラー、VMは`false`となるためAUD-014で統一する
 - 循環参照: `Rc<RefCell>`にはcycle collectorがなく、捕捉変数のListへその変数を捕捉したclosureを`push`すると、`cell → List → closure → cell`の循環を言語コードから構成できる。短命なscriptでは影響が限定的でも、REPLや長時間実行では解放されないメモリが累積し得る
-- 捕捉範囲: treeは定義時に見える全bindingを共有し、VMは自由変数だけをupvalue化する。treeではclosure生成コストと不要な値の生存期間が可視binding数に比例する
+- 捕捉範囲: treeは定義時に見える全bindingを共有し、VMは自由変数だけをupvalue化する。treeではclosure生成コストと不要な値の生存期間が可視binding数に比例する。さらにクロージャを保持するコンテナまで捕捉すると参照循環になりメモリが解放されない（AUD-042）
 - 意味論の重複: 共通Resolver/HIRはなく、scope・名前解決・call・比較・mutation・importの規則をEvaluatorとCompiler/VMが別々に実装する。拡張時はdifferential testで両engineの観測可能な挙動を固定する必要がある
 - パフォーマンス: `RefCell`の実行時借用チェックに加え、値cloneやVMのstack/cell管理コストがある。VMが常に高速とは限らず、workloadごとに優劣が異なる。判断はフェーズ別ベンチマーク（`parse` / `compile` / `execute` / `end_to_end`）の実測に基づき、最新値は `docs/roadmap.md` のスナップショットに記録する
 
@@ -687,6 +690,20 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 
 ## 変更履歴
+
+### 2026-08-27: tree関数値のRc共有化（AUD-040）
+
+**問題:** AUD-038でフェーズ別に計測したところ、treeの`fib_20`が旧スナップショットの14.982 msから28.349 msへ遅くなっていた。二分探索の結果、AUD-037で入れた呼び出し時self-bindingが原因で、`self.env.set(func_name, func_value.clone())`が毎回`Value::Fn`を複製していた。`Value::Fn`は`body: Vec<Stmt>`を値で持つため、呼び出しごとに関数本体のASTを深くコピーしていた。`env.get`による取得時の複製と合わせて1回の呼び出しで2回、さらに`captured`のHashMapも同数複製していた。body 2文の関数を300回呼ぶと909,821バイト、body 100文なら14,457,505バイト（比15.89）を確保していた。
+
+**決定:** 関数値の不変部分を`Rc`で共有する。VM側の`VmFn`が`Rc<Chunk>`で同じ問題を避けているため、新しい方針ではなくtreeへの適用である。`captured`は定義時に作って以後読むだけで、中のセルは元から共有参照なので、マップ自体も`Rc`で共有して差し支えない。AUD-037が定めた「呼び出し時にself-bindingする」意味論は変えず、複製を安くするだけに留める。
+
+**実装:** `value.rs`に`FnDef { name, params, body }`を追加し、`Value::Fn { def: Rc<FnDef>, captured: Rc<HashMap<String, SharedValue>> }`とした。`eval_call`と`call_fn_value`（map/filter/each経路）は`Rc::clone`で借用から切り離してから本体を実行する。定義時（`Stmt::FnDef` / `Expr::Lambda`）はASTから本体を一度複製して`Rc`へ入れる。
+
+**不採用案:** self-bindingでbinding cellを共有する案（`set_shared`）は、本体内で関数名へ再代入した場合に外側のbindingまで書き換わるため、意味論が変わる。`body`だけを`Rc`にする案は`captured`と`params`の複製が残る。AST側の本体まで共有して定義時の複製もなくす案は、`ast.rs`とparser・compilerへ波及するため、効果を`closure_def_200`で測ってから判断する。
+
+**互換性と境界:** 言語の観測可能な挙動は変わらない。`Value::Fn`は`def`と`captured`の2フィールドになるため、パターンマッチしている箇所は追従が必要。定義時の本体複製は残るため、ループ内でクロージャを生成する場合のコストは本体長に比例する。treeの捕捉範囲が広いことによる参照循環（AUD-042）は本変更の対象外で、`93b7606`と同じ挙動である。
+
+**回帰テスト:** `tests/scaling.rs`に、到達しない文で本体だけを膨らませた関数を同じ回数呼び出し、確保量が本体長に比例しないことを検証する測定を追加した（比15.89 → 1.06）。グローバルアロケータを共有するため、測定は`MEASURE_LOCK`で直列化する。関数の意味論（再帰、関数内named関数の自己参照、相互再帰、第一級関数、クロージャの状態共有、self-bindingのparameter shadow、再定義、map/filter/each経由のcallback、arity・非関数呼び出し・深い再帰のエラー）はtree/VMの差分比較で一致を確認した。
 
 ### 2026-08-27: ベンチマークのフェーズ分離とVM forループの計算量修正（AUD-038）
 

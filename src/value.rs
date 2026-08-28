@@ -9,6 +9,18 @@ use crate::chunk::Chunk;
 /// 共有可能な変数セル（参照キャプチャ用）
 pub type SharedValue = Rc<RefCell<Value>>;
 
+/// ツリーウォーク用関数の不変部分
+///
+/// 呼び出しごとに本体ASTを複製しないよう `Rc` で共有する。
+/// VM側の `VmFn` が `Rc<Chunk>` で同じ問題を避けているのと同じ方針。
+#[derive(Debug)]
+pub struct FnDef {
+    /// 関数名（無名関数は `<lambda>`）
+    pub name: String,
+    pub params: Vec<String>,
+    pub body: Vec<Stmt>,
+}
+
 /// Tsumugi の実行時の値
 #[derive(Clone)]
 pub enum Value {
@@ -20,11 +32,12 @@ pub enum Value {
     List(Vec<Value>),
     Dict(BTreeMap<String, Value>),
     /// 関数値（ツリーウォーク用: ユーザー定義関数を値として扱う）
+    /// `Rc` により関数呼び出し・self-binding・クロージャ生成時のディープコピーを回避
     Fn {
-        name: String,
-        params: Vec<String>,
-        body: Vec<Stmt>,
-        captured: HashMap<String, SharedValue>,
+        /// 定義時に確定する不変部分（名前・引数・本体）
+        def: Rc<FnDef>,
+        /// 定義時にキャプチャした変数セル。セル自体は参照共有される
+        captured: Rc<HashMap<String, SharedValue>>,
     },
     /// VM用関数値（コンパイル済みバイトコード）
     /// Rc<Chunk> により関数呼び出し・クロージャ生成時のディープコピーを回避
@@ -85,8 +98,8 @@ impl std::fmt::Debug for Value {
             Value::Null => write!(f, "Null"),
             Value::List(items) => write!(f, "List({:?})", items),
             Value::Dict(map) => write!(f, "Dict({:?})", map),
-            Value::Fn { name, params, .. } => {
-                write!(f, "Fn({}, params={:?})", name, params)
+            Value::Fn { def, .. } => {
+                write!(f, "Fn({}, params={:?})", def.name, def.params)
             }
             Value::VmFn { name, arity, .. } => {
                 write!(f, "VmFn({}, arity={})", name, arity)
@@ -140,8 +153,8 @@ impl std::fmt::Display for Value {
                     .collect();
                 write!(f, "{{{}}}", parts.join(", "))
             }
-            Value::Fn { name, params, .. } => {
-                write!(f, "<fn {}({})>", name, params.join(", "))
+            Value::Fn { def, .. } => {
+                write!(f, "<fn {}({})>", def.name, def.params.join(", "))
             }
             Value::VmFn { name, params, .. } => {
                 write!(f, "<fn {}({})>", name, params.join(", "))

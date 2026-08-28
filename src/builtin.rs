@@ -33,12 +33,13 @@ impl Evaluator {
             ));
         }
         match func {
-            Value::Fn {
-                name,
-                params,
-                body,
-                captured,
-            } => {
+            Value::Fn { def, captured } => {
+                // Rcを複製して以降の借用から切り離す（値の複製は起きない）
+                let def = std::rc::Rc::clone(def);
+                let captured = std::rc::Rc::clone(captured);
+                let name = def.name.as_str();
+                let params = &def.params;
+
                 if arg_values.len() != params.len() {
                     return Err(TsumugiError::runtime(
                         line,
@@ -51,7 +52,7 @@ impl Evaluator {
                     ));
                 }
                 let saved_scopes = self.env.push_call_frame();
-                for (k, cell) in captured {
+                for (k, cell) in captured.iter() {
                     self.env.set_shared(k, cell.clone());
                 }
                 // 通常callと同じく、名前付き関数を宣言名へself-bindする。
@@ -65,12 +66,12 @@ impl Evaluator {
 
                 use crate::error::TraceFrame;
                 self.call_stack.push(TraceFrame {
-                    name: name.clone(),
+                    name: name.to_string(),
                     line,
                 });
 
                 let mut result = Value::Null;
-                for stmt in body {
+                for stmt in &def.body {
                     match self.exec_stmt(stmt) {
                         Ok(super::EvalResult::Return(v)) => {
                             result = v;
