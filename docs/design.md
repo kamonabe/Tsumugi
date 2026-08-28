@@ -710,6 +710,20 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 ## 変更履歴
 
+### 2026-08-28: VMの内部不変条件をinternal errorへ置換（AUD-023）
+
+**問題:** VMは`self.frames.last().unwrap()`や`chunk.constants[idx]`のように、compilerが正しい命令列を作ることを前提とした無検査アクセスを多く持っていた。公開APIの`Vm::new` / `Vm::run_repl_chunk`は任意の`Chunk`を受け取るため、library利用者が手組みしたbytecodeではこれらがRustのindex panicやunwrap panicになり、ホストプロセスが落ちた。実測では、範囲外のlocal slot・定数index・upvalue index、行番号表が命令列より短いChunk、関数先頭の`MakeClosure`によるoperand計算のunderflowが、それぞれ`src/vm.rs`のindexアクセスでpanicした。`dispatch`の`unreachable!()`も同種の到達点だった。
+
+**決定:** 内部不変条件の破れを`internal`種別の構造化エラーとして返す。エラーメッセージは原因（どの参照が不正か）を示し、行番号は命令に対応するものを使う。scriptの書き方で防ぐのではなく、VM側で必ず検査する。`Chunk::patch_jump`はbytecodeを組み立てる側のAPIなので今回の対象に含めず、compilerの不変条件として残す。
+
+**実装:** `internal_error(line, message)`を追加し、`frame` / `frame_mut` / `take_frame` / `set_ip` / `constant` / `upvalue_cell` / `local_stack_index` / `require_stack_len`を通して参照する形へ統一した。`get_local` / `set_local` / `ensure_local_cell`は`Result`を返すよう変更し、呼び出し側で`?`を伝播する。`Print` / `PopN` / `FStrConcat` / `CallBuiltin` / `MakeClosure`は取り出す個数を先に検査するため、巨大なoperandで`Vec::with_capacity`が過大な確保を行うこともない。`Pop` / `PopN`のslot計算と`MakeClosure`の命令位置計算は`checked_sub`にした。`ReturnValue` / `Return` / `SetupTry` / `TeardownTry`が`dispatch`へ到達した場合は`unreachable!()`ではなくinternal errorを返す。これで本番コードから`unwrap()`・`expect()`・`unreachable!()`はなくなった。
+
+**不採用案:** `debug_assert!`で開発時だけ検査する案は、releaseビルドのライブラリ利用者を守れない。`Chunk`を検証してから実行するvalidator方式は、jump先の到達可能性やstack効果の静的検証が必要で、今回の目的（panicを構造化エラーに変える）に対して過大である。将来bytecodeを外部から読み込む機能を入れる場合に改めて検討する。
+
+**互換性と境界:** compilerが生成した正しいChunkでは挙動が変わらない。golden fixtureのtree/VM出力一致で確認した。ライブラリ利用者から見ると、これまでpanicだった状況が`internal`種別のランタイムエラーになる。`internal`はscriptから`try` / `catch`で捕捉できるが、これは処理系のバグまたは不正なbytecodeを示すため、捕捉して継続することは推奨しない。
+
+**回帰テスト:** 公開APIだけを使う`tests/defensive_vm.rs`を追加し、範囲外のlocal読み書き・定数参照・upvalue参照、stackが足りない`FStrConcat` / `PopN` / `Print` / `CallBuiltin`、関数先頭の`MakeClosure`、行番号表が空のChunk、`dispatch`へ到達する`try`命令の8ケースを検証する。VM実装を修正前へ戻すと、これらは`index out of bounds`のpanicで失敗する。`src/vm.rs`側には内部実装と一緒に読める最小ケースだけ残した。
+
 ### 2026-08-28: CLI・標準I/Oのhost panic経路を構造化（AUD-035）
 
 **問題:** 標準I/Oの失敗がpanicへ直結していた。`print`は`println!`を使うため、`tsumugi script.tsg | head -1`のような通常のパイプ利用でbroken pipeになり、tree/VMとも`failed printing to stdout`でpanicした。REPLも`io::stdout().flush().unwrap()`と`io::stdin().read_line().unwrap()`を持ち、出力先が閉じた状態で起動するだけでpanicした。さらにUnixの非UTF-8 argvは`std::env::args()`が内部でunwrapするため、`tsumugi $'\xff'`でpanicした。実行スレッドの`spawn().unwrap()`も同様である。いずれもscriptの結果ではなくホストの異常終了になり、「失敗を観測可能な結果として扱う」というマニフェストの方針と衝突していた。
