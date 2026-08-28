@@ -1,0 +1,70 @@
+true
+true
+true
+true
+false
+true
+false
+true
+true
+false
+true
+false
+true
+true
+false
+false
+true
+true
+false
+true
+false
+false
+false
+false
+false
+false
+false
+false
+false
+false
+false
+false
+true
+true
+true
+false
+true
+false
+true
+true
+true
+true
+false
+false
+true
+true
+false
+true
+false
+true
+true
+true
+false
+true
+true
+true
+true
+true
+true
+Str < Str: type
+Bool < Bool: type
+Null < Null: type
+List < List: type
+Dict <= Dict: type
+Fn > Fn: type
+Error >= Error: type
+Int < Str: type
+Int < "ゼロ除算": type
+Int + "ゼロ除算": type
+Int < Error: type

@@ -57,7 +57,7 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 | AUD-011 | VMのcompile-time name resolution差を仕様化／縮小する | dead branchの未定義名、global forward reference、引数評価順がtreeと異なる | ✅ call validation順とruntime global fallbackを統一（dead code・forward read/write・mutual recursion・REPL/import回帰テスト追加） |
 | AUD-012 | context依存builtinの契約を統一する | `input(side())`等の不正arityでtreeは引数を評価せず、VMは副作用後に拒否する。`push`/`pop`はupvalue・一時List・error kindにも差がある | ✅ builtin選択後のarity・破壊対象を引数評価前に検査。一時List拒否、left-to-right snapshot/writeback、local/upvalue/runtime global更新、collection error kindをtree/VMで統一 |
 | AUD-013 | VM index assignmentのupvalue対応と評価順を統一する | captured listへ代入不可。object取得順の違いで副作用後に古いlistを書き戻す | ✅ target解決→index→value→in-place更新へ統一。local/upvalue/runtime global対応、未定義targetの先行報告、共有`assign_index`によるメッセージ・境界判定一致（golden pair・両engine REPL回帰テスト追加） |
-| AUD-014 | equality / relational comparisonの対象型を統一する | List/Dict/Function/Error、Int×Floatでtreeはtype error、VMはboolを返す場合がある | ⬜ 仕様確定待ち |
+| AUD-014 | equality / relational comparisonの対象型を統一する | List/Dict/Function/Error、Int×Floatでtreeはtype error、VMはboolを返す場合がある。486ケース（9型×9型×6演算子）の網羅比較で128件の差分を確認した | ✅ 完了（等価比較を全型で成立させ、Int×Floatを数値比較、List/Dict/Errorを構造比較、関数値を`Rc::ptr_eq`の同一性比較へ統一。大小比較は数値のみ（混在可）。判定を`Value::PartialEq`へ集約し、486ケースの差分が0件。付随して型エラーの種別をkind明示へ変え、被演算子の値による誤分類も解消。仕様revisionを0.9へ） |
 | AUD-029 | 複数行lambdaの終端`end`を必須検証する | `let f = fn(x)\n return x`をtree/VMとも構文エラーにせず終了コード0で受理する。EOFを`end`として無条件消費している | ✅ Parserで`End`を必須検証し、tree/VM共通でEOFを構文エラー化 |
 | AUD-030 | top-level importの評価時点を統一／仕様化する | `print("BEFORE")`後の失敗importでtreeだけ先行出力する。実行中に生成したmoduleもtreeだけimport可能で、VMのcompile-time inlineと観測可能な差がある | ⬜ 仕様確定待ち（両engine差を再現済み） |
 | AUD-031 | Windowsで`TSUMUGI_*`環境変数保護をcase-insensitiveにする | Windowsの環境変数検索は大文字小文字を区別しないがprefix検査は区別するため、`env("tsumugi_sandbox")`等で保護値を読める可能性がある | ✅ Unicode uppercase後のprefix保護を実装。tree/VM、allow-list未設定/全許可、ASCII大小文字・Unicode case alias・secret非漏洩をWindows実OS CIで確認 |
@@ -202,7 +202,7 @@ tree側は旧スナップショットより遅くなっている（`fib_20` 14.9
 ### 追加監査後の推奨改修順
 
 1. **停止性・ホスト安定性:** AUD-023 / AUD-026 / AUD-027 / AUD-028 / AUD-035 / AUD-043は完了。timeout・深度境界・host abortなしを継続検証する。`Chunk::patch_jump`は不正なoffsetでpanicするビルダーAPIとして残るため、compiler側の不変条件として扱う。
-2. **誤実行・安全境界:** AUD-012 / AUD-013 / AUD-029 / AUD-031 / AUD-037は完了。意味論選択が必要なAUD-014 / AUD-030は仕様決定後に実装する。AUD-043はトップレベル`return`をパースエラーへ統一し、panic・無言終了・import時のengine差を同時に解消した。
+2. **誤実行・安全境界:** AUD-012 / AUD-013 / AUD-014 / AUD-029 / AUD-031 / AUD-037は完了。意味論選択が必要な残件はAUD-030（top-level importの評価時点）で、仕様決定後に実装する。AUD-043はトップレベル`return`をパースエラーへ統一し、panic・無言終了・import時のengine差を同時に解消した。
 3. **品質基盤:** AUD-022のharness整備、AUD-038の測定分離、AUD-040のtree呼び出しコスト、AUD-041のコレクション読み取り、AUD-042のclosure捕捉範囲、AUD-046のglobal複製は完了。次はAUD-025（VM REPL checkpointの複製）とAUD-047（コレクションのcopy-on-write）を検討し、その後にP2境界とfuzzを拡充する。
 4. **文書・配布:** AUD-021に続き、AUD-044でREADMEと規範仕様の古い記述を除き、AUD-045で実行手順とtoolchain下限を明示する。
 
@@ -251,7 +251,7 @@ tree側は旧スナップショットより遅くなっている（`fib_20` 14.9
 - [x] `From<String>` 廃止（全エラー生成箇所を `TsumugiError::runtime()` に統一、文字列再パース除去）
 - [x] import のサンドボックス対応（`TSUMUGI_SANDBOX` 設定時に import 先パスも検証、ツリーウォーク版/VM版両対応）
 - [x] 環境変数アクセス制御（`TSUMUGI_ENV_ALLOW` で env() の読み取り可能キーを許可リスト制限）
-- [x] 浮動小数点 IEEE 754 の基本挙動（VMのFloatゼロ除算をinf/NaNに修正、ツリーウォークにFloat比較armを追加。異種型・複合値を含む比較parityはAUD-014で継続）
+- [x] 浮動小数点 IEEE 754 の基本挙動（VMのFloatゼロ除算をinf/NaNに修正、ツリーウォークにFloat比較armを追加。異種型・複合値を含む比較parityはAUD-014で解消）
 - [x] セキュリティ強化（コールフレーム深度制限 MAX_CALL_DEPTH=128、map/filter/each ステップカウント修正、TSUMUGI_* 環境変数ブロック）
 - [x] f-string（文字列補間）— `f"hello, {expr}"` 構文。レキサー/パーサー/評価器/VM全対応
 - [x] 構造化エラー — try/catch で `Value::Error` を返す。`e["type"]` / `e["message"]` / `e["line"]` でアクセス可能。既存の文字列結合との互換性を維持

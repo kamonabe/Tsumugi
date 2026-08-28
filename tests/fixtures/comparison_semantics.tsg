@@ -1,0 +1,154 @@
+# 比較演算の規範意味論（AUD-014）
+# 等価比較は全ての型の組み合わせで結果を返し、大小比較は数値だけを対象にする。
+
+let err = null
+try
+    let bad = 1 / 0
+catch e
+    err = e
+end
+let plain = fn(x) return x end
+fn make_counter()
+    let n = 0
+    return fn() return n end
+end
+
+# --- 同じ型の等価比較 ---
+print(1 == 1)
+print(1 != 2)
+print(1.5 == 1.5)
+print("a" == "a")
+print("a" == "b")
+print(true == true)
+print(true == false)
+print(null == null)
+print([1, 2] == [1, 2])
+print([1, 2] == [2, 1])
+print({"a": 1} == {"a": 1})
+print({"a": 1} == {"b": 1})
+print(err == err)
+
+# --- IntとFloatは数値として比較する ---
+print(1 == 1.0)
+print(1 != 1.0)
+print(1 == 1.5)
+print([1] == [1.0])
+print({"a": 1} == {"a": 1.0})
+
+# --- NaNはIEEE 754どおり自分自身と等しくない ---
+let nan = 0.0 / 0.0
+print(nan == nan)
+print(nan != nan)
+print(1 == nan)
+
+# --- 型が違う値は等しくない（エラーにしない） ---
+print(1 == "1")
+print(1 == true)
+print(1 == null)
+print(1 == [1])
+print(1 == {"a": 1})
+print(1 == plain)
+print(1 == err)
+print("1" == [1])
+print(true == null)
+print([1] == {"a": 1})
+print(plain == err)
+print(1 != "1")
+print(null != [1])
+
+# --- ネストした構造も要素ごとに比較する ---
+print([[1], [2]] == [[1], [2]])
+print([[1], [2]] == [[1], [3]])
+print({"a": [1], "b": {"c": 2}} == {"a": [1], "b": {"c": 2}})
+print({"a": [1]} == {"a": [2]})
+
+# --- 関数値は同一の関数値とだけ等しい ---
+let same = plain
+print(plain == plain)
+print(plain == same)
+let counter_a = make_counter()
+let counter_b = make_counter()
+let counter_alias = counter_a
+print(counter_a == counter_a)
+print(counter_a == counter_alias)
+print(counter_a == counter_b)
+print(plain == counter_a)
+
+# --- 等価規則は contains でも共有する ---
+print(contains([1, 2], 2))
+print(contains([1, 2], 2.0))
+print(contains([1, 2], "2"))
+print(contains([plain], plain))
+print(contains([plain], counter_a))
+
+# --- 大小比較は数値のみ。IntとFloatは跨いで比較できる ---
+print(1 < 2)
+print(2 <= 2)
+print(3 > 2)
+print(3 >= 4)
+print(1.5 < 2.5)
+print(1 < 1.5)
+print(1.5 < 2)
+print(2 > 1.5)
+print(1.0 <= 1)
+print(1 >= 1.0)
+
+# --- 数値以外の大小比較は型エラー ---
+try
+    print("a" < "b")
+catch e
+    print("Str < Str: " + e["type"])
+end
+try
+    print(true < false)
+catch e
+    print("Bool < Bool: " + e["type"])
+end
+try
+    print(null < null)
+catch e
+    print("Null < Null: " + e["type"])
+end
+try
+    print([1] < [2])
+catch e
+    print("List < List: " + e["type"])
+end
+try
+    print({"a": 1} <= {"a": 2})
+catch e
+    print("Dict <= Dict: " + e["type"])
+end
+try
+    print(plain > plain)
+catch e
+    print("Fn > Fn: " + e["type"])
+end
+try
+    print(err >= err)
+catch e
+    print("Error >= Error: " + e["type"])
+end
+try
+    print(1 < "2")
+catch e
+    print("Int < Str: " + e["type"])
+end
+
+# --- 被演算子の値でエラー種別が変わらない ---
+let tricky = "ゼロ除算"
+try
+    print(1 < tricky)
+catch e
+    print("Int < \"ゼロ除算\": " + e["type"])
+end
+try
+    print(1 + tricky)
+catch e
+    print("Int + \"ゼロ除算\": " + e["type"])
+end
+try
+    print(1 < err)
+catch e
+    print("Int < Error: " + e["type"])
+end

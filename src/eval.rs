@@ -685,43 +685,36 @@ impl Evaluator {
                 Ok(Value::Str(format!("{}{}", l, r)))
             }
 
-            // 比較演算（整数）
-            (Value::Int(l), BinOpKind::Eq, Value::Int(r)) => Ok(Value::Bool(l == r)),
-            (Value::Int(l), BinOpKind::NotEq, Value::Int(r)) => Ok(Value::Bool(l != r)),
+            // 大小比較は数値だけを対象にする。IntとFloatは跨いで比較できる（AUD-014）
             (Value::Int(l), BinOpKind::Lt, Value::Int(r)) => Ok(Value::Bool(l < r)),
             (Value::Int(l), BinOpKind::Gt, Value::Int(r)) => Ok(Value::Bool(l > r)),
             (Value::Int(l), BinOpKind::LtEq, Value::Int(r)) => Ok(Value::Bool(l <= r)),
             (Value::Int(l), BinOpKind::GtEq, Value::Int(r)) => Ok(Value::Bool(l >= r)),
-
-            // 比較演算（浮動小数点）
-            (Value::Float(l), BinOpKind::Eq, Value::Float(r)) => Ok(Value::Bool(l == r)),
-            (Value::Float(l), BinOpKind::NotEq, Value::Float(r)) => Ok(Value::Bool(l != r)),
             (Value::Float(l), BinOpKind::Lt, Value::Float(r)) => Ok(Value::Bool(l < r)),
             (Value::Float(l), BinOpKind::Gt, Value::Float(r)) => Ok(Value::Bool(l > r)),
             (Value::Float(l), BinOpKind::LtEq, Value::Float(r)) => Ok(Value::Bool(l <= r)),
             (Value::Float(l), BinOpKind::GtEq, Value::Float(r)) => Ok(Value::Bool(l >= r)),
+            (Value::Int(l), BinOpKind::Lt, Value::Float(r)) => Ok(Value::Bool((*l as f64) < *r)),
+            (Value::Int(l), BinOpKind::Gt, Value::Float(r)) => Ok(Value::Bool((*l as f64) > *r)),
+            (Value::Int(l), BinOpKind::LtEq, Value::Float(r)) => Ok(Value::Bool((*l as f64) <= *r)),
+            (Value::Int(l), BinOpKind::GtEq, Value::Float(r)) => Ok(Value::Bool((*l as f64) >= *r)),
+            (Value::Float(l), BinOpKind::Lt, Value::Int(r)) => Ok(Value::Bool(*l < (*r as f64))),
+            (Value::Float(l), BinOpKind::Gt, Value::Int(r)) => Ok(Value::Bool(*l > (*r as f64))),
+            (Value::Float(l), BinOpKind::LtEq, Value::Int(r)) => Ok(Value::Bool(*l <= (*r as f64))),
+            (Value::Float(l), BinOpKind::GtEq, Value::Int(r)) => Ok(Value::Bool(*l >= (*r as f64))),
 
-            // 比較演算（文字列）
-            (Value::Str(l), BinOpKind::Eq, Value::Str(r)) => Ok(Value::Bool(l == r)),
-            (Value::Str(l), BinOpKind::NotEq, Value::Str(r)) => Ok(Value::Bool(l != r)),
-
-            // 比較演算（null との等価比較）
-            (Value::Null, BinOpKind::Eq, Value::Null) => Ok(Value::Bool(true)),
-            (Value::Null, BinOpKind::NotEq, Value::Null) => Ok(Value::Bool(false)),
-            (_, BinOpKind::Eq, Value::Null) => Ok(Value::Bool(false)),
-            (_, BinOpKind::NotEq, Value::Null) => Ok(Value::Bool(true)),
-            (Value::Null, BinOpKind::Eq, _) => Ok(Value::Bool(false)),
-            (Value::Null, BinOpKind::NotEq, _) => Ok(Value::Bool(true)),
-
-            // 比較演算（Bool）
-            (Value::Bool(l), BinOpKind::Eq, Value::Bool(r)) => Ok(Value::Bool(l == r)),
-            (Value::Bool(l), BinOpKind::NotEq, Value::Bool(r)) => Ok(Value::Bool(l != r)),
+            // 等価比較は全ての型の組み合わせで結果を返す（AUD-014）
+            // 判定は `Value` の等価規則へ集約し、VMと同じ意味論にする
+            (l, BinOpKind::Eq, r) => Ok(Value::Bool(l == r)),
+            (l, BinOpKind::NotEq, r) => Ok(Value::Bool(l != r)),
 
             // 論理演算は eval_expr 側で短絡評価するため、ここには到達しない
             (_, BinOpKind::And, _) | (_, BinOpKind::Or, _) => unreachable!(),
 
-            _ => Err(TsumugiError::runtime(
+            // 被演算子の値がメッセージに入っても種別がぶれないよう、kindを明示する
+            _ => Err(TsumugiError::runtime_with_kind(
                 line,
+                crate::error::ErrorKind::Type,
                 format!("型エラー: {:?} {:?} {:?} は計算できません", left, op, right),
             )),
         }

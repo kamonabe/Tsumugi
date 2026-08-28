@@ -60,17 +60,53 @@ pub enum Value {
 }
 
 impl PartialEq for Value {
+    /// 規範仕様の等価比較（AUD-014）
+    ///
+    /// 全ての型の組み合わせで結果を返し、型エラーにしない。型が違う値は等しくない。
+    /// 数値だけは例外で、IntとFloatを数値として比較する（`1 == 1.0` は true）。
+    /// List / Dict / Error は構造で比較し、関数値は同一の関数値とだけ等しい。
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a == b,
+            // 数値はIntとFloatを跨いで比較する（NaNはIEEE 754どおり不一致）
+            (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
+            (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Null, Value::Null) => true,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Dict(a), Value::Dict(b)) => a == b,
-            (Value::Fn { .. }, Value::Fn { .. }) => false,
-            (Value::VmFn { .. }, Value::VmFn { .. }) => false,
+            // 関数値は同一性で比較する。同じ定義から作った別のクロージャは等しくない。
+            (
+                Value::Fn {
+                    def: def_a,
+                    captured: captured_a,
+                },
+                Value::Fn {
+                    def: def_b,
+                    captured: captured_b,
+                },
+            ) => Rc::ptr_eq(def_a, def_b) && Rc::ptr_eq(captured_a, captured_b),
+            (
+                Value::VmFn {
+                    chunk: chunk_a,
+                    upvalues: upvalues_a,
+                    ..
+                },
+                Value::VmFn {
+                    chunk: chunk_b,
+                    upvalues: upvalues_b,
+                    ..
+                },
+            ) => {
+                Rc::ptr_eq(chunk_a, chunk_b)
+                    && upvalues_a.len() == upvalues_b.len()
+                    && upvalues_a
+                        .iter()
+                        .zip(upvalues_b.iter())
+                        .all(|(a, b)| Rc::ptr_eq(a, b))
+            }
             (
                 Value::Error {
                     error_type: t1,
