@@ -9,6 +9,14 @@ use crate::error::TsumugiError;
 use crate::opcode::{MutationTarget, OpCode};
 use crate::value::{SharedValue, Value};
 
+/// 内部不変条件の破れを構造化エラーにする（AUD-023）
+///
+/// libraryから不正な`Chunk`を渡された場合でもhost panicさせず、
+/// `internal`種別のランタイムエラーとして返すために使う。
+fn internal_error(line: usize, message: impl Into<String>) -> TsumugiError {
+    TsumugiError::runtime_with_kind(line, crate::error::ErrorKind::Internal, message)
+}
+
 /// コールフレーム: 関数呼び出しの状態を保存する
 #[derive(Debug, Clone)]
 struct CallFrame {
@@ -181,7 +189,7 @@ impl Vm {
     /// 呼ばれた関数内の try/catch も正しく動作する。
     fn run_frames(&mut self, stop_depth: usize) -> Result<Value, TsumugiError> {
         loop {
-            let frame = self.frames.last().unwrap();
+            let frame = self.frame(0)?;
             if frame.ip >= frame.chunk.code.len() {
                 // フレームの命令が尽きた = 暗黙 null return
                 if self.frames.len() <= stop_depth + 1 {
@@ -189,7 +197,7 @@ impl Vm {
                     break;
                 }
                 // ネストされた関数が暗黙 null return で終わった場合
-                let f = self.frames.pop().unwrap();
+                let f = self.take_frame(0)?;
                 self.stack.truncate(f.base);
                 // 暗黙 return 時にこのフレーム内の try ハンドラを除去する
                 self.try_handlers
@@ -198,14 +206,25 @@ impl Vm {
                 continue;
             }
 
-            let instruction = frame.chunk.code[frame.ip].clone();
-            let line = frame.chunk.lines[frame.ip];
-            self.frames.last_mut().unwrap().ip += 1;
+            let instruction = frame
+                .chunk
+                .code
+                .get(frame.ip)
+                .cloned()
+                .ok_or_else(|| internal_error(0, "命令の参照が不正です"))?;
+            // 行番号表が命令列と対応していないChunkでもpanicさせない
+            let line = frame
+                .chunk
+                .lines
+                .get(frame.ip)
+                .copied()
+                .ok_or_else(|| internal_error(0, "命令に対応する行番号がありません"))?;
+            self.frame_mut(line)?.ip += 1;
 
             let result = match &instruction {
                 OpCode::ReturnValue => {
                     let return_value = self.pop(line)?;
-                    let frame = self.frames.pop().unwrap();
+                    let frame = self.take_frame(line)?;
                     self.stack.truncate(frame.base);
                     // return 時にこのフレーム内の try ハンドラを除去する
                     let current_depth = self.frames.len();
@@ -221,7 +240,7 @@ impl Vm {
                         return Ok(Value::Null);
                     }
                     // ネストされたフレーム内の Return（通常は起きないがガード）
-                    let f = self.frames.pop().unwrap();
+                    let f = self.take_frame(line)?;
                     self.stack.truncate(f.base);
                     // return 時にこのフレーム内の try ハンドラを除去する
                     self.try_handlers
@@ -273,7 +292,7 @@ impl Vm {
                         };
                         self.stack.push(error_value);
                         // catch ブロックへジャンプ
-                        self.frames.last_mut().unwrap().ip = handler.catch_ip;
+                        self.set_ip(handler.catch_ip, line)?;
                     } else {
                         // このハンドラは呼び出し元のもの → 戻してからエラーを伝播
                         self.try_handlers.push(handler);
@@ -299,6 +318,91 @@ impl Vm {
         Ok(())
     }
 
+    // --- 内部不変条件の検査（AUD-023） ---
+    //
+    // 公開APIは `Vm::new` / `Vm::run_repl_chunk` で任意の `Chunk` を受け取れるため、
+    // compiler が生成しない命令列でも panic せず internal error を返す。
+
+    /// 実行中のframeを取得する
+    fn frame(&self, line: usize) -> Result<&CallFrame, TsumugiError> {
+        self.frames
+            .last()
+            .ok_or_else(|| internal_error(line, "実行中のframeがありません"))
+    }
+
+    /// 実行中のframeを可変で取得する
+    fn frame_mut(&mut self, line: usize) -> Result<&mut CallFrame, TsumugiError> {
+        self.frames
+            .last_mut()
+            .ok_or_else(|| internal_error(line, "実行中のframeがありません"))
+    }
+
+    /// 現在のframeを取り出す（return・暗黙returnでの復帰用）
+    fn take_frame(&mut self, line: usize) -> Result<CallFrame, TsumugiError> {
+        self.frames
+            .pop()
+            .ok_or_else(|| internal_error(line, "戻り先のframeがありません"))
+    }
+
+    /// 命令ポインタを移動する
+    fn set_ip(&mut self, target: usize, line: usize) -> Result<(), TsumugiError> {
+        self.frame_mut(line)?.ip = target;
+        Ok(())
+    }
+
+    /// 定数表から値を取り出す
+    fn constant(&self, index: usize, line: usize) -> Result<Value, TsumugiError> {
+        self.frame(line)?
+            .chunk
+            .constants
+            .get(index)
+            .cloned()
+            .ok_or_else(|| internal_error(line, format!("定数表の参照が不正です: {}", index)))
+    }
+
+    /// upvalueのセルを取り出す
+    fn upvalue_cell(&self, index: usize, line: usize) -> Result<SharedValue, TsumugiError> {
+        self.frame(line)?
+            .upvalues
+            .get(index)
+            .map(Rc::clone)
+            .ok_or_else(|| internal_error(line, format!("upvalueの参照が不正です: {}", index)))
+    }
+
+    /// local slotに対応するstack位置を検査付きで求める
+    fn local_stack_index(
+        &self,
+        base: usize,
+        slot: usize,
+        line: usize,
+    ) -> Result<usize, TsumugiError> {
+        let at = base
+            .checked_add(slot)
+            .ok_or_else(|| internal_error(line, "local slotの計算がオーバーフローしました"))?;
+        if at >= self.stack.len() {
+            return Err(internal_error(
+                line,
+                format!("local slotが不正です: {}", slot),
+            ));
+        }
+        Ok(at)
+    }
+
+    /// stackから取り出す個数が足りているか検査する（大きすぎるoperandの確保も防ぐ）
+    fn require_stack_len(&self, count: usize, line: usize) -> Result<(), TsumugiError> {
+        if count > self.stack.len() {
+            return Err(internal_error(
+                line,
+                format!(
+                    "スタックの要素数が不足しています (要求: {}, 実際: {})",
+                    count,
+                    self.stack.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// エラーにスタックトレース情報を付加する
     fn attach_trace(&self, error: TsumugiError) -> TsumugiError {
         use crate::error::TraceFrame;
@@ -311,11 +415,12 @@ impl Vm {
         for i in (0..self.frames.len() - 1).rev() {
             let caller = &self.frames[i];
             let callee = &self.frames[i + 1];
-            let call_line = if caller.ip > 0 {
-                caller.chunk.lines[caller.ip - 1]
-            } else {
-                1
-            };
+            // trace生成はエラー整形の途中なので、行番号が引けない場合も panic させない
+            let call_line = caller
+                .ip
+                .checked_sub(1)
+                .and_then(|at| caller.chunk.lines.get(at).copied())
+                .unwrap_or(1);
             trace.push(TraceFrame {
                 name: callee.chunk.name.clone(),
                 line: call_line,
@@ -326,16 +431,15 @@ impl Vm {
     }
 
     /// ローカル変数を読み取る（セル経由の場合はセルから読む）
-    fn get_local(&self, slot: usize) -> Value {
-        let frame = self.frames.last().unwrap();
+    fn get_local(&self, slot: usize, line: usize) -> Result<Value, TsumugiError> {
+        let frame = self.frame(line)?;
         // locals_cells にセルがあればそこから読む
-        if slot < frame.locals_cells.len()
-            && let Some(ref cell) = frame.locals_cells[slot]
-        {
-            return cell.borrow().clone();
+        if let Some(Some(cell)) = frame.locals_cells.get(slot) {
+            return Ok(cell.borrow().clone());
         }
         // 通常のスタック読み取り
-        self.stack[frame.base + slot].clone()
+        let at = self.local_stack_index(frame.base, slot, line)?;
+        Ok(self.stack[at].clone())
     }
 
     /// ローカル変数を参照のまま読む。
@@ -378,35 +482,44 @@ impl Vm {
     }
 
     /// ローカル変数を書き込む（セル経由の場合はセルに書く）
-    fn set_local(&mut self, slot: usize, value: Value) {
-        let frame = self.frames.last().unwrap();
-        // locals_cells にセルがあればそこに書く
-        if slot < frame.locals_cells.len()
-            && let Some(ref cell) = frame.locals_cells[slot]
-        {
-            *cell.borrow_mut() = value;
-            return;
-        }
-        let base = frame.base;
-        self.stack[base + slot] = value;
+    fn set_local(&mut self, slot: usize, value: Value, line: usize) -> Result<(), TsumugiError> {
+        let base = {
+            let frame = self.frame(line)?;
+            // locals_cells にセルがあればそこに書く
+            if let Some(Some(cell)) = frame.locals_cells.get(slot) {
+                let cell = Rc::clone(cell);
+                *cell.borrow_mut() = value;
+                return Ok(());
+            }
+            frame.base
+        };
+        let at = self.local_stack_index(base, slot, line)?;
+        self.stack[at] = value;
+        Ok(())
     }
 
     /// ローカル変数をキャプチャ用セルに昇格させる
     /// 既にセルがあればそれを返す。なければスタックの値からセルを作成し、登録して返す
-    fn ensure_local_cell(&mut self, slot: usize) -> SharedValue {
-        let frame = self.frames.last_mut().unwrap();
-        // locals_cells を必要なサイズに拡張
-        while frame.locals_cells.len() <= slot {
-            frame.locals_cells.push(None);
-        }
-        if let Some(ref cell) = frame.locals_cells[slot] {
-            return Rc::clone(cell);
+    fn ensure_local_cell(&mut self, slot: usize, line: usize) -> Result<SharedValue, TsumugiError> {
+        let base = self.frame(line)?.base;
+        let at = self.local_stack_index(base, slot, line)?;
+        {
+            let frame = self.frame_mut(line)?;
+            // locals_cells を必要なサイズに拡張
+            while frame.locals_cells.len() <= slot {
+                frame.locals_cells.push(None);
+            }
+            if let Some(Some(cell)) = frame.locals_cells.get(slot) {
+                return Ok(Rc::clone(cell));
+            }
         }
         // スタックから現在の値を取り出してセルを作成
-        let value = self.stack[frame.base + slot].clone();
+        let value = self.stack[at].clone();
         let cell = Rc::new(RefCell::new(value));
-        frame.locals_cells[slot] = Some(Rc::clone(&cell));
-        cell
+        if let Some(entry) = self.frame_mut(line)?.locals_cells.get_mut(slot) {
+            *entry = Some(Rc::clone(&cell));
+        }
+        Ok(cell)
     }
 
     /// runtime globalを読み取る。registryはtop-level slotだけを保持し、
@@ -620,7 +733,7 @@ impl Vm {
     fn dispatch(&mut self, instruction: OpCode, line: usize) -> Result<(), TsumugiError> {
         match instruction {
             OpCode::LoadConst(idx) => {
-                let value = self.frames.last().unwrap().chunk.constants[idx].clone();
+                let value = self.constant(idx, line)?;
                 self.stack.push(value);
             }
             OpCode::Add => {
@@ -709,7 +822,7 @@ impl Vm {
                 self.stack.push(result);
             }
             OpCode::GetLocal(slot) => {
-                let value = self.get_local(slot);
+                let value = self.get_local(slot, line)?;
                 self.stack.push(value);
             }
             OpCode::SetLocal(slot) => {
@@ -717,7 +830,7 @@ impl Vm {
                     self.stack.last().cloned().ok_or_else(|| {
                         TsumugiError::runtime(line, "内部エラー: スタックが空です")
                     })?;
-                self.set_local(slot, value);
+                self.set_local(slot, value, line)?;
             }
             OpCode::GetGlobal(name) => {
                 let value = self.get_global(&name, line, false)?;
@@ -742,19 +855,19 @@ impl Vm {
             }
             OpCode::JumpIfGlobalDefined(name, target) => {
                 if self.globals.contains_key(&name) {
-                    self.frames.last_mut().unwrap().ip = target;
+                    self.set_ip(target, line)?;
                 }
             }
             OpCode::RequireGlobal(name) => {
                 self.require_global(&name, line)?;
             }
             OpCode::Jump(target) => {
-                self.frames.last_mut().unwrap().ip = target;
+                self.set_ip(target, line)?;
             }
             OpCode::JumpIfFalse(target) => {
                 let value = self.pop(line)?;
                 if !value.is_truthy() {
-                    self.frames.last_mut().unwrap().ip = target;
+                    self.set_ip(target, line)?;
                 }
             }
             OpCode::JumpIfFalseKeep(target) => {
@@ -766,7 +879,7 @@ impl Vm {
                     )
                 })?;
                 if !value.is_truthy() {
-                    self.frames.last_mut().unwrap().ip = target;
+                    self.set_ip(target, line)?;
                 }
             }
             OpCode::JumpIfTrueKeep(target) => {
@@ -778,15 +891,15 @@ impl Vm {
                     )
                 })?;
                 if value.is_truthy() {
-                    self.frames.last_mut().unwrap().ip = target;
+                    self.set_ip(target, line)?;
                 }
             }
             OpCode::Loop(target) => {
                 self.count_step(line)?;
-                self.frames.last_mut().unwrap().ip = target;
+                self.set_ip(target, line)?;
             }
             OpCode::GetUpvalue(index) => {
-                let value = self.frames.last().unwrap().upvalues[index].borrow().clone();
+                let value = self.upvalue_cell(index, line)?.borrow().clone();
                 self.stack.push(value);
             }
             OpCode::SetUpvalue(index) => {
@@ -794,7 +907,7 @@ impl Vm {
                     self.stack.last().cloned().ok_or_else(|| {
                         TsumugiError::runtime(line, "内部エラー: スタックが空です")
                     })?;
-                let cell = self.frames.last().unwrap().upvalues[index].clone();
+                let cell = self.upvalue_cell(index, line)?;
                 *cell.borrow_mut() = value;
             }
             OpCode::MakeClosure(upvalue_count) => {
@@ -802,17 +915,25 @@ impl Vm {
                 // コンパイラは MakeClosure(N) の直前に N 個の GetLocal/GetUpvalue を emit する
                 // GetLocal → 親のローカル変数セルを共有
                 // GetUpvalue → 親の upvalue セルを共有（多段キャプチャ）
-                let frame = self.frames.last().unwrap();
-                let make_closure_ip = frame.ip - 1;
+                // 不正なoperandで巨大な確保やindex計算のunderflowを起こさない
+                self.require_stack_len(upvalue_count, line)?;
+                let frame = self.frame(line)?;
+                let sources_start = frame
+                    .ip
+                    .checked_sub(1)
+                    .and_then(|make_closure_ip| make_closure_ip.checked_sub(upvalue_count))
+                    .ok_or_else(|| {
+                        internal_error(line, "MakeClosure の直前にupvalue命令がありません")
+                    })?;
 
                 let mut upvalue_sources = Vec::with_capacity(upvalue_count);
                 for i in 0..upvalue_count {
-                    let instr_ip = make_closure_ip - upvalue_count + i;
-                    match &frame.chunk.code[instr_ip] {
-                        OpCode::GetLocal(slot) => {
+                    let instr_ip = sources_start + i;
+                    match frame.chunk.code.get(instr_ip) {
+                        Some(OpCode::GetLocal(slot)) => {
                             upvalue_sources.push((true, *slot)); // is_local, slot
                         }
-                        OpCode::GetUpvalue(index) => {
+                        Some(OpCode::GetUpvalue(index)) => {
                             upvalue_sources.push((false, *index)); // is_upvalue, index
                         }
                         _ => {
@@ -833,12 +954,12 @@ impl Vm {
                         if slot == usize::MAX {
                             upvalue_cells.push(Rc::new(RefCell::new(Value::Null)));
                         } else {
-                            let cell = self.ensure_local_cell(slot);
+                            let cell = self.ensure_local_cell(slot, line)?;
                             upvalue_cells.push(cell);
                         }
                     } else {
                         // 親の upvalue セルを直接共有（多段キャプチャ）
-                        let cell = self.frames.last().unwrap().upvalues[slot].clone();
+                        let cell = self.upvalue_cell(slot, line)?;
                         upvalue_cells.push(cell);
                     }
                 }
@@ -953,6 +1074,7 @@ impl Vm {
                 }
             }
             OpCode::Print(arg_count) => {
+                self.require_stack_len(arg_count, line)?;
                 let mut values = Vec::with_capacity(arg_count);
                 for _ in 0..arg_count {
                     values.push(self.pop(line)?);
@@ -963,20 +1085,29 @@ impl Vm {
             }
             OpCode::Pop => {
                 // 単一 pop 時もセルをクリア
-                let frame = self.frames.last_mut().unwrap();
-                let slot = self.stack.len() - 1 - frame.base;
-                if slot < frame.locals_cells.len() {
+                let stack_top = self.stack.len();
+                let frame = self.frame_mut(line)?;
+                if let Some(slot) = stack_top
+                    .checked_sub(1)
+                    .and_then(|top| top.checked_sub(frame.base))
+                    && slot < frame.locals_cells.len()
+                {
                     frame.locals_cells[slot] = None;
                 }
                 self.pop(line)?;
             }
             OpCode::PopN(count) => {
                 // スコープ終了: 対応する locals_cells をクリアしてからスタックを削除
-                let frame = self.frames.last_mut().unwrap();
+                self.require_stack_len(count, line)?;
                 let stack_top = self.stack.len();
+                let frame = self.frame_mut(line)?;
                 for i in 0..count {
-                    let slot = stack_top - 1 - i - frame.base;
-                    if slot < frame.locals_cells.len() {
+                    if let Some(slot) = stack_top
+                        .checked_sub(1)
+                        .and_then(|top| top.checked_sub(i))
+                        .and_then(|top| top.checked_sub(frame.base))
+                        && slot < frame.locals_cells.len()
+                    {
                         frame.locals_cells[slot] = None;
                     }
                 }
@@ -1088,15 +1219,16 @@ impl Vm {
                 )?;
             }
             OpCode::CallBuiltin(name_idx, arg_count) => {
-                let name = match &self.frames.last().unwrap().chunk.constants[name_idx] {
-                    Value::Str(s) => s.clone(),
+                let name = match self.constant(name_idx, line)? {
+                    Value::Str(s) => s,
                     _ => {
-                        return Err(TsumugiError::runtime(
+                        return Err(internal_error(
                             line,
                             "内部エラー: CallBuiltin の関数名が文字列ではありません",
                         ));
                     }
                 };
+                self.require_stack_len(arg_count, line)?;
                 let mut args = Vec::with_capacity(arg_count);
                 for _ in 0..arg_count {
                     args.push(self.pop(line)?);
@@ -1107,6 +1239,7 @@ impl Vm {
             }
             OpCode::FStrConcat(count) => {
                 // スタックから count 個の値を取り出して文字列に連結
+                self.require_stack_len(count, line)?;
                 let start = self.stack.len() - count;
                 let parts: Vec<Value> = self.stack.drain(start..).collect();
                 let mut result = String::new();
@@ -1116,12 +1249,18 @@ impl Vm {
                 self.stack.push(Value::Str(result));
             }
             OpCode::ReturnValue | OpCode::Return => {
-                // これらは run_frames() で処理済み、ここに来ない
-                unreachable!()
+                // 通常は run_frames() が処理する。不正な呼び出しでもpanicさせない。
+                return Err(internal_error(
+                    line,
+                    "内部エラー: return命令がdispatchへ到達しました",
+                ));
             }
             OpCode::SetupTry(_) | OpCode::TeardownTry => {
-                // これらは run_frames() で処理済み、ここに来ない
-                unreachable!()
+                // 通常は run_frames() が処理する。不正な呼び出しでもpanicさせない。
+                return Err(internal_error(
+                    line,
+                    "内部エラー: try命令がdispatchへ到達しました",
+                ));
             }
         }
         Ok(())
@@ -1650,5 +1789,26 @@ mod tests {
             .run()
             .expect_err("overflowする引数数のCallが成功しました");
         assert!(error.message().contains("Call の引数数が不正"));
+    }
+
+    /// AUD-023: compilerが生成しない命令列でもhost panicさせず internal error を返す。
+    ///
+    /// 網羅ケースは公開APIだけで書ける `tests/defensive_vm.rs` にある。
+    /// ここでは内部実装と一緒に読める最小のケースだけ残す。
+    #[test]
+    fn out_of_range_local_slot_returns_internal_error() {
+        let mut chunk = Chunk::new();
+        chunk.emit(OpCode::GetLocal(999), 1);
+        chunk.emit(OpCode::Return, 1);
+
+        let error = Vm::new(chunk)
+            .run()
+            .expect_err("範囲外のlocal読み取りが成功しました");
+        assert_eq!(error.error_type(), "internal");
+        assert!(
+            error.message().contains("local slotが不正です"),
+            "想定外のメッセージ: {}",
+            error.message()
+        );
     }
 }
