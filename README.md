@@ -17,9 +17,34 @@ Tsumugiは、プログラミング言語処理系への理解を深めるため�
 
 現在のTsumugiはRuby風の文法を持つ動的型付け言語である。Lexer・Parser・ASTを共有し、デフォルトのツリーウォーク評価器、またはバイトコードコンパイラ + スタックVM（`--vm`）で実行する。
 
-現在は**教育・実験用途のalpha版**であり、言語仕様・組み込みAPI・CLIの後方互換性は保証していない。安定した組み込みAPI、実行単位のdeny-by-default capability、包括的な実行予算、実行時audit eventは今後の設計・実装対象である。`--vm`は処理系比較のための実験的backendで、同一スコープでの`let`再宣言、捕捉のない関数値の同一性、コールフレーム深度の境界、error種別・メッセージ、未捕捉エラー後のREPL状態にデフォルト実行系との既知の差が残る。規範となる挙動は[言語仕様](docs/language-spec.md)、差分の一覧と修正状況は[ロードマップ](docs/roadmap.md)を参照すること。
+現在は**教育・実験用途のalpha版**であり、言語仕様・組み込みAPI・CLIの後方互換性は保証していない。crate root には、デフォルトのツリーウォークを利用する最小の埋め込み facade（`Engine`、`CompiledScript`、`ExecutionContext`、`ExecutionOutcome`）がある。これはCLIも利用する入口だが、VM、host I/Oの注入、deny-by-default capability、包括的な実行予算、監査 event は今後の設計・実装対象である。`--vm`は処理系比較のための実験的backendで、同一スコープでの`let`再宣言、捕捉のない関数値の同一性、コールフレーム深度の境界、error種別・メッセージ、未捕捉エラー後のREPL状態にデフォルト実行系との既知の差が残る。規範となる挙動は[言語仕様](docs/language-spec.md)、差分の一覧と修正状況は[ロードマップ](docs/roadmap.md)を参照すること。
 
 組み込みのステップ上限やfilesystem制限はdefense-in-depthであり、非信頼コードを隔離するsecurity sandboxではない。また、現行CLIは`--help` / `--version`とスクリプトへの追加引数に未対応である。Cargo package / REPLの`0.1.0`と[言語仕様](docs/language-spec.md)の`0.11`は、それぞれ実装版と仕様revisionを表す独立した番号として管理している。
+
+## 組み込み API（tree-walk）
+
+`Engine::compile` はソースをパースして再利用可能な `CompiledScript` を返し、`Engine::execute` は `ExecutionContext` 上で実行する。構文エラーは `Vec<TsumugiError>`、実行時エラーは単一の `TsumugiError` として区別される。import は `ExecutionContext` の状態とスクリプトパスに依存するため、compile 時ではなく execute 時に解決される。
+
+```rust
+use tsumugi::{Engine, ExecutionContext, ExecutionOutcome};
+
+fn main() {
+    let engine = Engine::new();
+    let script = engine
+        .compile("let greeting = \"hello\"\nprint(greeting)\n")
+        .expect("valid script");
+    let mut context = ExecutionContext::new();
+
+    assert_eq!(
+        engine.execute(&script, &mut context).expect("runtime success"),
+        ExecutionOutcome::Completed,
+    );
+}
+```
+
+同じ context を再利用すると、変数・関数・解決済みimportが実行間で維持される。相対importを使うファイルは実行前に `context.set_script_path("/absolute/path/to/rules.tsg")` を呼ぶ。REPL相当の入力単位ごとにステップ予算を独立させる場合は `context.reset_step_budget()` を呼ぶ。
+
+このAPIは caller のスレッド上で同期的にツリーウォーク評価を行う。`ExecutionContext` は別スレッドへ移動できないため、埋め込み先は十分なスタックを持つ同一スレッド内で context を生成・利用する（CLIは8 MiBの実行スレッドを使う）。`input` / `print` / `args` / `exit` はまだprocess-globalな既存挙動のままであり、特に `exit()` はホストプロセスを終了し得る。敵対的コードの隔離やホストI/Oの安全な注入には使わない。
 
 ## クイックスタート
 
@@ -223,7 +248,8 @@ Windows固有の挙動（`TSUMUGI_*` 環境変数のcase-insensitive保護など
 ```
 src/
 ├── main.rs       # CLIエントリポイント（REPL / ファイル実行 / --vm 切り替え）
-├── lib.rs        # library crateのルート（各モジュールを公開）
+├── lib.rs        # library crateのルート（埋め込みAPIと各モジュールを公開）
+├── engine.rs     # tree-walk向け埋め込み facade（compile / execute / context）
 │
 │  --- フロントエンド（両実行系で共有） ---
 ├── token.rs      # トークン型定義（Spanned: Token + 行番号）

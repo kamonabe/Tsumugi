@@ -1,6 +1,6 @@
 # Tsumugi — 設計ドキュメント
 
-最終更新: 2026-08-28
+最終更新: 2026-08-29
 
 ## 目的と位置づけ
 
@@ -22,7 +22,9 @@ Tsumugiは、言語処理系の開発を入り口から理解するための個�
 - **観測・監査可能性:** script identity、言語version、付与権限、予算消費、外部効果、終了理由を構造化してホストへ通知する
 - **小さく理解可能な中核:** 純粋な計算を中核に保ち、外部効果をhost boundaryの後ろへ移す
 
-これらは目標であり、現在のalpha実装に対する保証ではない。現行の環境変数ベースのstep・collection・filesystem・env制限はdefense-in-depthで、実行単位のdeny-by-default capabilityや総heap quotaをまだ提供していない。現在地と実現順序は[ロードマップ](roadmap.md)で管理する。
+これらは目標であり、現在のalpha実装に対する保証ではない。Phase 1 の最初の縦切りとして、`src/engine.rs` はツリーウォーク用の `Engine`、パース済み `CompiledScript`、状態保持用 `ExecutionContext`、`ExecutionOutcome` を crate root から公開し、CLIもこの入口を利用する。compile は構文解析までで、import は context に依存して execute 時に解決する。実行は caller の同一スレッドで同期的に行われるため、context は十分なスタックを持つスレッド内で生成・利用する必要がある。
+
+現行の環境変数ベースのstep・collection・filesystem・env制限はdefense-in-depthで、実行単位のdeny-by-default capabilityや総heap quotaをまだ提供していない。VM、host I/Oの注入、キャンセル、`exit()`を構造化outcomeとして返す契約も未実装である。現在地と実現順序は[ロードマップ](roadmap.md)で管理する。
 
 ## 日時変換の停止性
 
@@ -267,7 +269,7 @@ let result = filter(test, fn(item) item != "kani" end)
 
 `vm.rs` の単体テストは内部実装と一緒に読める最小ケースだけを置き、公開APIだけで書いた網羅ケースは `tests/defensive_vm.rs` に分ける（AUD-023）。
 
-`src/lib.rs` と `src/main.rs` が同じモジュールを別々に宣言しているため、これらの単体テストは lib target と bin target の両方でコンパイルされ、`cargo test` では同じテストが2回実行される（AUD-039）。
+`src/main.rs` はlibrary crateの公開APIを利用するため、処理系モジュールとその単体テストはlib targetで一度だけコンパイルされる（AUD-039）。binary targetはCLI adapterだけを持ち、CLIの振る舞いは統合テストで検証する。
 
 ### 統合テスト（ゴールデンテスト）
 
