@@ -1,30 +1,11 @@
-mod ast;
-mod builtin_core;
-mod chunk;
-mod compiler;
-mod env;
-mod error;
-mod eval;
-mod lexer;
-mod limits;
-mod module;
-mod opcode;
-mod parser;
-mod sandbox;
-mod token;
-mod value;
-mod vm;
-
 use std::env as std_env;
 use std::fs;
 use std::io::{self, Write};
 
-use compiler::Compiler;
-use eval::Evaluator;
-use lexer::Lexer;
-use parser::Parser;
-use token::Token;
-use vm::Vm;
+use tsumugi::{
+    Engine, ExecutionContext, compiler::Compiler, error::TsumugiError, lexer::Lexer,
+    module::ModuleLoader, parser::Parser, token::Token, vm::Vm,
+};
 
 fn main() {
     // ツリーウォーク版の再帰がスタックを多く消費するため、
@@ -119,10 +100,11 @@ fn run_file(path: &str) {
         }
     };
 
-    let mut evaluator = Evaluator::new();
-    evaluator.set_base_dir(std::path::Path::new(path));
+    let engine = Engine::new();
+    let mut context = ExecutionContext::new();
+    context.set_script_path(path);
 
-    if let Err(errors) = execute(&source, &mut evaluator) {
+    if let Err(errors) = execute(&engine, &source, &mut context) {
         for e in &errors {
             eprintln!("{}", e);
         }
@@ -133,7 +115,8 @@ fn run_file(path: &str) {
 /// REPL（対話実行モード）
 fn run_repl() {
     write_stdout("Tsumugi v0.1.0 — 終了するには Ctrl+D\n");
-    let mut evaluator = Evaluator::new();
+    let engine = Engine::new();
+    let mut context = ExecutionContext::new();
     let mut input = String::new();
 
     loop {
@@ -161,8 +144,8 @@ fn run_repl() {
         }
 
         // 実行。ステップ予算はREPL入力ごとに独立させる。
-        evaluator.reset_step_budget();
-        if let Err(errors) = execute(&input, &mut evaluator) {
+        context.reset_step_budget();
+        if let Err(errors) = execute(&engine, &input, &mut context) {
             for e in &errors {
                 eprintln!("  エラー: {}", e);
             }
@@ -172,16 +155,19 @@ fn run_repl() {
     }
 }
 
-/// ソースを実行する共通関数
-fn execute(source: &str, evaluator: &mut Evaluator) -> Result<(), Vec<error::TsumugiError>> {
-    let mut lexer = Lexer::new(source);
-    let tokens = lexer.tokenize();
-
-    let mut parser = Parser::new(tokens);
-    let program = parser.parse()?;
-
-    evaluator.run(&program).map_err(|e| vec![e])?;
-    Ok(())
+/// ソースを実行する CLI 用のアダプター。
+///
+/// パースエラーは複数件、実行時エラーは1件という既存の表示契約を維持する。
+fn execute(
+    engine: &Engine,
+    source: &str,
+    context: &mut ExecutionContext,
+) -> Result<(), Vec<TsumugiError>> {
+    let script = engine.compile(source)?;
+    engine
+        .execute(&script, context)
+        .map(|_| ())
+        .map_err(|error| vec![error])
 }
 
 /// 入力が未完結か判定（if/fn/while/for が end で閉じられていない）
@@ -229,7 +215,7 @@ fn run_repl_vm() {
     let mut input = String::new();
     let mut compiler = Compiler::new();
     let mut vm = Vm::new_repl();
-    let mut loader = module::ModuleLoader::new();
+    let mut loader = ModuleLoader::new();
 
     loop {
         write_stdout(if input.is_empty() {
@@ -300,7 +286,7 @@ fn run_repl_vm() {
 }
 
 /// VMモードの実行関数（ファイルパス付き）
-fn execute_vm_with_path(source: &str, path: &str) -> Result<(), Vec<error::TsumugiError>> {
+fn execute_vm_with_path(source: &str, path: &str) -> Result<(), Vec<TsumugiError>> {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize();
 
@@ -308,7 +294,7 @@ fn execute_vm_with_path(source: &str, path: &str) -> Result<(), Vec<error::Tsumu
     let program = parser.parse()?;
 
     // import は実行前に解決する（AUD-030）
-    let mut loader = module::ModuleLoader::new();
+    let mut loader = ModuleLoader::new();
     loader.set_base_dir(std::path::Path::new(path));
     let (linked, _) = loader.link(&program).map_err(|e| vec![e])?;
     let program = linked.as_ref().unwrap_or(&program);

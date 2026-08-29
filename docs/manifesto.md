@@ -1,6 +1,6 @@
 # Tsumugi Manifesto
 
-最終更新: 2026-08-28
+最終更新: 2026-08-29
 
 ## この文書の位置づけ
 
@@ -129,12 +129,13 @@ Tsumugiは、少なくとも現在の方向性では、次のものを目指さ�
 
 ## 現在地
 
-現在のTsumugiには、ステップ上限、コレクションサイズ上限、call・AST・import深度制限、filesystemと環境変数のallow-list、構造化エラー、ツリーウォーク版とVM版の差分テストがある。
-これらは新しい方向性の土台だが、完成した組み込み実行基盤ではない。
+現在のTsumugiには、ステップ上限、コレクションサイズ上限、call・AST・import深度制限、filesystemと環境変数のallow-list、構造化エラー、ツリーウォーク版とVM版の差分テストがある。加えて、ツリーウォークを利用する最小の組み込み facade として `Engine`、パース済みscript、`ExecutionContext`、`ExecutionOutcome` を公開し、CLIもこの入口を利用する。
+
+これらは新しい方向性の土台だが、完成した組み込み実行基盤ではない。現在の facade は caller thread 上で同期的にツリーウォークを実行するだけで、VM、host I/O、`exit()`、権限、予算、停止理由を安全に抽象化していない。
 
 特に、次の項目は今後の設計・実装対象である。
 
-- 安定した高水準の組み込みAPI
+- backendやhost I/Oを含む、安定した高水準の組み込みAPI
 - 実行単位のdeny-by-default capability
 - fuel、総メモリ、wall-clock、入出力を含む包括的な実行予算
 - エンジン全体の同時実行制御とbackpressure

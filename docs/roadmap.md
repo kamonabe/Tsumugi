@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-08-28
+最終更新: 2026-08-29
 
 ## プロジェクトの方向性
 
@@ -15,7 +15,7 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 | Phase | 目的 | 主な完了条件 | 状態 |
 |---|---|---|---|
 | 0 | 保証範囲と脅威モデル | マニフェスト、対象script作者、ホストとOS隔離の責務、用語を文書化 | 🟡 マニフェスト策定。詳細な保証境界は継続 |
-| 1 | 安定した組み込みAPI | `Engine`、compile済みscript、実行context、構造化outcomeを公開し、CLIも同じAPIを利用 | ⬜ 未着手 |
+| 1 | 安定した組み込みAPI | `Engine`、compile済みscript、実行context、構造化outcomeを公開し、CLIも同じAPIを利用 | 🟡 tree-walk向け最小facadeとCLI移行を実装。VM・host I/O・終了理由の完全な抽象化は継続 |
 | 2 | deny-by-default capability | filesystem、env、clock、stdin/stdout、process、host functionを実行単位で明示付与し、ambient accessを既定で禁止 | ⬜ 未着手 |
 | 3 | 包括的な実行予算 | fuel、総heap、文字列・入出力、source/import、deadline、cancellationを扱い、超過後の再開可否を規定 | 🟡 step・collection・深度上限のみ実装済み |
 | 4 | 協調実行と負荷制御 | 実行slice、yield、一時停止・再開、エンジン全体の同時実行上限、backpressureを提供 | ⬜ 未着手 |
@@ -84,7 +84,7 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 | AUD-035 | CLI・標準I/Oのhost panic経路を構造化する | REPLのthread spawn・stdout flush・stdin readに`unwrap()`があり、broken pipe/I/O障害でpanicする。`print`も`println!`のため`tsumugi script.tsg \| head -1`でpanicした。Unixの非UTF-8 argvは`std::env::args()`でもpanicし得る | ✅ 完了（`ErrorKind::Io`を追加し`print`の出力失敗を構造化エラーへ。CLIのbanner・prompt・stdin・spawn・argv検証は診断＋終了コード1へ。パイプ切断と非UTF-8 argvの回帰テストを追加） |
 | AUD-036 | lossyな数値・OS境界変換を検証する | `exit`のi64→i32、`file_size`のu64→i64、NaN/Infを含む`to_int`/`floor`/`ceil`/`round`がwrap・飽和・0化し得る | ⬜ 仕様確定待ち（境界回帰テストが必要） |
 | AUD-038 | benchmarkをparse / compile / executeへ分離しVM退行を調査する | 現行Criterionは毎回parseし、VMはcompileも含む。aarch64 release実測でVMはfibが約2.77倍高速な一方、loop 5000回は約358倍低速で、単純な「VMは高速」という説明が成立しない | ✅ 4フェーズへ分離し退行の原因を特定・修正（VMのforが反復ごとにコレクションを複製しO(n^2)だった）。確保量ベースのスケーリングゲートを追加。副産物としてAUD-040 / AUD-041を検出 |
-| AUD-039 | binaryからlibrary moduleを利用して二重コンパイルを解消する | `main.rs`が`lib.rs`と同じ16モジュールを再宣言し、`use tsumugi::`を一切使わないため、同一ソースがlib targetとbin targetで2回コンパイルされる。単体テストも両方に取り込まれ、`cargo test`が同じテストを2回実行する（2026-08-28時点で各152件）。ビルド時間・テスト件数の解釈を歪める | ⬜ 未着手 |
+| AUD-039 | binaryからlibrary moduleを利用して二重コンパイルを解消する | `main.rs`が`lib.rs`と同じ16モジュールを再宣言し、`use tsumugi::`を一切使わないため、同一ソースがlib targetとbin targetで2回コンパイルされる。単体テストも両方に取り込まれ、`cargo test`が同じテストを2回実行する（2026-08-28時点で各152件）。ビルド時間・テスト件数の解釈を歪める | ✅ 完了（binaryのローカルmodule宣言を削除し、tree-walk CLIを`Engine` facade、VM CLIをlibrary moduleの型へ移行。単体テストはlib targetで一度だけ実行） |
 | AUD-040 | treeの名前付き関数self-bindingで`Value::Fn`の複製を避ける | AUD-037の呼び出し時self-bindingが毎回`Value::Fn`（body AST含む）をcloneし、呼び出しコストが関数body長に比例する。`fib(22)`で67.0ms（該当行を無効化すると42.2ms、約1.6倍） | ✅ `Value::Fn`を`Rc<FnDef>` + `Rc<captured>`へ変更（VmFnの`Rc<Chunk>`と同じ方針）。同一条件A/Bで`fib(22)` 64.5ms→21.2ms、確保量の比 15.89→1.06。確保量ベースの回帰ゲートを追加 |
 | AUD-041 | コレクション読み取りで全体複製を避ける | `GetLocal`が値を複製するため、ループ内の`d[k]` / `xs[i]`読み取りがコレクション全体をコピーする。forループの反復自体はAUD-038で解消したが、一般のindex読み取り経路は残っていた。実測ではtreeの`Env::get`も同じく全体を複製し、`len`も同じ経路だった（確保量の比は両engineとも約4.0） | ✅ 完了（副作用のないindex式に限り参照読みへ。VMは`IndexLocal` / `LenLocal`へlowering、treeは変数セルを`borrow()`して読む。比は`xs[i]`が3.98→1.99（tree）/3.99→1.79（VM）、`d[k]`が4.00→2.00/4.01→1.95、`len(xs)`が3.97→1.99/3.98→1.79。goldenフィクスチャとscalingゲートを追加） |
 | AUD-047 | コレクションをcopy-on-writeにして複製コストを構造的に下げる | AUD-041は副作用のないindex式だけを参照読みにしたため、`d[to_str(i)]`のように関数呼び出しを含むindex式は評価前のコレクションを読む意味論を保つために複製が残る（確保量の比4.00）。`Value::List` / `Value::Dict`を`Rc<Vec>` / `Rc<BTreeMap>`にして書き込み時に複製すれば、意味論を変えずに複製を減らせる。upvalue経由の読み取り（`GetUpvalue`のclone）も同時に解消できる | ⬜ 未着手（`Value`の表現・破壊的更新・`assign_index`・push/popの書き戻しに広く影響するため、影響範囲を洗い出してから着手する） |
