@@ -157,3 +157,39 @@ fn try_opcode_reaching_dispatch_does_not_panic() {
     // catch経路へ入り、host panicにはならない（結果の成否は問わない）。
     let _ = Vm::new(chunk).run();
 }
+
+#[test]
+fn repl_rolls_back_malformed_chunk_and_recovers() {
+    let mut vm = Vm::new_repl();
+
+    // LoadConstで一時値を積んだ後に失敗させ、入力開始時の空stackへ戻ることを検証する。
+    let mut malformed = Chunk::new();
+    malformed.emit_constant(Value::Int(1), 1);
+    malformed.emit(OpCode::SetLocal(999), 1);
+    malformed.emit(OpCode::Return, 1);
+
+    let error = vm
+        .run_repl_chunk(malformed)
+        .expect_err("不正なREPL chunkが成功しました");
+    assert_eq!(error.error_type(), "internal");
+    assert!(
+        error.message().contains("local slotが不正です"),
+        "想定外のメッセージ: {}",
+        error.message()
+    );
+
+    // rollbackされていれば、前の入力が積んだ値をPopできない。
+    let mut stack_probe = Chunk::new();
+    stack_probe.emit(OpCode::Pop, 2);
+    stack_probe.emit(OpCode::Return, 2);
+    let error = vm
+        .run_repl_chunk(stack_probe)
+        .expect_err("失敗した入力のstack値が次の入力へ漏洩しています");
+    assert_eq!(error.error_type(), "internal");
+
+    // 防御エラーが続いても、後続の正常な入力を受け付けられる。
+    let mut valid = Chunk::new();
+    valid.emit(OpCode::Return, 3);
+    vm.run_repl_chunk(valid)
+        .expect("不正な入力の後にREPL VMが回復しませんでした");
+}
