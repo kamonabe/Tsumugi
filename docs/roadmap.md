@@ -78,7 +78,7 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 | AUD-022 | REPL・differential・limit境界・defensive VMテストを追加する | subprocess timeoutなし、error goldenが部分一致、fixture登録が手動、tree/VMが固定`/tmp`を共有して並列raceする。厳密なstderr/stdout副作用比較も不足 | 🟡 harnessを整備（全子プロセスにtimeout、期待出力を完全一致化、`fixture_tests!`宣言とディレクトリ整合検査、実行ごとの一時ディレクトリ分離）。網羅matrixとfuzzは継続 |
 | AUD-023 | VMのunchecked index/`unwrap()`を構造化internal errorへ置換する | compiler/VM invariantが崩れるとhost panic。AUD-001/002でユーザー入力から到達可能だった。`Vm::new` / `run_repl_chunk`は任意の`Chunk`を受け取るため、library利用では範囲外のslot・定数・upvalue・行番号表の不足・operandのunderflowでindex panicへ到達した | ✅ 完了（frame/stack/upvalue/定数/命令参照を検査付きヘルパー経由にし、`unreachable!`も含め本番コードから`unwrap`を排除。公開APIだけで書いた`tests/defensive_vm.rs`で8ケースを固定し、修正前はindex panicで失敗することを確認） |
 | AUD-024 | import・REPLの状態commit方針を明文化する | 未捕捉error前の代入/list mutation/upvalue更新を保持するかrollbackするか未定義。外部I/Oはrollback不能 | ⬜ 設計判断が必要 |
-| AUD-025 | VM REPL checkpointの複製コストを削減する | 入力ごとの`stack.clone()`が保持中List/Dictをdeep cloneし、時間・一時メモリがREPL状態量に比例する | ⬜ 計測後にCOW/mutation logを検討 |
+| AUD-025 | VM REPL checkpointの複製コストを削減する | 入力ごとの`stack.clone()`が保持中List/Dictをdeep cloneし、時間・一時メモリがREPL状態量に比例する | ✅ 完了（stack全体cloneを初期長と変更済みslotのmutation logへ置換。通常入力は保持中List/Dictを複製せず、既存slotの書換・削除時だけrollback用の元値を記録して未捕捉エラー時に復元） |
 | AUD-033 | 未完結REPL入力のEOFを診断する | `if true`等の継続入力中にEOFを送ると、tree/VMとも構文エラーを出さずbufferを破棄して終了コード0になる | ⬜ 未着手（両engineで再現済み） |
 | AUD-034 | `path_join`の引数型契約を厳格化する | `path_join("a", 123, "b")`が型エラーにならず`a/b`を返し、非文字列argumentを無言で欠落させる | ⬜ 仕様確定待ち（両engine共通で再現済み） |
 | AUD-035 | CLI・標準I/Oのhost panic経路を構造化する | REPLのthread spawn・stdout flush・stdin readに`unwrap()`があり、broken pipe/I/O障害でpanicする。`print`も`println!`のため`tsumugi script.tsg \| head -1`でpanicした。Unixの非UTF-8 argvは`std::env::args()`でもpanicし得る | ✅ 完了（`ErrorKind::Io`を追加し`print`の出力失敗を構造化エラーへ。CLIのbanner・prompt・stdin・spawn・argv検証は診断＋終了コード1へ。パイプ切断と非UTF-8 argvの回帰テストを追加） |
@@ -231,7 +231,7 @@ tree側は旧スナップショットより遅くなっている（`fib_20` 14.9
 
 1. **停止性・ホスト安定性:** AUD-023 / AUD-026 / AUD-027 / AUD-028 / AUD-035 / AUD-043は完了。timeout・深度境界・host abortなしを継続検証する。`Chunk::patch_jump`は不正なoffsetでpanicするビルダーAPIとして残るため、compiler側の不変条件として扱う。
 2. **誤実行・安全境界:** AUD-012 / AUD-013 / AUD-014 / AUD-029 / AUD-030 / AUD-031 / AUD-037は完了。P1の意味論選択はすべて決着した。残るengine差はAUD-016（同一scope再宣言のcell identity）、AUD-017（call-depth境界）、AUD-019（error kind / message）、AUD-048（捕捉のない関数値の同一性）、AUD-024（未捕捉REPLエラー後の状態）で、いずれもP2として扱う。
-3. **品質基盤:** AUD-022のharness整備、AUD-038の測定分離、AUD-040のtree呼び出しコスト、AUD-041のコレクション読み取り、AUD-042のclosure捕捉範囲、AUD-046のglobal複製は完了。次はAUD-025（VM REPL checkpointの複製）とAUD-047（コレクションのcopy-on-write）を検討し、その後にP2境界とfuzzを拡充する。
+3. **品質基盤:** AUD-022のharness整備、AUD-038の測定分離、AUD-040のtree呼び出しコスト、AUD-041のコレクション読み取り、AUD-042のclosure捕捉範囲、AUD-046のglobal複製、AUD-025のVM REPL checkpoint複製は完了。次はAUD-047（コレクションのcopy-on-write）を検討し、その後にP2境界とfuzzを拡充する。
 4. **文書・配布:** AUD-021とAUD-044は完了。残るのはAUD-045（実行手順とtoolchain下限）で、`cargo install`手順、`rust-version`の宣言、release / install workflowを扱う。文書の重複は文法定義（`LANG_GUIDE.md`へ集約）とengine差リスト（`language-spec.md`の既知非適合へ集約）で解消したが、builtin名一覧（AUD-049）と`MAX_CALL_DEPTH`（AUD-050）はコード側の重複として残る。
 
 ### 初回監査の改修境界（記録）

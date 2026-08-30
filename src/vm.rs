@@ -80,6 +80,16 @@ enum BindingStorage {
     Stack(usize),
 }
 
+/// REPL入力の開始時点にあったスタック値を、変更されたslotだけ記録するjournal。
+///
+/// 通常の入力は既存のtop-level bindingを読むだけなので、保持中のList/Dictを
+/// 入力ごとに深く複製しない。既存slotの書換・削除が発生した場合だけ、
+/// rollback用にその時点の値を複製する。
+struct ReplStackCheckpoint {
+    stack_len: usize,
+    originals: HashMap<usize, Value>,
+}
+
 /// スタックベースの仮想マシン
 pub struct Vm {
     /// コールフレームスタック
@@ -87,6 +97,9 @@ pub struct Vm {
 
     /// 値スタック
     stack: Vec<Value>,
+
+    /// REPL実行中だけ有効な、変更済みstack slotのrollback journal。
+    repl_stack_checkpoint: Option<ReplStackCheckpoint>,
 
     /// 実行済みtop-level宣言の名前からstack slotへの対応。
     /// 値自体はstack/locals_cellsをsource of truthとし、bindingを複製しない。
@@ -114,6 +127,7 @@ impl Vm {
         Vm {
             frames: vec![frame],
             stack: Vec::with_capacity(256),
+            repl_stack_checkpoint: None,
             globals: HashMap::new(),
             steps: 0,
             max_steps: vm_resolve_max_steps(),
@@ -126,6 +140,7 @@ impl Vm {
         Vm {
             frames: Vec::new(),
             stack: Vec::with_capacity(256),
+            repl_stack_checkpoint: None,
             globals: HashMap::new(),
             steps: 0,
             max_steps: vm_resolve_max_steps(),
@@ -144,11 +159,16 @@ impl Vm {
     pub fn run_repl_chunk(&mut self, chunk: Chunk) -> Result<(), TsumugiError> {
         // 未捕捉エラー時に、入力途中の一時値・callee frame・try handlerを
         // 次の入力へ持ち越さないための構造状態checkpoint。
+        // stackはList/Dictを深く複製せず、既存slotの書換・削除時だけjournalへ退避する。
         let frames_checkpoint = self.frames.clone();
-        let stack_checkpoint = self.stack.clone();
         let globals_checkpoint = self.globals.clone();
         let handlers_checkpoint = self.try_handlers.clone();
         let steps_checkpoint = self.steps;
+        debug_assert!(self.repl_stack_checkpoint.is_none());
+        self.repl_stack_checkpoint = Some(ReplStackCheckpoint {
+            stack_len: self.stack.len(),
+            originals: HashMap::new(),
+        });
 
         // top-levelでcell化された変数は入力間でも同じcellを使う。
         // これを空にすると既存closureとtop-level変数の参照先が分離する。
@@ -175,10 +195,16 @@ impl Vm {
         self.steps = 0;
 
         match self.run_frames(0) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.repl_stack_checkpoint = None;
+                Ok(())
+            }
             Err(error) => {
+                let stack_checkpoint = self.repl_stack_checkpoint.take();
                 self.frames = frames_checkpoint;
-                self.stack = stack_checkpoint;
+                if let Some(stack_checkpoint) = stack_checkpoint {
+                    self.restore_repl_stack(stack_checkpoint);
+                }
                 self.globals = globals_checkpoint;
                 self.try_handlers = handlers_checkpoint;
                 self.steps = steps_checkpoint;
@@ -206,7 +232,7 @@ impl Vm {
                 }
                 // ネストされた関数が暗黙 null return で終わった場合
                 let f = self.take_frame(0)?;
-                self.stack.truncate(f.base);
+                self.truncate_stack(f.base);
                 // 暗黙 return 時にこのフレーム内の try ハンドラを除去する
                 self.try_handlers
                     .retain(|h| h.frame_depth <= self.frames.len());
@@ -233,7 +259,7 @@ impl Vm {
                 OpCode::ReturnValue => {
                     let return_value = self.pop(line)?;
                     let frame = self.take_frame(line)?;
-                    self.stack.truncate(frame.base);
+                    self.truncate_stack(frame.base);
                     // return 時にこのフレーム内の try ハンドラを除去する
                     let current_depth = self.frames.len();
                     self.try_handlers.retain(|h| h.frame_depth <= current_depth);
@@ -249,7 +275,7 @@ impl Vm {
                     }
                     // ネストされたフレーム内の Return（通常は起きないがガード）
                     let f = self.take_frame(line)?;
-                    self.stack.truncate(f.base);
+                    self.truncate_stack(f.base);
                     // return 時にこのフレーム内の try ハンドラを除去する
                     self.try_handlers
                         .retain(|h| h.frame_depth <= self.frames.len());
@@ -291,7 +317,7 @@ impl Vm {
                             frame.locals_cells.truncate(handler.locals_count);
                         }
                         // スタックを巻き戻す
-                        self.stack.truncate(handler.stack_depth);
+                        self.truncate_stack(handler.stack_depth);
                         // 構造化エラーをスタックに積む
                         let error_value = Value::Error {
                             error_type: e.error_type().to_string(),
@@ -502,6 +528,7 @@ impl Vm {
             frame.base
         };
         let at = self.local_stack_index(base, slot, line)?;
+        self.checkpoint_stack_slot(at);
         self.stack[at] = value;
         Ok(())
     }
@@ -687,6 +714,7 @@ impl Vm {
                 "global slotの計算がオーバーフローしました",
             )
         })?;
+        self.checkpoint_stack_slot(stack_index);
         let target = self.stack.get_mut(stack_index).ok_or_else(|| {
             TsumugiError::runtime_with_kind(
                 line,
@@ -1145,6 +1173,8 @@ impl Vm {
             }
             OpCode::ListPush => {
                 let value = self.pop(line)?;
+                let stack_index = self.stack.len().saturating_sub(1);
+                self.checkpoint_stack_slot(stack_index);
                 let list = self
                     .stack
                     .last_mut()
@@ -1165,6 +1195,8 @@ impl Vm {
             OpCode::DictInsert => {
                 let value = self.pop(line)?;
                 let key = self.pop(line)?;
+                let stack_index = self.stack.len().saturating_sub(1);
+                self.checkpoint_stack_slot(stack_index);
                 let dict = self
                     .stack
                     .last_mut()
@@ -1252,6 +1284,7 @@ impl Vm {
                 // スタックから count 個の値を取り出して文字列に連結
                 self.require_stack_len(count, line)?;
                 let start = self.stack.len() - count;
+                self.checkpoint_stack_range(start, self.stack.len());
                 let parts: Vec<Value> = self.stack.drain(start..).collect();
                 let mut result = String::new();
                 for val in parts {
@@ -1277,8 +1310,59 @@ impl Vm {
         Ok(())
     }
 
+    /// REPL checkpointに含まれる既存stack slotを、最初の書換・削除時だけ記録する。
+    fn checkpoint_stack_slot(&mut self, index: usize) {
+        let should_record = self
+            .repl_stack_checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| {
+                index < checkpoint.stack_len && !checkpoint.originals.contains_key(&index)
+            });
+        if !should_record {
+            return;
+        }
+
+        let Some(value) = self.stack.get(index).cloned() else {
+            return;
+        };
+        if let Some(checkpoint) = &mut self.repl_stack_checkpoint {
+            checkpoint.originals.entry(index).or_insert(value);
+        }
+    }
+
+    /// REPL開始時点に存在したstack範囲を、削除前にjournalへ退避する。
+    fn checkpoint_stack_range(&mut self, start: usize, end: usize) {
+        let end = end.min(self.stack.len());
+        for index in start.min(end)..end {
+            self.checkpoint_stack_slot(index);
+        }
+    }
+
+    /// stackを短縮する。REPL transaction中は削除される既存slotを記録する。
+    fn truncate_stack(&mut self, len: usize) {
+        let current_len = self.stack.len();
+        if len < current_len {
+            self.checkpoint_stack_range(len, current_len);
+        }
+        self.stack.truncate(len);
+    }
+
+    /// 変更済みslotを復元し、REPL開始後に積まれた一時値を破棄する。
+    fn restore_repl_stack(&mut self, checkpoint: ReplStackCheckpoint) {
+        self.stack.truncate(checkpoint.stack_len);
+        if self.stack.len() < checkpoint.stack_len {
+            self.stack.resize(checkpoint.stack_len, Value::Null);
+        }
+        for (index, value) in checkpoint.originals {
+            self.stack[index] = value;
+        }
+    }
+
     /// スタックからpop
     fn pop(&mut self, line: usize) -> Result<Value, TsumugiError> {
+        if let Some(index) = self.stack.len().checked_sub(1) {
+            self.checkpoint_stack_slot(index);
+        }
         self.stack
             .pop()
             .ok_or_else(|| TsumugiError::runtime(line, "内部エラー: スタックが空です"))
@@ -1363,6 +1447,7 @@ impl Vm {
                 crate::builtin_core::assign_index(&mut cell.borrow_mut(), index, value, line)
             }
             BindingStorage::Stack(stack_index) => {
+                self.checkpoint_stack_slot(stack_index);
                 let slot = self.stack.get_mut(stack_index).ok_or_else(|| {
                     TsumugiError::runtime_with_kind(
                         line,
