@@ -4,6 +4,7 @@ mod builtin;
 use crate::ast::*;
 use crate::env::Env;
 use crate::error::{TraceFrame, TsumugiError};
+use crate::limits::MAX_USER_CALL_DEPTH;
 use crate::value::{FnDef, Value};
 
 use std::collections::BTreeMap;
@@ -19,9 +20,6 @@ enum EvalResult {
 
 /// デフォルトのステップ上限（100万）
 const DEFAULT_MAX_STEPS: u64 = 1_000_000;
-
-/// コールフレーム深度の上限（スタックオーバーフロー防止）
-const MAX_CALL_DEPTH: usize = 128;
 
 /// 環境変数からステップ上限を読み取る
 fn resolve_max_steps() -> u64 {
@@ -670,12 +668,12 @@ impl Evaluator {
 
         // ユーザー定義関数の呼び出し: ステップカウント + 深度チェック
         self.count_step(line)?;
-        if self.call_stack.len() >= MAX_CALL_DEPTH {
+        if self.call_stack.len() >= MAX_USER_CALL_DEPTH {
             return Err(TsumugiError::runtime(
                 line,
                 format!(
                     "スタックオーバーフロー: 再帰が深すぎます (上限: {})",
-                    MAX_CALL_DEPTH
+                    MAX_USER_CALL_DEPTH
                 ),
             ));
         }

@@ -511,11 +511,16 @@ fn fixture_declarations_match_directory() {
 
 /// 深度上限エラーとスタックトレースを厳密に検証する。
 ///
-/// trace frame数だけは engine 間で異なる（VMは上限128にtop-level frameを含めるため
-/// 許容user frameが1少ない = AUD-017）。129行の期待ファイルを置く代わりに、
-/// 差分を数値として明示し、AUD-017の修正時にこのテストが落ちるようにしている。
+/// AUD-017/AUD-050 の統一後、tree-walk 版と VM 版はどちらも root script frame を数えず
+/// active な user frame 数（`MAX_USER_CALL_DEPTH = 128`）で判定する。したがって両 engine
+/// とも 128 個の user frame を許可し、129 個目の直前で同じ line/message/trace を返す。
+/// trace は内側の再帰 127 フレーム（3行目）＋最外の呼び出し元 1 フレーム（6行目）の
+/// 計 128 フレームになる。engine 差が再発した場合はこのテストが落ちる。
 #[test]
 fn stack_overflow_reports_depth_limit_with_trace() {
+    // 両 engine で完全一致する期待出力（root を数えず 128 user frame）。
+    const EXPECTED_FRAMES: usize = 128;
+
     for use_vm in [false, true] {
         let mode = if use_vm { "VM" } else { "tree-walk" };
         let context = format!("error_stack_overflow [{mode}]");
@@ -536,14 +541,13 @@ fn stack_overflow_reports_depth_limit_with_trace() {
             "{context}: 先頭のエラー行が一致しません: {stderr}"
         );
 
-        let expected_frames = if use_vm { 127 } else { 128 };
         assert_eq!(
             lines.len(),
-            expected_frames + 1,
+            EXPECTED_FRAMES + 1,
             "{context}: trace行数が期待と異なります: {}",
             lines.len()
         );
-        for line in &lines[1..expected_frames] {
+        for line in &lines[1..EXPECTED_FRAMES] {
             assert_eq!(
                 *line, "  in recurse() (3行目)",
                 "{context}: 再帰フレームの表示が一致しません: {line}"
@@ -554,6 +558,97 @@ fn stack_overflow_reports_depth_limit_with_trace() {
             Some("  in recurse() (6行目)"),
             "{context}: 最外のcall元フレームが一致しません: {stderr}"
         );
+    }
+}
+
+/// AUD-017/AUD-050: user frame の許容深度が tree/VM で一致することを境界値で検証する。
+///
+/// `recurse(n)` は自身を含めて (n + 1) 個の user frame を積む。`MAX_USER_CALL_DEPTH = 128`
+/// なので、n = 127（= 128 frame）までは成功し、n = 128（= 129 frame目の直前）で拒否される。
+/// root script frame は数えないため、この境界は両 engine で完全に一致する。
+#[test]
+fn user_call_depth_boundary_is_identical_across_engines() {
+    // (target_n, should_succeed): 127 frame=126, 128 frame=127 は成功、129 frame目=128 は失敗
+    let cases = [(126usize, true), (127usize, true), (128usize, false)];
+
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree-walk" };
+        for (target, should_succeed) in cases {
+            let dir = TestDir::new(&format!("call-depth-{}-{}", mode, target));
+            let script = dir.path.join("depth.tsg");
+            let source = format!(
+                "fn recurse(n)\n    if n <= 0\n        return \"ok\"\n    end\n    return recurse(n - 1)\nend\nprint(recurse({target}))\n"
+            );
+            std::fs::write(&script, source).expect("深度スクリプトの作成に失敗");
+
+            let context = format!("call-depth [{mode}] n={target}");
+            let output = run_script_process(&script, use_vm, &[], &context);
+            let stdout = normalize(&String::from_utf8_lossy(&output.stdout));
+            let stderr = normalize(&String::from_utf8_lossy(&output.stderr));
+
+            if should_succeed {
+                assert!(
+                    output.status.success(),
+                    "{context}: 成功するはずが失敗しました: {stderr}"
+                );
+                assert_eq!(stdout, "ok", "{context}: 出力が一致しません");
+            } else {
+                assert!(
+                    !output.status.success(),
+                    "{context}: 上限超過が拒否されませんでした"
+                );
+                assert_eq!(stdout, "", "{context}: 拒否時に予期しないstdout: {stdout}");
+                assert_eq!(
+                    stderr.lines().next(),
+                    Some("5行目: スタックオーバーフロー: 再帰が深すぎます (上限: 128)"),
+                    "{context}: 上限エラーの先頭行が一致しません: {stderr}"
+                );
+            }
+        }
+    }
+}
+
+/// 相互再帰・lambda 再帰・callback 再帰でも同じ user frame 上限で拒否され、
+/// tree/VM で挙動が一致することを検証する（AUD-017 の迂回経路がないことの確認）。
+#[test]
+fn user_call_depth_limit_applies_to_all_call_forms() {
+    // 各スクリプトは上限を超える再帰を行い、必ず overflow で停止する。
+    let scripts: &[(&str, &str)] = &[
+        (
+            "mutual",
+            "fn ping(n)\n    return pong(n)\nend\nfn pong(n)\n    return ping(n)\nend\nping(0)\n",
+        ),
+        (
+            "lambda",
+            "let loop = fn(self, n) return self(self, n) end\nloop(loop, 0)\n",
+        ),
+        (
+            "callback",
+            "fn go(n)\n    each([1], fn(x) go(n) end)\nend\ngo(0)\n",
+        ),
+    ];
+
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree-walk" };
+        for (label, source) in scripts {
+            let dir = TestDir::new(&format!("call-form-{}-{}", mode, label));
+            let script = dir.path.join("form.tsg");
+            std::fs::write(&script, source).expect("再帰スクリプトの作成に失敗");
+
+            let context = format!("call-form [{mode}] {label}");
+            let output = run_script_process(&script, use_vm, &[], &context);
+            let stdout = normalize(&String::from_utf8_lossy(&output.stdout));
+            let stderr = normalize(&String::from_utf8_lossy(&output.stderr));
+
+            assert!(
+                !output.status.success(),
+                "{context}: 上限超過が拒否されませんでした: {stdout}"
+            );
+            assert!(
+                stderr.contains("スタックオーバーフロー: 再帰が深すぎます (上限: 128)"),
+                "{context}: 上限エラーが出ていません: {stderr}"
+            );
+        }
     }
 }
 
