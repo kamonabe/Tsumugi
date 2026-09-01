@@ -17,13 +17,13 @@ Tsumugiは、プログラミング言語処理系への理解を深めるため�
 
 現在のTsumugiはRuby風の文法を持つ動的型付け言語である。Lexer・Parser・ASTを共有し、デフォルトのツリーウォーク評価器、またはバイトコードコンパイラ + スタックVM（`--vm`）で実行する。
 
-現在は**教育・実験用途のalpha版**であり、言語仕様・組み込みAPI・CLIの後方互換性は保証していない。crate root には、デフォルトのツリーウォークを利用する最小の埋め込み facade（`Engine`、`CompiledScript`、`ExecutionContext`、`ExecutionOutcome`）がある。これはCLIも利用する入口だが、VM、host I/Oの注入、deny-by-default capability、包括的な実行予算、監査 event は今後の設計・実装対象である。`--vm`は処理系比較のための実験的backendで、同一スコープでの`let`再宣言、捕捉のない関数値の同一性、コールフレーム深度の境界、error種別・メッセージ、未捕捉エラー後のREPL状態にデフォルト実行系との既知の差が残る。規範となる挙動は[言語仕様](docs/language-spec.md)、差分の一覧と修正状況は[ロードマップ](docs/roadmap.md)を参照すること。
+現在は**教育・実験用途のalpha版**であり、言語仕様・組み込みAPI・CLIの後方互換性は保証していない。crate root には、デフォルトのツリーウォークを利用する最小の埋め込み facade（`Engine`、`CompiledScript`、`ExecutionContext`、`ExecutionOutcome`）がある。これはCLIも利用する入口だが、stable Engine APIからのVM利用、host I/Oの注入、deny-by-default capability、包括的な実行予算、監査 event は未実装である。`--vm`は処理系比較のための実験的backendで、同一スコープでの`let`再宣言、捕捉のない関数値の同一性、コールフレーム深度の境界、error種別・メッセージ、未捕捉エラー後のREPL状態にデフォルト実行系との既知の差が残る。現在利用できる観測仕様は[言語仕様](docs/language-spec.md)、現行アーキテクチャは[設計ドキュメント](docs/design.md)を正本とする。Phase 0〜7の次期実装契約は後述の7設計正本で確定済みだが、設計確定は実装完了を意味しない。実装差の一覧と進捗は[ロードマップ](docs/roadmap.md)を参照すること。
 
 組み込みのステップ上限やfilesystem制限はdefense-in-depthであり、非信頼コードを隔離するsecurity sandboxではない。また、現行CLIは`--help` / `--version`とスクリプトへの追加引数に未対応である。Cargo package / REPLの`0.1.0`と[言語仕様](docs/language-spec.md)の`0.11`は、それぞれ実装版と仕様revisionを表す独立した番号として管理している。
 
 ## 組み込み API（tree-walk）
 
-`Engine::compile` はソースをパースして再利用可能な `CompiledScript` を返し、`Engine::execute` は `ExecutionContext` 上で実行する。構文エラーは `Vec<TsumugiError>`、実行時エラーは単一の `TsumugiError` として区別される。import は `ExecutionContext` の状態とスクリプトパスに依存するため、compile 時ではなく execute 時に解決される。
+`Engine::compile` はソースをパースして再利用可能な `CompiledScript` を返し、`Engine::execute` は `ExecutionContext` 上で実行する。構文エラーは `Vec<TsumugiError>`、実行時エラーは単一の `TsumugiError` として区別される。import は `ExecutionContext` の状態とスクリプトパスに依存するためcompile時には解決せず、`Engine::execute`開始時に最初のscript文を実行する前に全件を解決する。これは現行APIの説明であり、次期APIのcompile/link分離は[組み込みAPI仕様](docs/embedding-api.md)を正本とする。
 
 ```rust
 use tsumugi::{Engine, ExecutionContext, ExecutionOutcome};
@@ -286,10 +286,17 @@ benches/
 └── interpreter.rs    # parse / compile / execute / end_to_end のフェーズ別計測
 
 docs/
-├── manifesto.md      # プロジェクトの方向性・設計原則・非目標
-├── design.md         # 設計ドキュメント
-├── language-spec.md  # 言語仕様（規範）
-└── roadmap.md        # ロードマップ・監査バックログ
+├── manifesto.md                     # プロジェクトの価値基準・設計原則・非目標
+├── design.md                        # 現行実装の設計正本
+├── language-spec.md                 # 現行実装の観測仕様（規範）
+├── threat-model.md                  # Phase 0: 保証境界・責任分界
+├── embedding-api.md                 # Phase 1/2: 組み込みAPI・terminal channel
+├── capability-model.md              # Phase 2: deny-by-default認可
+├── execution-control.md             # Phase 3/4: 実行予算・協調実行
+├── determinism-and-audit.md          # Phase 5/6: 決定性・実行時監査
+├── semantic-decisions.md             # 横断: 次期revisionの意味論・CLI決定
+├── verification-release-operations.md # Phase 7: 検証・リリース・運用gate
+└── roadmap.md                        # 設計trace・実装状態・実現順序
 
 examples/
 ├── hello.tsg         # 基本構文（変数・関数・条件分岐・ループ）
@@ -306,10 +313,19 @@ LANG_GUIDE.md         # AIコード支援向けの言語ガイド（形式文法
 
 ## ドキュメント
 
-- [Tsumugi Manifesto](docs/manifesto.md) — プロジェクトの方向性・設計原則・非目標
-- [設計ドキュメント](docs/design.md) — 設計判断の経緯・アーキテクチャ・今後の候補
-- [言語仕様](docs/language-spec.md) — 文法・データ型・演算子の一覧
-- [ロードマップ](docs/roadmap.md) — 実装済み機能・設計方針・今後の検討事項
+現行利用者が依存できる仕様は[言語仕様](docs/language-spec.md)と[設計ドキュメント](docs/design.md)である。次期実装契約は以下の7設計正本で確定済みだが、[ロードマップ](docs/roadmap.md)の受入gateを満たすまでは未実装または部分実装として扱う。
+
+- [Tsumugi Manifesto](docs/manifesto.md) — プロジェクトの価値基準・設計原則・非目標
+- [設計ドキュメント](docs/design.md) — 現行実装のアーキテクチャと実装済み判断
+- [言語仕様](docs/language-spec.md) — 現行実装から観測できる文法・意味論の規範
+- [脅威モデル](docs/threat-model.md) — Phase 0の保証境界、非保証、責任分界
+- [組み込みAPI仕様](docs/embedding-api.md) — Phase 1/2のEngine、compile/link、terminal channel
+- [Capability Model仕様](docs/capability-model.md) — Phase 2のdeny-by-default認可とadapter境界
+- [実行予算・協調実行仕様](docs/execution-control.md) — Phase 3/4の有限budget、transaction、協調実行
+- [決定性・実行時監査仕様](docs/determinism-and-audit.md) — Phase 5/6の規範backend、決定性、audit
+- [次期意味論・実装決定](docs/semantic-decisions.md) — 次期revisionの意味論、CLI、canonical error、class/HTTP判断
+- [検証・リリース・運用設計](docs/verification-release-operations.md) — Phase 7の検証、配布、supply chain、運用gate
+- [ロードマップ](docs/roadmap.md) — 設計正本へのtrace、実装状態、実現順序
 
 ## ライセンス
 

@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-08-29
+最終更新: 2026-08-31
 
 ## プロジェクトの方向性
 
@@ -12,16 +12,16 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 
 以下は目標アーキテクチャへの移行順序である。現行のstep上限、collection上限、深度制限、filesystem/env allow-list、構造化エラー、差分テストは土台として再利用するが、それだけで各phaseが完了したとはみなさない。
 
-| Phase | 目的 | 主な完了条件 | 状態 |
-|---|---|---|---|
-| 0 | 保証範囲と脅威モデル | マニフェスト、対象script作者、ホストとOS隔離の責務、用語を文書化 | 🟡 マニフェスト策定。詳細な保証境界は継続 |
-| 1 | 安定した組み込みAPI | `Engine`、compile済みscript、実行context、構造化outcomeを公開し、CLIも同じAPIを利用 | 🟡 tree-walk向け最小facadeとCLI移行を実装。VM・host I/O・終了理由の完全な抽象化は継続 |
-| 2 | deny-by-default capability | filesystem、env、clock、stdin/stdout、process、host functionを実行単位で明示付与し、ambient accessを既定で禁止 | ⬜ 未着手 |
-| 3 | 包括的な実行予算 | fuel、総heap、文字列・入出力、source/import、deadline、cancellationを扱い、超過後の再開可否を規定 | 🟡 step・collection・深度上限のみ実装済み |
-| 4 | 協調実行と負荷制御 | 実行slice、yield、一時停止・再開、エンジン全体の同時実行上限、backpressureを提供 | ⬜ 未着手 |
-| 5 | 規範意味論と決定的境界 | 正式backendを一つに定め、clock・env・I/O・module resolverをhost注入し、既知のengine差を解消 | 🟡 差分監査とpaired testを継続中 |
-| 6 | 実行時監査 | script/source hash、version、capability、host call、deny、予算消費、終了理由をaudit sinkへ通知 | 🟡 構造化エラーのみ実装済み |
-| 7 | 運用保証と検証 | 資源制約下の通常テスト、opt-in stress/fuzz、capability matrix、budget境界、audit完全性を継続検証 | 🟡 timeout・scaling・golden testを実装済み |
+| Phase | 目的 | 設計正本 | 設計状態 | 実装状態 | 完了gate |
+|---|---|---|---|---|---|
+| 0 | 保証範囲と脅威モデル | [脅威モデル](threat-model.md) | ✅ 確定済み | 🟡 文書化は完了。OS隔離guideとrelease導線は未実装 | 第11節Phase 0、TM-AT-07・TM-AT-12（host部分） |
+| 1 | 安定した組み込みAPI | [組み込みAPI仕様](embedding-api.md) | ✅ 確定済み | 🟡 tree向け最小facadeとCLI入口のみ部分実装。LinkedScript、最終terminal型、panic境界等は未実装 | 第14〜15節 E1〜E6・E8a、EMB-AT-01〜09・13・15〜17 |
+| 2 | deny-by-default capability | [Capability Model仕様](capability-model.md)・[組み込みAPI仕様](embedding-api.md) | ✅ 確定済み | ⬜ 未実装。現行sandbox/env allow-listはfail-openのdefense-in-depth | Capability第18〜19節 C1〜C10・Phase 2 CAP-AT、Embedding E7・E8b |
+| 3 | 包括的な実行予算 | [実行予算・協調実行仕様](execution-control.md) | ✅ 確定済み | 🟡 step・collection・AST/import/call深度のみ部分実装。総heap、全I/O/source/host budget、deadline、runtime cancel、transactionは未実装 | 第3〜8・10・15.1〜15.3・16節、EMB-AT-21 |
+| 4 | 協調実行と負荷制御 | [実行予算・協調実行仕様](execution-control.md) | ✅ 確定済み | ⬜ 未実装 | 第6.2・9・11〜12・15.3〜15.5・16節、EMB-AT-22 |
+| 5 | 規範意味論と決定的境界 | [決定性・実行時監査仕様](determinism-and-audit.md)・[次期意味論・実装決定](semantic-decisions.md) | ✅ 確定済み | 🟡 paired testはあるが既知のbackend差とHostBoundary/FunctionId/record-replayが未実装 | Determinism第2〜6・14節Slice 1〜4/6・15.1/15.2/15.5・16節 |
+| 6 | 実行時監査 | [決定性・実行時監査仕様](determinism-and-audit.md) | ✅ 確定済み | 🟡 構造化errorのみ。canonical 8 event、sink、sequence、redaction、bounded journal、fail-closedは未実装 | 第7〜12・14節Slice 5・15.3/15.4・16節、EMB-AT-23・CAP-AT-30 |
+| 7 | 運用保証と検証 | [検証・リリース・運用設計](verification-release-operations.md) | ✅ 確定済み | 🟡 timeout・golden・scaling・defensive test、3 OS CI、coverage artifactのみ実装。MSRV/release/fuzz/stress/OCI/運用は未実装 | 第6節matrix、第17節VRO-AT-01〜15、第18節 |
 
 長時間処理について「確実に終わる」とは、任意のscriptの成功を保証することではない。ホストを不安定にせず、完了、停止、または失敗を観測可能な結果として扱い、有限の処理を設定された負荷の中で着実に進められることを目標とする。
 
@@ -29,11 +29,13 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 
 ツリーウォーク版とVM版を、REPL継続実行・失敗時状態・スコープ・クロージャ・import・全組み込み関数・資源上限・既存仕様の観点で横断監査した。既存テストは全件成功したが、REPL入力間の状態回復や実行系差を検出できない空白がある。優先度は、ホストプロセス停止／メモリ枯渇につながるものを **P0**、誤実行・状態漏洩・主要仕様差を **P1**、診断性・境界値・文書不整合を **P2** とする。
 
-追加監査では `cargo fmt --check`、`cargo clippy -- -D warnings`、`cargo build`、`cargo test` がすべて成功した状態から、隔離した最小入力で既存テスト外の不具合を再現した。再現済み項目は状態欄に明記し、Windows固有挙動やsymlink操作など実環境確認が必要な項目はコード監査結果として区別する。
+追加監査では `cargo fmt --check`、`cargo clippy -- -D warnings`、`cargo build`、`cargo test` がすべて成功した状態から、隔離した最小入力で既存テスト外の不具合を再現した。再現済み項目は実装状況欄に明記し、Windows固有挙動やsymlink操作など実環境確認が必要な項目はコード監査結果として区別する。
+
+> **状態の読み方:** 以下のAUD表の最終列はコード・test・workflow・配布物の**実装状況**であり、設計状態ではない。次期設計正本で判断が確定済みでも、受入gateを満たす実装がなければ完了扱いにしない。
 
 ### P0 — Critical
 
-| ID | 項目 | 再現・影響 | 状態 |
+| ID | 項目 | 再現・影響 | 実装状況 |
 |---|---|---|---|
 | AUD-001 | VM REPLのコンパイル失敗をtransactionalにする | ブロック内でlocal追加後にcompile error（当時は未解決index assignment target、現在はループ外`break`等）を置くと、Compilerだけが更新され、次入力の`GetLocal`でRustの範囲外panic。stale loopから`Jump(0)`生成にも到達可能 | ✅ 完了（REPL回帰テスト追加） |
 | AUD-002 | VM REPLの未捕捉runtime error後にstack/frame/handler/compilerを復元する | 一時値・callee frame・未実行bindingが次入力へ残り、誤値参照、古い関数の再開、二次panicを起こす | ✅ 完了（REPL回帰テスト追加） |
@@ -45,7 +47,7 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 
 ### P1 — High
 
-| ID | 項目 | 再現・影響 | 状態 |
+| ID | 項目 | 再現・影響 | 実装状況 |
 |---|---|---|---|
 | AUD-004 | VMの`locals_cells`をREPL入力・try unwindで正しく保存／復元する | 入力ごとにtop-level cell対応が消え、closureと変数が別値になる。try内localのcellがcatch変数slotと衝突する | ✅ 完了（cell同一性・catch回帰テスト追加） |
 | AUD-005 | treeのwhile/forでエラー時もscopeを必ず解放する | ループ内エラーをcatchすると反復localが後続処理・次REPL入力から見える | ✅ 完了（caught error回帰テスト追加） |
@@ -66,23 +68,23 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 
 ### P2 — Medium / Quality
 
-| ID | 項目 | 再現・影響 | 状態 |
+| ID | 項目 | 再現・影響 | 実装状況 |
 |---|---|---|---|
 | AUD-015 | callback内`break`/`continue`を通常関数と同じくエラー化する | treeのmap/filter/eachだけ`break`を暗黙`null`として扱い、VMはcompile error | ✅ 完了（control-flow回帰テスト追加） |
-| AUD-016 | 同一scopeの`let`再宣言時のbinding identityを仕様化する | 既存closureがtreeでは旧cell、VMでは更新済みcellを参照 | ⬜ 未着手 |
-| AUD-017 | call-depth境界を統一する | 上限128にtop-level frameを含めるVMだけ、許容user frame数が1少ない | ⬜ 未着手 |
-| AUD-018 | CLIからscript引数を渡せるようにする | `args()`を公開しているがCLIが2個目以降の非flag引数をusage errorにする | ⬜ 未着手 |
-| AUD-019 | engine固有error kind/messageを統一する | iteration/index/callback等でkind・messageが異なる。push/pop/map/filter/eachの主要なkindはAUD-012で統一したが、callback messageやtrace差は残る。具体例として、コレクション以外へのindex（`let n = 42` に対する `n[0]`）はtreeが`runtime` / 「インデックスアクセスできません: Int(42)[Int(0)]」、VMが`type` / 「型エラー: Int(42) に対して Int(0) でインデックスアクセスできません」になる（AUD-041で`index_read_lowering`の期待値を分けて明示済み） | ⬜ 未着手 |
-| AUD-020 | sandboxの脅威モデルとTOCTOU制約を明記する | checkとI/O間のsymlink race、sandbox検査前のcanonicalizeによる許可外path存在oracle、dangling final symlink経由の新規write/append、空設定のfail-open意味論が未整理 | 🟡 security boundaryではないこと、fail-open、未保護資源、symlink/TOCTOU制約を文書化。dangling linkを含む実装修正と隔離環境ガイドは継続 |
+| AUD-016 | 同一scopeの`let`再宣言時のbinding identityを仕様化する | 既存closureがtreeでは旧cell、VMでは更新済みcellを参照 | 🟡 設計確定・未実装（[次期意味論・実装決定](semantic-decisions.md)第4節: globalを含む全scopeでfresh cell） |
+| AUD-017 | call-depth境界を統一する | 上限128にtop-level frameを含めるVMだけ、許容user frame数が1少ない | 🟡 設計確定・未実装（同第5節、AUD-050と一体） |
+| AUD-018 | CLIからscript引数を渡せるようにする | `args()`を公開しているがCLIが2個目以降の非flag引数をusage errorにする | 🟡 設計確定・未実装（同第6節、Embedding E8a。capability profile/optionsとsafe/legacy移行はE8bで別追跡） |
+| AUD-019 | engine固有error kind/messageを統一する | iteration/index/callback等でkind・messageが異なる。push/pop/map/filter/eachの主要なkindはAUD-012で統一したが、callback messageやtrace差は残る。具体例として、コレクション以外へのindex（`let n = 42` に対する `n[0]`）はtreeが`runtime` / 「インデックスアクセスできません: Int(42)[Int(0)]」、VMが`type` / 「型エラー: Int(42) に対して Int(0) でインデックスアクセスできません」になる（AUD-041で`index_read_lowering`の期待値を分けて明示済み） | 🟡 設計確定・未実装（同第3節のcanonical error契約） |
+| AUD-020 | sandboxの脅威モデルとTOCTOU制約を明記する | checkとI/O間のsymlink race、sandbox検査前のcanonicalizeによる許可外path存在oracle、dangling final symlink経由の新規write/append、空設定のfail-open意味論が未整理 | 🟡 設計確定・部分実装（現行制約の文書化のみ完了。[脅威モデル](threat-model.md) TM-002〜004と[Capability Model仕様](capability-model.md) CAP-AT-10〜14のpath-handle実装は未完了） |
 | AUD-021 | language-spec / LANG_GUIDE / designのdriftを解消する | engine parity・Float完全一致・全module unit test・coverage/benchmark gate等の記載が現実装やAUD残件と矛盾する | 🟡 規範仕様と既知非適合、VMの実験的位置付け、sandbox制約、予約語、循環参照を更新。意味論確定後の更新は継続 |
-| AUD-022 | REPL・differential・limit境界・defensive VMテストを追加する | subprocess timeoutなし、error goldenが部分一致、fixture登録が手動、tree/VMが固定`/tmp`を共有して並列raceする。厳密なstderr/stdout副作用比較も不足 | 🟡 harnessを整備（全子プロセスにtimeout、期待出力を完全一致化、`fixture_tests!`宣言とディレクトリ整合検査、実行ごとの一時ディレクトリ分離）。網羅matrixとfuzzは継続 |
+| AUD-022 | REPL・differential・limit境界・defensive VMテストを追加する | subprocess timeoutなし、error goldenが部分一致、fixture登録が手動、tree/VMが固定`/tmp`を共有して並列raceする。厳密なstderr/stdout副作用比較も不足 | 🟡 設計確定・部分実装（harness、timeout、完全一致、temp分離は完了。[検証・リリース・運用設計](verification-release-operations.md)のmatrix/fuzz/stressは未実装） |
 | AUD-023 | VMのunchecked index/`unwrap()`を構造化internal errorへ置換する | compiler/VM invariantが崩れるとhost panic。AUD-001/002でユーザー入力から到達可能だった。`Vm::new` / `run_repl_chunk`は任意の`Chunk`を受け取るため、library利用では範囲外のslot・定数・upvalue・行番号表の不足・operandのunderflowでindex panicへ到達した | ✅ 完了（frame/stack/upvalue/定数/命令参照を検査付きヘルパー経由にし、`unreachable!`も含め本番コードから`unwrap`を排除。公開APIだけで書いた`tests/defensive_vm.rs`で8ケースを固定し、修正前はindex panicで失敗することを確認） |
-| AUD-024 | import・REPLの状態commit方針を明文化する | 未捕捉error前の代入/list mutation/upvalue更新を保持するかrollbackするか未定義。外部I/Oはrollback不能 | ⬜ 設計判断が必要 |
+| AUD-024 | import・REPLの状態commit方針を明文化する | 未捕捉error前の代入/list mutation/upvalue更新を保持するかrollbackするか未定義。外部I/Oはrollback不能 | 🟡 設計確定・未実装（[次期意味論・実装決定](semantic-decisions.md)第7節・[実行予算・協調実行仕様](execution-control.md)第10節。`Completed` / `Exited`だけ全language-stateをcommitし、その他terminalは開始時点へrollback。完了済み外部効果はrollbackしない） |
 | AUD-025 | VM REPL checkpointの複製コストを削減する | 入力ごとの`stack.clone()`が保持中List/Dictをdeep cloneし、時間・一時メモリがREPL状態量に比例する | ✅ 完了（stack全体cloneを初期長と変更済みslotのmutation logへ置換。通常入力は保持中List/Dictを複製せず、既存slotの書換・削除時だけrollback用の元値を記録して未捕捉エラー時に復元） |
-| AUD-033 | 未完結REPL入力のEOFを診断する | `if true`等の継続入力中にEOFを送ると、tree/VMとも構文エラーを出さずbufferを破棄して終了コード0になる | ⬜ 未着手（両engineで再現済み） |
-| AUD-034 | `path_join`の引数型契約を厳格化する | `path_join("a", 123, "b")`が型エラーにならず`a/b`を返し、非文字列argumentを無言で欠落させる | ⬜ 仕様確定待ち（両engine共通で再現済み） |
+| AUD-033 | 未完結REPL入力のEOFを診断する | `if true`等の継続入力中にEOFを送ると、tree/VMとも構文エラーを出さずbufferを破棄して終了コード0になる | 🟡 設計確定・未実装（両engineで再現済み。[次期意味論・実装決定](semantic-decisions.md)第8節） |
+| AUD-034 | `path_join`の引数型契約を厳格化する | `path_join("a", 123, "b")`が型エラーにならず`a/b`を返し、非文字列argumentを無言で欠落させる | 🟡 設計確定・未実装（同第9節: 全argumentをStrとして検査） |
 | AUD-035 | CLI・標準I/Oのhost panic経路を構造化する | REPLのthread spawn・stdout flush・stdin readに`unwrap()`があり、broken pipe/I/O障害でpanicする。`print`も`println!`のため`tsumugi script.tsg \| head -1`でpanicした。Unixの非UTF-8 argvは`std::env::args()`でもpanicし得る | ✅ 完了（`ErrorKind::Io`を追加し`print`の出力失敗を構造化エラーへ。CLIのbanner・prompt・stdin・spawn・argv検証は診断＋終了コード1へ。パイプ切断と非UTF-8 argvの回帰テストを追加） |
-| AUD-036 | lossyな数値・OS境界変換を検証する | `exit`のi64→i32、`file_size`のu64→i64、NaN/Infを含む`to_int`/`floor`/`ceil`/`round`がwrap・飽和・0化し得る | ⬜ 仕様確定待ち（境界回帰テストが必要） |
+| AUD-036 | lossyな数値・OS境界変換を検証する | `exit`のi64→i32、`file_size`のu64→i64、NaN/Infを含む`to_int`/`floor`/`ceil`/`round`がwrap・飽和・0化し得る | 🟡 設計確定・未実装（同第10節: checked変換と構造化`Exited`。境界回帰testも未実装） |
 | AUD-038 | benchmarkをparse / compile / executeへ分離しVM退行を調査する | 現行Criterionは毎回parseし、VMはcompileも含む。aarch64 release実測でVMはfibが約2.77倍高速な一方、loop 5000回は約358倍低速で、単純な「VMは高速」という説明が成立しない | ✅ 4フェーズへ分離し退行の原因を特定・修正（VMのforが反復ごとにコレクションを複製しO(n^2)だった）。確保量ベースのスケーリングゲートを追加。副産物としてAUD-040 / AUD-041を検出 |
 | AUD-039 | binaryからlibrary moduleを利用して二重コンパイルを解消する | `main.rs`が`lib.rs`と同じ16モジュールを再宣言し、`use tsumugi::`を一切使わないため、同一ソースがlib targetとbin targetで2回コンパイルされる。単体テストも両方に取り込まれ、`cargo test`が同じテストを2回実行する（2026-08-28時点で各152件）。ビルド時間・テスト件数の解釈を歪める | ✅ 完了（binaryのローカルmodule宣言を削除し、tree-walk CLIを`Engine` facade、VM CLIをlibrary moduleの型へ移行。単体テストはlib targetで一度だけ実行） |
 | AUD-040 | treeの名前付き関数self-bindingで`Value::Fn`の複製を避ける | AUD-037の呼び出し時self-bindingが毎回`Value::Fn`（body AST含む）をcloneし、呼び出しコストが関数body長に比例する。`fib(22)`で67.0ms（該当行を無効化すると42.2ms、約1.6倍） | ✅ `Value::Fn`を`Rc<FnDef>` + `Rc<captured>`へ変更（VmFnの`Rc<Chunk>`と同じ方針）。同一条件A/Bで`fib(22)` 64.5ms→21.2ms、確保量の比 15.89→1.06。確保量ベースの回帰ゲートを追加 |
@@ -91,10 +93,10 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 | AUD-042 | treeのclosure捕捉範囲を自由変数へ絞る | treeは`capture_all()`で定義時に見える全bindingを捕捉するため、クロージャを保持するコンテナ（`push(saved, fn ...)`の`saved`等）まで捕捉し、cell→list→closure→captured→cellの参照循環でメモリが解放されない。200回×200個で51.8MB（循環しない書き方では2.19MB）。VMは自由変数だけをupvalue化するため発生しない。捕捉範囲の統一は生成コストの削減にもなる | ✅ 完了（本体で言及される名前だけを捕捉。生存量は400個で345,796→0バイト、定義コストは可視binding 100個で19,640,166→2,560,166バイト。生存量ベースと定義コストのscalingゲート、tree/VM両engineのfixtureを追加） |
 | AUD-046 | treeの関数呼び出しでglobal scopeの複製を避ける | `push_call_frame`が`self.scopes[0].clone()`でglobal scopeのHashMapを呼び出しごとに複製するため、呼び出しコストがtop-level bindingの数に比例していた。global 5個と100個で同じ関数を2,000回呼ぶと確保量の比が3.67（AUD-042前は7.66）。VMは同条件で1.03。cellは`Rc`共有なので値は複製されないが、entry数ぶんのRc複製とHashMap確保が毎回発生していた | ✅ 完了（スコープスタックを差し替えず`frame_base`で探索範囲を限定。確保量は2,000回の呼び出しでglobal 100個のとき12,203,174→2,349,174バイト、比3.67→1.01。releaseの実時間は`fib(22)` 22→17 ms、global 100個×20,000回 56→8 ms。可視性の単体テストとscalingゲートを追加） |
 | AUD-044 | 完了済み非適合と古い記述をREADME・規範仕様から除く | 仕様revision表記の不一致（当時`README.md` 0.5 / `language-spec.md` 0.6）、完了済み非適合（captured collectionへのindex代入）の掲載、`README.md`の構成図が`lib.rs` / `builtin_core.rs` / `limits.rs` / `sandbox.rs` / `module.rs` / `tests/defensive_vm.rs`を欠くこと、`env.rs`を「関数テーブル」と説明すること、examplesを3件中1件しか挙げないこと、CI手順が矢印区切りでコピー実行できず`cargo clippy`の`--`を欠き3 OS matrixとcoverage jobを記載していないこと。組み込み関数53個とLICENSE(MIT)の記載は実測と一致する | ✅ 完了（revision表記はAUD-043で揃え、以後0.10まで追随。完了済み非適合は`language-spec.md`から除去しID付きの表へ置換。構成図は`src/*.rs` 19件が実ファイルと1対1で一致することを確認し、examplesも3件掲載。CI手順は3ジョブの表とコピー可能なコマンド列へ置換） |
-| AUD-045 | 配布・実行手順とtoolchainの下限を明示する | READMEのクイックスタートは`cargo build` / `cargo run`だけだが、エラーメッセージの例は`$ tsumugi file.tsg`を使う。`cargo install --path .`やPATH設定、再導入手順の記載がない。`Cargo.toml`はedition 2024を要求しながら`rust-version`を宣言せず、`rust-toolchain.toml`もないためCIはstable追従で、compiler版の下限を検証できない。release / install workflowとcommit SHA固定のaction参照もない | ⬜ 未着手 |
-| AUD-048 | 捕捉のない関数値の同一性判定を統一する | AUD-014は「関数値は同一の関数値とだけ等しい」を規範としたが、同一性の粒度がengine間で揃っていない。`fn make() return fn(x) x end end` に対する `make() == make()` がtreeで`false`、VMで`true`になる。捕捉なし名前付き関数の2回生成、ループ内で同じlambda式を2回評価した2値の比較でも同じ差が出る。原因は`src/value.rs`の`PartialEq`で、treeの`Value::Fn`は定義式の評価ごとに新しい`Rc<FnDef>`を作るのに対し、VMの`Value::VmFn`はcompile時に共有される`Rc<Chunk>`とupvalue cellで比較するため、`upvalues`が空だと`all`が真になる。upvalueを持つ関数値、および別々に書いた同形lambdaの比較は両engineで一致する。AUD-014の486ケース網羅比較は型の組み合わせを対象としたため、同一sourceから複数インスタンスを作る形を含んでおらず検出できなかった | 🟡 差分をgolden fixture `comparison_semantics` に固定し、`.expected` / `.expected.vm` で両engineの現状を明示した。統一方針は未決定（VM側にclosure生成ごとのidentity tokenを持たせる案と、treeをchunk相当の共有単位へ寄せる案があり、`Value`表現に影響するため方針決定が必要） |
-| AUD-049 | builtin名一覧の3重管理を解消する | スクリプトから呼べるbuiltin名が3か所に分散している。`builtin_core.rs`の`dispatch`（46名。`__pop_update`は内部専用）、`builtin.rs`の`match name`（53名、`_ => Ok(None)`で終わる）、`compiler.rs`の`is_builtin()`（52名。`print`は予約tokenのため別扱い）。現状は3リストが整合しているが、追加時に1か所でも漏らすと「treeでは呼べるがVMでは呼べない」状態になり、compile errorではなく実行時の`name`エラーとして現れる。`design.md`が「`builtin_core.rs` + dispatchへの登録のみで両engineに反映される」と書いていたのはこの構造と矛盾していた | 🟡 文書側を修正（`design.md`と`builtin_core.rs`冒頭に3か所登録が必要と明記）。単一の名前テーブルから3経路を導出する実装統合は未着手 |
-| AUD-050 | `MAX_CALL_DEPTH`を`limits.rs`へ集約する | 構造的上限のうち`MAX_AST_DEPTH`と`MAX_IMPORT_DEPTH`は`src/limits.rs`にあるが、`MAX_CALL_DEPTH = 128`だけ`eval.rs`と`vm.rs`に同じdoc commentで二重定義されている。値とエラー文面は一致しているが、境界の数え方が揃っておらず、tree（`call_stack`が空開始）とVM（`frames: vec![frame]`でtop-level込み）で到達できる再帰深度が1段ずれる（AUD-017）。定義が分かれていることがこのズレを見つけにくくしている | ⬜ 未着手（AUD-017の境界統一と同時に扱うのが自然） |
+| AUD-045 | 配布・実行手順とtoolchainの下限を明示する | READMEのクイックスタートは`cargo build` / `cargo run`だけだが、エラーメッセージの例は`$ tsumugi file.tsg`を使う。`cargo install --path .`やPATH設定、再導入手順の記載がない。`Cargo.toml`はedition 2024を要求しながら`rust-version`を宣言せず、`rust-toolchain.toml`もないためCIはstable追従で、compiler版の下限を検証できない。release / install workflowとcommit SHA固定のaction参照もない | 🟡 設計確定・未実装（[検証・リリース・運用設計](verification-release-operations.md): MSRV Rust 1.97、install/release、artifact/OCI/運用gate。現行workflow・manifestは未変更） |
+| AUD-048 | 捕捉のない関数値の同一性判定を統一する | AUD-014は「関数値は同一の関数値とだけ等しい」を規範としたが、同一性の粒度がengine間で揃っていない。`fn make() return fn(x) x end end` に対する `make() == make()` がtreeで`false`、VMで`true`になる。捕捉なし名前付き関数の2回生成、ループ内で同じlambda式を2回評価した2値の比較でも同じ差が出る。原因は`src/value.rs`の`PartialEq`で、treeの`Value::Fn`は定義式の評価ごとに新しい`Rc<FnDef>`を作るのに対し、VMの`Value::VmFn`はcompile時に共有される`Rc<Chunk>`とupvalue cellで比較するため、`upvalues`が空だと`all`が真になる。upvalueを持つ関数値、および別々に書いた同形lambdaの比較は両engineで一致する。AUD-014の486ケース網羅比較は型の組み合わせを対象としたため、同一sourceから複数インスタンスを作る形を含んでおらず検出できなかった | 🟡 設計確定・未実装（差分fixtureのみ実装済み。[次期意味論・実装決定](semantic-decisions.md)第12節・[決定性・実行時監査仕様](determinism-and-audit.md)第4.7節: function/lambda式の動的評価ごとにfresh `FunctionId`） |
+| AUD-049 | builtin名一覧の3重管理を解消する | スクリプトから呼べるbuiltin名が3か所に分散している。`builtin_core.rs`の`dispatch`（46名。`__pop_update`は内部専用）、`builtin.rs`の`match name`（53名、`_ => Ok(None)`で終わる）、`compiler.rs`の`is_builtin()`（52名。`print`は予約tokenのため別扱い）。現状は3リストが整合しているが、追加時に1か所でも漏らすと「treeでは呼べるがVMでは呼べない」状態になり、compile errorではなく実行時の`name`エラーとして現れる。`design.md`が「`builtin_core.rs` + dispatchへの登録のみで両engineに反映される」と書いていたのはこの構造と矛盾していた | 🟡 設計確定・未実装（現行文書の3か所登録注意だけ反映済み。[次期意味論・実装決定](semantic-decisions.md)第13節と[Capability Model仕様](capability-model.md)第17節: 単一`BuiltinSpec` / callable catalogからtree・VM・compiler・生成文書を導出） |
+| AUD-050 | `MAX_CALL_DEPTH`を`limits.rs`へ集約する | 構造的上限のうち`MAX_AST_DEPTH`と`MAX_IMPORT_DEPTH`は`src/limits.rs`にあるが、`MAX_CALL_DEPTH = 128`だけ`eval.rs`と`vm.rs`に同じdoc commentで二重定義されている。値とエラー文面は一致しているが、境界の数え方が揃っておらず、tree（`call_stack`が空開始）とVM（`frames: vec![frame]`でtop-level込み）で到達できる再帰深度が1段ずれる（AUD-017）。定義が分かれていることがこのズレを見つけにくくしている | 🟡 設計確定・未実装（[次期意味論・実装決定](semantic-decisions.md)第5節: `MAX_USER_CALL_DEPTH = 128`を`limits.rs`へ集約し、rootを数えずactive user call数で統一） |
 
 ### 2026-08-27 検証スナップショット
 
@@ -227,12 +229,34 @@ tree側は旧スナップショットより遅くなっている（`fib_20` 14.9
 
 `language-spec.md`の組み込み関数表では、実行して確認した挙動と説明が食い違う箇所を修正した。`contains`が辞書ではキーを見ること、`keys` / `values` / `for`の辞書反復が「アルファベット順」ではなくコードポイント順（`"Z" < "a"`）であること、`slice`の負値が0クランプでindexアクセスの末尾参照とは非対称であること、`has_key`のキーがStr限定であること、`format_time`がInt限定・UTC固定であること、`to_int`が`"3.5"`や`" 42"`を受けないこと、`return`に式が必須であることを明記した。
 
-### 追加監査後の推奨改修順
+### 設計決定crosswalk
 
-1. **停止性・ホスト安定性:** AUD-023 / AUD-026 / AUD-027 / AUD-028 / AUD-035 / AUD-043は完了。timeout・深度境界・host abortなしを継続検証する。`Chunk::patch_jump`は不正なoffsetでpanicするビルダーAPIとして残るため、compiler側の不変条件として扱う。
-2. **誤実行・安全境界:** AUD-012 / AUD-013 / AUD-014 / AUD-029 / AUD-030 / AUD-031 / AUD-037は完了。P1の意味論選択はすべて決着した。残るengine差はAUD-016（同一scope再宣言のcell identity）、AUD-017（call-depth境界）、AUD-019（error kind / message）、AUD-048（捕捉のない関数値の同一性）、AUD-024（未捕捉REPLエラー後の状態）で、いずれもP2として扱う。
-3. **品質基盤:** AUD-022のharness整備、AUD-038の測定分離、AUD-040のtree呼び出しコスト、AUD-041のコレクション読み取り、AUD-042のclosure捕捉範囲、AUD-046のglobal複製、AUD-025のVM REPL checkpoint複製は完了。次はAUD-047（コレクションのcopy-on-write）を検討し、その後にP2境界とfuzzを拡充する。
-4. **文書・配布:** AUD-021とAUD-044は完了。残るのはAUD-045（実行手順とtoolchain下限）で、`cargo install`手順、`rust-version`の宣言、release / install workflowを扱う。文書の重複は文法定義（`LANG_GUIDE.md`へ集約）とengine差リスト（`language-spec.md`の既知非適合へ集約）で解消したが、builtin名一覧（AUD-049）と`MAX_CALL_DEPTH`（AUD-050）はコード側の重複として残る。
+次の表は、監査で未決定または未完了として記録された論点を、設計正本と現行実装へ対応付ける。**設計状態が確定でも、実装状況が未実装・部分実装ならAUD完了ではない。**
+
+| AUD | 設計状態 | 決定概要 | 正本 | 実装状態 |
+|---|---|---|---|---|
+| AUD-018 | 確定済み | CLIは`tsumugi [OPTIONS] [SCRIPT [ARGS...]]`とし、script引数を`ExecutionRequest.arguments` snapshotへ渡す。入口統合をE8a、profile/options移行をE8bに分離 | [次期意味論・実装決定](semantic-decisions.md)第6節、[組み込みAPI仕様](embedding-api.md)第12・14〜16節 | 未実装。現行CLIは追加引数を拒否 |
+| AUD-019 | 確定済み | operation別の単一constructorからcanonical kind/message/line/traceを生成し、backend固有診断とmessage推測を廃止 | [次期意味論・実装決定](semantic-decisions.md)第3節 | 未実装。既知のkind/message/trace差あり |
+| AUD-020 | 確定済み | Tsumugi単体をsecurity boundaryとせず、filesystemはportable path-handleで認可と利用をbindし、TOCTOU・oracle・dangling symlinkを受入試験化 | [脅威モデル](threat-model.md) TM-002〜004・第11節、[Capability Model仕様](capability-model.md)第8節・CAP-AT-10〜14 | 部分実装。現行制約の文書化のみ完了、path-handle未実装 |
+| AUD-022 | 確定済み | timeout/golden/differential/limit/defensive matrixに加え、fuzz・stress・failure injection・資源制約gateを段階導入 | [検証・リリース・運用設計](verification-release-operations.md)第4〜6・17節 | 部分実装。harness、timeout、完全一致、temp分離は完了。matrix/fuzz/stressは未実装 |
+| AUD-024 | 確定済み | `Completed` / `Exited`だけ全language-stateをcommitし、その他terminalはexecution開始時点へrollbackする。catch済みerror後に最終完了した実行はcommitする。stdout/filesystem/network/DB/host function等の完了済み外部効果はrollbackしない | [次期意味論・実装決定](semantic-decisions.md)第7節、[実行予算・協調実行仕様](execution-control.md)第10節、[組み込みAPI仕様](embedding-api.md)第10節 | 未実装。現行REPLの内部構造rollbackだけ実装済みで、全language-state契約は未達 |
+| AUD-034 | 確定済み | `path_join`は全argumentをStrとして検査し、非Strを無言で欠落させない | [次期意味論・実装決定](semantic-decisions.md)第9節 | 未実装。なおglobalを含む同一scopeの`let`再宣言をfresh cellにする決定は同文書第4節のAUD-016として追跡する |
+| AUD-036 | 確定済み | `exit`、file size、Float→Intのlossy変換を共通checked helperで拒否し、valid `exit`は構造化`Exited`にする | [次期意味論・実装決定](semantic-decisions.md)第10節 | 未実装。なおloop変数をiterationごとのfresh cellにする意味論はAUD-010で実装・完了済み |
+| AUD-045 | 確定済み | MSRVをRust 1.97とし、stable/MSRV CI、install/release、6 platform artifact、署名・SBOM・OCI、参照用Kubernetes Jobの順序とgateを固定 | [検証・リリース・運用設計](verification-release-operations.md)第3〜10・17〜18節 | 未実装。現行はrolling stable、release/install workflow・OCI・manifestなし |
+| AUD-048 | 確定済み | function/lambda式の**動的評価ごと**にfresh `FunctionId`を発行し、clone/captureは同じIDを保持、rollback後もIDを再利用しない | [次期意味論・実装決定](semantic-decisions.md)第12節、[決定性・実行時監査仕様](determinism-and-audit.md)第4.7節 | 未実装。現行差分fixtureのみ存在 |
+| AUD-049 | 確定済み | 単一`BuiltinSpec` / callable catalogからtree、VM、compiler、arity、context metadata、生成文書を導出。HostFunction registryは別registryだが共通resolverで衝突検査 | [次期意味論・実装決定](semantic-decisions.md)第13節、[Capability Model仕様](capability-model.md)第17節・CAP-AT-20 | 未実装。現行3一覧は一致するが手書き重複のまま |
+| AUD-050 | 確定済み | `MAX_USER_CALL_DEPTH = 128`を`limits.rs`へ集約し、root frameを数えずactive user call数で統一。128個目を許可し129個目の直前で拒否 | [次期意味論・実装決定](semantic-decisions.md)第5節 | 未実装。現行はtree/VM二重定義かつ境界差あり |
+
+### 設計sliceに沿う推奨実装順
+
+1. **基準固定:** [次期意味論・実装決定](semantic-decisions.md)第17節の基準固定と、現行非適合fixtureを維持する。文書の設計確定を実装完了として扱わない。
+2. **意味論基盤:** 内部refactor → AUD-050/017深度統合 → AUD-049単一BuiltinSpec → AUD-019 canonical error → AUD-047 COW/AUD-048 FunctionId → AUD-016 binding/AUD-024 transaction → AUD-034/036/018/033境界挙動の順で進める。
+3. **Phase 1 embedding:** [組み込みAPI仕様](embedding-api.md) E1〜E6→E8a。最終terminal型のsubsetを使い、先行公開型を作らない。
+4. **Phase 2 capability:** E7→E8bと[Capability Model仕様](capability-model.md) C1→C2、C3/C4/C5/C7、C6、C8、最後にC9/C10。現行ambient accessを削除するまで完了扱いにしない。
+5. **Phase 3/4 control:** E11/C11で有限budget・transactionを完成し、その後E12/C12でcooperative state machine、yield/pause/resume、admission/backpressureを実装する。
+6. **Phase 5/6 determinism/audit:** Determinism Slice 1〜4→Audit Slice 5→VM conformance Slice 6。E13/C13はSlice 5へ統合し、別event実装を作らない。
+7. **Phase 7 verification/release:** VRO-AT-01〜15を満たし、MSRV、release/install、artifact、OCI、運用資材は前段Phaseの受入を再検証してから導入する。
+8. **将来機能:** classは[次期意味論・実装決定](semantic-decisions.md)第15節で**設計済み・低優先度**。基盤と総heap budgetの後に扱う。HTTPは同第16節で**設計済み・着手禁止（具体ユースケース承認待ち）**であり、Phase 1〜6完了と着手gate承認後だけ別計画を作る。
 
 ### 初回監査の改修境界（記録）
 
@@ -309,7 +333,7 @@ filesystem、環境変数、時刻、標準入出力、process、network、datab
 | HTTP・DB・メール | 未実装 | coreへ追加せずhost function/moduleとして提供 |
 | 業務操作 | 登録手段なし | host function registryから明示的に公開 |
 
-この移行は、stable embedding APIと実行contextを先に設計してから行う。既存builtinをただ削除するのではなく、CLIが必要なcapabilityを明示的に付与する構造へ変え、同じengineを組み込み用途でも利用できるようにする。
+この移行は、設計確定済みのstable embedding APIと実行contextを先に実装してから行う。既存builtinをただ削除するのではなく、CLIが必要なcapabilityを明示的に付与する構造へ変え、同じengineを組み込み用途でも利用できるようにする。
 
 現行の`import`はTsumugi sourceを読み込む機能であり、native host moduleやhost functionを登録する拡張境界ではない。host extension APIが成立するまで、「HTTPやDBを外部moduleで提供する器が完成した」とは扱わない。
 
@@ -324,11 +348,11 @@ filesystem、環境変数、時刻、標準入出力、process、network、datab
 
 ### 外部機能を追加する順序
 
-1. `Engine` / `ExecutionContext` / `ExecutionOutcome`を定義する
-2. host function registryとcapability policyを定義する
-3. clock、env、stdio、filesystem、process操作をhost境界へ移す
-4. budget、deadline、cancellation、audit eventをhost callへ伝播する
-5. 具体的なユースケースができた段階で、HTTPやDB等をホスト側adapterとして実装する
+1. [組み込みAPI仕様](embedding-api.md)のE1〜E6・E8aでstable Engine入口を作る
+2. [Capability Model仕様](capability-model.md)の単一callable catalog、host function registry、deny-by-default policyを実装する
+3. clock、env、stdio、filesystem、process操作をhost境界へ移し、E7・E8bでsafe/legacy profileを接続する
+4. [実行予算・協調実行仕様](execution-control.md)のbudget、deadline、cancellation、backpressureと、[決定性・実行時監査仕様](determinism-and-audit.md)のauditをhost callへ伝播する
+5. HTTPは[次期意味論・実装決定](semantic-decisions.md)第16節の着手gateを満たし、具体的ユースケースが承認された場合だけhost adapterとして別計画を作る
 
 ## 次の候補（バイトコード VM）
 
@@ -347,20 +371,19 @@ filesystem、環境変数、時刻、標準入出力、process、network、datab
 
 | 優先度 | 項目 | メモ |
 |---|---|---|
-| 低 | クラス（継承なし） | データと操作の束ね方。合成で拡張する方針 |
+| 低 | クラス（継承なし） | [次期意味論・実装決定](semantic-decisions.md)第15節で設計済み。基盤と総heap budget後の低優先度実装候補 |
 
-## 検討事項: クラス
+## 設計済み・低優先度: クラス
 
 ### 背景
 
-現状の Tsumugi には辞書 + 関数で「オブジェクト的なもの」を表現する方法がある。
-しかし「データと操作の紐付け」が慣例（第一引数に辞書を渡す）に依存しており、構造が大きくなると見通しが悪い。
+クラスの規範的なgrammar、identity、construction、error、受入基準は[次期意味論・実装決定](semantic-decisions.md)第15節で確定済みである。以下は判断に至った背景と候補記録として残し、実装時は同正本を優先する。
 
-### 方針: クラスは検討するが継承はスコープ外
+### 方針: クラスは設計確定済みとし、継承は採用しない
 
-- **クラス構文自体**: 検討スコープ内。`class ... end` でデータと操作をまとめられると便利な場面がある
-- **クラス継承（スーパークラス/サブクラス）**: 2026-08 現在スコープ外。理由は後述
-- **合成（composition）**: 検討スコープ内。部品を「持つ」方式でクラス間の機能共有を実現する
+- **クラス構文自体**: 設計確定済み。`class ... end` でデータと操作をまとめる低優先度の実装候補とする
+- **クラス継承（スーパークラス/サブクラス）**: 採用しない。理由は後述
+- **合成（composition）**: 採用する。部品を「持つ」方式でクラス間の機能共有を実現する
 
 ### 継承をスコープ外とする理由
 
@@ -395,7 +418,7 @@ end
 クラス構文を入れる場合も同様に「フィールドに別のオブジェクトを持つ」ことで機能を共有する:
 
 ```
-# 将来のクラス構文（仮）
+# 設計確定済みクラス構文の非規範例
 class RobotDog
     fn init(name)
         self.name = name
@@ -514,9 +537,11 @@ Tsumugi にはファイルI/O やサンドボックス機能が既に実装さ�
 | VM の `unwrap()` 除去 | コンパイラバグ時にパニックではなく構造化エラーを返す | ✅ 完了（AUD-023） |
 | エラー種別の enum 化 | `classify_runtime_error()` の `contains()` 判定を `ErrorKind` enum に移行 | ✅ 完了 |
 
-## 検討事項: HTTPアクセス機能
+## 設計済み・着手禁止: HTTPアクセス機能
 
 ### 方針: 言語中核へ組み込まない
+
+HTTP adapterの着手gate、capability、SSRF/DNS/TLS/redirect、budget、audit、error契約は[次期意味論・実装決定](semantic-decisions.md)第16節で設計済みである。ただしPhase 1〜6完了と具体的ユースケースの設計レビュー承認までは、依存追加・実装・DNS接続testを開始しない。
 
 HTTPはnetwork access、DNS、TLS、認証、redirect、response size、timeoutなど、権限・資源・監査の境界を伴う。特定のHTTP clientをTsumugi中核へ組み込まず、host functionまたはhost moduleとして提供する。
 
@@ -535,6 +560,6 @@ HTTPはnetwork access、DNS、TLS、認証、redirect、response size、timeout�
 
 ### 実装タイミング
 
-- stable embedding API、host function registry、capability、budget、audit sinkの後に実装する
-- 具体的な業務ユースケースと必要な権限境界が明確になった段階でhost adapterとして追加する
-- core builtin化は既定の選択肢とせず、必要性と安全境界を改めて設計レビューする
+- **着手禁止（具体ユースケース承認待ち）**。Phase 1〜6の受入gateと[次期意味論・実装決定](semantic-decisions.md)第16.1節の全条件を満たすまで開始しない
+- 承認後もcore builtinではなくhost adapterとして別計画を作る
+- 具体的なRust HTTP clientと認証方式は承認ユースケースとhost責任に合わせて選び、coreへ固定しない

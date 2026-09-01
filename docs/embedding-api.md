@@ -528,14 +528,15 @@ compatibility shimもprocess exitやambient accessを復活させず、script操
 | E5 | 1 | Completed/Runtime/Internal/Cancelled(pre-run) channel | process継続、catch規則 |
 | E6 | 1 | compile/link/run panic隔離 | unwind test、fault ID |
 | E7 | 2 | capability/import graph/Denied/Exited/HostError/host function接続 | capability Phase 2基準 |
-| E8 | 2 | CLI args/profile | AUD-018、outcome mapping |
+| E8a | 1 | CLIがEngine APIだけを通る入口統合、基本引数転送 | EMB-AT-15/16/17のPhase 1範囲、AUD-018 |
+| E8b | 2 | capability profile/options、safe/legacy移行 | EMB-AT-10/11/16、CAP-AT-23〜26、migration warning |
 | E9 | 5/7 | VM experimental adapter/conformance | 同API、差分0でstable化 |
 | E10 | N-1/N | deprecation/migration | compile test |
 | E11 | 3 | budget/deadline/runtime cancel | terminal variant境界test |
 | E12 | 4 | final state machineとpoll/pause/resume | `PollSlice` / `PollResult`、yield/pause/state test |
 | E13 | 6 | canonical audit sink/event/usage完全性 | 8 event、fail-closed、`BudgetUsage` test |
 
-E1→E2→E3→E4→E5→E6、次にE7/E8。E11以降をPhase 1/2完了条件へ前倒ししない。
+E1→E2→E3→E4→E5→E6→E8a、次にE7→E8b。E11以降をPhase 1/2完了条件へ前倒ししない。
 
 ## 15. 受入基準
 
@@ -555,7 +556,7 @@ E1→E2→E3→E4→E5→E6、次にE7/E8。E11以降をPhase 1/2完了条件へ
 | EMB-AT-12 | 1/3 | pre-cancelは命令0。Phase 3でloop/host call境界cancelを各1 terminalにする |
 | EMB-AT-13 | 1/2 | Phase 1でroot hash、Phase 2でimport graph hashのgolden bytes/SHA-256を固定し1 byte変更で差が出る |
 | EMB-AT-14 | 1/2 | fake secretがpublic error/Debugへ現れない |
-| EMB-AT-15 | 2 | CLI引数0/1/複数/`--`/非UTF-8がAUD-018契約どおり |
+| EMB-AT-15 | 1 | CLI引数0/1/複数/`--`/非UTF-8がAUD-018契約どおりで、Engine APIの`ExecutionRequest.arguments`へ転送される |
 | EMB-AT-16 | 1〜3 | 実装済みoutcomeのCLI exit mappingをsubprocess完全一致検証 |
 | EMB-AT-17 | 1/5 | tree/VM CLIがEngine APIだけを通る |
 | EMB-AT-18 | N-1 | 旧sampleはdeprecation warning、新sampleはwarningなし |
@@ -568,8 +569,8 @@ E1→E2→E3→E4→E5→E6、次にE7/E8。E11以降をPhase 1/2完了条件へ
 ## 16. ロードマップ・監査項目との関係
 
 - **Phase 0:** fault非保証、panic/abort責任分界は[脅威モデル](threat-model.md)。
-- **Phase 1:** E1〜E6、E8のAPI/CLI入口部分、EMB-AT-01〜09、13、17を完了条件とする。現行tree-only facadeだけでは不足する。
-- **Phase 2:** E7とprofile/args、[capability model](capability-model.md)のPhase 2基準を完了する。
+- **Phase 1:** E1〜E6・E8a、EMB-AT-01〜09・13・15〜17を完了条件とする。E8aでCLIのtree/VM両経路をEngine APIだけへ統合し、基本引数転送を行う。現行tree-only facadeだけでは不足する。
+- **Phase 2:** E7・E8b、EMB-AT-10/11/16、CAP-AT-23〜26と[capability model](capability-model.md)のPhase 2基準を完了する。E8bでcapability profile/optionsとsafe/legacy移行を接続する。
 - **AUD-018:** process argvをExecutionRequest snapshotへ置換し、複数script引数とCLI syntaxを固定した。
 - **AUD-020:** Engineでpath文字列checkをせず、path-handle adapterへ委譲する。
 - **AUD-049:** compile/link callable解決は単一catalogを使い、host registryを第4のbuiltin名一覧にしない。

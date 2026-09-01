@@ -24,7 +24,7 @@
 1. `CapabilitySet::empty()`が唯一のlibrary既定値で、全外部操作を拒否する。CLI profileはこのempty setから必要なadapterを明示grantして構築する。
 2. grantはhostだけが行う。scriptはcapabilityを生成、列挙、複製、grant、revokeできない。
 3. setはstart時freezeされ、実行中のgrant/revokeはない。取消はexecution全体をcancelし、新setで再実行する。
-4. denialは対象OS API、resolver、host callbackより前に成立する。script実行中のoperation denialは[次期意味論・実装決定](semantic-decisions.md)第3節のcatch可能なcanonical `capability` / `sandbox` errorで、未捕捉時は`RuntimeError`となる。link/import等handler開始前のdenialだけがcatch不可terminal `Denied`となる。
+4. denialは対象OS API、resolver、host callbackより前に成立する。script実行中のoperation denialは[次期意味論・実装決定](semantic-decisions.md)第3節のcatch可能なcanonical `capability` / `sandbox` errorで、未捕捉時は`RuntimeError`となる。link/import等handler開始前のdenialだけがcatch不可terminal `Denied`となる。budget超過、deadline、cancel、audit fail-closed、`InternalFailure`等の制御・基盤terminalはscriptからcatchできない。
 5. Environment、Clock、Stdin、Stdout、Filesystem各操作、ProcessExit、ModuleResolver、HostFunctionを別authorityとし、一方から他方を導出しない。
 6. adapterは`Send + Sync`である。Phase 2同期traitはcaller thread上で有限時間にReady相当の結果を返す。Phase 4 cooperative extensionだけが`Pending`を返し、同期traitを暗黙に別threadへ移さない。HTTP/DB/mail/queueはcoreへ入れずhost adapterとする。
 
@@ -136,6 +136,10 @@ impl CapabilityCallContext<'_> {
 
 `ControlStop`、`BudgetRequest`、reservationのreserve/commit/refund、`MonotonicInstant`は[実行予算・協調実行仕様](execution-control.md)第3・7節を唯一の正本とする。独立した`BudgetFailure`、optional deadline、未計測時に成功するpublic `charge` APIを作らない。adapterはcall前、bounded block中に可能な地点、return前に`check_control`し、外部効果またはallocation前にatomic reservationを得る。
 
+error projectionはvariantごとに分離する。script操作中の`AdapterError::Host`だけをsanitized canonical `host` errorとしてcatch可能にし、`SecureResolutionUnsupported`は第8.4節のfilesystem操作に限って同じchannelへ投影する。`AdapterError::Control`はcatch可能なlanguage errorへ変換せず、`ControlStop`のvariantに応じてterminal `BudgetExceeded` / `DeadlineExceeded` / `Cancelled`へだけ投影する。link/control-plane中のhost failureはterminal `HostError`とする。
+
+script操作中のnon-filesystem capability denialは、[次期意味論・実装決定](semantic-decisions.md)第3.4節の「host function capability拒否」を共通のcanonical projectionとして使う。adapter-backed builtinの`{name}`は閉じた集合`env` / `now` / `input` / `print` / `exit`から選び、登録host functionではcatalogに固定した公開名を使う。filesystem denialだけは同節の`sandbox` projectionを使う。これはadapter-backed builtinをnative host functionとみなす分類ではなく、公開error kind/messageを一意にする互換境界である。
+
 Phase 2の各同期traitは`may_block = false`で、caller thread上で有限時間に完了する場合だけ登録できる。Phase 4では同文書第6.2節の`CooperativeAdapter<Request, Response>` / `HostCallPoll::{Ready, Pending}` / `HostCallTicket`を対応request/response型へ追加できる。`Pending`はcooperative extensionだけが返し、同期traitのsignatureや意味を変更しない。両実装は同じcapability decision、budget、deadline、cancellation、call ID、audit lifecycleを共有する。
 
 Phase 6のaudit emitterはprivate fieldとしてcontextへ追加するが、adapterから任意event名を発行するAPIは公開しない。core dispatcherだけがcanonical eventを生成する。
@@ -174,7 +178,7 @@ impl EnvironmentSnapshot {
 
 key/valueはUTF-8、NULなし。keyは1..=256 bytes、重複keyはerror。snapshotはstart前に完成し、run中にprocess environmentを再読しない。
 
-- Environment capabilityなしの`env()`はterminal `Denied`。
+- Environment capabilityなしの`env()`はenvironment adapter call 0で内部`Denial`を生成し、script実行中はsanitized canonical `capability` errorとしてcatch可能にする。未捕捉時は`RuntimeError`であり、terminal `Denied`にはしない。
 - capabilityあり・keyなしは`null`。
 - safe profileはprotected runtime keyをsnapshotへ入れない。CLIの`--allow-env`とlegacy profileにも同じ判定を使う。
 - protected判定はWindowsではkeyをUnicode uppercase化して`TSUMUGI_` prefixと比較し、その他OSではcase-sensitiveに`TSUMUGI_` prefixと比較する。これにより`tsumugi_*`とUnicode case aliasもWindowsで拒否する。
@@ -193,7 +197,7 @@ pub trait Clock: Send + Sync + 'static {
 }
 ```
 
-`now()`はこのtraitだけを使う。deadlineはscript用ClockでなくEngineのmonotonic clockを使う。test utilityとして`FixedClock`を提供する。clockなしはtrait call 0で`Denied`。
+`now()`はこのtraitだけを使う。deadlineはscript用ClockでなくEngineのmonotonic clockを使う。test utilityとして`FixedClock`を提供する。Clockなしの`now()`はtrait call 0で内部`Denial`を生成し、script実行中はcatch可能なcanonical `capability` error、未捕捉時は`RuntimeError`とする。
 
 ## 7. Stdin / Stdout
 
@@ -226,9 +230,9 @@ pub trait Output: Send + Sync + 'static {
 }
 ```
 
-- Inputなしの`input()`はDenied。EOFは`null`、adapter failureは`HostError`で、`null`へ潰さない。
-- Input adapterはincremental readし、finite limit NならN+1 byteを蓄積する前に`AdapterError::Budget`。改行なしも同じ。
-- Outputなしの`print`はDenied。UTF-8 bytes+改行をlogical write前に一括chargeする。
+- Inputなしの`input()`はInput adapter call 0で内部`Denial`を生成し、script実行中はcatch可能なcanonical `capability` error、未捕捉時は`RuntimeError`とする。EOFは`null`、`AdapterError::Host`はcatch可能なcanonical `host` errorで、`null`へ潰さない。`AdapterError::Control`は第4節どおりterminal outcomeへ投影する。
+- Input adapterはincremental readし、finite limit NならN+1 byteを蓄積する前に`AdapterError::Control(ControlStop::BudgetExceeded(_))`。改行なしも同じ。
+- Outputなしの`print`はOutput call 0で内部`Denial`を生成し、script実行中はcatch可能なcanonical `capability` error、未捕捉時は`RuntimeError`とする。grant時はUTF-8 bytes+改行をlogical write前に一括chargeする。
 - 残量NならN bytes成功、N+1は`Output::write_all` call 0でBudgetExceeded。
 - Phase 2はtraitとdeny/error分離まで、有限meterとN境界はPhase 3。
 
@@ -292,7 +296,7 @@ impl FilesystemCapability {
 }
 ```
 
-`MountName`はASCII `[A-Za-z][A-Za-z0-9_-]{0,31}`。mount重複と空operationsはconfiguration error。同じpolicy IDは、同じadapter Arc・operations・symlink policyへ別mount aliasを付ける場合だけ許可する。`FilesystemRoot::new`は`adapter.policy_id()`と`adapter.symlink_policy()`が指定値と一致することを検証する。
+`MountName`はASCII `[A-Za-z][A-Za-z0-9_-]{0,31}`。mount重複と空operationsはconfiguration error。同じpolicy IDは、同じadapter Arc・operations・symlink policyへ別mount aliasを付ける場合だけ許可する。`FilesystemRoot::new`は`adapter.policy_id()`と`adapter.symlink_policy()`が指定値と一致することを検証する。script filesystem operationでmountまたはoperationが不足する場合はadapter/OS call 0で内部`Denial`を生成し、catch可能なcanonical `sandbox` errorへ変換する。未捕捉時は`RuntimeError`であり、handler開始前のlink/importだけがterminal `Denied`となる。
 
 ### 8.2 Script pathとrouting
 
@@ -327,9 +331,9 @@ impl FilesystemTarget {
 }
 ```
 
-規範syntaxは`@MOUNT/component/component`。unqualified `component/component`はmount名`default`へparseする。parse後に該当mountがなければadapter call 0の`Denied { code: ResourceNotGranted }`。mountは完全一致し、prefix一致や登録順fallbackをしない。
+規範syntaxは`@MOUNT/component/component`。unqualified `component/component`はmount名`default`へparseする。mountは完全一致し、prefix一致や登録順fallbackをしない。
 
-relative componentはUTF-8、1 byte以上、NULなし。`/`だけをseparatorとし、absolute `/`、`.`、`..`、空component、backslash、drive prefix、UNCを拒否する。host platform pathへ変換する前に検証する。`PathError`はcapabilityの有無を調べる前にcatch可能な`RuntimeErrorCode::Argument`へ変換するため、malformed pathとauthority不足のchannelは混在しない。
+relative componentはUTF-8、1 byte以上、NULなし。`/`だけをseparatorとし、absolute `/`、`.`、`..`、空component、backslash、drive prefix、UNCを拒否する。host platform pathへ変換する前に検証する。`PathError`はcapabilityの有無を調べる前にcatch可能な`RuntimeErrorCode::Argument`へ変換するため、malformed pathとauthority不足のchannelは混在しない。parse後に該当mountがない場合はadapter/OS call 0で内部`Denial { code: ResourceNotGranted }`を生成し、script filesystem operationならcatch可能なcanonical `sandbox` errorへ変換する。
 
 ### 8.3 Portable path-handle契約
 
@@ -455,7 +459,7 @@ builtin mappingは固定する。`read_file`/`read_lines`は`ReadExisting`、`wr
 
 ### 8.5 Denialと存在oracle
 
-lexical path syntaxはcapability lookupより先に検証し、`PathError`をcatch可能な`RuntimeErrorCode::Argument`へ変換する。syntaxが正しい場合だけcapability/mount/operationを調べ、capabilityなし、operationなし、mount不一致はadapter call 0で`Denied`。存在path/不存在pathを同じpublic denial code/messageにし、absolute host path、symlink、permissionを含めない。grant済みroot内のnot-found等だけが`HostError`または既存言語意味論の`null`/`false`になれる。denyを`null`/`false`へ変換しない。
+lexical path syntaxはcapability lookupより先に検証し、`PathError`をcatch可能な`RuntimeErrorCode::Argument`へ変換する。syntaxが正しい場合だけcapability/mount/operationを調べ、不足時はadapter/OS call 0で内部`Denial`を生成する。script filesystem operationではsafe fieldだけからcatch可能なcanonical `sandbox` errorへ変換し、未捕捉なら`RuntimeError`とする。handler開始前のimport resolver denialだけはcatch不可terminal `Denied`である。存在path/不存在pathを同じpublic denial code/messageにし、absolute host path、symlink、permissionを含めない。grant済みroot内のnot-found等だけがcatch可能なcanonical `host` errorまたは既存言語意味論の`null`/`false`になれる。denyを`null`/`false`へ変換しない。
 
 ### 8.6 Filesystem policy encoding
 
@@ -482,7 +486,7 @@ impl ProcessExit {
 }
 ```
 
-OS process終了権限ではなくexecutionを`ExecutionOutcome::Exited { code, usage }`にする権限。grant済み0..=255はcatch不可terminal `Exited`、未grantはadapter/process call 0のcatch可能canonical capability errorである。library/callback/adapterは`std::process::exit`を呼ばない。
+OS process終了権限ではなくexecutionを`ExecutionOutcome::Exited { code, usage }`にする権限。grant済み0..=255はcatch不可terminal `Exited`、未grantはadapter/process/OS call 0で内部`Denial`を生成し、script実行中はcatch可能なcanonical `capability` error、未捕捉時は`RuntimeError`とする。library/callback/adapterは`std::process::exit`を呼ばない。
 
 ## 10. ModuleResolverとbounded source
 
@@ -611,7 +615,7 @@ nameは既存identifier grammarを満たす1..=64 UTF-8 bytesとする。`host_`
 
 `validate()`は次を強制する。`Arity::Range`は`min <= max`。`argument_audit`が空なら全indexを`Omit`とする。空でない場合、`Exact(n)`では長さがn、`Range { max, .. }`では長さがmaxでなければerror。実callのindex `i < actual_arity`にはvector[i]を使い、actualより後のpolicyは無視する。`max`は1024以下、`name`は64 bytes以下、host function IDはregistry内で一意でなければならない。
 
-registry登録とexecution grantは別。link時にname→IDを固定し、run中のname lookupやregistry差替えをしない。registered-but-not-grantedはcallback call 0のDenied。unknown nameは通常language name error。
+registry登録とexecution grantは別。link時にname→IDを固定し、run中のname lookupやregistry差替えをしない。registered-but-not-grantedはcallback call 0で内部`Denial`を生成し、script call中はcatch可能なcanonical `capability` error、未捕捉時は`RuntimeError`とする。unknown nameは通常language name error。handler開始前に同じ判断が必要なcontrol-plane処理だけがterminal `Denied`となる。
 
 ### 11.2 Arity、cost、result
 
@@ -728,7 +732,7 @@ OPTIONS:
 - process envをstart前snapshotし`TSUMUGI_`を除外。
 - system clock、script stdin/stdout、ProcessExitをgrant。
 - CLI adapterだけが`TSUMUGI_SANDBOX`と`TSUMUGI_ENV_ALLOW`を1回読む。core evaluator/builtinは読まない。
-- sandbox設定あり: comma-separated host rootsをstart時CWD基準でabsolute化してdirectory handleとして開き、`legacy0`, `legacy1`, ... mountへ順序固定する。rootが1つなら`default` aliasも同じhandle/policy IDへ付ける。旧absolute pathはOS lexical componentで各rootへのrelative candidateを作り、含むrootのうちcomponent数が最長のものを選ぶ。同じ長さの候補が複数ならprofile構築error。旧relative pathはsnapshot CWDを含む最長rootへrouteし、該当rootがなければDenied。候補選択後の解決とI/Oはroot handleだけを使う。
+- sandbox設定あり: comma-separated host rootsをstart時CWD基準でabsolute化してdirectory handleとして開き、`legacy0`, `legacy1`, ... mountへ順序固定する。rootが1つなら`default` aliasも同じhandle/policy IDへ付ける。旧absolute pathはOS lexical componentで各rootへのrelative candidateを作り、含むrootのうちcomponent数が最長のものを選ぶ。同じ長さの候補が複数ならprofile構築error。旧relative pathはsnapshot CWDを含む最長rootへrouteし、該当rootがなければadapter/OS call 0の内部`Denial`からcatch可能なcanonical `sandbox` errorへ変換する。候補選択後の解決とI/Oはroot handleだけを使う。
 - sandbox未設定/空: legacy専用`LegacyFilesystemTranslator`へunrestricted filesystem namespace authorityを明示grantしsecurity warningをstderrへ1件出す。Unixは`/`とsnapshot CWD handle、Windowsは要求されたvolume rootとsnapshot CWD handleへ安全なhandle操作を使う。authority自体がunrestrictedなだけでcheck/use文字列fallbackは使わない。
 - env allow設定あり: comma-separated exact keyまたは末尾`*` prefixだけsnapshot。未設定/空は`TSUMUGI_`以外を全snapshotしwarning 1件。
 - translatorは旧absolute pathをnamespace root handle、旧relative pathをstart時CWD handleへ変換する。symlink操作はhandle adapter契約に従う。secure handleを実装できないplatformではfilesystem capability構築を拒否。
@@ -795,21 +799,21 @@ C1→C2、C3/C4/C5/C7を並行、C6はstream後、C8はBuiltinSpec衝突検査�
 | CAP-AT-02 | 2 | grantした1操作だけ成功し隣接操作deny |
 | CAP-AT-03 | 2 | clone ID/権限一致、変更/revoke APIなし、start後snapshot不変 |
 | CAP-AT-04 | 2/3 | cancel後、新setで別実行可。Phase 3で旧実行だけCancelled |
-| CAP-AT-05 | 2 | env snapshot後process env変更が不変、missing=null、capability missing=Denied |
-| CAP-AT-06 | 2 | fixed clockで同結果、clockなしtrait call 0 |
+| CAP-AT-05 | 2 | env snapshot後process env変更が不変、missing=null。capability不足はenvironment adapter call 0のcatch可能capability errorで、未捕捉時RuntimeError |
+| CAP-AT-06 | 2 | fixed clockで同結果。Clockなしはtrait call 0のcatch可能capability errorで、未捕捉時RuntimeError |
 | CAP-AT-07 | 3 | input N-1/N成功、N+1は蓄積前BudgetExceeded。改行なし同じ |
 | CAP-AT-08 | 3 | output N-1/N成功、N+1はOutput call 0 |
-| CAP-AT-09 | 2 | EOF/adapter failure/authority不足をnull/catch可能 host error/catch可能 capability errorへ分離。link前failureはterminal channelへ分離 |
+| CAP-AT-09 | 2/3 | EOF / `AdapterError::Host` / authority不足 / `AdapterError::Control`を、順に`null` / catch可能host error / catch可能capability error / terminal control outcomeへ分離する。第4節のcanonical name全件をexact matchし、link前failureはterminal channelへ分離 |
 | CAP-AT-10 | 2 | path absolute/dot/dotdot/NUL/empty/backslash/drive/UNC/prefix衝突を拒否 |
 | CAP-AT-11 | 2/7 | symlink途中/final/dangling/renameを全policyで検証しroot外変更0。raceをstress gate化 |
 | CAP-AT-12 | 2 | 許可外存在/不存在はadapter call 0、同denial。root内だけnot-found可 |
-| CAP-AT-13 | 2 | FS operation matrix全組合せで1 authority欠落ごとI/O前Denied |
-| CAP-AT-14 | 2 | secure resolution不能adapterはfail closed、文字列fallback 0 |
+| CAP-AT-13 | 2 | FS operation matrix全組合せで1 authority欠落ごとI/O前に内部Denialを生成。script operationはcatch可能sandbox error、未捕捉時RuntimeError |
+| CAP-AT-14 | 2 | secure resolution不能adapterはfail closed、文字列fallback 0。script operationはcatch可能host error、未捕捉時RuntimeError |
 | CAP-AT-15 | 3 | file read/write N-1/N成功、N+1はallocation/write前BudgetExceeded |
-| CAP-AT-16 | 2 | importありresolverなしはcall 0 Denied。grant時linkだけ、run 0 |
+| CAP-AT-16 | 2 | importありresolverなしはresolver call 0のterminal Denied。grant時linkだけ、run 0 |
 | CAP-AT-17 | 3 | source N-1/N成功、N+1はchunk蓄積前拒否 |
-| CAP-AT-18 | 2 | exit capabilityなしはcatch可能error、あり0/255 Exited、-1/256 RuntimeError、process継続 |
-| CAP-AT-19 | 2/3 | Phase 2でregistered/granted 4組合せとarity、Phase 3でfuel N-1/N/N+1。拒否時callback 0 |
+| CAP-AT-18 | 2 | exit capabilityなしはprocess/OS call 0のcatch可能capability error（未捕捉時RuntimeError）、あり0/255 Exited、-1/256 RuntimeError、process継続 |
+| CAP-AT-19 | 2/3 | Phase 2でregistered/granted 4組合せとarity。ungrantedはcallback 0のcatch可能capability error（未捕捉時RuntimeError）。Phase 3でfuel N-1/N/N+1 |
 | CAP-AT-20 | 2 | catalog/tree/VM/compiler/generated docsの名前・arity・metadata完全一致、重複build error |
 | CAP-AT-21 | 2/3 | callback success/catch可能host error/panicを分離。Phase 3でresult N+1 BudgetExceeded。link前host failureはterminal HostError |
 | CAP-AT-22 | 2/6 | Omit/TypeOnly/LengthOnly serializerにfake secret本文0。Phase 6でsink eventも同じ |
