@@ -1,6 +1,6 @@
 # Tsumugi Manifesto
 
-最終更新: 2026-08-29
+最終更新: 2026-08-31
 
 ## この文書の位置づけ
 
@@ -133,7 +133,7 @@ Tsumugiは、少なくとも現在の方向性では、次のものを目指さ�
 
 これらは新しい方向性の土台だが、完成した組み込み実行基盤ではない。現在の facade は caller thread 上で同期的にツリーウォークを実行するだけで、VM、host I/O、`exit()`、権限、予算、停止理由を安全に抽象化していない。
 
-特に、次の項目は今後の設計・実装対象である。
+特に、次の項目は今後の実装・検証対象である。設計契約は関連文書で確定済みだが、現行実装が受入基準を満たすまでは保証として扱わない。
 
 - backendやhost I/Oを含む、安定した高水準の組み込みAPI
 - 実行単位のdeny-by-default capability
@@ -150,6 +150,15 @@ Tsumugiは、少なくとも現在の方向性では、次のものを目指さ�
 
 ## 関連文書
 
-- [設計ドキュメント](design.md) — 原則を実装へ落とし込むための設計判断
-- [言語仕様](language-spec.md) — スクリプトから観測できる規範的な挙動
-- [ロードマップ](roadmap.md) — 現在地、未実装事項、実現順序
+本マニフェストは設計判断の**価値基準**であり、APIや挙動の実装契約そのものではない。Phase 0〜7の具体的な契約は次の領域別正本に置き、設計確定と実装完了は[ロードマップ](roadmap.md)で分けて管理する。
+
+- [設計ドキュメント](design.md) — 現行実装のアーキテクチャと実装済み判断
+- [言語仕様](language-spec.md) — 現行実装から観測できる規範的な挙動
+- [脅威モデル](threat-model.md) — Phase 0の保証境界、非保証、host/Tsumugi/OSの責任分界
+- [組み込みAPI仕様](embedding-api.md) — Phase 1/2のEngine、compile/link、source identity、terminal channel
+- [Capability Model仕様](capability-model.md) — Phase 2のdeny-by-default認可とhost adapter境界
+- [実行予算・協調実行仕様](execution-control.md) — Phase 3/4の有限budget、transaction、状態機械、協調実行
+- [決定性・実行時監査仕様](determinism-and-audit.md) — Phase 5/6の規範backend、決定性、audit、record/replay
+- [次期意味論・実装決定](semantic-decisions.md) — 次期revisionの意味論、CLI、canonical error、将来機能の決定
+- [検証・リリース・運用設計](verification-release-operations.md) — Phase 7の検証、配布、supply chain、運用gate
+- [ロードマップ](roadmap.md) — 設計正本へのtrace、実装状態、実現順序

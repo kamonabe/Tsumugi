@@ -1,6 +1,6 @@
 # Tsumugi — 設計ドキュメント
 
-最終更新: 2026-08-29
+最終更新: 2026-08-31
 
 ## 目的と位置づけ
 
@@ -8,7 +8,7 @@ Tsumugiは、言語処理系の開発を入り口から理解するための個�
 
 そのうえで、プロジェクトの次の段階として、サーバーアプリケーションや業務システムに組み込める、制御可能なスクリプト言語を目指す。ホストが明示的に付与した権限と実行予算の範囲内で、業務ルールや拡張ロジックを予測可能かつ監査可能に実行し、瞬間的な性能よりもホストの安定性を優先する。
 
-設計上の価値基準と非目標の正本は[Tsumugi Manifesto](manifesto.md)とする。本書は、その原則を現在のアーキテクチャと具体的な技術判断へ落とし込む。
+設計上の価値基準と非目標の正本は[Tsumugi Manifesto](manifesto.md)とする。本書は**現行実装のアーキテクチャと実装済み判断の正本**であり、現在利用できる挙動は[言語仕様](language-spec.md)と合わせて読む。Phase 0〜7の次期実装契約は、[脅威モデル](threat-model.md)、[組み込みAPI仕様](embedding-api.md)、[Capability Model仕様](capability-model.md)、[実行予算・協調実行仕様](execution-control.md)、[決定性・実行時監査仕様](determinism-and-audit.md)、[次期意味論・実装決定](semantic-decisions.md)、[検証・リリース・運用設計](verification-release-operations.md)を領域別正本とする。これらは設計確定済みだが未実装または部分実装であり、本書の現行実装記録を先行して置き換えない。
 
 ## 設計目標
 
@@ -22,7 +22,7 @@ Tsumugiは、言語処理系の開発を入り口から理解するための個�
 - **観測・監査可能性:** script identity、言語version、付与権限、予算消費、外部効果、終了理由を構造化してホストへ通知する
 - **小さく理解可能な中核:** 純粋な計算を中核に保ち、外部効果をhost boundaryの後ろへ移す
 
-これらは目標であり、現在のalpha実装に対する保証ではない。Phase 1 の最初の縦切りとして、`src/engine.rs` はツリーウォーク用の `Engine`、パース済み `CompiledScript`、状態保持用 `ExecutionContext`、`ExecutionOutcome` を crate root から公開し、CLIもこの入口を利用する。compile は構文解析までで、import は context に依存して execute 時に解決する。実行は caller の同一スレッドで同期的に行われるため、context は十分なスタックを持つスレッド内で生成・利用する必要がある。
+これらは目標であり、現在のalpha実装に対する保証ではない。Phase 1 の最初の縦切りとして、`src/engine.rs` はツリーウォーク用の `Engine`、パース済み `CompiledScript`、状態保持用 `ExecutionContext`、`ExecutionOutcome` を crate root から公開し、CLIもこの入口を利用する。compile は構文解析までで、import は context に依存するため、execute開始時に最初のscript文を実行する前に共有`ModuleLoader`で全件を解決する。実行は caller の同一スレッドで同期的に行われるため、context は十分なスタックを持つスレッド内で生成・利用する必要がある。
 
 現行の環境変数ベースのstep・collection・filesystem・env制限はdefense-in-depthで、実行単位のdeny-by-default capabilityや総heap quotaをまだ提供していない。VM、host I/Oの注入、キャンセル、`exit()`を構造化outcomeとして返す契約も未実装である。現在地と実現順序は[ロードマップ](roadmap.md)で管理する。
 
@@ -343,9 +343,11 @@ toolchainは全ジョブで `dtolnay/rust-toolchain@stable` を使う。`Cargo.t
 
 ## 今後の候補
 
+クラスは[次期意味論・実装決定](semantic-decisions.md)第15節で設計済みであり、現時点では低優先度の実装候補とする。本文書の旧検討記録より同正本を優先する。
+
 | 優先度 | 項目 |
 |---|---|
-| 低 | クラス（継承なし・合成で拡張） |
+| 低 | クラス（[次期意味論・実装決定](semantic-decisions.md)で設計済み。継承なし・合成で拡張する低優先度実装候補） |
 
 ## クロージャ・無名関数の設計判断
 
@@ -426,11 +428,11 @@ let f = fn(x) x * 2 end
 
 ### 設計判断
 
-#### import をトップレベルに限定
+#### import を実行前解決へ統一
 
 `import` はプログラムのトップレベルでのみ有効とし、関数・条件分岐・ループ・`try` / `catch`・複数行ラムダのブロック内ではパースエラーにする。
 
-ツリーウォーク版はimport文へ到達した実行時にファイルを読み込む一方、VM版はコンパイル時にASTをインライン展開する。非トップレベルを許可すると、false branchでの読込有無、loopでの実行回数、関数呼び出し時の読込、相対パス基準、エラー発生フェーズの差がさらに広がるため、配置をトップレベルへ限定した。ただし、importより前の出力、実行中に生成したmodule、失敗時の副作用順など、トップレベルでも評価時点の違いは観測可能であり、完全な統一には至っていない（AUD-030）。
+ツリーウォーク版・VM版とも共有`ModuleLoader`で、最初のscript文を実行する前に全importを解決する。読み込み・パース・sandbox検査・深度検査のいずれかが失敗した場合は、プログラムを1文も実行しない。正常時はlink済みのモジュール文を`import`文の位置で実行するため、source上の副作用順を維持する。実行中のdynamic importはなく、実行中に生成したmoduleを読み込むこともできない（AUD-030完了）。
 
 Parserはプログラム直下とblock内の文を区別し、block内のimportをファイルI/O前に `import はトップレベルでのみ使用できます` で拒否する。これによりtree版・VM版でエラーフェーズとメッセージが一致し、到達不能branch内でもimport先へアクセスしない。
 
@@ -458,15 +460,15 @@ Parserはプログラム直下とblock内の文を区別し、block内のimport�
 - 正常に完了したimportの2回目以降は何もせずスキップ（エラーにしない）
 - 読み込み・パース・実行に失敗した場合はmarkerと一時的な`base_dir`を復元し、同じpathを再試行可能にする
 - A→B→Aのように同じ正規化pathへ戻る循環は、深度検査前の既訪問判定で従来どおり停止する
-- `Evaluator`と`Compiler`はloaded集合と分離した`import_depth`でactive chainだけを数え、root scriptを除く128ファイルまで許可する。129段目は`ErrorKind::Import`で拒否し、marker挿入前に停止する
+- 共有`ModuleLoader`はloaded集合と分離した`import_depth`でactive chainだけを数え、root scriptを除く128ファイルまで許可する。129段目は`ErrorKind::Import`で拒否し、marker挿入前に停止する
 - active depthと一時的な`base_dir`はinner処理の成否にかかわらず呼び出し元の値へ復元する
 - Python の挙動に近い（部分的に実行済みのモジュールオブジェクトを返す）
 
-#### VM版: コンパイル時にインライン展開
+#### 共有ローダーから両backendへ渡す
 
-- VM ではファイルを読み込んでパースし、得られた AST を現在の `Compiler` でそのままコンパイルする
-- ランタイムの新しい OpCode は不要（コンパイル時に解決される）
-- import先ファイルからの再帰的なimportに対応するため、コンパイル中に `base_dir` を一時切り替えする
+- `src/module.rs`の`ModuleLoader`がファイルを読み込み、パースし、import文をmodule文へ置換したlink済みProgramを作る
+- ツリーウォーク版は`Evaluator::run`の実行前、VM版はCompilerへProgramを渡す前に同じlink処理を使う
+- Compiler固有の`compile_import`、`base_dir`、`imported`、`import_depth`はAUD-030で削除済みであり、両backendは実行中にimportを解決しない
 
 ### 制約・トレードオフ
 
@@ -700,7 +702,7 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 - top-levelの`locals_cells`は正常入力間で引き継ぎ、既存closureとの参照同一性を維持
 - try/catchは開始時の有効local slot数を保存し、unwind時はtry-local cellだけを破棄する。既存localがtry中に初めてcell化された場合は昇格を維持する
 - catch済みエラーは通常の制御フローとしてcommitする
-- エラー前の外部I/Oや共有cellへの代入をどこまでrollbackするかは、完全な意味論を今後仕様化する
+- 現行実装ではエラー前の共有cell代入のcommit/rollbackがengine間で未統一である。次期契約は[次期意味論・実装決定](semantic-decisions.md)第7節と[実行予算・協調実行仕様](execution-control.md)第10節で確定済みだが未実装である
 
 ### コレクションサイズ上限
 
@@ -849,7 +851,7 @@ n=1000の絶対値では、`xs[i]`がtree 88,518,619→518,619バイト、VM 88,
 
 **不採用案:** 実行時エラーにする案は、tree（`EvalResult::Return`をtop-levelで無視）とVM（frameを畳む）の両方に別々の対処が必要で、REPLのrollback契約にも手が入る。Parserを触らずVMの`get_local`だけ構造化エラーへ変える案は、panicは避けられても無言終了とimport時のengine差が残る。トップレベル`return`をscript終了として仕様化する案は、`exit()`と役割が重なり、import先で「どこまで終了するか」を新たに定義する必要がある。
 
-**互換性と境界:** 関数外の`return`に依存したスクリプトはパースエラーになる。早期終了が目的なら`exit()`、値を返すなら関数にまとめる。既存fixtureとexamplesに該当箇所はなかった。import先の`return`は両engineで同じ`import`エラーになるが、tree側だけ失敗より前のtop-level出力が残る点は評価時点の差（AUD-030）であり、本変更の対象外である。library利用者が不正な`Chunk`を直接VMへ渡す経路のpanic面はAUD-023として残る。
+**互換性と境界:** 関数外の`return`に依存したスクリプトはパースエラーになる。早期終了が目的なら`exit()`、値を返すなら関数にまとめる。既存fixtureとexamplesに該当箇所はなかった。import先の`return`は両engineで同じ`import`エラーになり、後続AUD-030でimport解決を実行前へ統一したため、失敗前のtop-level出力差も解消済みである。library利用者が不正な`Chunk`を直接VMへ渡す経路のpanic面はAUD-023として残る。
 
 **回帰テスト:** Parserの単体テストで、トップレベル・`if` / `elif` / `else` / `while` / `for` / `try` / `catch`の各ブロックでの拒否、関数・多段ネスト・複数行ラムダ・1行ラムダ・関数内関数での受理、関数本体を抜けた後の再拒否（`fn_depth`の戻し漏れ検出）、複数箇所の全件報告と進行保証を検証する。統合テストではfixture `error_return_outside_fn`をtree/VM両方で実行し、2件のパースエラーとstdout副作用なしを完全一致で固定する。REPLテストは`bare` / `try`内 / `for`内の3形をtree/VM双方で流し、host panicが出ないこと、配置エラーが1件であること、失敗入力の後もtop-level bindingを読めることを検証する。
 
