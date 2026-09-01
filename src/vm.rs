@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use crate::chunk::Chunk;
 use crate::error::TsumugiError;
+use crate::limits::MAX_USER_CALL_DEPTH;
 use crate::opcode::{MutationTarget, OpCode};
 use crate::value::{SharedValue, Value};
 
@@ -43,9 +44,6 @@ struct CallFrame {
 
 /// デフォルトのステップ上限（100万）
 const DEFAULT_MAX_STEPS: u64 = 1_000_000;
-
-/// コールフレーム深度の上限（スタックオーバーフロー防止）
-const MAX_CALL_DEPTH: usize = 128;
 
 /// 環境変数からステップ上限を読み取る
 fn vm_resolve_max_steps() -> u64 {
@@ -146,6 +144,16 @@ impl Vm {
             max_steps: vm_resolve_max_steps(),
             try_handlers: Vec::new(),
         }
+    }
+
+    /// root script frame を除いた、現在 active な user 定義呼び出しフレーム数。
+    ///
+    /// VM は `run()` / `run_repl_chunk()` の実行中は常に 1 つの root frame を base に
+    /// 持つ。深度上限（[`MAX_USER_CALL_DEPTH`]）はこの root を数えないため、判定・doc
+    /// 契約はこの値だけを唯一の計数として用いる。tree-walk 版の `call_stack.len()` と
+    /// 同じ意味になる。
+    fn active_user_frame_count(&self) -> usize {
+        self.frames.len().saturating_sub(1)
     }
 
     /// チャンクを実行する
@@ -1025,12 +1033,12 @@ impl Vm {
             }
             OpCode::PrepareCall => {
                 self.count_step(line)?;
-                if self.frames.len() >= MAX_CALL_DEPTH {
+                if self.active_user_frame_count() >= MAX_USER_CALL_DEPTH {
                     return Err(TsumugiError::runtime(
                         line,
                         format!(
                             "スタックオーバーフロー: 再帰が深すぎます (上限: {})",
-                            MAX_CALL_DEPTH
+                            MAX_USER_CALL_DEPTH
                         ),
                     ));
                 }
@@ -1059,12 +1067,12 @@ impl Vm {
             OpCode::Call(arg_count) => {
                 // PrepareCallを経由しない不正bytecodeでもframe上限を迂回させない。
                 // stepはPrepareCallだけで数え、ここでは二重countしない。
-                if self.frames.len() >= MAX_CALL_DEPTH {
+                if self.active_user_frame_count() >= MAX_USER_CALL_DEPTH {
                     return Err(TsumugiError::runtime(
                         line,
                         format!(
                             "スタックオーバーフロー: 再帰が深すぎます (上限: {})",
-                            MAX_CALL_DEPTH
+                            MAX_USER_CALL_DEPTH
                         ),
                     ));
                 }
@@ -1599,13 +1607,13 @@ impl Vm {
     ) -> Result<Value, TsumugiError> {
         self.count_step(line)?;
         // 再帰制限チェック（OpCode::Call と同じガードを適用）
-        if self.frames.len() >= MAX_CALL_DEPTH {
+        if self.active_user_frame_count() >= MAX_USER_CALL_DEPTH {
             return Err(TsumugiError::runtime_with_kind(
                 line,
                 crate::error::ErrorKind::StackOverflow,
                 format!(
                     "スタックオーバーフロー: 再帰が深すぎます (上限: {})",
-                    MAX_CALL_DEPTH
+                    MAX_USER_CALL_DEPTH
                 ),
             ));
         }

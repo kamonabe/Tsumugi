@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-08-31
+最終更新: 2026-09-01
 
 ## プロジェクトの方向性
 
@@ -72,7 +72,7 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 |---|---|---|---|
 | AUD-015 | callback内`break`/`continue`を通常関数と同じくエラー化する | treeのmap/filter/eachだけ`break`を暗黙`null`として扱い、VMはcompile error | ✅ 完了（control-flow回帰テスト追加） |
 | AUD-016 | 同一scopeの`let`再宣言時のbinding identityを仕様化する | 既存closureがtreeでは旧cell、VMでは更新済みcellを参照 | 🟡 設計確定・未実装（[次期意味論・実装決定](semantic-decisions.md)第4節: globalを含む全scopeでfresh cell） |
-| AUD-017 | call-depth境界を統一する | 上限128にtop-level frameを含めるVMだけ、許容user frame数が1少ない | 🟡 設計確定・未実装（同第5節、AUD-050と一体） |
+| AUD-017 | call-depth境界を統一する | 上限128にtop-level frameを含めるVMだけ、許容user frame数が1少ない | ✅ 完了（AUD-050と一体で解消。VMを`active_user_frame_count() = frames.len() - 1`によるroot除外計数へ変更し、tree/VMとも128 user frameを許可・129個目を拒否。境界値127/128/129・相互再帰・lambda・callbackの回帰テストと、両engine一致のstack overflow traceテストを追加） |
 | AUD-018 | CLIからscript引数を渡せるようにする | `args()`を公開しているがCLIが2個目以降の非flag引数をusage errorにする | 🟡 設計確定・未実装（同第6節、Embedding E8a。capability profile/optionsとsafe/legacy移行はE8bで別追跡） |
 | AUD-019 | engine固有error kind/messageを統一する | iteration/index/callback等でkind・messageが異なる。push/pop/map/filter/eachの主要なkindはAUD-012で統一したが、callback messageやtrace差は残る。具体例として、コレクション以外へのindex（`let n = 42` に対する `n[0]`）はtreeが`runtime` / 「インデックスアクセスできません: Int(42)[Int(0)]」、VMが`type` / 「型エラー: Int(42) に対して Int(0) でインデックスアクセスできません」になる（AUD-041で`index_read_lowering`の期待値を分けて明示済み） | 🟡 設計確定・未実装（同第3節のcanonical error契約） |
 | AUD-020 | sandboxの脅威モデルとTOCTOU制約を明記する | checkとI/O間のsymlink race、sandbox検査前のcanonicalizeによる許可外path存在oracle、dangling final symlink経由の新規write/append、空設定のfail-open意味論が未整理 | 🟡 設計確定・部分実装（現行制約の文書化のみ完了。[脅威モデル](threat-model.md) TM-002〜004と[Capability Model仕様](capability-model.md) CAP-AT-10〜14のpath-handle実装は未完了） |
@@ -96,7 +96,7 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 | AUD-045 | 配布・実行手順とtoolchainの下限を明示する | READMEのクイックスタートは`cargo build` / `cargo run`だけだが、エラーメッセージの例は`$ tsumugi file.tsg`を使う。`cargo install --path .`やPATH設定、再導入手順の記載がない。`Cargo.toml`はedition 2024を要求しながら`rust-version`を宣言せず、`rust-toolchain.toml`もないためCIはstable追従で、compiler版の下限を検証できない。release / install workflowとcommit SHA固定のaction参照もない | 🟡 設計確定・未実装（[検証・リリース・運用設計](verification-release-operations.md): MSRV Rust 1.97、install/release、artifact/OCI/運用gate。現行workflow・manifestは未変更） |
 | AUD-048 | 捕捉のない関数値の同一性判定を統一する | AUD-014は「関数値は同一の関数値とだけ等しい」を規範としたが、同一性の粒度がengine間で揃っていない。`fn make() return fn(x) x end end` に対する `make() == make()` がtreeで`false`、VMで`true`になる。捕捉なし名前付き関数の2回生成、ループ内で同じlambda式を2回評価した2値の比較でも同じ差が出る。原因は`src/value.rs`の`PartialEq`で、treeの`Value::Fn`は定義式の評価ごとに新しい`Rc<FnDef>`を作るのに対し、VMの`Value::VmFn`はcompile時に共有される`Rc<Chunk>`とupvalue cellで比較するため、`upvalues`が空だと`all`が真になる。upvalueを持つ関数値、および別々に書いた同形lambdaの比較は両engineで一致する。AUD-014の486ケース網羅比較は型の組み合わせを対象としたため、同一sourceから複数インスタンスを作る形を含んでおらず検出できなかった | 🟡 設計確定・未実装（差分fixtureのみ実装済み。[次期意味論・実装決定](semantic-decisions.md)第12節・[決定性・実行時監査仕様](determinism-and-audit.md)第4.7節: function/lambda式の動的評価ごとにfresh `FunctionId`） |
 | AUD-049 | builtin名一覧の3重管理を解消する | スクリプトから呼べるbuiltin名が3か所に分散している。`builtin_core.rs`の`dispatch`（46名。`__pop_update`は内部専用）、`builtin.rs`の`match name`（53名、`_ => Ok(None)`で終わる）、`compiler.rs`の`is_builtin()`（52名。`print`は予約tokenのため別扱い）。現状は3リストが整合しているが、追加時に1か所でも漏らすと「treeでは呼べるがVMでは呼べない」状態になり、compile errorではなく実行時の`name`エラーとして現れる。`design.md`が「`builtin_core.rs` + dispatchへの登録のみで両engineに反映される」と書いていたのはこの構造と矛盾していた | 🟡 設計確定・未実装（現行文書の3か所登録注意だけ反映済み。[次期意味論・実装決定](semantic-decisions.md)第13節と[Capability Model仕様](capability-model.md)第17節: 単一`BuiltinSpec` / callable catalogからtree・VM・compiler・生成文書を導出） |
-| AUD-050 | `MAX_CALL_DEPTH`を`limits.rs`へ集約する | 構造的上限のうち`MAX_AST_DEPTH`と`MAX_IMPORT_DEPTH`は`src/limits.rs`にあるが、`MAX_CALL_DEPTH = 128`だけ`eval.rs`と`vm.rs`に同じdoc commentで二重定義されている。値とエラー文面は一致しているが、境界の数え方が揃っておらず、tree（`call_stack`が空開始）とVM（`frames: vec![frame]`でtop-level込み）で到達できる再帰深度が1段ずれる（AUD-017）。定義が分かれていることがこのズレを見つけにくくしている | 🟡 設計確定・未実装（[次期意味論・実装決定](semantic-decisions.md)第5節: `MAX_USER_CALL_DEPTH = 128`を`limits.rs`へ集約し、rootを数えずactive user call数で統一） |
+| AUD-050 | `MAX_CALL_DEPTH`を`limits.rs`へ集約する | 構造的上限のうち`MAX_AST_DEPTH`と`MAX_IMPORT_DEPTH`は`src/limits.rs`にあるが、`MAX_CALL_DEPTH = 128`だけ`eval.rs`と`vm.rs`に同じdoc commentで二重定義されている。値とエラー文面は一致しているが、境界の数え方が揃っておらず、tree（`call_stack`が空開始）とVM（`frames: vec![frame]`でtop-level込み）で到達できる再帰深度が1段ずれる（AUD-017）。定義が分かれていることがこのズレを見つけにくくしている | ✅ 完了（`MAX_USER_CALL_DEPTH = 128`を`src/limits.rs`へdoc contract付きで集約。`eval.rs`/`builtin.rs`/`vm.rs`のローカル定義を削除し共有定数を参照。VMは`active_user_frame_count()`でroot frameを除いて数え、AUD-017の1段ズレも同時に解消） |
 
 ### 2026-08-27 検証スナップショット
 
@@ -245,12 +245,12 @@ tree側は旧スナップショットより遅くなっている（`fib_20` 14.9
 | AUD-045 | 確定済み | MSRVをRust 1.97とし、stable/MSRV CI、install/release、6 platform artifact、署名・SBOM・OCI、参照用Kubernetes Jobの順序とgateを固定 | [検証・リリース・運用設計](verification-release-operations.md)第3〜10・17〜18節 | 未実装。現行はrolling stable、release/install workflow・OCI・manifestなし |
 | AUD-048 | 確定済み | function/lambda式の**動的評価ごと**にfresh `FunctionId`を発行し、clone/captureは同じIDを保持、rollback後もIDを再利用しない | [次期意味論・実装決定](semantic-decisions.md)第12節、[決定性・実行時監査仕様](determinism-and-audit.md)第4.7節 | 未実装。現行差分fixtureのみ存在 |
 | AUD-049 | 確定済み | 単一`BuiltinSpec` / callable catalogからtree、VM、compiler、arity、context metadata、生成文書を導出。HostFunction registryは別registryだが共通resolverで衝突検査 | [次期意味論・実装決定](semantic-decisions.md)第13節、[Capability Model仕様](capability-model.md)第17節・CAP-AT-20 | 未実装。現行3一覧は一致するが手書き重複のまま |
-| AUD-050 | 確定済み | `MAX_USER_CALL_DEPTH = 128`を`limits.rs`へ集約し、root frameを数えずactive user call数で統一。128個目を許可し129個目の直前で拒否 | [次期意味論・実装決定](semantic-decisions.md)第5節 | 未実装。現行はtree/VM二重定義かつ境界差あり |
+| AUD-050 | 確定済み | `MAX_USER_CALL_DEPTH = 128`を`limits.rs`へ集約し、root frameを数えずactive user call数で統一。128個目を許可し129個目の直前で拒否 | [次期意味論・実装決定](semantic-decisions.md)第5節 | ✅ 完了（AUD-017と一体）。`limits.rs`へ集約、VMは`active_user_frame_count()`でroot除外計数。tree/VMとも128 user frameを許可し129個目を同じline/message/traceで拒否。境界値・相互再帰・lambda・callbackの回帰テスト追加 |
 
 ### 設計sliceに沿う推奨実装順
 
 1. **基準固定:** [次期意味論・実装決定](semantic-decisions.md)第17節の基準固定と、現行非適合fixtureを維持する。文書の設計確定を実装完了として扱わない。
-2. **意味論基盤:** 内部refactor → AUD-050/017深度統合 → AUD-049単一BuiltinSpec → AUD-019 canonical error → AUD-047 COW/AUD-048 FunctionId → AUD-016 binding/AUD-024 transaction → AUD-034/036/018/033境界挙動の順で進める。
+2. **意味論基盤:** 内部refactor → ~~AUD-050/017深度統合~~（✅ 完了） → AUD-049単一BuiltinSpec → AUD-019 canonical error → AUD-047 COW/AUD-048 FunctionId → AUD-016 binding/AUD-024 transaction → AUD-034/036/018/033境界挙動の順で進める。
 3. **Phase 1 embedding:** [組み込みAPI仕様](embedding-api.md) E1〜E6→E8a。最終terminal型のsubsetを使い、先行公開型を作らない。
 4. **Phase 2 capability:** E7→E8bと[Capability Model仕様](capability-model.md) C1→C2、C3/C4/C5/C7、C6、C8、最後にC9/C10。現行ambient accessを削除するまで完了扱いにしない。
 5. **Phase 3/4 control:** E11/C11で有限budget・transactionを完成し、その後E12/C12でcooperative state machine、yield/pause/resume、admission/backpressureを実装する。
@@ -525,7 +525,7 @@ Tsumugi にはファイルI/O やサンドボックス機能が既に実装さ�
 
 | 項目 | 詳細 | 状態 |
 |---|---|---|
-| ユーザー関数のコール深度制限 | 関数再帰を128フレームでRust実stack overflow前にエラー化 | ✅ 完了（境界差はAUD-017で継続） |
+| ユーザー関数のコール深度制限 | 関数再帰を128フレームでRust実stack overflow前にエラー化。root除外のactive user frame数で数え、tree/VM境界を統一（`MAX_USER_CALL_DEPTH`を`limits.rs`へ集約） | ✅ 完了（AUD-050 / AUD-017） |
 | 関数外 `return` の拒否 | 関数本体の外の`return`をパース時にエラー化し、VM REPLのhost panicと無言終了を防止 | ✅ 完了（AUD-043） |
 | 構文・AST深度制限 | Parser生成時とCompiler/Evaluator入口でAST深度256を検査。nested f-stringにも親深度を継承 | ✅ 完了（AUD-027） |
 | import chain深度制限 | rootを除くactive import chainをtree/VMとも128に制限 | ✅ 完了（AUD-028） |
