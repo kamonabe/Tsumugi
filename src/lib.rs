@@ -11,6 +11,7 @@
 
 pub mod ast;
 pub mod builtin_core;
+pub mod builtin_registry;
 pub mod chunk;
 pub mod compiler;
 pub mod engine;

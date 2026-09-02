@@ -13,9 +13,11 @@
 //! - `push` / `pop` — 変数bindingへの書き戻し
 //! - `map` / `filter` / `each` — クロージャ呼び出し
 //!
-//! 名前一覧は本モジュールの `dispatch`、`builtin.rs` の `match name`、
-//! `compiler.rs` の `is_builtin()` の3か所にある。追加時は3か所すべてへ登録する
-//! （AUD-049）。
+//! language-visible builtin 名の正本は [`crate::builtin_registry`] の
+//! `PUBLIC_BUILTINS` 1か所だけである（AUD-049）。本モジュールの `dispatch` は
+//! PureCore builtin の handler 正本であり、名前の可否判定は registry から導出する。
+//! 内部命令 `__pop_update` は public registry へ置かず、Compiler の pop lowering
+//! 専用 opcode として実装するため source から到達できない。
 
 use crate::error::TsumugiError;
 use crate::value::Value;
@@ -96,10 +98,10 @@ pub fn check_arity(
 }
 
 pub fn is_context_builtin(name: &str) -> bool {
-    matches!(
-        name,
-        "input" | "args" | "exit" | "push" | "pop" | "map" | "filter" | "each"
-    )
+    // 名前一覧は単一の BuiltinSpec registry から導出する（AUD-049）。
+    // `print` は Compiler が予約 token として直接 lowering するため、context
+    // builtin だが本 registry 判定の対象にはならない（ValidateBuiltinCall を出さない）。
+    crate::builtin_registry::is_context_builtin(name) && !matches!(name, "print")
 }
 
 pub fn validate_context_builtin_call(
@@ -942,15 +944,16 @@ pub fn builtin_is_dir(args: &[Value], line: usize) -> Result<Value, TsumugiError
 // ディスパッチ関数
 // =============================================================================
 
-/// 共通化されたビルトインを名前で呼び出す。
+/// PureCore builtin と、両engineが値だけで実行できる `push` / `pop` を名前で呼び出す。
 /// 該当すれば Ok(Some(value))、該当しなければ Ok(None) を返す。
-/// map/filter/each/print/input/exit/args はコンテキスト依存のため含まない。
+/// map/filter/each/print/input/exit/args は実行コンテキスト依存のため含まない。
+/// 内部命令 `__pop_update` は public 名として持たず、[`builtin_pop_update`] を
+/// VM の [`crate::opcode::OpCode::PopUpdate`] と tree の pop 実装が直接呼ぶ（AUD-049）。
 pub fn dispatch(name: &str, args: &[Value], line: usize) -> Result<Option<Value>, TsumugiError> {
     let result = match name {
         "len" => builtin_len(args, line)?,
         "push" => builtin_push(args, line)?,
         "pop" => builtin_pop(args, line)?,
-        "__pop_update" => builtin_pop_update(args, line)?,
         "keys" => builtin_keys(args, line)?,
         "values" => builtin_values(args, line)?,
         "has_key" => builtin_has_key(args, line)?,

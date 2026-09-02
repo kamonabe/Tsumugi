@@ -265,6 +265,7 @@ let result = filter(test, fn(item) item != "kani" end)
 | `parser.rs` | 各文のAST生成、リスト/辞書リテラル、インデックスアクセス、インデックス代入の対象が識別子であること、非トップレベル`import`の拒否、関数外`return`の拒否と全件報告、エラー回復と行番号含有 |
 | `eval.rs` | 算術・比較・論理、関数呼び出し、リスト/辞書操作、組み込み関数、エラーケース全般 |
 | `vm.rs` | 内部不変条件の破れをinternal errorとして返すこと（範囲外local slot、stack不足の`Call`、operand overflow、`PrepareCall`を経由しない呼び出しでの深度上限） |
+| `builtin_registry.rs` | `BuiltinSpec` 全 entry の名前・`BuiltinId` の一意性、name↔id 往復、context/pure 分類の整合、内部 prefix `__` の排除、`__pop_update` が public でないこと（AUD-049） |
 | `sandbox.rs` | `.` / `..` を含むパスの正規化 |
 
 `vm.rs` の単体テストは内部実装と一緒に読める最小ケースだけを置き、公開APIだけで書いた網羅ケースは `tests/defensive_vm.rs` に分ける（AUD-023）。
@@ -306,6 +307,10 @@ fixture 追加手順は、`.tsg` と期待ファイルを置き、`fixture_tests
 `tests/defensive_vm.rs` は、library利用者が不正な `Chunk` を公開APIへ渡してもホストプロセスが落ちないことを検証する（AUD-023）。`tsumugi::` の公開APIだけを使い、`Vm::new` / `Vm::run_repl_chunk` に手組みのbytecodeを渡す。
 
 固定しているのは、範囲外のlocal slot読み書き・定数参照・upvalue参照、stackが足りない `FStrConcat` / `PopN` / `Print` / `CallBuiltin`、関数先頭の `MakeClosure`、行番号表が空のChunk、`dispatch` へ到達する `try` 命令の8ケース。いずれも`internal`種別の構造化エラーになることを期待値とし、VM実装を修正前へ戻すと `index out of bounds` のpanicで失敗する。
+
+### registry契約テスト
+
+`tests/builtin_registry_contract.rs` は、単一 BuiltinSpec registry（AUD-049）の正本性をクロスエンジンで固定する。`PUBLIC_BUILTINS` の全 entry について、VM の Compiler が呼び出しを compile でき、tree の実行系が builtin として名前解決する（`未定義の関数` にならない）ことを検査する。外部副作用を避けるため、各呼び出しは arity 検査で先に失敗する引数個数を渡す（arity を強制できない `path_join` だけは純粋関数として成功を許容）。内部命令 `__pop_update` が両engineで source から到達不能であることも固定する。registry 自体の一意性・往復・分類は `src/builtin_registry.rs` の単体テストで検査する。
 
 ### CI
 
@@ -537,6 +542,7 @@ Parserはプログラム直下とblock内の文を区別し、block内のimport�
 | `src/compiler.rs` | Compiler — AST を走査して Chunk を生成する |
 | `src/vm.rs` | Vm — Chunk をスタックマシンとして実行する |
 | `src/builtin_core.rs` | 組み込み関数の共通ロジック — VM/ツリーウォーク両方から呼ばれる |
+| `src/builtin_registry.rs` | 単一 BuiltinSpec registry — language-visible builtin 名・arity・context/pure 分類の正本（AUD-049） |
 
 ### スタックマシンの動作原理
 
@@ -601,7 +607,7 @@ VmFn {
 
 ```
 builtin_core.rs
-├── dispatch(name, &[Value], line) → Result<Option<Value>>   # 47アーム
+├── dispatch(name, &[Value], line) → Result<Option<Value>>   # public名46アーム（__pop_updateは含まず、OpCode::PopUpdate/tree pop が builtin_pop_update を直接呼ぶ）
 ├── builtin_len, builtin_push, ...（builtin_* が47個）
 │   ├── 副作用なしの値変換: 32個
 │   └── filesystem / env / clock に触るもの: 15個
@@ -619,7 +625,7 @@ builtin_core.rs
 - **エンジン固有のビルトインは各モジュールに残す** — `push`/`pop`（binding更新）、`map`/`filter`/`each`（クロージャ呼び出し）、`print`/`input`/`exit`/`args`（I/O・プロセス操作）
 - **user bindingをbuiltinより優先する** — `print`以外の識別子calleeはlocal/upvalue/runtime globalを先に探し、bindingがない場合だけbuiltinへfallbackする。VMは`JumpIfGlobalDefined`で実行時のglobal登録状態を分岐し、builtin branchとuser-call branchの評価順を混在させない
 - **破壊的List操作はbindingへ書き戻す** — builtin `push`/`pop`が選ばれた場合、第1引数はlocal/upvalue/runtime globalの識別子bindingに限定する。第1引数の値を先にsnapshotし、更新後のListを同じbindingへ書き戻す。一時Listは永続化先がないため拒否する
-- **新規ビルトイン追加は3か所への登録が必要** — 実装と `dispatch` アームを `builtin_core.rs` へ、委譲名を `builtin.rs` の `match name` へ、VM側の名前判定を `compiler.rs` の `is_builtin()` へ登録する。`builtin.rs` の `match` は `_ => Ok(None)` で終わるため、`builtin_core.rs` だけに足しても両engineから呼べない。名前一覧が3か所に分散していることは既知の構造的リスクで、片側だけ足すと「treeでは呼べるがVMでは呼べない」状態になる（AUD-049）
+- **builtin名の正本は単一registry** — language-visible builtin名は `builtin_registry.rs` の `PUBLIC_BUILTINS`（`BuiltinSpec` 配列）1か所で定義する（AUD-049）。tree の委譲判定（`is_pure_core_builtin`）、Compiler の builtin 判定（`is_builtin` → `is_public_builtin`）、context 判定（`is_context_builtin`）、VM の dispatch はすべてこの registry から導出し、手書きの名前一覧を持たない。VM の `CallBuiltin` opcode は名前文字列ではなく `BuiltinId` を保持するため、typo は compile 時に検出される。新規ビルトイン追加は「handler 実装（`builtin_core.rs` の `dispatch` アーム、または各engineのcontext実装）+ `BuiltinSpec` 1 entry + tests」に一本化される。内部命令 `__pop_update` は public registry へ置かず、`pop` の書き戻し専用 opcode `OpCode::PopUpdate` として実装するため source から到達できない。`builtin_registry` 内の contract test と `tests/builtin_registry_contract.rs` が、全 entry の一意性・往復・tree/VM の名前解決・`__pop_update` 非到達を自動検査する
 
 ### 設計判断
 

@@ -268,13 +268,14 @@ src/
 │  --- バイトコードVM実行（--vm） ---
 ├── opcode.rs     # バイトコード命令セット
 ├── chunk.rs      # 命令列 + 定数テーブル
-├── compiler.rs   # コンパイラ（AST → Chunk、builtin名の判定）
+├── compiler.rs   # コンパイラ（AST → Chunk、builtin判定はregistryから導出）
 ├── vm.rs         # スタックマシン VM + コンテキスト依存の組み込み関数
 │
 │  --- 実行時ガードレール（両実行系で共有） ---
-├── builtin_core.rs  # 組み込み関数の共通実装（47個）
-├── limits.rs        # 構造的上限（MAX_AST_DEPTH / MAX_IMPORT_DEPTH）
-└── sandbox.rs       # ファイルI/Oと環境変数のallow-list検査
+├── builtin_core.rs     # 組み込み関数の共通実装（47個）
+├── builtin_registry.rs # builtin名・arity・context/pure分類の単一正本（BuiltinSpec）
+├── limits.rs           # 構造的上限（MAX_AST_DEPTH / MAX_IMPORT_DEPTH）
+└── sandbox.rs          # ファイルI/Oと環境変数のallow-list検査
 
 tests/
 ├── integration.rs    # 統合テスト（ゴールデンテスト + stdin駆動REPL）

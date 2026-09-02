@@ -154,8 +154,16 @@ pub enum OpCode {
     ToIterList,
 
     /// 組み込み関数呼び出し
-    /// operand: (定数テーブル上の関数名インデックス, 引数の数)
-    CallBuiltin(usize, usize),
+    /// operand: (呼び出す builtin の [`crate::builtin_registry::BuiltinId`], 引数の数)
+    CallBuiltin(crate::builtin_registry::BuiltinId, usize),
+
+    /// `pop` の書き戻し専用の内部命令（source から到達不能）。
+    ///
+    /// スタックトップの List を、末尾要素を取り除いた List へ置き換える（空 List は
+    /// そのまま）。以前は public builtin 名 `__pop_update` を定数テーブルへ載せて
+    /// `CallBuiltin` で呼んでいたが、AUD-049 で内部命令へ隔離し、public registry から
+    /// 除外した。
+    PopUpdate,
 
     /// プログラム終了
     Return,

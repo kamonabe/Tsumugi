@@ -1269,24 +1269,24 @@ impl Vm {
                     line,
                 )?;
             }
-            OpCode::CallBuiltin(name_idx, arg_count) => {
-                let name = match self.constant(name_idx, line)? {
-                    Value::Str(s) => s,
-                    _ => {
-                        return Err(internal_error(
-                            line,
-                            "内部エラー: CallBuiltin の関数名が文字列ではありません",
-                        ));
-                    }
-                };
+            OpCode::CallBuiltin(builtin_id, arg_count) => {
+                let name = crate::builtin_registry::name_of(builtin_id);
                 self.require_stack_len(arg_count, line)?;
                 let mut args = Vec::with_capacity(arg_count);
                 for _ in 0..arg_count {
                     args.push(self.pop(line)?);
                 }
                 args.reverse();
-                let result = self.exec_builtin(&name, args, line)?;
+                let result = self.exec_builtin(name, args, line)?;
                 self.stack.push(result);
+            }
+            OpCode::PopUpdate => {
+                // pop の書き戻し専用の内部命令。スタックトップの List から末尾を
+                // 取り除いた List へ置き換える（source から到達不能）。
+                self.require_stack_len(1, line)?;
+                let list = self.pop(line)?;
+                let updated = crate::builtin_core::builtin_pop_update(&[list], line)?;
+                self.stack.push(updated);
             }
             OpCode::FStrConcat(count) => {
                 // スタックから count 個の値を取り出して文字列に連結

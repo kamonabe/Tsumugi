@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-09-01
+最終更新: 2026-09-02
 
 ## プロジェクトの方向性
 
@@ -95,7 +95,7 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 | AUD-044 | 完了済み非適合と古い記述をREADME・規範仕様から除く | 仕様revision表記の不一致（当時`README.md` 0.5 / `language-spec.md` 0.6）、完了済み非適合（captured collectionへのindex代入）の掲載、`README.md`の構成図が`lib.rs` / `builtin_core.rs` / `limits.rs` / `sandbox.rs` / `module.rs` / `tests/defensive_vm.rs`を欠くこと、`env.rs`を「関数テーブル」と説明すること、examplesを3件中1件しか挙げないこと、CI手順が矢印区切りでコピー実行できず`cargo clippy`の`--`を欠き3 OS matrixとcoverage jobを記載していないこと。組み込み関数53個とLICENSE(MIT)の記載は実測と一致する | ✅ 完了（revision表記はAUD-043で揃え、以後0.10まで追随。完了済み非適合は`language-spec.md`から除去しID付きの表へ置換。構成図は`src/*.rs` 19件が実ファイルと1対1で一致することを確認し、examplesも3件掲載。CI手順は3ジョブの表とコピー可能なコマンド列へ置換） |
 | AUD-045 | 配布・実行手順とtoolchainの下限を明示する | READMEのクイックスタートは`cargo build` / `cargo run`だけだが、エラーメッセージの例は`$ tsumugi file.tsg`を使う。`cargo install --path .`やPATH設定、再導入手順の記載がない。`Cargo.toml`はedition 2024を要求しながら`rust-version`を宣言せず、`rust-toolchain.toml`もないためCIはstable追従で、compiler版の下限を検証できない。release / install workflowとcommit SHA固定のaction参照もない | 🟡 設計確定・未実装（[検証・リリース・運用設計](verification-release-operations.md): MSRV Rust 1.97、install/release、artifact/OCI/運用gate。現行workflow・manifestは未変更） |
 | AUD-048 | 捕捉のない関数値の同一性判定を統一する | AUD-014は「関数値は同一の関数値とだけ等しい」を規範としたが、同一性の粒度がengine間で揃っていない。`fn make() return fn(x) x end end` に対する `make() == make()` がtreeで`false`、VMで`true`になる。捕捉なし名前付き関数の2回生成、ループ内で同じlambda式を2回評価した2値の比較でも同じ差が出る。原因は`src/value.rs`の`PartialEq`で、treeの`Value::Fn`は定義式の評価ごとに新しい`Rc<FnDef>`を作るのに対し、VMの`Value::VmFn`はcompile時に共有される`Rc<Chunk>`とupvalue cellで比較するため、`upvalues`が空だと`all`が真になる。upvalueを持つ関数値、および別々に書いた同形lambdaの比較は両engineで一致する。AUD-014の486ケース網羅比較は型の組み合わせを対象としたため、同一sourceから複数インスタンスを作る形を含んでおらず検出できなかった | 🟡 設計確定・未実装（差分fixtureのみ実装済み。[次期意味論・実装決定](semantic-decisions.md)第12節・[決定性・実行時監査仕様](determinism-and-audit.md)第4.7節: function/lambda式の動的評価ごとにfresh `FunctionId`） |
-| AUD-049 | builtin名一覧の3重管理を解消する | スクリプトから呼べるbuiltin名が3か所に分散している。`builtin_core.rs`の`dispatch`（46名。`__pop_update`は内部専用）、`builtin.rs`の`match name`（53名、`_ => Ok(None)`で終わる）、`compiler.rs`の`is_builtin()`（52名。`print`は予約tokenのため別扱い）。現状は3リストが整合しているが、追加時に1か所でも漏らすと「treeでは呼べるがVMでは呼べない」状態になり、compile errorではなく実行時の`name`エラーとして現れる。`design.md`が「`builtin_core.rs` + dispatchへの登録のみで両engineに反映される」と書いていたのはこの構造と矛盾していた | 🟡 設計確定・未実装（現行文書の3か所登録注意だけ反映済み。[次期意味論・実装決定](semantic-decisions.md)第13節と[Capability Model仕様](capability-model.md)第17節: 単一`BuiltinSpec` / callable catalogからtree・VM・compiler・生成文書を導出） |
+| AUD-049 | builtin名一覧の3重管理を解消する | スクリプトから呼べるbuiltin名が3か所に分散している。`builtin_core.rs`の`dispatch`（46名。`__pop_update`は内部専用）、`builtin.rs`の`match name`（53名、`_ => Ok(None)`で終わる）、`compiler.rs`の`is_builtin()`（52名。`print`は予約tokenのため別扱い）。現状は3リストが整合しているが、追加時に1か所でも漏らすと「treeでは呼べるがVMでは呼べない」状態になり、compile errorではなく実行時の`name`エラーとして現れる。`design.md`が「`builtin_core.rs` + dispatchへの登録のみで両engineに反映される」と書いていたのはこの構造と矛盾していた | ✅ 完了（`src/builtin_registry.rs`に単一`BuiltinSpec` registry（`PUBLIC_BUILTINS`）を新設し、tree委譲判定・Compilerの`is_builtin`・context判定・VM dispatchをすべてregistryから導出。手書き名一覧を3か所とも除去。VM `CallBuiltin` opcodeを名前文字列から`BuiltinId`へ変更しtypoをcompile時検出。内部`__pop_update`はpublic registryから外し`pop`書き戻し専用の`OpCode::PopUpdate`へ隔離してsourceから到達不能化。registry内unit test 9件と`tests/builtin_registry_contract.rs` 3件で一意性・往復・tree/VM名前解決・`__pop_update`非到達を自動検査。HostFunction registry連携（[Capability Model仕様](capability-model.md)）はPhase 2で別途） |
 | AUD-050 | `MAX_CALL_DEPTH`を`limits.rs`へ集約する | 構造的上限のうち`MAX_AST_DEPTH`と`MAX_IMPORT_DEPTH`は`src/limits.rs`にあるが、`MAX_CALL_DEPTH = 128`だけ`eval.rs`と`vm.rs`に同じdoc commentで二重定義されている。値とエラー文面は一致しているが、境界の数え方が揃っておらず、tree（`call_stack`が空開始）とVM（`frames: vec![frame]`でtop-level込み）で到達できる再帰深度が1段ずれる（AUD-017）。定義が分かれていることがこのズレを見つけにくくしている | ✅ 完了（`MAX_USER_CALL_DEPTH = 128`を`src/limits.rs`へdoc contract付きで集約。`eval.rs`/`builtin.rs`/`vm.rs`のローカル定義を削除し共有定数を参照。VMは`active_user_frame_count()`でroot frameを除いて数え、AUD-017の1段ズレも同時に解消） |
 
 ### 2026-08-27 検証スナップショット
@@ -244,13 +244,13 @@ tree側は旧スナップショットより遅くなっている（`fib_20` 14.9
 | AUD-036 | 確定済み | `exit`、file size、Float→Intのlossy変換を共通checked helperで拒否し、valid `exit`は構造化`Exited`にする | [次期意味論・実装決定](semantic-decisions.md)第10節 | 未実装。なおloop変数をiterationごとのfresh cellにする意味論はAUD-010で実装・完了済み |
 | AUD-045 | 確定済み | MSRVをRust 1.97とし、stable/MSRV CI、install/release、6 platform artifact、署名・SBOM・OCI、参照用Kubernetes Jobの順序とgateを固定 | [検証・リリース・運用設計](verification-release-operations.md)第3〜10・17〜18節 | 未実装。現行はrolling stable、release/install workflow・OCI・manifestなし |
 | AUD-048 | 確定済み | function/lambda式の**動的評価ごと**にfresh `FunctionId`を発行し、clone/captureは同じIDを保持、rollback後もIDを再利用しない | [次期意味論・実装決定](semantic-decisions.md)第12節、[決定性・実行時監査仕様](determinism-and-audit.md)第4.7節 | 未実装。現行差分fixtureのみ存在 |
-| AUD-049 | 確定済み | 単一`BuiltinSpec` / callable catalogからtree、VM、compiler、arity、context metadata、生成文書を導出。HostFunction registryは別registryだが共通resolverで衝突検査 | [次期意味論・実装決定](semantic-decisions.md)第13節、[Capability Model仕様](capability-model.md)第17節・CAP-AT-20 | 未実装。現行3一覧は一致するが手書き重複のまま |
+| AUD-049 | 確定済み | 単一`BuiltinSpec` / callable catalogからtree、VM、compiler、arity、context metadata、生成文書を導出。HostFunction registryは別registryだが共通resolverで衝突検査 | [次期意味論・実装決定](semantic-decisions.md)第13節、[Capability Model仕様](capability-model.md)第17節・CAP-AT-20 | ✅ 完了（language core分。`src/builtin_registry.rs`の`PUBLIC_BUILTINS`をtree/VM/compiler/arity/context metadataの正本にし、`CallBuiltin`をBuiltinId化、`__pop_update`を`OpCode::PopUpdate`へ隔離。HostFunction registryとの共通resolver衝突検査はPhase 2で別追跡） |
 | AUD-050 | 確定済み | `MAX_USER_CALL_DEPTH = 128`を`limits.rs`へ集約し、root frameを数えずactive user call数で統一。128個目を許可し129個目の直前で拒否 | [次期意味論・実装決定](semantic-decisions.md)第5節 | ✅ 完了（AUD-017と一体）。`limits.rs`へ集約、VMは`active_user_frame_count()`でroot除外計数。tree/VMとも128 user frameを許可し129個目を同じline/message/traceで拒否。境界値・相互再帰・lambda・callbackの回帰テスト追加 |
 
 ### 設計sliceに沿う推奨実装順
 
 1. **基準固定:** [次期意味論・実装決定](semantic-decisions.md)第17節の基準固定と、現行非適合fixtureを維持する。文書の設計確定を実装完了として扱わない。
-2. **意味論基盤:** 内部refactor → ~~AUD-050/017深度統合~~（✅ 完了） → AUD-049単一BuiltinSpec → AUD-019 canonical error → AUD-047 COW/AUD-048 FunctionId → AUD-016 binding/AUD-024 transaction → AUD-034/036/018/033境界挙動の順で進める。
+2. **意味論基盤:** 内部refactor → ~~AUD-050/017深度統合~~（✅ 完了） → ~~AUD-049単一BuiltinSpec~~（✅ 完了） → AUD-019 canonical error → AUD-047 COW/AUD-048 FunctionId → AUD-016 binding/AUD-024 transaction → AUD-034/036/018/033境界挙動の順で進める。
 3. **Phase 1 embedding:** [組み込みAPI仕様](embedding-api.md) E1〜E6→E8a。最終terminal型のsubsetを使い、先行公開型を作らない。
 4. **Phase 2 capability:** E7→E8bと[Capability Model仕様](capability-model.md) C1→C2、C3/C4/C5/C7、C6、C8、最後にC9/C10。現行ambient accessを削除するまで完了扱いにしない。
 5. **Phase 3/4 control:** E11/C11で有限budget・transactionを完成し、その後E12/C12でcooperative state machine、yield/pause/resume、admission/backpressureを実装する。
@@ -495,7 +495,7 @@ Tsumugi にはファイルI/O やサンドボックス機能が既に実装さ�
 
 | 項目 | 詳細 | 状態 |
 |---|---|---|
-| `OpCode::CallBuiltin` の String 除去 | 関数名を定数テーブルに移し `CallBuiltin(usize, usize)` にする | ✅ 完了 |
+| `OpCode::CallBuiltin` の String 除去 | 関数名を定数テーブルへ移し、AUD-049 で `CallBuiltin(BuiltinId, usize)` へ更に前進（typo を compile 時に検出） | ✅ 完了 |
 | `dispatch` の match 分割 | 算術・比較・制御フローをメソッドに分けて可読性向上 | 未着手 |
 | `call_fn_value` ループ統一 | `run_frames(stop_depth)` を抽出し run() と共有、try/catch 対応を統一 | ✅ 完了 |
 
