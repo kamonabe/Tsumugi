@@ -737,6 +737,10 @@ impl Compiler {
             return Ok(());
         }
 
+        // builtin ID は registry から引く。compile_builtin_call は is_builtin(name)
+        // を満たした名前だけに到達するため、ここでの欠落は内部不整合である（AUD-049）。
+        let builtin_id = self.resolve_builtin_id(name, line)?;
+
         // push/pop は第一引数のリストを破壊的に変更する
         // → 実行後に元の変数スロットを更新する
         if (name == "push" || name == "pop")
@@ -748,21 +752,18 @@ impl Compiler {
             for arg in args {
                 self.compile_expr(arg, line)?;
             }
-            let name_idx = self.chunk.add_constant(Value::Str(name.to_string()));
             self.chunk
-                .emit(OpCode::CallBuiltin(name_idx, arg_count), line);
+                .emit(OpCode::CallBuiltin(builtin_id, arg_count), line);
             if name == "push" {
                 self.emit_set_mutation_target(&target, line);
                 self.chunk.emit(OpCode::Pop, line);
                 self.chunk.emit_constant(Value::Null, line);
             }
             if name == "pop" {
+                // pop の戻り値（取り出した要素）はスタックに残したまま、変数側の
+                // List を PopUpdate で更新する。内部命令なので source から呼べない。
                 self.emit_get_mutation_target(&target, line);
-                let pop_update_idx = self
-                    .chunk
-                    .add_constant(Value::Str("__pop_update".to_string()));
-                self.chunk
-                    .emit(OpCode::CallBuiltin(pop_update_idx, 1), line);
+                self.chunk.emit(OpCode::PopUpdate, line);
                 self.emit_set_mutation_target(&target, line);
                 self.chunk.emit(OpCode::Pop, line);
             }
@@ -773,10 +774,28 @@ impl Compiler {
         for arg in args {
             self.compile_expr(arg, line)?;
         }
-        let name_idx = self.chunk.add_constant(Value::Str(name.to_string()));
         self.chunk
-            .emit(OpCode::CallBuiltin(name_idx, arg_count), line);
+            .emit(OpCode::CallBuiltin(builtin_id, arg_count), line);
         Ok(())
+    }
+
+    /// builtin 名から [`crate::builtin_registry::BuiltinId`] を引く。
+    /// registry に無ければ内部不整合として構造化エラーにする（source から到達不能）。
+    fn resolve_builtin_id(
+        &self,
+        name: &str,
+        line: usize,
+    ) -> Result<crate::builtin_registry::BuiltinId, TsumugiError> {
+        crate::builtin_registry::id_of(name).ok_or_else(|| {
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Internal,
+                format!(
+                    "内部エラー: 未登録の builtin をコンパイルしようとしました: {}",
+                    name
+                ),
+            )
+        })
     }
 
     fn resolve_mutation_target(&mut self, name: &str, line: usize) -> MutationTarget {
@@ -1148,61 +1167,11 @@ impl Compiler {
     }
 }
 
-/// 組み込み関数かどうかを判定する
+/// 組み込み関数かどうかを判定する。
+///
+/// 名前一覧は単一の BuiltinSpec registry から導出する（AUD-049）。ここへ手書きの
+/// 名前列挙を復活させない。`print` は呼び出し元が予約 token として先に直接
+/// lowering するため、この判定へは到達しない。
 fn is_builtin(name: &str) -> bool {
-    matches!(
-        name,
-        "len"
-            | "push"
-            | "pop"
-            | "keys"
-            | "values"
-            | "has_key"
-            | "type"
-            | "slice"
-            | "contains"
-            | "split"
-            | "join"
-            | "to_int"
-            | "to_str"
-            | "to_float"
-            | "range"
-            | "map"
-            | "filter"
-            | "each"
-            | "sort"
-            | "reverse"
-            | "trim"
-            | "upper"
-            | "lower"
-            | "starts_with"
-            | "ends_with"
-            | "replace"
-            | "abs"
-            | "min"
-            | "max"
-            | "floor"
-            | "ceil"
-            | "round"
-            | "input"
-            | "exit"
-            | "read_file"
-            | "read_lines"
-            | "write_file"
-            | "append_file"
-            | "env"
-            | "args"
-            | "now"
-            | "format_time"
-            | "path_exists"
-            | "path_join"
-            | "mkdir"
-            | "remove"
-            | "remove_dir"
-            | "rename"
-            | "list_dir"
-            | "file_size"
-            | "is_file"
-            | "is_dir"
-    )
+    crate::builtin_registry::is_public_builtin(name)
 }

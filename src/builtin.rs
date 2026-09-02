@@ -162,13 +162,10 @@ impl Evaluator {
                 crate::builtin_core::builtin_len(std::slice::from_ref(&collection), line).map(Some)
             }
 
-            "len" | "keys" | "values" | "has_key" | "type" | "slice" | "contains" | "sort"
-            | "reverse" | "range" | "split" | "join" | "trim" | "starts_with" | "ends_with"
-            | "replace" | "upper" | "lower" | "to_int" | "to_str" | "to_float" | "abs" | "min"
-            | "max" | "floor" | "ceil" | "round" | "now" | "format_time" | "env" | "read_file"
-            | "read_lines" | "write_file" | "append_file" | "path_exists" | "path_join"
-            | "mkdir" | "remove" | "remove_dir" | "rename" | "list_dir" | "file_size"
-            | "is_file" | "is_dir" => {
+            // --- PureCore builtin は引数を評価してから builtin_core::dispatch へ委譲 ---
+            // 名前一覧は単一の BuiltinSpec registry から導出する（AUD-049）。
+            // ここへ手書きの名前列挙を復活させない。
+            _ if crate::builtin_registry::is_pure_core_builtin(name) => {
                 let mut evaluated = Vec::with_capacity(args.len());
                 for arg in args {
                     evaluated.push(self.eval_expr(arg, line)?);

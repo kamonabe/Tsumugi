@@ -87,7 +87,10 @@ fn stack_hungry_operands_return_internal_errors() {
         ("FStrConcat", OpCode::FStrConcat(5)),
         ("PopN", OpCode::PopN(10)),
         ("Print", OpCode::Print(3)),
-        ("CallBuiltin", OpCode::CallBuiltin(999, 0)),
+        (
+            "CallBuiltin",
+            OpCode::CallBuiltin(tsumugi::builtin_registry::BuiltinId::Len, 3),
+        ),
     ];
 
     for (label, op) in cases {
