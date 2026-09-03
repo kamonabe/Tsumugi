@@ -8,9 +8,9 @@ o
 30
 30
 null
-index: インデックス範囲外: 99 (長さ: 3)
+index: List のインデックスが範囲外です: 99 (長さ: 3)
 index
-runtime
+type
 call-index: index
 [1, 42]
 30
@@ -26,4 +26,4 @@ outer
 5
 4
 4
-builtin_type: len は List/Str/Dict に対してのみ使えます
+builtin_type: len の第 1 引数は List/Str/Dict である必要があります: Int

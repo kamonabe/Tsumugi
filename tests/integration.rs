@@ -994,13 +994,15 @@ fn vm_repl_rolls_back_runtime_global_registry_after_error() {
     assert!(output.status.success(), "VM REPLが異常終了: {stderr}");
     assert_eq!(
         stderr
-            .matches("未定義の変数: missing_in_failed_import")
+            .matches("未定義の変数または関数: missing_in_failed_import")
             .count(),
         1,
         "import内の元のruntime errorが不正: {stderr}"
     );
     assert_eq!(
-        stderr.matches("未定義の変数: failed_global").count(),
+        stderr
+            .matches("未定義の変数または関数: failed_global")
+            .count(),
         1,
         "失敗入力のglobal registry entryが残留: {stderr}"
     );
@@ -1150,7 +1152,7 @@ fn repl_control_flow_block_locals_do_not_leak() {
             "try_only",
             "separated",
         ] {
-            let expected = format!("未定義の変数: {name}");
+            let expected = format!("未定義の変数または関数: {name}");
             assert_eq!(
                 stderr.matches(&expected).count(),
                 1,
@@ -1239,7 +1241,7 @@ fn vm_repl_recovers_after_compile_error() {
         "元のcompile errorがない: {stderr}"
     );
     assert!(
-        stderr.contains("未定義の変数: ghost"),
+        stderr.contains("未定義の変数または関数: ghost"),
         "失敗入力のlocalが残留: {stderr}"
     );
     assert!(
@@ -1366,7 +1368,7 @@ fn tree_repl_cleans_loop_scope_after_caught_error() {
     );
     assert!(!stdout.contains("42\n"), "loop localがREPLへ漏洩: {stdout}");
     assert!(
-        stderr.contains("未定義の変数: leaked"),
+        stderr.contains("未定義の変数または関数: leaked"),
         "漏洩検査が期待どおり失敗しない: {stderr}"
     );
 }
@@ -1404,7 +1406,9 @@ fn tree_repl_retries_failed_import() {
     assert!(output.status.success(), "tree REPLが異常終了: {stderr}");
     assert_eq!(
         stderr
-            .matches("import 失敗 (tests/fixtures/import_bad_syntax.tsg)")
+            .matches(
+                "import に失敗しました: モジュールの構文が不正です: tests/fixtures/import_bad_syntax.tsg"
+            )
             .count(),
         2,
         "失敗したimportがloaded扱いになったか、base_dirが復元されていない: {stderr}"
@@ -1428,7 +1432,9 @@ fn collection_limit_is_consistent_in_both_engines() {
 
         assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
         assert_eq!(
-            stderr.matches("コレクションサイズ上限超過").count(),
+            stderr
+                .matches("コレクション要素数が上限を超えました")
+                .count(),
             3,
             "{mode}でliteral/pushの上限適用が不一致: {stderr}"
         );
@@ -1458,7 +1464,7 @@ fn index_assign_recovers_and_writes_across_inputs_in_both_engines() {
 
         assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
         assert!(
-            stderr.contains("未定義の変数: missing_target"),
+            stderr.contains("未定義の変数または関数: missing_target"),
             "{mode}で未定義targetが報告されていない: {stderr}"
         );
         assert!(
@@ -1497,7 +1503,7 @@ fn context_builtins_reject_invalid_control_flow_and_exit_type() {
     let vm = run_repl_process("exit(\"bad\")\nprint(\"alive\")\n", true, &[]);
     let (vm_stdout, vm_stderr) = output_text(&vm);
     assert!(vm.status.success(), "VM REPLが異常終了: {vm_stderr}");
-    assert!(vm_stderr.contains("exit() の引数は整数である必要があります"));
+    assert!(vm_stderr.contains("exit の第 1 引数は Int である必要があります: Str"));
     assert!(
         vm_stdout.contains("alive\n"),
         "不正なexitがprocessを終了した: {vm_stdout}"

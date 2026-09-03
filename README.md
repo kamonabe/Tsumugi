@@ -158,7 +158,7 @@ let x = "hello"
 let y = x + 1
 
 $ tsumugi error.tsg
-2行目: 型エラー: Str("hello") Add Int(1) は計算できません
+2行目: 演算子 + は Str と Int に適用できません
 ```
 
 複数パースエラーの報告例:
@@ -217,6 +217,9 @@ cargo test parser::
 |---|---|---|
 | ユニットテスト | `src/*.rs` 内 `#[cfg(test)]` | 各モジュールの個別ロジック検証 |
 | 統合テスト | `tests/integration.rs` | ファイル実行のゴールデンテスト + stdin駆動REPLの状態回復・資源上限テスト |
+| 埋め込みAPIテスト | `tests/engine_api.rs` | crate root の `Engine` / `ExecutionContext` 公開APIの契約を固定 |
+| canonical errorテスト | `tests/canonical_error_inventory.rs` | operation別canonical errorのkind/message/lineをtree/VMで完全一致検証（AUD-019）+ trace/catch/line/importの軸 |
+| builtin registryテスト | `tests/builtin_registry_contract.rs` | 単一BuiltinSpec registry（AUD-049）の正本性をクロスエンジンで固定 |
 | スケーリングテスト | `tests/scaling.rs` | 確保バイト数と生存バイト数で計算量オーダーと解放漏れを固定 |
 | 防御的テスト | `tests/defensive_vm.rs` | 不正な `Chunk` を公開APIへ渡してもホストを落とさないことを検証 |
 | テストデータ | `tests/fixtures/` | 正常系 `.tsg` + `.expected` / エラー系 `.tsg` + `.expected_err` |
@@ -278,10 +281,13 @@ src/
 └── sandbox.rs          # ファイルI/Oと環境変数のallow-list検査
 
 tests/
-├── integration.rs    # 統合テスト（ゴールデンテスト + stdin駆動REPL）
-├── scaling.rs        # 計算量オーダーと解放漏れの回帰ゲート
-├── defensive_vm.rs   # 不正な Chunk を公開APIへ渡してもホストが落ちないこと
-└── fixtures/         # テスト用 .tsg + 期待出力ファイル
+├── integration.rs                # 統合テスト（ゴールデンテスト + stdin駆動REPL）
+├── engine_api.rs                 # 埋め込みAPI（Engine / ExecutionContext）の契約
+├── canonical_error_inventory.rs  # canonical error（AUD-019）のtree/VM一致・inventory
+├── builtin_registry_contract.rs  # 単一BuiltinSpec registry（AUD-049）の正本性
+├── scaling.rs                    # 計算量オーダーと解放漏れの回帰ゲート
+├── defensive_vm.rs               # 不正な Chunk を公開APIへ渡してもホストが落ちないこと
+└── fixtures/                     # テスト用 .tsg + 期待出力ファイル
 
 benches/
 └── interpreter.rs    # parse / compile / execute / end_to_end のフェーズ別計測

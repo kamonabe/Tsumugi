@@ -242,13 +242,14 @@ let result = filter(test, fn(item) item != "kani" end)
 
 - `TsumugiError` enum でパースエラー（`Parse`）とランタイムエラー（`Runtime`）を構造的に区別
 - 各バリアントに `line: usize` と `message: String` を保持
-- `Runtime` バリアントには `kind: ErrorKind` フィールドを持ち、エラーの種別を構造的に表現する
-- `ErrorKind` enum（18バリアント）: `ZeroDivision`, `Type`, `Index`, `Name`, `StepLimit`, `StackOverflow`, `Sandbox`, `Import`, `Argument`, `IntOverflow`, `ControlFlow`, `CollectionLimit`, `Conversion`, `BuiltinType`, `Iteration`, `Io`, `Internal`, `Runtime`
+- `Runtime` バリアントには `kind: ErrorKind` と `trace: Vec<TraceFrame>` を持ち、エラーの種別と呼び出し経路を構造的に表現する
+- `ErrorKind` enum（18バリアント）: `ZeroDivision`, `Type`, `Index`, `Name`, `StepLimit`, `StackOverflow`, `Sandbox`, `Import`, `Argument`, `IntOverflow`, `ControlFlow`, `CollectionLimit`, `Conversion`, `BuiltinType`, `Iteration`, `Io`, `Internal`, `Runtime`。`Runtime` は互換用に残すが、現行の言語コアが生成する経路は持たない
 - `error_type()` メソッドは `kind.as_str()` を返す — try/catch で `e["type"]` として利用される
-- `Display` 実装で「N行目: メッセージ」形式の出力を生成（従来と同じ形式を維持）
-- 全箇所で `TsumugiError::runtime(line, msg)`（メッセージから kind を自動推定）/ `TsumugiError::runtime_with_kind(line, kind, msg)`（明示指定）/ `TsumugiError::parse(line, msg)` コンストラクタを使用
+- `Display` 実装で「N行目: メッセージ」形式の出力を生成し、trace があれば `  in 関数名() (M行目)` を内側から外側の順に付加する
+- **canonical error constructor（AUD-019）**: runtime error は operation ごとの共通 constructor から `kind` と canonical message を生成する。`src/error.rs` に `undefined_name` / `arithmetic_type` / `comparison_type` / `list_index_out_of_range` / `not_callable` / `user_arity` / `builtin_arg_type` / `callback_arity` などの constructor を集約し、tree（`eval.rs` / `builtin.rs`）・VM（`vm.rs`）・共有（`builtin_core.rs`）・`compiler.rs` / `module.rs` はすべてこれらを経由する。message には値そのものを埋め込まず、`type_name(&Value)` が返す型名（`Int` / `Str` など）だけを用いるため、tree と VM で kind / message / line が完全一致する。テンプレートの正本は [`language-spec.md`](language-spec.md) の「エラーの kind とメッセージ（正本）」、設計判断は [次期意味論・実装決定](semantic-decisions.md) 第3節
+- constructor は `TsumugiError::runtime_with_kind(line, kind, msg)` の上に薄く積む。個別の error 生成箇所で kind を手書きせず、operation constructor を呼ぶ
 - `From<String>` は廃止済み — 文字列の再パースに頼らず、行番号を構造として保持する方式に統一
-- `classify_runtime_error()` はメッセージ文字列から kind を推定するフォールバック関数として残存（`runtime()` 経由の既存コード向け後方互換）
+- メッセージ文字列から kind を推定していた `classify_runtime_error()` と、それを経由する `runtime()` は **削除した**（AUD-019）。任意文字列からの kind 推測は行わない
 
 ## テスト設計
 
@@ -282,7 +283,7 @@ let result = filter(test, fn(item) item != "kani" end)
 fixture 追加手順は、`.tsg` と期待ファイルを置き、`fixture_tests!` へ名前を1行宣言する。宣言から tree / VM 両方のテスト（`<name>::tree` / `<name>::vm`）が生成されるため、片側の登録漏れが起きない。`fixture_declarations_match_directory` が宣言とディレクトリの整合を検査するので、未宣言の fixture はテスト失敗として検出される。
 
 - OS・ロケール依存の文字列は期待ファイル側で `{*}` に逃がす（それ以外は完全一致）
-- engine 間に差が残る箇所は、期待ファイルを `<name>.<ext>.vm` で上書きして明示する（`<name>.expected.vm` / `<name>.expected_err.vm`）。`.vm` が無ければ共通の期待ファイルを使うため、差がある fixture だけが `.vm` を持つ。現在は `index_read_lowering`（AUD-019）と `comparison_semantics`（AUD-048）が該当する
+- engine 間に差が残る箇所は、期待ファイルを `<name>.<ext>.vm` で上書きして明示する（`<name>.expected.vm` / `<name>.expected_err.vm`）。`.vm` が無ければ共通の期待ファイルを使うため、差がある fixture だけが `.vm` を持つ。現在は `comparison_semantics`（捕捉のない関数値の同一性 / AUD-048）だけが該当する（error kind/message の差は AUD-019 で解消し、`index_read_lowering.expected.vm` は削除した）
 - 期待ファイルを持たず専用テストから実行する fixture は `CUSTOM_FIXTURES`、import 先の補助ファイルは `HELPER_FIXTURES` に分類する
 - ファイルを触る fixture は `env("TSG_TEST_DIR")` で実行ごとの一時ディレクトリを受け取る（固定パスを共有しない）
 - 子プロセスは必ず制限時間付きで待つため、停止しないコードは失敗として検出される
@@ -310,7 +311,20 @@ fixture 追加手順は、`.tsg` と期待ファイルを置き、`fixture_tests
 
 ### registry契約テスト
 
-`tests/builtin_registry_contract.rs` は、単一 BuiltinSpec registry（AUD-049）の正本性をクロスエンジンで固定する。`PUBLIC_BUILTINS` の全 entry について、VM の Compiler が呼び出しを compile でき、tree の実行系が builtin として名前解決する（`未定義の関数` にならない）ことを検査する。外部副作用を避けるため、各呼び出しは arity 検査で先に失敗する引数個数を渡す（arity を強制できない `path_join` だけは純粋関数として成功を許容）。内部命令 `__pop_update` が両engineで source から到達不能であることも固定する。registry 自体の一意性・往復・分類は `src/builtin_registry.rs` の単体テストで検査する。
+`tests/builtin_registry_contract.rs` は、単一 BuiltinSpec registry（AUD-049）の正本性をクロスエンジンで固定する。`PUBLIC_BUILTINS` の全 entry について、VM の Compiler が呼び出しを compile でき、tree の実行系が builtin として名前解決する（`未定義の変数または関数` にならない）ことを検査する。外部副作用を避けるため、各呼び出しは arity 検査で先に失敗する引数個数を渡す（arity を強制できない `path_join` だけは純粋関数として成功を許容）。内部命令 `__pop_update` が両engineで source から到達不能であることも固定する。registry 自体の一意性・往復・分類は `src/builtin_registry.rs` の単体テストで検査する。
+
+### canonical error inventory テスト
+
+`tests/canonical_error_inventory.rs` は、operation別canonical error（AUD-019）を tree-walk 評価器と VM で完全一致させることを固定する。`tsumugi::` の公開モジュールから両engineを直接駆動し、[`language-spec.md`](language-spec.md) の operation 表の各行について `(kind, message, line)` が一致すること、および対象経路が `ErrorKind::Runtime`（任意文字列からの kind 推測に使っていた catch-all）を生成しないことを検査する。VM が compile 時に検出する診断（loop外 `break` / `continue`、arity）と、実行前 link で検出する import エラーも、tree の実行時診断と同じ canonical 値になることを同じ経路で確認する。
+
+operation の網羅に加えて、次の軸を paired で固定する。
+
+- **trace**: 多段呼び出し（`divide` → `calc`）の trace 全文と、callback body 内エラーが origin の kind/message/line を保持し `map` 自体を frame に出さないこと
+- **catch**: `Value::Error` へ写る `type` / `message` / `line`（`e[...]` の読み取り元）が両engineで一致し、caller frame で捕捉しても origin line を保つこと
+- **line**: 後続文・`if` / `while` / `for` 本体・関数本体の各位置で行番号が一致すること
+- **import**: モジュールが読めない / 構文が不正な場合の canonical error が一致すること
+
+網羅の下限は `inventory_covers_reachable_operations` が守り、operation 行が減った場合に検出する。
 
 ### CI
 
@@ -492,7 +506,7 @@ Parserはプログラム直下とblock内の文を区別し、block内のimport�
 ### 概要
 
 ツリーウォークインタプリタに加え、バイトコードコンパイラ + スタックVMを並行実装する。
-`--vm`フラグで実行方式を切り替え可能。Lexer・Parser・ASTは共有し、両方式が同じ規範仕様を満たすことを目標とする。比較（AUD-014）、index代入（AUD-013）、context依存builtin（AUD-012）、import解決時点（AUD-030）はいずれも統一済みである。ただし意味解析以降は別実装のため、同一scopeの`let`再宣言でのcell identity（AUD-016）、捕捉のない関数値の同一性（AUD-048）、error kind・message（AUD-019）、未捕捉エラー後のREPL状態（AUD-024）に既知の差が残る。現時点のVMは互換性・性能ともに実験的backendとして扱い、非適合は`roadmap.md`で管理する。
+`--vm`フラグで実行方式を切り替え可能。Lexer・Parser・ASTは共有し、両方式が同じ規範仕様を満たすことを目標とする。比較（AUD-014）、index代入（AUD-013）、context依存builtin（AUD-012）、import解決時点（AUD-030）、error kind・message・line（AUD-019）はいずれも統一済みである。ただし意味解析以降は別実装のため、同一scopeの`let`再宣言でのcell identity（AUD-016）、捕捉のない関数値の同一性（AUD-048）、未捕捉エラー後のREPL状態（AUD-024）に既知の差が残る。現時点のVMは互換性・性能ともに実験的backendとして扱い、非適合は`roadmap.md`で管理する。
 
 ### 動機
 

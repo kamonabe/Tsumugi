@@ -47,14 +47,7 @@ fn max_collection_size() -> usize {
 fn check_collection_size(size: usize, line: usize) -> Result<(), TsumugiError> {
     let limit = max_collection_size();
     if size > limit {
-        return Err(TsumugiError::runtime_with_kind(
-            line,
-            crate::error::ErrorKind::CollectionLimit,
-            format!(
-                "コレクションサイズ上限超過: {} 要素 (上限: {})",
-                size, limit
-            ),
-        ));
+        return Err(TsumugiError::collection_limit(line, size, limit));
     }
     Ok(())
 }
@@ -75,14 +68,7 @@ pub fn check_arity_count(
     line: usize,
 ) -> Result<(), TsumugiError> {
     if actual != expected {
-        Err(TsumugiError::runtime_with_kind(
-            line,
-            crate::error::ErrorKind::Argument,
-            format!(
-                "{}: 引数の数が合いません: {}個必要ですが{}個渡されました",
-                name, expected, actual
-            ),
-        ))
+        Err(TsumugiError::builtin_arity(line, name, expected, actual))
     } else {
         Ok(())
     }
@@ -129,12 +115,7 @@ pub fn validate_context_builtin_call(
             if first_arg_is_identifier {
                 Ok(())
             } else {
-                let message = if name == "push" {
-                    "push() の第1引数はリスト変数である必要があります"
-                } else {
-                    "pop() の第1引数はリスト変数である必要があります"
-                };
-                Err(type_error(line, message))
+                Err(TsumugiError::mutation_target_not_variable(line, name))
             }
         }
         "map" | "filter" | "each" => check_arity_count(name, arg_count, 2, line),
@@ -142,8 +123,19 @@ pub fn validate_context_builtin_call(
     }
 }
 
-pub fn type_error(line: usize, msg: &str) -> TsumugiError {
-    TsumugiError::runtime_with_kind(line, crate::error::ErrorKind::BuiltinType, msg)
+/// builtin 引数が Str であることを要求し、そうでなければ canonical な引数型エラーを返す。
+fn require_str<'a>(
+    value: &'a Value,
+    builtin: &str,
+    position: usize,
+    line: usize,
+) -> Result<&'a String, TsumugiError> {
+    match value {
+        Value::Str(s) => Ok(s),
+        other => Err(TsumugiError::builtin_arg_type(
+            line, builtin, position, "Str", other,
+        )),
+    }
 }
 
 // =============================================================================
@@ -156,9 +148,12 @@ pub fn builtin_len(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
         Value::List(v) => Ok(Value::Int(v.len() as i64)),
         Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
         Value::Dict(m) => Ok(Value::Int(m.len() as i64)),
-        _ => Err(type_error(
+        other => Err(TsumugiError::builtin_arg_type(
             line,
-            "len は List/Str/Dict に対してのみ使えます",
+            "len",
+            1,
+            "List/Str/Dict",
+            other,
         )),
     }
 }
@@ -178,20 +173,14 @@ pub fn assign_index(
         Value::List(list) => {
             let i = match index {
                 Value::Int(n) => *n,
-                _ => {
-                    return Err(TsumugiError::runtime(
-                        line,
-                        "リストのインデックスは整数である必要があります",
-                    ));
+                other => {
+                    return Err(TsumugiError::list_index_type(line, other));
                 }
             };
             let len = list.len() as i64;
             let actual_idx = if i < 0 { len + i } else { i };
             if actual_idx < 0 || actual_idx >= len {
-                return Err(TsumugiError::runtime(
-                    line,
-                    format!("インデックス範囲外: {} (長さ: {})", i, len),
-                ));
+                return Err(TsumugiError::list_index_out_of_range(line, i, list.len()));
             }
             list[actual_idx as usize] = value;
             Ok(())
@@ -199,11 +188,8 @@ pub fn assign_index(
         Value::Dict(map) => {
             let key = match index {
                 Value::Str(s) => s.clone(),
-                _ => {
-                    return Err(TsumugiError::runtime(
-                        line,
-                        "辞書のキーは文字列である必要があります",
-                    ));
+                other => {
+                    return Err(TsumugiError::dict_key_type(line, other));
                 }
             };
             if !map.contains_key(&key) {
@@ -212,10 +198,7 @@ pub fn assign_index(
             map.insert(key, value);
             Ok(())
         }
-        _ => Err(TsumugiError::runtime(
-            line,
-            "インデックス代入はリストまたは辞書にのみ使用できます",
-        )),
+        other => Err(TsumugiError::index_assign_unsupported(line, other)),
     }
 }
 
@@ -227,7 +210,9 @@ pub fn builtin_push(args: &[Value], line: usize) -> Result<Value, TsumugiError> 
         v.push(args[1].clone());
         Ok(list)
     } else {
-        Err(type_error(line, "push はリストに対してのみ使えます"))
+        Err(TsumugiError::builtin_arg_type(
+            line, "push", 1, "List", &args[0],
+        ))
     }
 }
 
@@ -236,16 +221,14 @@ pub fn builtin_pop(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     let mut list = args[0].clone();
     if let Value::List(ref mut v) = list {
         if v.is_empty() {
-            Err(TsumugiError::runtime_with_kind(
-                line,
-                crate::error::ErrorKind::BuiltinType,
-                "pop: 空のリストからは取り出せません",
-            ))
+            Err(TsumugiError::pop_empty_list(line))
         } else {
             Ok(v.pop().unwrap())
         }
     } else {
-        Err(type_error(line, "pop はリストに対してのみ使えます"))
+        Err(TsumugiError::builtin_arg_type(
+            line, "pop", 1, "List", &args[0],
+        ))
     }
 }
 
@@ -269,7 +252,9 @@ pub fn builtin_keys(args: &[Value], line: usize) -> Result<Value, TsumugiError> 
         let keys: Vec<Value> = map.keys().map(|k| Value::Str(k.clone())).collect();
         Ok(Value::List(keys))
     } else {
-        Err(type_error(line, "keys は辞書に対してのみ使えます"))
+        Err(TsumugiError::builtin_arg_type(
+            line, "keys", 1, "Dict", &args[0],
+        ))
     }
 }
 
@@ -280,16 +265,22 @@ pub fn builtin_values(args: &[Value], line: usize) -> Result<Value, TsumugiError
         let vals: Vec<Value> = map.values().cloned().collect();
         Ok(Value::List(vals))
     } else {
-        Err(type_error(line, "values は辞書に対してのみ使えます"))
+        Err(TsumugiError::builtin_arg_type(
+            line, "values", 1, "Dict", &args[0],
+        ))
     }
 }
 
 pub fn builtin_has_key(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("has_key", args, 2, line)?;
-    if let (Value::Dict(map), Value::Str(key)) = (&args[0], &args[1]) {
-        Ok(Value::Bool(map.contains_key(key)))
-    } else {
-        Err(type_error(line, "has_key(dict, str) の形式で使います"))
+    match (&args[0], &args[1]) {
+        (Value::Dict(map), Value::Str(key)) => Ok(Value::Bool(map.contains_key(key))),
+        (Value::Dict(_), other) => Err(TsumugiError::builtin_arg_type(
+            line, "has_key", 2, "Str", other,
+        )),
+        (other, _) => Err(TsumugiError::builtin_arg_type(
+            line, "has_key", 1, "Dict", other,
+        )),
     }
 }
 
@@ -311,8 +302,21 @@ pub fn builtin_type(args: &[Value], line: usize) -> Result<Value, TsumugiError> 
 
 pub fn builtin_slice(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("slice", args, 3, line)?;
-    let (Value::Int(start), Value::Int(end)) = (&args[1], &args[2]) else {
-        return Err(type_error(line, "slice の開始・終了は整数で指定します"));
+    let start = match &args[1] {
+        Value::Int(n) => n,
+        other => {
+            return Err(TsumugiError::builtin_arg_type(
+                line, "slice", 2, "Int", other,
+            ));
+        }
+    };
+    let end = match &args[2] {
+        Value::Int(n) => n,
+        other => {
+            return Err(TsumugiError::builtin_arg_type(
+                line, "slice", 3, "Int", other,
+            ));
+        }
     };
     // 負数は 0 にクランプ
     let start = if *start < 0 { 0usize } else { *start as usize };
@@ -337,7 +341,9 @@ pub fn builtin_slice(args: &[Value], line: usize) -> Result<Value, TsumugiError>
             }
             Ok(Value::Str(chars[st..en].iter().collect()))
         }
-        _ => Err(type_error(line, "slice は List/Str に対してのみ使えます")),
+        other => Err(TsumugiError::builtin_arg_type(
+            line, "slice", 1, "List/Str", other,
+        )),
     }
 }
 
@@ -359,9 +365,12 @@ pub fn builtin_contains(args: &[Value], line: usize) -> Result<Value, TsumugiErr
                 Ok(Value::Bool(false))
             }
         }
-        _ => Err(type_error(
+        other => Err(TsumugiError::builtin_arg_type(
             line,
-            "contains は List/Str/Dict に対してのみ使えます",
+            "contains",
+            1,
+            "List/Str/Dict",
+            other,
         )),
     }
 }
@@ -373,7 +382,9 @@ pub fn builtin_sort(args: &[Value], line: usize) -> Result<Value, TsumugiError> 
         sorted.sort_by_key(|a| a.to_string());
         Ok(Value::List(sorted))
     } else {
-        Err(type_error(line, "sort はリストに対してのみ使えます"))
+        Err(TsumugiError::builtin_arg_type(
+            line, "sort", 1, "List", &args[0],
+        ))
     }
 }
 
@@ -386,32 +397,42 @@ pub fn builtin_reverse(args: &[Value], line: usize) -> Result<Value, TsumugiErro
             Ok(Value::List(rev))
         }
         Value::Str(s) => Ok(Value::Str(s.chars().rev().collect())),
-        _ => Err(type_error(line, "reverse は List/Str に対してのみ使えます")),
+        other => Err(TsumugiError::builtin_arg_type(
+            line, "reverse", 1, "List/Str", other,
+        )),
     }
 }
 
 pub fn builtin_range(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("range", args, 2, line)?;
-    if let (Value::Int(start), Value::Int(end)) = (&args[0], &args[1]) {
-        let size = if *end > *start {
-            // checked_sub でオーバーフローを防ぐ
-            let diff = end.checked_sub(*start).ok_or_else(|| {
-                TsumugiError::runtime_with_kind(
-                    line,
-                    crate::error::ErrorKind::IntOverflow,
-                    "整数オーバーフロー: range の範囲が大きすぎます",
-                )
-            })?;
-            diff as usize
-        } else {
-            0
-        };
-        check_collection_size(size, line)?;
-        let list: Vec<Value> = (*start..*end).map(Value::Int).collect();
-        Ok(Value::List(list))
+    let start = match &args[0] {
+        Value::Int(n) => *n,
+        other => {
+            return Err(TsumugiError::builtin_arg_type(
+                line, "range", 1, "Int", other,
+            ));
+        }
+    };
+    let end = match &args[1] {
+        Value::Int(n) => *n,
+        other => {
+            return Err(TsumugiError::builtin_arg_type(
+                line, "range", 2, "Int", other,
+            ));
+        }
+    };
+    let size = if end > start {
+        // checked_sub でオーバーフローを防ぐ
+        let diff = end
+            .checked_sub(start)
+            .ok_or_else(|| TsumugiError::int_overflow(line, "range の範囲が大きすぎます"))?;
+        diff as usize
     } else {
-        Err(type_error(line, "range(int, int) の形式で使います"))
-    }
+        0
+    };
+    check_collection_size(size, line)?;
+    let list: Vec<Value> = (start..end).map(Value::Int).collect();
+    Ok(Value::List(list))
 }
 
 // =============================================================================
@@ -420,80 +441,66 @@ pub fn builtin_range(args: &[Value], line: usize) -> Result<Value, TsumugiError>
 
 pub fn builtin_split(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("split", args, 2, line)?;
-    if let (Value::Str(s), Value::Str(sep)) = (&args[0], &args[1]) {
-        let mut parts = Vec::new();
-        for part in s.split(sep.as_str()) {
-            check_collection_size(parts.len().saturating_add(1), line)?;
-            parts.push(Value::Str(part.to_string()));
-        }
-        Ok(Value::List(parts))
-    } else {
-        Err(type_error(line, "split(str, str) の形式で使います"))
+    let s = require_str(&args[0], "split", 1, line)?;
+    let sep = require_str(&args[1], "split", 2, line)?;
+    let mut parts = Vec::new();
+    for part in s.split(sep.as_str()) {
+        check_collection_size(parts.len().saturating_add(1), line)?;
+        parts.push(Value::Str(part.to_string()));
     }
+    Ok(Value::List(parts))
 }
 
 pub fn builtin_join(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("join", args, 2, line)?;
-    if let (Value::List(list), Value::Str(sep)) = (&args[0], &args[1]) {
-        let parts: Vec<String> = list.iter().map(|v| v.to_string()).collect();
-        Ok(Value::Str(parts.join(sep)))
-    } else {
-        Err(type_error(line, "join(list, str) の形式で使います"))
-    }
+    let Value::List(list) = &args[0] else {
+        return Err(TsumugiError::builtin_arg_type(
+            line, "join", 1, "List", &args[0],
+        ));
+    };
+    let sep = require_str(&args[1], "join", 2, line)?;
+    let parts: Vec<String> = list.iter().map(|v| v.to_string()).collect();
+    Ok(Value::Str(parts.join(sep)))
 }
 
 pub fn builtin_trim(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("trim", args, 1, line)?;
-    if let Value::Str(s) = &args[0] {
-        Ok(Value::Str(s.trim().to_string()))
-    } else {
-        Err(type_error(line, "trim は文字列に対してのみ使えます"))
-    }
+    let s = require_str(&args[0], "trim", 1, line)?;
+    Ok(Value::Str(s.trim().to_string()))
 }
 
 pub fn builtin_upper(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("upper", args, 1, line)?;
-    if let Value::Str(s) = &args[0] {
-        Ok(Value::Str(s.to_uppercase()))
-    } else {
-        Err(type_error(line, "upper は文字列に対してのみ使えます"))
-    }
+    let s = require_str(&args[0], "upper", 1, line)?;
+    Ok(Value::Str(s.to_uppercase()))
 }
 
 pub fn builtin_lower(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("lower", args, 1, line)?;
-    if let Value::Str(s) = &args[0] {
-        Ok(Value::Str(s.to_lowercase()))
-    } else {
-        Err(type_error(line, "lower は文字列に対してのみ使えます"))
-    }
+    let s = require_str(&args[0], "lower", 1, line)?;
+    Ok(Value::Str(s.to_lowercase()))
 }
 
 pub fn builtin_starts_with(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("starts_with", args, 2, line)?;
-    if let (Value::Str(s), Value::Str(prefix)) = (&args[0], &args[1]) {
-        Ok(Value::Bool(s.starts_with(prefix.as_str())))
-    } else {
-        Err(type_error(line, "starts_with(str, str) の形式で使います"))
-    }
+    let s = require_str(&args[0], "starts_with", 1, line)?;
+    let prefix = require_str(&args[1], "starts_with", 2, line)?;
+    Ok(Value::Bool(s.starts_with(prefix.as_str())))
 }
 
 pub fn builtin_ends_with(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("ends_with", args, 2, line)?;
-    if let (Value::Str(s), Value::Str(suffix)) = (&args[0], &args[1]) {
-        Ok(Value::Bool(s.ends_with(suffix.as_str())))
-    } else {
-        Err(type_error(line, "ends_with(str, str) の形式で使います"))
-    }
+    let s = require_str(&args[0], "ends_with", 1, line)?;
+    let suffix = require_str(&args[1], "ends_with", 2, line)?;
+    Ok(Value::Bool(s.ends_with(suffix.as_str())))
 }
 
 pub fn builtin_replace(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("replace", args, 3, line)?;
-    if let (Value::Str(s), Value::Str(old), Value::Str(new)) = (&args[0], &args[1], &args[2]) {
-        Ok(Value::Str(s.replace(old.as_str(), new.as_str())))
-    } else {
-        Err(type_error(line, "replace(str, str, str) の形式で使います"))
-    }
+    let s = require_str(&args[0], "replace", 1, line)?;
+    let old = require_str(&args[1], "replace", 2, line)?;
+    let new = require_str(&args[2], "replace", 3, line)?;
+    Ok(Value::Str(s.replace(old.as_str(), new.as_str())))
 }
 
 // =============================================================================
@@ -510,10 +517,16 @@ pub fn builtin_to_int(args: &[Value], line: usize) -> Result<Value, TsumugiError
             TsumugiError::runtime_with_kind(
                 line,
                 crate::error::ErrorKind::Conversion,
-                format!("to_int: 変換失敗: \"{}\"", s),
+                "to_int で Int に変換できません: 数値として解釈できません",
             )
         }),
-        _ => Err(type_error(line, "to_int: 変換できない型です")),
+        other => Err(TsumugiError::builtin_arg_type(
+            line,
+            "to_int",
+            1,
+            "Int/Float/Bool/Str",
+            other,
+        )),
     }
 }
 
@@ -531,10 +544,16 @@ pub fn builtin_to_float(args: &[Value], line: usize) -> Result<Value, TsumugiErr
             TsumugiError::runtime_with_kind(
                 line,
                 crate::error::ErrorKind::Conversion,
-                format!("to_float: 変換失敗: \"{}\"", s),
+                "to_float で Float に変換できません: 数値として解釈できません",
             )
         }),
-        _ => Err(type_error(line, "to_float: 変換できない型です")),
+        other => Err(TsumugiError::builtin_arg_type(
+            line,
+            "to_float",
+            1,
+            "Int/Float/Str",
+            other,
+        )),
     }
 }
 
@@ -545,14 +564,19 @@ pub fn builtin_abs(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
             .checked_abs()
             .map(|v| Ok(Value::Int(v)))
             .unwrap_or_else(|| {
-                Err(TsumugiError::runtime_with_kind(
+                Err(TsumugiError::int_overflow(
                     line,
-                    crate::error::ErrorKind::IntOverflow,
-                    "整数オーバーフロー: abs() の結果が表現できません",
+                    "abs の結果が表現できません",
                 ))
             }),
         Value::Float(f) => Ok(Value::Float(f.abs())),
-        _ => Err(type_error(line, "abs は数値に対してのみ使えます")),
+        other => Err(TsumugiError::builtin_arg_type(
+            line,
+            "abs",
+            1,
+            "Int/Float",
+            other,
+        )),
     }
 }
 
@@ -563,7 +587,20 @@ pub fn builtin_min(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.min(*b))),
         (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).min(*b))),
         (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.min(*b as f64))),
-        _ => Err(type_error(line, "min は数値に対してのみ使えます")),
+        (Value::Int(_) | Value::Float(_), other) => Err(TsumugiError::builtin_arg_type(
+            line,
+            "min",
+            2,
+            "Int/Float",
+            other,
+        )),
+        (other, _) => Err(TsumugiError::builtin_arg_type(
+            line,
+            "min",
+            1,
+            "Int/Float",
+            other,
+        )),
     }
 }
 
@@ -574,7 +611,20 @@ pub fn builtin_max(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.max(*b))),
         (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).max(*b))),
         (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.max(*b as f64))),
-        _ => Err(type_error(line, "max は数値に対してのみ使えます")),
+        (Value::Int(_) | Value::Float(_), other) => Err(TsumugiError::builtin_arg_type(
+            line,
+            "max",
+            2,
+            "Int/Float",
+            other,
+        )),
+        (other, _) => Err(TsumugiError::builtin_arg_type(
+            line,
+            "max",
+            1,
+            "Int/Float",
+            other,
+        )),
     }
 }
 
@@ -583,7 +633,13 @@ pub fn builtin_floor(args: &[Value], line: usize) -> Result<Value, TsumugiError>
     match &args[0] {
         Value::Float(f) => Ok(Value::Int(f.floor() as i64)),
         Value::Int(n) => Ok(Value::Int(*n)),
-        _ => Err(type_error(line, "floor は数値に対してのみ使えます")),
+        other => Err(TsumugiError::builtin_arg_type(
+            line,
+            "floor",
+            1,
+            "Int/Float",
+            other,
+        )),
     }
 }
 
@@ -592,7 +648,13 @@ pub fn builtin_ceil(args: &[Value], line: usize) -> Result<Value, TsumugiError> 
     match &args[0] {
         Value::Float(f) => Ok(Value::Int(f.ceil() as i64)),
         Value::Int(n) => Ok(Value::Int(*n)),
-        _ => Err(type_error(line, "ceil は数値に対してのみ使えます")),
+        other => Err(TsumugiError::builtin_arg_type(
+            line,
+            "ceil",
+            1,
+            "Int/Float",
+            other,
+        )),
     }
 }
 
@@ -601,7 +663,13 @@ pub fn builtin_round(args: &[Value], line: usize) -> Result<Value, TsumugiError>
     match &args[0] {
         Value::Float(f) => Ok(Value::Int(f.round() as i64)),
         Value::Int(n) => Ok(Value::Int(*n)),
-        _ => Err(type_error(line, "round は数値に対してのみ使えます")),
+        other => Err(TsumugiError::builtin_arg_type(
+            line,
+            "round",
+            1,
+            "Int/Float",
+            other,
+        )),
     }
 }
 
@@ -621,11 +689,17 @@ pub fn builtin_now(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
 
 pub fn builtin_format_time(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("format_time", args, 2, line)?;
-    if let (Value::Int(ts), Value::Str(fmt)) = (&args[0], &args[1]) {
-        Ok(Value::Str(format_unix_timestamp(*ts, fmt)))
-    } else {
-        Err(type_error(line, "format_time(int, str) の形式で使います"))
-    }
+    let Value::Int(ts) = &args[0] else {
+        return Err(TsumugiError::builtin_arg_type(
+            line,
+            "format_time",
+            1,
+            "Int",
+            &args[0],
+        ));
+    };
+    let fmt = require_str(&args[1], "format_time", 2, line)?;
+    Ok(Value::Str(format_unix_timestamp(*ts, fmt)))
 }
 
 // =============================================================================
@@ -640,11 +714,11 @@ pub fn write_stdout_line(text: &str, line: usize) -> Result<(), TsumugiError> {
     use std::io::Write;
 
     let mut out = std::io::stdout().lock();
-    writeln!(out, "{}", text).map_err(|error| {
+    writeln!(out, "{}", text).map_err(|_| {
         TsumugiError::runtime_with_kind(
             line,
             crate::error::ErrorKind::Io,
-            format!("標準出力への書き込みに失敗しました: {}", error),
+            "標準出力への書き込みに失敗しました",
         )
     })
 }
@@ -662,7 +736,13 @@ pub fn builtin_read_file(args: &[Value], line: usize) -> Result<Value, TsumugiEr
             Err(_) => Ok(Value::Null),
         }
     } else {
-        Err(type_error(line, "read_file(str) の形式で使います"))
+        Err(TsumugiError::builtin_arg_type(
+            line,
+            "read_file",
+            1,
+            "Str",
+            &args[0],
+        ))
     }
 }
 
@@ -682,7 +762,13 @@ pub fn builtin_read_lines(args: &[Value], line: usize) -> Result<Value, TsumugiE
             Err(_) => Ok(Value::Null),
         }
     } else {
-        Err(type_error(line, "read_lines(str) の形式で使います"))
+        Err(TsumugiError::builtin_arg_type(
+            line,
+            "read_lines",
+            1,
+            "Str",
+            &args[0],
+        ))
     }
 }
 
@@ -696,9 +782,12 @@ pub fn builtin_write_file(args: &[Value], line: usize) -> Result<Value, TsumugiE
         };
         Ok(Value::Bool(std::fs::write(&safe_path, &content).is_ok()))
     } else {
-        Err(type_error(
+        Err(TsumugiError::builtin_arg_type(
             line,
-            "write_file(str, content) の形式で使います",
+            "write_file",
+            1,
+            "Str",
+            &args[0],
         ))
     }
 }
@@ -720,9 +809,12 @@ pub fn builtin_append_file(args: &[Value], line: usize) -> Result<Value, Tsumugi
             .and_then(|mut f| f.write_all(content.as_bytes()));
         Ok(Value::Bool(result.is_ok()))
     } else {
-        Err(type_error(
+        Err(TsumugiError::builtin_arg_type(
             line,
-            "append_file(str, content) の形式で使います",
+            "append_file",
+            1,
+            "Str",
+            &args[0],
         ))
     }
 }
@@ -801,7 +893,9 @@ pub fn builtin_env(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
             Err(_) => Ok(Value::Null),
         }
     } else {
-        Err(type_error(line, "env(str) の形式で使います"))
+        Err(TsumugiError::builtin_arg_type(
+            line, "env", 1, "Str", &args[0],
+        ))
     }
 }
 
@@ -815,7 +909,13 @@ pub fn builtin_path_exists(args: &[Value], line: usize) -> Result<Value, Tsumugi
         let safe_path = crate::sandbox::check_path(path, line)?;
         Ok(Value::Bool(safe_path.exists()))
     } else {
-        Err(type_error(line, "path_exists(str) の形式で使います"))
+        Err(TsumugiError::builtin_arg_type(
+            line,
+            "path_exists",
+            1,
+            "Str",
+            &args[0],
+        ))
     }
 }
 
@@ -836,7 +936,9 @@ pub fn builtin_mkdir(args: &[Value], line: usize) -> Result<Value, TsumugiError>
         let safe_path = crate::sandbox::check_path(path, line)?;
         Ok(Value::Bool(std::fs::create_dir_all(&safe_path).is_ok()))
     } else {
-        Err(type_error(line, "mkdir(str) の形式で使います"))
+        Err(TsumugiError::builtin_arg_type(
+            line, "mkdir", 1, "Str", &args[0],
+        ))
     }
 }
 
@@ -857,7 +959,9 @@ pub fn builtin_remove(args: &[Value], line: usize) -> Result<Value, TsumugiError
         };
         Ok(Value::Bool(result.is_ok()))
     } else {
-        Err(type_error(line, "remove(str) の形式で使います"))
+        Err(TsumugiError::builtin_arg_type(
+            line, "remove", 1, "Str", &args[0],
+        ))
     }
 }
 
@@ -871,19 +975,23 @@ pub fn builtin_remove_dir(args: &[Value], line: usize) -> Result<Value, TsumugiE
         };
         Ok(Value::Bool(result.is_ok()))
     } else {
-        Err(type_error(line, "remove_dir(str) の形式で使います"))
+        Err(TsumugiError::builtin_arg_type(
+            line,
+            "remove_dir",
+            1,
+            "Str",
+            &args[0],
+        ))
     }
 }
 
 pub fn builtin_rename(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("rename", args, 2, line)?;
-    if let (Value::Str(from), Value::Str(to)) = (&args[0], &args[1]) {
-        let safe_from = crate::sandbox::check_entry_path(from, line)?;
-        let safe_to = crate::sandbox::check_entry_path(to, line)?;
-        Ok(Value::Bool(std::fs::rename(&safe_from, &safe_to).is_ok()))
-    } else {
-        Err(type_error(line, "rename(str, str) の形式で使います"))
-    }
+    let from = require_str(&args[0], "rename", 1, line)?;
+    let to = require_str(&args[1], "rename", 2, line)?;
+    let safe_from = crate::sandbox::check_entry_path(from, line)?;
+    let safe_to = crate::sandbox::check_entry_path(to, line)?;
+    Ok(Value::Bool(std::fs::rename(&safe_from, &safe_to).is_ok()))
 }
 
 pub fn builtin_list_dir(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
@@ -903,7 +1011,9 @@ pub fn builtin_list_dir(args: &[Value], line: usize) -> Result<Value, TsumugiErr
             Err(_) => Ok(Value::Null),
         }
     } else {
-        Err(type_error(line, "list_dir(str) の形式で使います"))
+        Err(TsumugiError::builtin_arg_type(
+            line, "list_dir", 1, "Str", &args[0],
+        ))
     }
 }
 
@@ -916,7 +1026,13 @@ pub fn builtin_file_size(args: &[Value], line: usize) -> Result<Value, TsumugiEr
             Err(_) => Ok(Value::Null),
         }
     } else {
-        Err(type_error(line, "file_size(str) の形式で使います"))
+        Err(TsumugiError::builtin_arg_type(
+            line,
+            "file_size",
+            1,
+            "Str",
+            &args[0],
+        ))
     }
 }
 
@@ -926,7 +1042,9 @@ pub fn builtin_is_file(args: &[Value], line: usize) -> Result<Value, TsumugiErro
         let safe_path = crate::sandbox::check_path(path, line)?;
         Ok(Value::Bool(safe_path.is_file()))
     } else {
-        Err(type_error(line, "is_file(str) の形式で使います"))
+        Err(TsumugiError::builtin_arg_type(
+            line, "is_file", 1, "Str", &args[0],
+        ))
     }
 }
 
@@ -936,7 +1054,9 @@ pub fn builtin_is_dir(args: &[Value], line: usize) -> Result<Value, TsumugiError
         let safe_path = crate::sandbox::check_path(path, line)?;
         Ok(Value::Bool(safe_path.is_dir()))
     } else {
-        Err(type_error(line, "is_dir(str) の形式で使います"))
+        Err(TsumugiError::builtin_arg_type(
+            line, "is_dir", 1, "Str", &args[0],
+        ))
     }
 }
 

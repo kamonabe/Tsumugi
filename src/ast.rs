@@ -173,7 +173,7 @@ pub enum FStrExprPart {
 }
 
 /// 二項演算子の種類
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BinOpKind {
     Add,   // +
     Sub,   // -
@@ -191,7 +191,7 @@ pub enum BinOpKind {
 }
 
 /// 単項演算子の種類
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UnaryOpKind {
     Neg, // -
     Not, // not

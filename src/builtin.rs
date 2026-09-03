@@ -16,6 +16,7 @@ impl Evaluator {
     /// Value::Fn を呼び出すヘルパー（map/filter/each 用）
     fn call_fn_value(
         &mut self,
+        builtin: &str,
         func: &Value,
         arg_values: Vec<Value>,
         line: usize,
@@ -23,13 +24,9 @@ impl Evaluator {
         // 再帰制限チェック（通常の関数呼び出しと同じガードを適用）
         self.count_step(line)?;
         if self.call_stack.len() >= super::MAX_USER_CALL_DEPTH {
-            return Err(TsumugiError::runtime_with_kind(
+            return Err(TsumugiError::call_depth_limit(
                 line,
-                crate::error::ErrorKind::StackOverflow,
-                format!(
-                    "スタックオーバーフロー: 再帰が深すぎます (上限: {})",
-                    super::MAX_USER_CALL_DEPTH
-                ),
+                super::MAX_USER_CALL_DEPTH,
             ));
         }
         match func {
@@ -40,16 +37,9 @@ impl Evaluator {
                 let name = def.name.as_str();
                 let params = &def.params;
 
+                // callbackは常に1引数で呼ぶため、arity不一致はcallback専用messageで報告する。
                 if arg_values.len() != params.len() {
-                    return Err(TsumugiError::runtime(
-                        line,
-                        format!(
-                            "関数 {} は引数{}個ですが、{}個渡されました",
-                            name,
-                            params.len(),
-                            arg_values.len()
-                        ),
-                    ));
+                    return Err(TsumugiError::callback_arity(line, builtin, params.len()));
                 }
                 let saved_scopes = self.env.push_call_frame();
                 for (k, cell) in captured.iter() {
@@ -82,22 +72,18 @@ impl Evaluator {
                             trace.reverse();
                             self.call_stack.pop();
                             self.env.pop_call_frame(saved_scopes);
-                            return Err(TsumugiError::runtime(
-                                stmt.line(),
-                                "break はループの中でのみ使用できます",
-                            )
-                            .with_trace(trace));
+                            return Err(
+                                TsumugiError::break_outside_loop(stmt.line()).with_trace(trace)
+                            );
                         }
                         Ok(super::EvalResult::Continue) => {
                             let mut trace = self.call_stack.clone();
                             trace.reverse();
                             self.call_stack.pop();
                             self.env.pop_call_frame(saved_scopes);
-                            return Err(TsumugiError::runtime(
-                                stmt.line(),
-                                "continue はループの中でのみ使用できます",
-                            )
-                            .with_trace(trace));
+                            return Err(
+                                TsumugiError::continue_outside_loop(stmt.line()).with_trace(trace)
+                            );
                         }
                         Ok(super::EvalResult::Val) => {}
                         Err(e) => {
@@ -113,10 +99,7 @@ impl Evaluator {
                 self.env.pop_call_frame(saved_scopes);
                 Ok(result)
             }
-            _ => Err(TsumugiError::runtime(
-                line,
-                format!("関数ではない値を呼び出そうとしました: {}", func),
-            )),
+            _ => Err(TsumugiError::callback_not_callable(line, builtin, func)),
         }
     }
 
@@ -199,10 +182,7 @@ impl Evaluator {
             }
             "input" => {
                 if !args.is_empty() {
-                    return Err(TsumugiError::runtime(
-                        line,
-                        format!("input() は引数0個ですが、{}個渡されました", args.len()),
-                    ));
+                    return Err(TsumugiError::builtin_arity(line, "input", 0, args.len()));
                 }
                 let stdin = io::stdin();
                 let mut line_buf = String::new();
@@ -222,10 +202,7 @@ impl Evaluator {
             }
             "args" => {
                 if !args.is_empty() {
-                    return Err(TsumugiError::runtime(
-                        line,
-                        format!("args() は引数0個ですが、{}個渡されました", args.len()),
-                    ));
+                    return Err(TsumugiError::builtin_arity(line, "args", 0, args.len()));
                 }
                 // 非UTF-8のargvでもpanicさせない（AUD-035）
                 let argv: Vec<Value> = std::env::args_os()
@@ -237,8 +214,9 @@ impl Evaluator {
             }
             "exit" => {
                 if args.len() > 1 {
-                    return Err(TsumugiError::runtime(
+                    return Err(TsumugiError::runtime_with_kind(
                         line,
+                        crate::error::ErrorKind::Argument,
                         format!("exit() は引数0〜1個ですが、{}個渡されました", args.len()),
                     ));
                 }
@@ -247,10 +225,9 @@ impl Evaluator {
                 } else {
                     match self.eval_expr(&args[0], line)? {
                         Value::Int(n) => n as i32,
-                        _ => {
-                            return Err(TsumugiError::runtime(
-                                line,
-                                "exit() の引数は整数である必要があります",
+                        other => {
+                            return Err(TsumugiError::builtin_arg_type(
+                                line, "exit", 1, "Int", &other,
                             ));
                         }
                     }
@@ -276,9 +253,10 @@ impl Evaluator {
                 let Expr::Ident(var_name) = &args[0] else {
                     unreachable!("push target was validated before argument evaluation")
                 };
-                let cell = self.env.get_cell(var_name).ok_or_else(|| {
-                    TsumugiError::runtime(line, format!("未定義の変数: {}", var_name))
-                })?;
+                let cell = self
+                    .env
+                    .get_cell(var_name)
+                    .ok_or_else(|| TsumugiError::undefined_name(line, var_name))?;
 
                 // 第1引数を先にsnapshotし、第2引数の評価後に同じbindingへ書き戻す。
                 let target_value = cell.borrow().clone();
@@ -291,9 +269,10 @@ impl Evaluator {
                 let Expr::Ident(var_name) = &args[0] else {
                     unreachable!("pop target was validated before argument evaluation")
                 };
-                let cell = self.env.get_cell(var_name).ok_or_else(|| {
-                    TsumugiError::runtime(line, format!("未定義の変数: {}", var_name))
-                })?;
+                let cell = self
+                    .env
+                    .get_cell(var_name)
+                    .ok_or_else(|| TsumugiError::undefined_name(line, var_name))?;
                 let target_value = cell.borrow().clone();
                 let value =
                     crate::builtin_core::builtin_pop(std::slice::from_ref(&target_value), line)?;
@@ -306,16 +285,15 @@ impl Evaluator {
                 let func = self.eval_expr(&args[1], line)?;
                 let list = match list_value {
                     Value::List(v) => v,
-                    _ => {
-                        return Err(crate::builtin_core::type_error(
-                            line,
-                            "map(list, fn) の形式で使います",
+                    other => {
+                        return Err(TsumugiError::builtin_arg_type(
+                            line, "map", 1, "List", &other,
                         ));
                     }
                 };
                 let mut result = Vec::new();
                 for item in list {
-                    let val = self.call_fn_value(&func, vec![item], line)?;
+                    let val = self.call_fn_value("map", &func, vec![item], line)?;
                     crate::builtin_core::check_collection_size_public(
                         result.len().saturating_add(1),
                         line,
@@ -329,16 +307,15 @@ impl Evaluator {
                 let func = self.eval_expr(&args[1], line)?;
                 let list = match list_value {
                     Value::List(v) => v,
-                    _ => {
-                        return Err(crate::builtin_core::type_error(
-                            line,
-                            "filter(list, fn) の形式で使います",
+                    other => {
+                        return Err(TsumugiError::builtin_arg_type(
+                            line, "filter", 1, "List", &other,
                         ));
                     }
                 };
                 let mut result = Vec::new();
                 for item in list {
-                    let val = self.call_fn_value(&func, vec![item.clone()], line)?;
+                    let val = self.call_fn_value("filter", &func, vec![item.clone()], line)?;
                     if val.is_truthy() {
                         crate::builtin_core::check_collection_size_public(
                             result.len().saturating_add(1),
@@ -354,15 +331,14 @@ impl Evaluator {
                 let func = self.eval_expr(&args[1], line)?;
                 let list = match list_value {
                     Value::List(v) => v,
-                    _ => {
-                        return Err(crate::builtin_core::type_error(
-                            line,
-                            "each(list, fn) の形式で使います",
+                    other => {
+                        return Err(TsumugiError::builtin_arg_type(
+                            line, "each", 1, "List", &other,
                         ));
                     }
                 };
                 for item in list {
-                    self.call_fn_value(&func, vec![item], line)?;
+                    self.call_fn_value("each", &func, vec![item], line)?;
                 }
                 Ok(Some(Value::Null))
             }

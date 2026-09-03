@@ -6,7 +6,7 @@ success-body
 arity-callee
 arity-argument
 noncall-callee
-noncall-name
+noncall-type
 failing-callee
 callee-error-zero_division
 arg-error-arg1

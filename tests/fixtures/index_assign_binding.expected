@@ -13,19 +13,19 @@ forward-name
 [0, 4]
 [1, 2, 30]
 {"a": 2}
-target-name-未定義の変数: missing_target
+target-name-未定義の変数または関数: missing_target
 note-index
 note-value
 [0, 5]
 [10, 20, 3]
 [1, 7]
-bounds-index-インデックス範囲外: 1 (長さ: 1)
+bounds-index-List のインデックスが範囲外です: 1 (長さ: 1)
 [1]
-list-key-runtime-リストのインデックスは整数である必要があります
-upper-index-インデックス範囲外: 2 (長さ: 2)
-lower-index-インデックス範囲外: -3 (長さ: 2)
-dict-key-runtime-辞書のキーは文字列である必要があります
-scalar-runtime-インデックス代入はリストまたは辞書にのみ使用できます
+list-key-type-List のインデックスは Int である必要があります: Str
+upper-index-List のインデックスが範囲外です: 2 (長さ: 2)
+lower-index-List のインデックスが範囲外です: -3 (長さ: 2)
+dict-key-type-Dict のキーは Str である必要があります: Int
+scalar-type-インデックス代入できない型です: Int
 [1, 2]
 {"a": 1}
 5
