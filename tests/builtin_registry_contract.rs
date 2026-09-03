@@ -108,8 +108,8 @@ fn tree_engine_resolves_every_public_builtin() {
             err
         );
         assert!(
-            !err.to_string().contains("未定義の関数"),
-            "{} が未定義の関数として扱われた: {}",
+            !err.to_string().contains("未定義の変数または関数"),
+            "{} が未定義として扱われた: {}",
             spec.name,
             err
         );
@@ -127,7 +127,7 @@ fn pop_update_is_unreachable_from_source() {
         .execute(&script, &mut ctx)
         .expect_err("__pop_update は undefined のはず");
     assert!(
-        err.to_string().contains("未定義の関数"),
+        err.to_string().contains("未定義の変数または関数"),
         "tree: __pop_update が呼べてしまった: {}",
         err
     );

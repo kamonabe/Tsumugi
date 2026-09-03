@@ -2,7 +2,7 @@
 
 バージョン: 0.12
 
-最終更新: 2026-09-01
+最終更新: 2026-09-03
 
 この番号は言語仕様のrevisionであり、Cargo package / REPLの実装バージョン `0.1.0` とは独立して管理する。
 
@@ -18,7 +18,6 @@
 |---|---|---|
 | 同一scopeでの`let`再宣言 | 既存クロージャが参照する変数セルの同一性が異なる | AUD-016 |
 | 捕捉のない関数値の同一性 | 同じ`fn`式から生成した別インスタンスを、デフォルト実行系は不等、`--vm`は等しいと判定する | AUD-048 |
-| error kind / messageの一部 | iteration / index / callbackなどで種別・メッセージが異なる | AUD-019 |
 | 未捕捉REPLエラー後の状態 | エラー前の代入・コレクション変更をcommitするかrollbackするかが未統一 | AUD-024 |
 
 両engine共通の仕様違反:
@@ -180,7 +179,7 @@ d["a"] = 10        # 既存キーの更新
 
 **評価順**: `target[index] = value` は左から右へ、次の順で処理する。
 
-1. `target` の変数を解決する。未定義なら、この時点で「未定義の変数」エラーになる（`index` と `value` は評価しない）
+1. `target` の変数を解決する。未定義なら、この時点で「未定義の変数または関数」エラーになる（`index` と `value` は評価しない）
 2. `index` を評価する
 3. `value` を評価する
 4. 解決済みの変数が保持するコレクションを直接更新する
@@ -769,6 +768,39 @@ end
 
 `zero_division`, `type`, `index`, `name`, `limit`, `overflow`, `sandbox`, `import`, `argument`, `int_overflow`, `control_flow`, `collection_limit`, `conversion`, `builtin_type`, `iteration`, `io`, `internal`, `runtime`
 
+### エラーの kind とメッセージ（正本）
+
+runtime error は operation ごとの共通 constructor から `kind`・メッセージ・行番号を生成し、デフォルトのツリーウォーク版と `--vm` 版で完全に一致する（AUD-019）。メッセージには値そのものを埋め込まず、型名（`Int` / `Float` / `Str` / `Bool` / `Null` / `List` / `Dict` / `Fn` / `Error`）だけを用いる。主な operation のテンプレートは次のとおり（波括弧は実行時に置換される）。
+
+| operation | kind | メッセージ |
+|---|---|---|
+| 変数read・callee名が未定義 | `name` | `未定義の変数または関数: {name}` |
+| 未定義変数への代入 | `name` | `未定義の変数に代入: {name}` |
+| ゼロ除算・剰余のゼロ | `zero_division` | `ゼロ除算` |
+| 算術演算の型不正 | `type` | `演算子 {op} は {left} と {right} に適用できません` |
+| 単項演算の型不正 | `type` | `演算子 {op} は {operand} に適用できません` |
+| 大小比較の型不正 | `type` | `比較演算子 {op} は {left} と {right} に適用できません` |
+| List/Str indexが非Int | `type` | `List のインデックスは Int である必要があります: {type}` / `Str の…` |
+| Dict keyが非Str | `type` | `Dict のキーは Str である必要があります: {type}` |
+| List/Str index範囲外 | `index` | `List のインデックスが範囲外です: {index} (長さ: {len})` / `Str の…` |
+| index read非対応型 | `type` | `インデックスアクセスできない型です: {type}` |
+| index assignment非対応型 | `type` | `インデックス代入できない型です: {type}` |
+| 反復非対応型 | `iteration` | `反復できない型です: {type}` |
+| 非callableの呼び出し | `type` | `呼び出せない型です: {type}` |
+| user関数arity | `argument` | `{callable} の引数個数が一致しません: 期待 {expected}, 実際 {actual}` |
+| builtin arity | `argument` | `{builtin} の引数個数が一致しません: 期待 {expected}, 実際 {actual}` |
+| builtin argument型 | `builtin_type` | `{builtin} の第 {position} 引数は {expected} である必要があります: {type}` |
+| callback非callable | `type` | `{builtin} のコールバックは呼び出し可能である必要があります: {type}` |
+| callback arity | `argument` | `{builtin} のコールバック引数個数が一致しません: 期待 1, 実際 {actual}` |
+| 空Listへの`pop` | `builtin_type` | `pop は空の List には使用できません` |
+| コレクション上限 | `collection_limit` | `コレクション要素数が上限を超えました: {requested} (上限: {limit})` |
+| user関数depth上限 | `overflow` | `スタックオーバーフロー: 再帰が深すぎます (上限: 128)` |
+| loop外の`break` / `continue` | `control_flow` | `break はループの中でのみ使用できます` / `continue は…` |
+| ステップ上限 | `limit` | `ステップ上限に達しました (上限: {limit})` |
+| 整数演算overflow | `int_overflow` | `整数オーバーフロー: {operation}` |
+
+`runtime` 種別は現行の言語コアが生成する経路を持たない（互換用に列挙のみ残す）。
+
 ### キャッチできないエラー
 
 - パースエラー（構文エラー）— プログラムの実行前に発生するため
@@ -856,12 +888,12 @@ end
 
 ```
 2行目: let の後に識別子が必要です。got: Assign
-3行目: 未定義の変数: z
+3行目: 未定義の変数または関数: z
 1行目: 未定義の変数に代入: x
 1行目: ゼロ除算
-3行目: 型エラー: Str("hello") Add Int(1) は計算できません
-2行目: インデックス範囲外: 5 (長さ: 3)
-1行目: 辞書のキーは文字列である必要があります
+3行目: 演算子 + は Str と Int に適用できません
+2行目: List のインデックスが範囲外です: 5 (長さ: 3)
+1行目: Dict のキーは Str である必要があります: Int
 1行目: 文字列リテラルが閉じられていません
 1行目: 整数リテラルが範囲外です (最大: 9223372036854775807): 99999999999999999999
 ```

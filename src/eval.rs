@@ -62,11 +62,7 @@ impl Evaluator {
     fn count_step(&mut self, line: usize) -> Result<(), TsumugiError> {
         self.steps += 1;
         if self.steps > self.max_steps {
-            let mut err = TsumugiError::runtime_with_kind(
-                line,
-                crate::error::ErrorKind::StepLimit,
-                format!("ステップ上限に達しました (上限: {})", self.max_steps),
-            );
+            let mut err = TsumugiError::step_limit(line, self.max_steps);
             if !self.call_stack.is_empty() {
                 let mut trace = self.call_stack.clone();
                 trace.reverse();
@@ -103,16 +99,10 @@ impl Evaluator {
             match self.exec_stmt(stmt)? {
                 EvalResult::Return(_) => break,
                 EvalResult::Break => {
-                    return Err(TsumugiError::runtime(
-                        stmt.line(),
-                        "break はループの中でのみ使用できます",
-                    ));
+                    return Err(TsumugiError::break_outside_loop(stmt.line()));
                 }
                 EvalResult::Continue => {
-                    return Err(TsumugiError::runtime(
-                        stmt.line(),
-                        "continue はループの中でのみ使用できます",
-                    ));
+                    return Err(TsumugiError::continue_outside_loop(stmt.line()));
                 }
                 EvalResult::Val => {}
             }
@@ -132,10 +122,7 @@ impl Evaluator {
             Stmt::Assign { name, value, line } => {
                 let val = self.eval_expr(value, *line)?;
                 if self.env.update(name, val).is_err() {
-                    return Err(TsumugiError::runtime(
-                        *line,
-                        format!("未定義の変数に代入: {}", name),
-                    ));
+                    return Err(TsumugiError::assign_undefined(*line, name));
                 }
                 Ok(EvalResult::Val)
             }
@@ -148,9 +135,10 @@ impl Evaluator {
             } => {
                 // 規範順序: target binding解決 → index → value → in-place更新。
                 // bindingを先に解決するため、未定義変数はindex/valueの副作用より前に報告する。
-                let cell = self.env.get_cell(name).ok_or_else(|| {
-                    TsumugiError::runtime(*line, format!("未定義の変数: {}", name))
-                })?;
+                let cell = self
+                    .env
+                    .get_cell(name)
+                    .ok_or_else(|| TsumugiError::undefined_name(*line, name))?;
                 let idx = self.eval_expr(index, *line)?;
                 let val = self.eval_expr(value, *line)?;
 
@@ -228,10 +216,7 @@ impl Evaluator {
                         s.chars().map(|c| Value::Str(c.to_string())).collect()
                     }
                     _ => {
-                        return Err(TsumugiError::runtime(
-                            *line,
-                            format!("for で反復できません: {:?}", collection),
-                        ));
+                        return Err(TsumugiError::not_iterable(*line, &collection));
                     }
                 };
 
@@ -282,10 +267,9 @@ impl Evaluator {
             Stmt::Continue { .. } => Ok(EvalResult::Continue),
 
             // import はリンク時に解決済みなので、ここへは到達しない
-            Stmt::Import { line, .. } => Err(TsumugiError::runtime_with_kind(
+            Stmt::Import { line, .. } => Err(TsumugiError::internal(
                 *line,
-                crate::error::ErrorKind::Internal,
-                "内部エラー: import がリンクされていません",
+                "import がリンクされていません",
             )),
 
             Stmt::TryCatch {
@@ -368,10 +352,7 @@ impl Evaluator {
                     let key = match self.eval_expr(key_expr, line)? {
                         Value::Str(s) => s,
                         other => {
-                            return Err(TsumugiError::runtime(
-                                line,
-                                format!("辞書のキーは文字列である必要があります。got: {:?}", other),
-                            ));
+                            return Err(TsumugiError::dict_key_type(line, &other));
                         }
                     };
                     let val = self.eval_expr(val_expr, line)?;
@@ -389,7 +370,7 @@ impl Evaluator {
             Expr::Ident(name) => self
                 .env
                 .get(name)
-                .ok_or_else(|| TsumugiError::runtime(line, format!("未定義の変数: {}", name))),
+                .ok_or_else(|| TsumugiError::undefined_name(line, name)),
 
             Expr::BinOp { left, op, right } => {
                 // and/or は短絡評価（右辺を常に評価しない）
@@ -479,48 +460,53 @@ impl Evaluator {
         index: &Value,
         line: usize,
     ) -> Result<Value, TsumugiError> {
-        match (object, index) {
-            (Value::List(list), Value::Int(i)) => {
+        match object {
+            Value::List(list) => {
+                let Value::Int(i) = index else {
+                    return Err(TsumugiError::list_index_type(line, index));
+                };
                 let len = list.len() as i64;
                 let actual = if *i < 0 { len + *i } else { *i };
                 if actual < 0 || actual >= len {
-                    return Err(TsumugiError::runtime(
-                        line,
-                        format!("インデックス範囲外: {} (長さ: {})", i, len),
-                    ));
+                    return Err(TsumugiError::list_index_out_of_range(line, *i, list.len()));
                 }
                 Ok(list[actual as usize].clone())
             }
-            (Value::Dict(map), Value::Str(key)) => Ok(map.get(key).cloned().unwrap_or(Value::Null)),
-            (
-                Value::Error {
-                    error_type,
-                    message,
-                    line: err_line,
-                },
-                Value::Str(key),
-            ) => match key.as_str() {
-                "type" => Ok(Value::Str(error_type.clone())),
-                "message" => Ok(Value::Str(message.clone())),
-                "line" => Ok(Value::Int(*err_line as i64)),
-                _ => Ok(Value::Null),
-            },
-            (Value::Str(s), Value::Int(i)) => {
-                let len = s.chars().count() as i64;
+            Value::Str(s) => {
+                let Value::Int(i) = index else {
+                    return Err(TsumugiError::str_index_type(line, index));
+                };
+                let count = s.chars().count();
+                let len = count as i64;
                 let actual = if *i < 0 { len + *i } else { *i };
                 if actual < 0 || actual >= len {
-                    return Err(TsumugiError::runtime(
-                        line,
-                        format!("インデックス範囲外: {} (長さ: {})", i, len),
-                    ));
+                    return Err(TsumugiError::str_index_out_of_range(line, *i, count));
                 }
                 let ch = s.chars().nth(actual as usize).unwrap();
                 Ok(Value::Str(ch.to_string()))
             }
-            _ => Err(TsumugiError::runtime(
-                line,
-                format!("インデックスアクセスできません: {:?}[{:?}]", object, index),
-            )),
+            Value::Dict(map) => {
+                let Value::Str(key) = index else {
+                    return Err(TsumugiError::dict_key_type(line, index));
+                };
+                Ok(map.get(key).cloned().unwrap_or(Value::Null))
+            }
+            Value::Error {
+                error_type,
+                message,
+                line: err_line,
+            } => {
+                let Value::Str(key) = index else {
+                    return Err(TsumugiError::dict_key_type(line, index));
+                };
+                match key.as_str() {
+                    "type" => Ok(Value::Str(error_type.clone())),
+                    "message" => Ok(Value::Str(message.clone())),
+                    "line" => Ok(Value::Int(*err_line as i64)),
+                    _ => Ok(Value::Null),
+                }
+            }
+            _ => Err(TsumugiError::index_read_unsupported(line, object)),
         }
     }
 
@@ -537,31 +523,31 @@ impl Evaluator {
             (Value::Int(l), BinOpKind::Add, Value::Int(r)) => l
                 .checked_add(*r)
                 .map(Value::Int)
-                .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー")),
+                .ok_or_else(|| TsumugiError::int_overflow(line, "加算")),
             (Value::Int(l), BinOpKind::Sub, Value::Int(r)) => l
                 .checked_sub(*r)
                 .map(Value::Int)
-                .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー")),
+                .ok_or_else(|| TsumugiError::int_overflow(line, "減算")),
             (Value::Int(l), BinOpKind::Mul, Value::Int(r)) => l
                 .checked_mul(*r)
                 .map(Value::Int)
-                .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー")),
+                .ok_or_else(|| TsumugiError::int_overflow(line, "乗算")),
             (Value::Int(l), BinOpKind::Div, Value::Int(r)) => {
                 if *r == 0 {
-                    Err(TsumugiError::runtime(line, "ゼロ除算"))
+                    Err(TsumugiError::zero_division(line))
                 } else {
                     l.checked_div(*r)
                         .map(Value::Int)
-                        .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー"))
+                        .ok_or_else(|| TsumugiError::int_overflow(line, "除算"))
                 }
             }
             (Value::Int(l), BinOpKind::Mod, Value::Int(r)) => {
                 if *r == 0 {
-                    Err(TsumugiError::runtime(line, "ゼロ除算"))
+                    Err(TsumugiError::zero_division(line))
                 } else {
                     l.checked_rem(*r)
                         .map(Value::Int)
-                        .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー"))
+                        .ok_or_else(|| TsumugiError::int_overflow(line, "剰余"))
                 }
             }
 
@@ -620,12 +606,13 @@ impl Evaluator {
             // 論理演算は eval_expr 側で短絡評価するため、ここには到達しない
             (_, BinOpKind::And, _) | (_, BinOpKind::Or, _) => unreachable!(),
 
-            // 被演算子の値がメッセージに入っても種別がぶれないよう、kindを明示する
-            _ => Err(TsumugiError::runtime_with_kind(
-                line,
-                crate::error::ErrorKind::Type,
-                format!("型エラー: {:?} {:?} {:?} は計算できません", left, op, right),
-            )),
+            // 大小比較の対象型不正（数値以外・型混在）
+            (l, BinOpKind::Lt | BinOpKind::Gt | BinOpKind::LtEq | BinOpKind::GtEq, r) => {
+                Err(TsumugiError::comparison_type(line, *op, l, r))
+            }
+
+            // 算術演算の対象型不正
+            (l, op, r) => Err(TsumugiError::arithmetic_type(line, *op, l, r)),
         }
     }
 
@@ -640,13 +627,10 @@ impl Evaluator {
             (UnaryOpKind::Neg, Value::Int(n)) => n
                 .checked_neg()
                 .map(Value::Int)
-                .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー")),
+                .ok_or_else(|| TsumugiError::int_overflow(line, "符号反転")),
             (UnaryOpKind::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
             (UnaryOpKind::Not, v) => Ok(Value::Bool(!v.is_truthy())),
-            _ => Err(TsumugiError::runtime(
-                line,
-                format!("型エラー: {:?} {:?} は計算できません", op, val),
-            )),
+            _ => Err(TsumugiError::unary_type(line, *op, val)),
         }
     }
 
@@ -669,13 +653,7 @@ impl Evaluator {
         // ユーザー定義関数の呼び出し: ステップカウント + 深度チェック
         self.count_step(line)?;
         if self.call_stack.len() >= MAX_USER_CALL_DEPTH {
-            return Err(TsumugiError::runtime(
-                line,
-                format!(
-                    "スタックオーバーフロー: 再帰が深すぎます (上限: {})",
-                    MAX_USER_CALL_DEPTH
-                ),
-            ));
+            return Err(TsumugiError::call_depth_limit(line, MAX_USER_CALL_DEPTH));
         }
 
         // callee を評価して関数値を取得
@@ -683,17 +661,14 @@ impl Evaluator {
         let func_value = if let Expr::Ident(name) = callee {
             self.env
                 .get(name)
-                .ok_or_else(|| TsumugiError::runtime(line, format!("未定義の関数: {}", name)))?
+                .ok_or_else(|| TsumugiError::undefined_name(line, name))?
         } else {
             // 識別子以外（式の評価結果を呼び出す）
             self.eval_expr(callee, line)?
         };
 
         let Value::Fn { def, captured } = &func_value else {
-            return Err(TsumugiError::runtime(
-                line,
-                format!("関数ではない値を呼び出そうとしました: {}", func_value),
-            ));
+            return Err(TsumugiError::not_callable(line, &func_value));
         };
         // Rcを複製して以降の借用から切り離す（値の複製は起きない）
         let def = Rc::clone(def);
@@ -702,14 +677,11 @@ impl Evaluator {
         let params = &def.params;
 
         if args.len() != params.len() {
-            return Err(TsumugiError::runtime(
+            return Err(TsumugiError::user_arity(
                 line,
-                format!(
-                    "関数 {} は引数{}個ですが、{}個渡されました",
-                    func_name,
-                    params.len(),
-                    args.len()
-                ),
+                func_name,
+                params.len(),
+                args.len(),
             ));
         }
 
@@ -751,18 +723,12 @@ impl Evaluator {
                 Ok(EvalResult::Break) => {
                     self.call_stack.pop();
                     self.env.pop_call_frame(saved_scopes);
-                    return Err(TsumugiError::runtime(
-                        line,
-                        "break はループの中でのみ使用できます",
-                    ));
+                    return Err(TsumugiError::break_outside_loop(line));
                 }
                 Ok(EvalResult::Continue) => {
                     self.call_stack.pop();
                     self.env.pop_call_frame(saved_scopes);
-                    return Err(TsumugiError::runtime(
-                        line,
-                        "continue はループの中でのみ使用できます",
-                    ));
+                    return Err(TsumugiError::continue_outside_loop(line));
                 }
                 Ok(EvalResult::Val) => {}
                 Err(e) => {
@@ -831,7 +797,7 @@ mod tests {
         let result = run_program("let x = \"hello\" + 1");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("型エラー"));
+        assert!(msg.contains("演算子 + は Str と Int に適用できません"));
     }
 
     #[test]
@@ -839,7 +805,7 @@ mod tests {
         let result = run_program("foo(1, 2)");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("未定義の関数"));
+        assert!(msg.contains("未定義の変数または関数: foo"));
     }
 
     #[test]
@@ -950,7 +916,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("インデックス範囲外")
+                .contains("List のインデックスが範囲外です")
         );
     }
 
@@ -983,7 +949,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("for で反復できません")
+                .contains("反復できない型です: Int")
         );
     }
 
@@ -1068,7 +1034,12 @@ mod tests {
     fn builtin_pop_empty_error() {
         let result = run_program("let xs = []\npop(xs)");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("空のリスト"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("pop は空の List には使用できません")
+        );
     }
 
     #[test]
@@ -1115,7 +1086,12 @@ mod tests {
     fn builtin_to_int_error() {
         let result = run_program("to_int(\"abc\")");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("変換失敗"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("to_int で Int に変換できません")
+        );
     }
 
     #[test]

@@ -128,12 +128,12 @@ impl ModuleLoader {
         depth: usize,
     ) -> Result<Option<(PathBuf, String)>, TsumugiError> {
         let resolved = base_dir.join(path);
-        let canonical = std::fs::canonicalize(&resolved).map_err(|error| {
+        let canonical = std::fs::canonicalize(&resolved).map_err(|_| {
             import_error(
                 line,
                 format!(
-                    "import 失敗: ファイルが見つかりません: {} ({})",
-                    path, error
+                    "import に失敗しました: モジュールを読み込めません: {}",
+                    path
                 ),
             )
         })?;
@@ -154,12 +154,12 @@ impl ModuleLoader {
             ));
         }
 
-        let source = std::fs::read_to_string(&canonical).map_err(|error| {
+        let source = std::fs::read_to_string(&canonical).map_err(|_| {
             import_error(
                 line,
                 format!(
-                    "import 失敗: ファイルを読み込めません: {} ({})",
-                    path, error
+                    "import に失敗しました: モジュールを読み込めません: {}",
+                    path
                 ),
             )
         })?;
@@ -178,17 +178,14 @@ fn parse_module(source: &str, path: &str, line: usize) -> Result<Program, Tsumug
     let tokens = crate::lexer::Lexer::new(source).tokenize();
     crate::parser::Parser::new(tokens)
         .parse()
-        .map_err(|errors| {
+        .map_err(|_errors| {
+            // parse詳細はcauseとして保持する設計だが、cause機構は未実装のため
+            // 現状は canonical wrapper message のみを返す（AUD-019）。
             import_error(
                 line,
                 format!(
-                    "import 失敗 ({}): {}",
-                    path,
-                    errors
-                        .iter()
-                        .map(|error| error.to_string())
-                        .collect::<Vec<_>>()
-                        .join("; ")
+                    "import に失敗しました: モジュールの構文が不正です: {}",
+                    path
                 ),
             )
         })

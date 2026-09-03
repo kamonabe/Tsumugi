@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-09-02
+最終更新: 2026-09-03
 
 ## プロジェクトの方向性
 
@@ -74,7 +74,7 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 | AUD-016 | 同一scopeの`let`再宣言時のbinding identityを仕様化する | 既存closureがtreeでは旧cell、VMでは更新済みcellを参照 | 🟡 設計確定・未実装（[次期意味論・実装決定](semantic-decisions.md)第4節: globalを含む全scopeでfresh cell） |
 | AUD-017 | call-depth境界を統一する | 上限128にtop-level frameを含めるVMだけ、許容user frame数が1少ない | ✅ 完了（AUD-050と一体で解消。VMを`active_user_frame_count() = frames.len() - 1`によるroot除外計数へ変更し、tree/VMとも128 user frameを許可・129個目を拒否。境界値127/128/129・相互再帰・lambda・callbackの回帰テストと、両engine一致のstack overflow traceテストを追加） |
 | AUD-018 | CLIからscript引数を渡せるようにする | `args()`を公開しているがCLIが2個目以降の非flag引数をusage errorにする | 🟡 設計確定・未実装（同第6節、Embedding E8a。capability profile/optionsとsafe/legacy移行はE8bで別追跡） |
-| AUD-019 | engine固有error kind/messageを統一する | iteration/index/callback等でkind・messageが異なる。push/pop/map/filter/eachの主要なkindはAUD-012で統一したが、callback messageやtrace差は残る。具体例として、コレクション以外へのindex（`let n = 42` に対する `n[0]`）はtreeが`runtime` / 「インデックスアクセスできません: Int(42)[Int(0)]」、VMが`type` / 「型エラー: Int(42) に対して Int(0) でインデックスアクセスできません」になる（AUD-041で`index_read_lowering`の期待値を分けて明示済み） | 🟡 設計確定・未実装（同第3節のcanonical error契約） |
+| AUD-019 | engine固有error kind/messageを統一する | iteration/index/callback等でkind・messageが異なる。push/pop/map/filter/eachの主要なkindはAUD-012で統一したが、callback messageやtrace差は残る。具体例として、コレクション以外へのindex（`let n = 42` に対する `n[0]`）はtreeが`runtime` / 「インデックスアクセスできません: Int(42)[Int(0)]」、VMが`type` / 「型エラー: Int(42) に対して Int(0) でインデックスアクセスできません」になっていた | ✅ 完了（`src/error.rs`にoperation別canonical constructorを新設し、tree/VM/compiler/module/builtin_coreの全runtime error生成をそれへ移行。値埋め込みを型名へ置換し、message文字列からのkind推測（`classify_runtime_error`）と`runtime()`を削除。`n[0]`は両engineとも`type` / 「インデックスアクセスできない型です: Int」に統一し、`index_read_lowering.expected.vm`を削除。`tests/canonical_error_inventory.rs`で28 operation行をtree/VM両engine実行し(kind, message, line)完全一致とRuntime catch-all非生成を検証。仕様revisionを0.12へ。traceのcanonical化はcall trace統一済みで、host adapter traceはPhase 2で別追跡） |
 | AUD-020 | sandboxの脅威モデルとTOCTOU制約を明記する | checkとI/O間のsymlink race、sandbox検査前のcanonicalizeによる許可外path存在oracle、dangling final symlink経由の新規write/append、空設定のfail-open意味論が未整理 | 🟡 設計確定・部分実装（現行制約の文書化のみ完了。[脅威モデル](threat-model.md) TM-002〜004と[Capability Model仕様](capability-model.md) CAP-AT-10〜14のpath-handle実装は未完了） |
 | AUD-021 | language-spec / LANG_GUIDE / designのdriftを解消する | engine parity・Float完全一致・全module unit test・coverage/benchmark gate等の記載が現実装やAUD残件と矛盾する | 🟡 規範仕様と既知非適合、VMの実験的位置付け、sandbox制約、予約語、循環参照を更新。意味論確定後の更新は継続 |
 | AUD-022 | REPL・differential・limit境界・defensive VMテストを追加する | subprocess timeoutなし、error goldenが部分一致、fixture登録が手動、tree/VMが固定`/tmp`を共有して並列raceする。厳密なstderr/stdout副作用比較も不足 | 🟡 設計確定・部分実装（harness、timeout、完全一致、temp分離は完了。[検証・リリース・運用設計](verification-release-operations.md)のmatrix/fuzz/stressは未実装） |
@@ -236,7 +236,7 @@ tree側は旧スナップショットより遅くなっている（`fib_20` 14.9
 | AUD | 設計状態 | 決定概要 | 正本 | 実装状態 |
 |---|---|---|---|---|
 | AUD-018 | 確定済み | CLIは`tsumugi [OPTIONS] [SCRIPT [ARGS...]]`とし、script引数を`ExecutionRequest.arguments` snapshotへ渡す。入口統合をE8a、profile/options移行をE8bに分離 | [次期意味論・実装決定](semantic-decisions.md)第6節、[組み込みAPI仕様](embedding-api.md)第12・14〜16節 | 未実装。現行CLIは追加引数を拒否 |
-| AUD-019 | 確定済み | operation別の単一constructorからcanonical kind/message/line/traceを生成し、backend固有診断とmessage推測を廃止 | [次期意味論・実装決定](semantic-decisions.md)第3節 | 未実装。既知のkind/message/trace差あり |
+| AUD-019 | 確定済み | operation別の単一constructorからcanonical kind/message/line/traceを生成し、backend固有診断とmessage推測を廃止 | [次期意味論・実装決定](semantic-decisions.md)第3節 | ✅ 完了（language core分）。operation別constructorへ全移行、`classify_runtime_error`削除、tree/VM完全一致をinventory/pairedテストで固定。host adapter error（HostErrorSpec）はPhase 2で別追跡 |
 | AUD-020 | 確定済み | Tsumugi単体をsecurity boundaryとせず、filesystemはportable path-handleで認可と利用をbindし、TOCTOU・oracle・dangling symlinkを受入試験化 | [脅威モデル](threat-model.md) TM-002〜004・第11節、[Capability Model仕様](capability-model.md)第8節・CAP-AT-10〜14 | 部分実装。現行制約の文書化のみ完了、path-handle未実装 |
 | AUD-022 | 確定済み | timeout/golden/differential/limit/defensive matrixに加え、fuzz・stress・failure injection・資源制約gateを段階導入 | [検証・リリース・運用設計](verification-release-operations.md)第4〜6・17節 | 部分実装。harness、timeout、完全一致、temp分離は完了。matrix/fuzz/stressは未実装 |
 | AUD-024 | 確定済み | `Completed` / `Exited`だけ全language-stateをcommitし、その他terminalはexecution開始時点へrollbackする。catch済みerror後に最終完了した実行はcommitする。stdout/filesystem/network/DB/host function等の完了済み外部効果はrollbackしない | [次期意味論・実装決定](semantic-decisions.md)第7節、[実行予算・協調実行仕様](execution-control.md)第10節、[組み込みAPI仕様](embedding-api.md)第10節 | 未実装。現行REPLの内部構造rollbackだけ実装済みで、全language-state契約は未達 |
@@ -250,7 +250,7 @@ tree側は旧スナップショットより遅くなっている（`fib_20` 14.9
 ### 設計sliceに沿う推奨実装順
 
 1. **基準固定:** [次期意味論・実装決定](semantic-decisions.md)第17節の基準固定と、現行非適合fixtureを維持する。文書の設計確定を実装完了として扱わない。
-2. **意味論基盤:** 内部refactor → ~~AUD-050/017深度統合~~（✅ 完了） → ~~AUD-049単一BuiltinSpec~~（✅ 完了） → AUD-019 canonical error → AUD-047 COW/AUD-048 FunctionId → AUD-016 binding/AUD-024 transaction → AUD-034/036/018/033境界挙動の順で進める。
+2. **意味論基盤:** 内部refactor → ~~AUD-050/017深度統合~~（✅ 完了） → ~~AUD-049単一BuiltinSpec~~（✅ 完了） → ~~AUD-019 canonical error~~（✅ 完了） → AUD-047 COW/AUD-048 FunctionId → AUD-016 binding/AUD-024 transaction → AUD-034/036/018/033境界挙動の順で進める。
 3. **Phase 1 embedding:** [組み込みAPI仕様](embedding-api.md) E1〜E6→E8a。最終terminal型のsubsetを使い、先行公開型を作らない。
 4. **Phase 2 capability:** E7→E8bと[Capability Model仕様](capability-model.md) C1→C2、C3/C4/C5/C7、C6、C8、最後にC9/C10。現行ambient accessを削除するまで完了扱いにしない。
 5. **Phase 3/4 control:** E11/C11で有限budget・transactionを完成し、その後E12/C12でcooperative state machine、yield/pause/resume、admission/backpressureを実装する。

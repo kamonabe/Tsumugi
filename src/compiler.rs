@@ -226,10 +226,9 @@ impl Compiler {
             }
             // import はリンク時に解決済みなので、ここへは到達しない
             Stmt::Import { line, .. } => {
-                return Err(TsumugiError::runtime_with_kind(
+                return Err(TsumugiError::internal(
                     *line,
-                    crate::error::ErrorKind::Internal,
-                    "内部エラー: import がリンクされていません",
+                    "import がリンクされていません",
                 ));
             }
             Stmt::TryCatch {
@@ -487,13 +486,10 @@ impl Compiler {
 
     /// break のコンパイル
     fn compile_break(&mut self, line: usize) -> Result<(), TsumugiError> {
-        let loop_state = self.loops.last().ok_or_else(|| {
-            TsumugiError::runtime_with_kind(
-                line,
-                crate::error::ErrorKind::ControlFlow,
-                "break はループの中でのみ使用できます",
-            )
-        })?;
+        let loop_state = self
+            .loops
+            .last()
+            .ok_or_else(|| TsumugiError::break_outside_loop(line))?;
 
         // break 時にアクティブな try ハンドラを解除する
         let try_depth = loop_state.try_depth;
@@ -516,13 +512,10 @@ impl Compiler {
 
     /// continue のコンパイル
     fn compile_continue(&mut self, line: usize) -> Result<(), TsumugiError> {
-        let loop_state = self.loops.last().ok_or_else(|| {
-            TsumugiError::runtime_with_kind(
-                line,
-                crate::error::ErrorKind::ControlFlow,
-                "continue はループの中でのみ使用できます",
-            )
-        })?;
+        let loop_state = self
+            .loops
+            .last()
+            .ok_or_else(|| TsumugiError::continue_outside_loop(line))?;
         let continue_target = loop_state.continue_target;
         let continue_resolved = loop_state.continue_resolved;
 
@@ -787,13 +780,9 @@ impl Compiler {
         line: usize,
     ) -> Result<crate::builtin_registry::BuiltinId, TsumugiError> {
         crate::builtin_registry::id_of(name).ok_or_else(|| {
-            TsumugiError::runtime_with_kind(
+            TsumugiError::internal(
                 line,
-                crate::error::ErrorKind::Internal,
-                format!(
-                    "内部エラー: 未登録の builtin をコンパイルしようとしました: {}",
-                    name
-                ),
+                format!("未登録の builtin をコンパイルしようとしました: {}", name),
             )
         })
     }
@@ -840,7 +829,8 @@ impl Compiler {
         self.chunk.emit(OpCode::PrepareCall, line);
         if let Expr::Ident(name) = callee {
             // 未解決calleeもcompile errorにせずruntime global lookupへ落とす。
-            // 存在しない場合の診断はtree evaluatorと同じ「未定義の関数」にする。
+            // 存在しない場合の診断はtree evaluatorと同じ canonical な
+            // 「未定義の変数または関数」にする（AUD-019）。
             self.compile_name_read(name, line, true);
         } else {
             self.compile_expr(callee, line)?;
@@ -1050,11 +1040,7 @@ impl Compiler {
                 return Ok(i);
             }
         }
-        Err(TsumugiError::runtime_with_kind(
-            line,
-            crate::error::ErrorKind::Name,
-            format!("未定義の変数: {}", name),
-        ))
+        Err(TsumugiError::undefined_name(line, name))
     }
 
     /// 外側のスコープから変数を探し、upvalue として登録する

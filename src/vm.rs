@@ -12,12 +12,6 @@ use crate::value::{SharedValue, Value};
 
 /// 演算・比較の型エラーを作る（AUD-014）
 ///
-/// メッセージには被演算子の値を含めるため、種別をメッセージから推測させず明示する。
-/// 値の中に「ゼロ除算」等が含まれていても種別が変わらないようにするための対策。
-fn internal_type_error(line: usize, message: impl Into<String>) -> TsumugiError {
-    TsumugiError::runtime_with_kind(line, crate::error::ErrorKind::Type, message)
-}
-
 /// 内部不変条件の破れを構造化エラーにする（AUD-023）
 ///
 /// libraryから不正な`Chunk`を渡された場合でもhost panicさせず、
@@ -352,10 +346,7 @@ impl Vm {
     fn count_step(&mut self, line: usize) -> Result<(), TsumugiError> {
         self.steps += 1;
         if self.steps > self.max_steps {
-            return Err(TsumugiError::runtime(
-                line,
-                format!("ステップ上限に達しました (上限: {})", self.max_steps),
-            ));
+            return Err(TsumugiError::step_limit(line, self.max_steps));
         }
         Ok(())
     }
@@ -567,15 +558,12 @@ impl Vm {
 
     /// runtime globalを読み取る。registryはtop-level slotだけを保持し、
     /// cell化済みなら同じSharedValue、未cell化なら同じstack slotから値を得る。
-    fn get_global(&self, name: &str, line: usize, for_call: bool) -> Result<Value, TsumugiError> {
-        let slot = self.globals.get(name).copied().ok_or_else(|| {
-            let message = if for_call {
-                format!("未定義の関数: {}", name)
-            } else {
-                format!("未定義の変数: {}", name)
-            };
-            TsumugiError::runtime_with_kind(line, crate::error::ErrorKind::Name, message)
-        })?;
+    fn get_global(&self, name: &str, line: usize) -> Result<Value, TsumugiError> {
+        let slot = self
+            .globals
+            .get(name)
+            .copied()
+            .ok_or_else(|| TsumugiError::undefined_name(line, name))?;
         let frame = self.frames.first().ok_or_else(|| {
             TsumugiError::runtime_with_kind(
                 line,
@@ -608,11 +596,7 @@ impl Vm {
         if self.globals.contains_key(name) {
             return Ok(());
         }
-        Err(TsumugiError::runtime_with_kind(
-            line,
-            crate::error::ErrorKind::Name,
-            format!("未定義の変数: {}", name),
-        ))
+        Err(TsumugiError::undefined_name(line, name))
     }
 
     /// binding の値が置かれている場所を解決する（値は複製しない）。
@@ -660,13 +644,11 @@ impl Vm {
                 Ok(BindingStorage::Cell(Rc::clone(cell)))
             }
             MutationTarget::Global(name) => {
-                let slot = self.globals.get(name).copied().ok_or_else(|| {
-                    TsumugiError::runtime_with_kind(
-                        line,
-                        crate::error::ErrorKind::Name,
-                        format!("未定義の変数: {}", name),
-                    )
-                })?;
+                let slot = self
+                    .globals
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| TsumugiError::undefined_name(line, name))?;
                 let frame = self.frames.first().ok_or_else(|| {
                     TsumugiError::runtime_with_kind(
                         line,
@@ -691,13 +673,11 @@ impl Vm {
 
     /// runtime globalを更新する。既存cellがあればcell、なければtop-level stackへ書く。
     fn set_global(&mut self, name: &str, value: Value, line: usize) -> Result<(), TsumugiError> {
-        let slot = self.globals.get(name).copied().ok_or_else(|| {
-            TsumugiError::runtime_with_kind(
-                line,
-                crate::error::ErrorKind::Name,
-                format!("未定義の変数に代入: {}", name),
-            )
-        })?;
+        let slot = self
+            .globals
+            .get(name)
+            .copied()
+            .ok_or_else(|| TsumugiError::assign_undefined(line, name))?;
         let (base, cell) = {
             let frame = self.frames.first().ok_or_else(|| {
                 TsumugiError::runtime_with_kind(
@@ -854,12 +834,13 @@ impl Vm {
                     Value::Int(n) => n
                         .checked_neg()
                         .map(Value::Int)
-                        .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー"))?,
+                        .ok_or_else(|| TsumugiError::int_overflow(line, "符号反転"))?,
                     Value::Float(n) => Value::Float(-n),
                     other => {
-                        return Err(TsumugiError::runtime(
+                        return Err(TsumugiError::unary_type(
                             line,
-                            format!("型エラー: -{} は計算できません", type_name(&other)),
+                            crate::ast::UnaryOpKind::Neg,
+                            &other,
                         ));
                     }
                 };
@@ -870,18 +851,19 @@ impl Vm {
                 self.stack.push(value);
             }
             OpCode::SetLocal(slot) => {
-                let value =
-                    self.stack.last().cloned().ok_or_else(|| {
-                        TsumugiError::runtime(line, "内部エラー: スタックが空です")
-                    })?;
+                let value = self
+                    .stack
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| internal_error(line, "内部エラー: スタックが空です"))?;
                 self.set_local(slot, value, line)?;
             }
             OpCode::GetGlobal(name) => {
-                let value = self.get_global(&name, line, false)?;
+                let value = self.get_global(&name, line)?;
                 self.stack.push(value);
             }
             OpCode::GetGlobalForCall(name) => {
-                let value = self.get_global(&name, line, true)?;
+                let value = self.get_global(&name, line)?;
                 self.stack.push(value);
             }
             OpCode::SetGlobal(name) => {
@@ -947,10 +929,11 @@ impl Vm {
                 self.stack.push(value);
             }
             OpCode::SetUpvalue(index) => {
-                let value =
-                    self.stack.last().cloned().ok_or_else(|| {
-                        TsumugiError::runtime(line, "内部エラー: スタックが空です")
-                    })?;
+                let value = self
+                    .stack
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| internal_error(line, "内部エラー: スタックが空です"))?;
                 let cell = self.upvalue_cell(index, line)?;
                 *cell.borrow_mut() = value;
             }
@@ -1025,7 +1008,7 @@ impl Vm {
                         upvalues: upvalue_cells,
                     });
                 } else {
-                    return Err(TsumugiError::runtime(
+                    return Err(internal_error(
                         line,
                         "内部エラー: MakeClosure の対象が VmFn ではありません",
                     ));
@@ -1034,54 +1017,35 @@ impl Vm {
             OpCode::PrepareCall => {
                 self.count_step(line)?;
                 if self.active_user_frame_count() >= MAX_USER_CALL_DEPTH {
-                    return Err(TsumugiError::runtime(
-                        line,
-                        format!(
-                            "スタックオーバーフロー: 再帰が深すぎます (上限: {})",
-                            MAX_USER_CALL_DEPTH
-                        ),
-                    ));
+                    return Err(TsumugiError::call_depth_limit(line, MAX_USER_CALL_DEPTH));
                 }
             }
             OpCode::ValidateCall(arg_count) => {
-                let fn_value = self.stack.last().ok_or_else(|| {
-                    TsumugiError::runtime(line, "内部エラー: ValidateCall のcalleeがありません")
-                })?;
+                let fn_value = self
+                    .stack
+                    .last()
+                    .ok_or_else(|| internal_error(line, "ValidateCall のcalleeがありません"))?;
                 if let Value::VmFn { name, arity, .. } = fn_value {
                     if arg_count != *arity {
-                        return Err(TsumugiError::runtime(
-                            line,
-                            format!(
-                                "関数 {} は引数{}個ですが、{}個渡されました",
-                                name, arity, arg_count
-                            ),
-                        ));
+                        return Err(TsumugiError::user_arity(line, name, *arity, arg_count));
                     }
                 } else {
-                    return Err(TsumugiError::runtime(
-                        line,
-                        format!("関数ではない値を呼び出そうとしました: {:?}", fn_value),
-                    ));
+                    return Err(TsumugiError::not_callable(line, fn_value));
                 }
             }
             OpCode::Call(arg_count) => {
                 // PrepareCallを経由しない不正bytecodeでもframe上限を迂回させない。
                 // stepはPrepareCallだけで数え、ここでは二重countしない。
                 if self.active_user_frame_count() >= MAX_USER_CALL_DEPTH {
-                    return Err(TsumugiError::runtime(
-                        line,
-                        format!(
-                            "スタックオーバーフロー: 再帰が深すぎます (上限: {})",
-                            MAX_USER_CALL_DEPTH
-                        ),
-                    ));
+                    return Err(TsumugiError::call_depth_limit(line, MAX_USER_CALL_DEPTH));
                 }
-                let required = arg_count.checked_add(1).ok_or_else(|| {
-                    TsumugiError::runtime(line, "内部エラー: Call の引数数が不正です")
-                })?;
-                let fn_pos = self.stack.len().checked_sub(required).ok_or_else(|| {
-                    TsumugiError::runtime(line, "内部エラー: Call のスタック要素が不足しています")
-                })?;
+                let required = arg_count
+                    .checked_add(1)
+                    .ok_or_else(|| internal_error(line, "Call の引数数が不正です"))?;
+                let fn_pos =
+                    self.stack.len().checked_sub(required).ok_or_else(|| {
+                        internal_error(line, "Call のスタック要素が不足しています")
+                    })?;
                 let fn_value = self.stack[fn_pos].clone();
                 if let Value::VmFn {
                     name,
@@ -1094,13 +1058,7 @@ impl Vm {
                     // ValidateCall後にcalleeが変化しないことを前提とするが、
                     // 不正bytecodeに対する防御として再検査する。
                     if arg_count != arity {
-                        return Err(TsumugiError::runtime(
-                            line,
-                            format!(
-                                "関数 {} は引数{}個ですが、{}個渡されました",
-                                name, arity, arg_count
-                            ),
-                        ));
+                        return Err(TsumugiError::user_arity(line, &name, arity, arg_count));
                     }
                     let base = fn_pos;
                     self.frames.push(CallFrame {
@@ -1111,10 +1069,7 @@ impl Vm {
                         locals_cells: Vec::new(),
                     });
                 } else {
-                    return Err(TsumugiError::runtime(
-                        line,
-                        format!("関数ではない値を呼び出そうとしました: {:?}", fn_value),
-                    ));
+                    return Err(TsumugiError::not_callable(line, &fn_value));
                 }
             }
             OpCode::Print(arg_count) => {
@@ -1186,7 +1141,7 @@ impl Vm {
                 let list = self
                     .stack
                     .last_mut()
-                    .ok_or_else(|| TsumugiError::runtime(line, "内部エラー: スタックが空です"))?;
+                    .ok_or_else(|| internal_error(line, "内部エラー: スタックが空です"))?;
                 if let Value::List(v) = list {
                     crate::builtin_core::check_collection_size_public(
                         v.len().saturating_add(1),
@@ -1194,7 +1149,7 @@ impl Vm {
                     )?;
                     v.push(value);
                 } else {
-                    return Err(TsumugiError::runtime(
+                    return Err(internal_error(
                         line,
                         "内部エラー: ListPush の対象がリストではありません",
                     ));
@@ -1208,7 +1163,7 @@ impl Vm {
                 let dict = self
                     .stack
                     .last_mut()
-                    .ok_or_else(|| TsumugiError::runtime(line, "内部エラー: スタックが空です"))?;
+                    .ok_or_else(|| internal_error(line, "内部エラー: スタックが空です"))?;
                 if let Value::Dict(map) = dict {
                     if let Value::Str(k) = key {
                         if !map.contains_key(&k) {
@@ -1219,13 +1174,10 @@ impl Vm {
                         }
                         map.insert(k, value);
                     } else {
-                        return Err(TsumugiError::runtime(
-                            line,
-                            "辞書のキーは文字列である必要があります",
-                        ));
+                        return Err(TsumugiError::dict_key_type(line, &key));
                     }
                 } else {
-                    return Err(TsumugiError::runtime(
+                    return Err(internal_error(
                         line,
                         "内部エラー: DictInsert の対象が辞書ではありません",
                     ));
@@ -1253,10 +1205,7 @@ impl Vm {
                         Value::List(s.chars().map(|c| Value::Str(c.to_string())).collect())
                     }
                     _ => {
-                        return Err(TsumugiError::runtime(
-                            line,
-                            format!("型エラー: {:?} はイテレートできません", value),
-                        ));
+                        return Err(TsumugiError::not_iterable(line, &value));
                     }
                 };
                 self.stack.push(list);
@@ -1373,7 +1322,7 @@ impl Vm {
         }
         self.stack
             .pop()
-            .ok_or_else(|| TsumugiError::runtime(line, "内部エラー: スタックが空です"))
+            .ok_or_else(|| internal_error(line, "内部エラー: スタックが空です"))
     }
 
     /// インデックスアクセス（コレクションは参照で受け取り複製しない）
@@ -1383,21 +1332,24 @@ impl Vm {
         index: &Value,
         line: usize,
     ) -> Result<Value, TsumugiError> {
-        match (collection, index) {
-            (Value::List(list), Value::Int(i)) => {
+        match collection {
+            Value::List(list) => {
+                let Value::Int(i) = index else {
+                    return Err(TsumugiError::list_index_type(line, index));
+                };
                 let idx = if *i < 0 {
                     (list.len() as i64 + i) as usize
                 } else {
                     *i as usize
                 };
-                list.get(idx).cloned().ok_or_else(|| {
-                    TsumugiError::runtime(
-                        line,
-                        format!("インデックス範囲外: {} (長さ: {})", i, list.len()),
-                    )
-                })
+                list.get(idx)
+                    .cloned()
+                    .ok_or_else(|| TsumugiError::list_index_out_of_range(line, *i, list.len()))
             }
-            (Value::Str(s), Value::Int(i)) => {
+            Value::Str(s) => {
+                let Value::Int(i) = index else {
+                    return Err(TsumugiError::str_index_type(line, index));
+                };
                 let chars: Vec<char> = s.chars().collect();
                 let idx = if *i < 0 {
                     (chars.len() as i64 + i) as usize
@@ -1407,34 +1359,30 @@ impl Vm {
                 chars
                     .get(idx)
                     .map(|c| Value::Str(c.to_string()))
-                    .ok_or_else(|| {
-                        TsumugiError::runtime(
-                            line,
-                            format!("インデックス範囲外: {} (長さ: {})", i, chars.len()),
-                        )
-                    })
+                    .ok_or_else(|| TsumugiError::str_index_out_of_range(line, *i, chars.len()))
             }
-            (Value::Dict(map), Value::Str(key)) => Ok(map.get(key).cloned().unwrap_or(Value::Null)),
-            (
-                Value::Error {
-                    error_type,
-                    message,
-                    line: err_line,
-                },
-                Value::Str(key),
-            ) => match key.as_str() {
-                "type" => Ok(Value::Str(error_type.clone())),
-                "message" => Ok(Value::Str(message.clone())),
-                "line" => Ok(Value::Int(*err_line as i64)),
-                _ => Ok(Value::Null),
-            },
-            _ => Err(TsumugiError::runtime(
-                line,
-                format!(
-                    "型エラー: {:?} に対して {:?} でインデックスアクセスできません",
-                    collection, index
-                ),
-            )),
+            Value::Dict(map) => {
+                let Value::Str(key) = index else {
+                    return Err(TsumugiError::dict_key_type(line, index));
+                };
+                Ok(map.get(key).cloned().unwrap_or(Value::Null))
+            }
+            Value::Error {
+                error_type,
+                message,
+                line: err_line,
+            } => {
+                let Value::Str(key) = index else {
+                    return Err(TsumugiError::dict_key_type(line, index));
+                };
+                match key.as_str() {
+                    "type" => Ok(Value::Str(error_type.clone())),
+                    "message" => Ok(Value::Str(message.clone())),
+                    "line" => Ok(Value::Int(*err_line as i64)),
+                    _ => Ok(Value::Null),
+                }
+            }
+            _ => Err(TsumugiError::index_read_unsupported(line, collection)),
         }
     }
 
@@ -1456,13 +1404,10 @@ impl Vm {
             }
             BindingStorage::Stack(stack_index) => {
                 self.checkpoint_stack_slot(stack_index);
-                let slot = self.stack.get_mut(stack_index).ok_or_else(|| {
-                    TsumugiError::runtime_with_kind(
-                        line,
-                        crate::error::ErrorKind::Internal,
-                        "インデックス代入の対象slotが不正です",
-                    )
-                })?;
+                let slot = self
+                    .stack
+                    .get_mut(stack_index)
+                    .ok_or_else(|| internal_error(line, "インデックス代入の対象slotが不正です"))?;
                 crate::builtin_core::assign_index(slot, index, value, line)
             }
         }
@@ -1502,18 +1447,18 @@ impl Vm {
             }
             "exit" => {
                 if args.len() > 1 {
-                    return Err(TsumugiError::runtime(
+                    return Err(TsumugiError::runtime_with_kind(
                         line,
+                        crate::error::ErrorKind::Argument,
                         format!("exit() は引数0〜1個ですが、{}個渡されました", args.len()),
                     ));
                 }
                 let code = match args.first() {
                     None => 0,
                     Some(Value::Int(n)) => *n as i32,
-                    Some(_) => {
-                        return Err(TsumugiError::runtime(
-                            line,
-                            "exit() の引数は整数である必要があります",
+                    Some(other) => {
+                        return Err(TsumugiError::builtin_arg_type(
+                            line, "exit", 1, "Int", other,
                         ));
                     }
                 };
@@ -1538,7 +1483,8 @@ impl Vm {
                     let func = args[1].clone();
                     let mut result = Vec::new();
                     for item in list {
-                        let value = self.call_fn_value(func.clone(), vec![item.clone()], line)?;
+                        let value =
+                            self.call_fn_value("map", func.clone(), vec![item.clone()], line)?;
                         crate::builtin_core::check_collection_size_public(
                             result.len().saturating_add(1),
                             line,
@@ -1547,9 +1493,8 @@ impl Vm {
                     }
                     Ok(Value::List(result))
                 } else {
-                    Err(crate::builtin_core::type_error(
-                        line,
-                        "map(list, fn) の形式で使います",
+                    Err(TsumugiError::builtin_arg_type(
+                        line, "map", 1, "List", &args[0],
                     ))
                 }
             }
@@ -1559,7 +1504,8 @@ impl Vm {
                     let func = args[1].clone();
                     let mut result = Vec::new();
                     for item in list {
-                        let cond = self.call_fn_value(func.clone(), vec![item.clone()], line)?;
+                        let cond =
+                            self.call_fn_value("filter", func.clone(), vec![item.clone()], line)?;
                         if cond.is_truthy() {
                             crate::builtin_core::check_collection_size_public(
                                 result.len().saturating_add(1),
@@ -1570,9 +1516,8 @@ impl Vm {
                     }
                     Ok(Value::List(result))
                 } else {
-                    Err(crate::builtin_core::type_error(
-                        line,
-                        "filter(list, fn) の形式で使います",
+                    Err(TsumugiError::builtin_arg_type(
+                        line, "filter", 1, "List", &args[0],
                     ))
                 }
             }
@@ -1581,17 +1526,16 @@ impl Vm {
                 if let Value::List(list) = &args[0] {
                     let func = args[1].clone();
                     for item in list {
-                        self.call_fn_value(func.clone(), vec![item.clone()], line)?;
+                        self.call_fn_value("each", func.clone(), vec![item.clone()], line)?;
                     }
                     Ok(Value::Null)
                 } else {
-                    Err(crate::builtin_core::type_error(
-                        line,
-                        "each(list, fn) の形式で使います",
+                    Err(TsumugiError::builtin_arg_type(
+                        line, "each", 1, "List", &args[0],
                     ))
                 }
             }
-            _ => Err(TsumugiError::runtime(
+            _ => Err(internal_error(
                 line,
                 format!("未定義の組み込み関数: {}", name),
             )),
@@ -1601,6 +1545,7 @@ impl Vm {
     /// 関数値を呼び出すヘルパー（map/filter/each 用）
     fn call_fn_value(
         &mut self,
+        builtin: &str,
         func: Value,
         args: Vec<Value>,
         line: usize,
@@ -1608,14 +1553,7 @@ impl Vm {
         self.count_step(line)?;
         // 再帰制限チェック（OpCode::Call と同じガードを適用）
         if self.active_user_frame_count() >= MAX_USER_CALL_DEPTH {
-            return Err(TsumugiError::runtime_with_kind(
-                line,
-                crate::error::ErrorKind::StackOverflow,
-                format!(
-                    "スタックオーバーフロー: 再帰が深すぎます (上限: {})",
-                    MAX_USER_CALL_DEPTH
-                ),
-            ));
+            return Err(TsumugiError::call_depth_limit(line, MAX_USER_CALL_DEPTH));
         }
         let self_value = func.clone();
         if let Value::VmFn {
@@ -1625,15 +1563,9 @@ impl Vm {
             ..
         } = func
         {
+            // callbackは常に1引数で呼ぶため、arity不一致はcallback専用messageで報告する。
             if args.len() != arity {
-                return Err(TsumugiError::runtime(
-                    line,
-                    format!(
-                        "引数の数が合いません: {}個必要ですが{}個渡されました",
-                        arity,
-                        args.len()
-                    ),
-                ));
+                return Err(TsumugiError::callback_arity(line, builtin, arity));
             }
             // 関数自身をスタックに積む（slot 0）。direct callback内の自己再帰でも
             // 通常のOpCode::Callと同じself bindingを参照できるようにする。
@@ -1653,9 +1585,10 @@ impl Vm {
             // run_frames で実行し、target_depth まで戻ったら値を返す
             self.run_frames(target_depth)
         } else {
-            Err(TsumugiError::runtime(
+            Err(TsumugiError::callback_not_callable(
                 line,
-                "関数ではない値を呼び出そうとしました",
+                builtin,
+                &self_value,
             ))
         }
     }
@@ -1667,16 +1600,18 @@ impl Vm {
             (Value::Int(a), Value::Int(b)) => a
                 .checked_add(*b)
                 .map(Value::Int)
-                .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー")),
+                .ok_or_else(|| TsumugiError::int_overflow(line, "加算")),
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + *b as f64)),
             (Value::Str(a), Value::Str(b)) => Ok(Value::Str(format!("{}{}", a, b))),
             (Value::Str(a), Value::Error { .. }) => Ok(Value::Str(format!("{}{}", a, right))),
             (Value::Error { .. }, Value::Str(b)) => Ok(Value::Str(format!("{}{}", left, b))),
-            _ => Err(internal_type_error(
+            _ => Err(TsumugiError::arithmetic_type(
                 line,
-                format!("型エラー: {:?} Add {:?} は計算できません", left, right),
+                crate::ast::BinOpKind::Add,
+                &left,
+                &right,
             )),
         }
     }
@@ -1686,13 +1621,15 @@ impl Vm {
             (Value::Int(a), Value::Int(b)) => a
                 .checked_sub(*b)
                 .map(Value::Int)
-                .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー")),
+                .ok_or_else(|| TsumugiError::int_overflow(line, "減算")),
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 - b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a - *b as f64)),
-            _ => Err(internal_type_error(
+            _ => Err(TsumugiError::arithmetic_type(
                 line,
-                format!("型エラー: {:?} Sub {:?} は計算できません", left, right),
+                crate::ast::BinOpKind::Sub,
+                &left,
+                &right,
             )),
         }
     }
@@ -1702,13 +1639,15 @@ impl Vm {
             (Value::Int(a), Value::Int(b)) => a
                 .checked_mul(*b)
                 .map(Value::Int)
-                .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー")),
+                .ok_or_else(|| TsumugiError::int_overflow(line, "乗算")),
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 * b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a * *b as f64)),
-            _ => Err(internal_type_error(
+            _ => Err(TsumugiError::arithmetic_type(
                 line,
-                format!("型エラー: {:?} Mul {:?} は計算できません", left, right),
+                crate::ast::BinOpKind::Mul,
+                &left,
+                &right,
             )),
         }
     }
@@ -1717,19 +1656,21 @@ impl Vm {
         match (&left, &right) {
             (Value::Int(a), Value::Int(b)) => {
                 if *b == 0 {
-                    Err(TsumugiError::runtime(line, "ゼロ除算"))
+                    Err(TsumugiError::zero_division(line))
                 } else {
                     a.checked_div(*b)
                         .map(Value::Int)
-                        .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー"))
+                        .ok_or_else(|| TsumugiError::int_overflow(line, "除算"))
                 }
             }
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a / b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 / b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a / *b as f64)),
-            _ => Err(internal_type_error(
+            _ => Err(TsumugiError::arithmetic_type(
                 line,
-                format!("型エラー: {:?} Div {:?} は計算できません", left, right),
+                crate::ast::BinOpKind::Div,
+                &left,
+                &right,
             )),
         }
     }
@@ -1738,19 +1679,21 @@ impl Vm {
         match (&left, &right) {
             (Value::Int(a), Value::Int(b)) => {
                 if *b == 0 {
-                    Err(TsumugiError::runtime(line, "ゼロ除算"))
+                    Err(TsumugiError::zero_division(line))
                 } else {
                     a.checked_rem(*b)
                         .map(Value::Int)
-                        .ok_or_else(|| TsumugiError::runtime(line, "整数オーバーフロー"))
+                        .ok_or_else(|| TsumugiError::int_overflow(line, "剰余"))
                 }
             }
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a % b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 % b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a % *b as f64)),
-            _ => Err(internal_type_error(
+            _ => Err(TsumugiError::arithmetic_type(
                 line,
-                format!("型エラー: {:?} Mod {:?} は計算できません", left, right),
+                crate::ast::BinOpKind::Mod,
+                &left,
+                &right,
             )),
         }
     }
@@ -1761,9 +1704,11 @@ impl Vm {
             (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a < b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Bool((*a as f64) < *b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a < (*b as f64))),
-            _ => Err(internal_type_error(
+            _ => Err(TsumugiError::comparison_type(
                 line,
-                format!("型エラー: {:?} < {:?} は比較できません", left, right),
+                crate::ast::BinOpKind::Lt,
+                &left,
+                &right,
             )),
         }
     }
@@ -1774,9 +1719,11 @@ impl Vm {
             (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a > b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Bool((*a as f64) > *b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a > (*b as f64))),
-            _ => Err(internal_type_error(
+            _ => Err(TsumugiError::comparison_type(
                 line,
-                format!("型エラー: {:?} > {:?} は比較できません", left, right),
+                crate::ast::BinOpKind::Gt,
+                &left,
+                &right,
             )),
         }
     }
@@ -1787,9 +1734,11 @@ impl Vm {
             (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a <= b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Bool((*a as f64) <= *b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a <= (*b as f64))),
-            _ => Err(internal_type_error(
+            _ => Err(TsumugiError::comparison_type(
                 line,
-                format!("型エラー: {:?} <= {:?} は比較できません", left, right),
+                crate::ast::BinOpKind::LtEq,
+                &left,
+                &right,
             )),
         }
     }
@@ -1800,27 +1749,13 @@ impl Vm {
             (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a >= b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Bool((*a as f64) >= *b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a >= (*b as f64))),
-            _ => Err(internal_type_error(
+            _ => Err(TsumugiError::comparison_type(
                 line,
-                format!("型エラー: {:?} >= {:?} は比較できません", left, right),
+                crate::ast::BinOpKind::GtEq,
+                &left,
+                &right,
             )),
         }
-    }
-}
-
-/// 型名を返すヘルパー
-fn type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Int(_) => "Int",
-        Value::Float(_) => "Float",
-        Value::Str(_) => "Str",
-        Value::Bool(_) => "Bool",
-        Value::Null => "Null",
-        Value::List(_) => "List",
-        Value::Dict(_) => "Dict",
-        Value::Fn { .. } => "Fn",
-        Value::VmFn { .. } => "Fn",
-        Value::Error { .. } => "Error",
     }
 }
 
