@@ -1,0 +1,10 @@
+# FunctionId の同一性検証（AUD-048）で import する補助ライブラリ。
+# import 先で定義した名前付き関数と、呼ぶたびに新しい関数値を返すファクトリを提供する。
+
+fn lib_named(x)
+    return x
+end
+
+fn lib_make()
+    return fn(x) return x end
+end

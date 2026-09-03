@@ -5,7 +5,7 @@ use crate::ast::*;
 use crate::env::Env;
 use crate::error::{TraceFrame, TsumugiError};
 use crate::limits::MAX_USER_CALL_DEPTH;
-use crate::value::{FnDef, Value};
+use crate::value::{FnDef, FunctionId, Value};
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -40,6 +40,9 @@ pub struct Evaluator {
     max_steps: u64,
     /// import の解決状態（実行前にリンクする。AUD-030）
     loader: crate::module::ModuleLoader,
+    /// 関数値へ発番する次の FunctionId（AUD-048）。単調増加し、
+    /// REPL の失敗入力でも巻き戻さない。
+    next_function_id: u64,
 }
 
 impl Evaluator {
@@ -50,7 +53,21 @@ impl Evaluator {
             steps: 0,
             max_steps: resolve_max_steps(),
             loader: crate::module::ModuleLoader::new(),
+            next_function_id: 0,
         }
+    }
+
+    /// 関数値へ新しい FunctionId を発番する（AUD-048）。
+    ///
+    /// 関数式・関数定義を評価して値を生成するたびに呼ぶ。u64 を使い切った場合は
+    /// binding が公開される前に internal error を返す（通常運用では到達不能）。
+    fn allocate_function_id(&mut self, line: usize) -> Result<FunctionId, TsumugiError> {
+        let id = self.next_function_id;
+        self.next_function_id = self
+            .next_function_id
+            .checked_add(1)
+            .ok_or_else(|| TsumugiError::internal(line, "FunctionId を割り当てできません"))?;
+        Ok(FunctionId(id))
     }
 
     /// 基準ディレクトリを設定する（ファイル実行時に呼ばれる）
@@ -238,12 +255,17 @@ impl Evaluator {
             }
 
             Stmt::FnDef {
-                name, params, body, ..
+                name,
+                params,
+                body,
+                line,
             } => {
                 // 関数を値として環境にセット
                 // ネストされた関数定義の場合、定義時のスコープをキャプチャする
                 // 捕捉するのは本体で言及される名前だけ（AUD-042）
                 // 本体ASTの複製は定義時の一度だけで、以降の呼び出しはRcを共有する
+                // FunctionId は定義を評価するたびに新規発番する（AUD-048）
+                let id = self.allocate_function_id(*line)?;
                 let captured = Rc::new(
                     self.env
                         .capture_referenced(&crate::ast::referenced_names(body)),
@@ -251,6 +273,7 @@ impl Evaluator {
                 self.env.set(
                     name,
                     Value::Fn {
+                        id,
                         def: Rc::new(FnDef {
                             name: name.clone(),
                             params: params.clone(),
@@ -407,11 +430,14 @@ impl Evaluator {
             Expr::Lambda { params, body } => {
                 // 無名関数: 定義時のスコープの変数セルを共有してキャプチャ
                 // 捕捉するのは本体で言及される名前だけ（AUD-042）
+                // FunctionId は lambda 式を評価するたびに新規発番する（AUD-048）
+                let id = self.allocate_function_id(line)?;
                 let captured = Rc::new(
                     self.env
                         .capture_referenced(&crate::ast::referenced_names(body)),
                 );
                 Ok(Value::Fn {
+                    id,
                     def: Rc::new(FnDef {
                         name: "<lambda>".to_string(),
                         params: params.clone(),
@@ -667,7 +693,7 @@ impl Evaluator {
             self.eval_expr(callee, line)?
         };
 
-        let Value::Fn { def, captured } = &func_value else {
+        let Value::Fn { def, captured, .. } = &func_value else {
             return Err(TsumugiError::not_callable(line, &func_value));
         };
         // Rcを複製して以降の借用から切り離す（値の複製は起きない）
@@ -1279,5 +1305,44 @@ mod tests {
     #[test]
     fn builtin_is_file_is_dir() {
         run_program("print(is_dir(\"/tmp\"))\nprint(is_file(\"/tmp\"))").unwrap();
+    }
+
+    #[test]
+    fn function_id_is_monotonic_and_starts_at_zero() {
+        // AUD-048: allocate_function_id は 0 から単調増加する
+        let mut eval = Evaluator::new();
+        assert_eq!(eval.allocate_function_id(1).unwrap(), FunctionId(0));
+        assert_eq!(eval.allocate_function_id(1).unwrap(), FunctionId(1));
+        assert_eq!(eval.allocate_function_id(1).unwrap(), FunctionId(2));
+    }
+
+    #[test]
+    fn function_id_overflow_reports_internal_error_before_binding() {
+        // AUD-048: u64 を使い切ったら binding が公開される前に internal error を返す
+        let mut eval = Evaluator::new();
+        eval.next_function_id = u64::MAX - 1;
+        // 最後の 1 個は割り当てられる
+        assert_eq!(
+            eval.allocate_function_id(3).unwrap(),
+            FunctionId(u64::MAX - 1)
+        );
+        // 次はオーバーフローで internal error
+        let err = eval.allocate_function_id(3).unwrap_err();
+        match err {
+            TsumugiError::Runtime {
+                line,
+                message,
+                kind,
+                ..
+            } => {
+                assert_eq!(line, 3);
+                assert_eq!(kind, crate::error::ErrorKind::Internal);
+                assert!(
+                    message.contains("FunctionId を割り当てできません"),
+                    "想定外のメッセージ: {message}"
+                );
+            }
+            other => panic!("Runtime error を期待したが {other:?}"),
+        }
     }
 }

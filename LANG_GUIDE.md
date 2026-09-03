@@ -759,6 +759,6 @@ When generating portable `.tsg` code:
 
 - Use string literals or expressions that evaluate to strings for Dict keys. The parser may accept another expression form, but runtime semantics require a String key.
 - Do not depend on same-scope redeclaration cell identity until the engine-parity issues are resolved.
-- Do not depend on inequality between two separately created function values that capture nothing. The default engine reports them as different, but `--vm` reports them as equal (AUD-048). Comparing a function value with itself is `true` on both engines.
+- Function values compare by identity: each evaluation of a function expression or definition gets a fresh identity, preserved across assignment, argument passing, and collection storage. Two separately created function values are never equal, even when they capture nothing; comparing a function value with itself is `true`. Both the default engine and `--vm` behave the same (AUD-048).
 - Do not depend on the exact recursion depth at which the call-depth guard fires. The limit is 128 frames, but the default engine and `--vm` differ by one frame (AUD-017).
 - Treat `TSUMUGI_SANDBOX` and resource limits as defense-in-depth, not as isolation for untrusted code.

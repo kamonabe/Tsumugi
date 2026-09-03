@@ -283,7 +283,7 @@ let result = filter(test, fn(item) item != "kani" end)
 fixture 追加手順は、`.tsg` と期待ファイルを置き、`fixture_tests!` へ名前を1行宣言する。宣言から tree / VM 両方のテスト（`<name>::tree` / `<name>::vm`）が生成されるため、片側の登録漏れが起きない。`fixture_declarations_match_directory` が宣言とディレクトリの整合を検査するので、未宣言の fixture はテスト失敗として検出される。
 
 - OS・ロケール依存の文字列は期待ファイル側で `{*}` に逃がす（それ以外は完全一致）
-- engine 間に差が残る箇所は、期待ファイルを `<name>.<ext>.vm` で上書きして明示する（`<name>.expected.vm` / `<name>.expected_err.vm`）。`.vm` が無ければ共通の期待ファイルを使うため、差がある fixture だけが `.vm` を持つ。現在は `comparison_semantics`（捕捉のない関数値の同一性 / AUD-048）だけが該当する（error kind/message の差は AUD-019 で解消し、`index_read_lowering.expected.vm` は削除した）
+- engine 間に差が残る箇所は、期待ファイルを `<name>.<ext>.vm` で上書きして明示できる（`<name>.expected.vm` / `<name>.expected_err.vm`）。`.vm` が無ければ共通の期待ファイルを使うため、差がある fixture だけが `.vm` を持つ。現在は `.vm` を持つ fixture は存在しない（関数値の同一性差は AUD-048、error kind/message の差は AUD-019 で解消し、`comparison_semantics.expected.vm` / `index_read_lowering.expected.vm` は削除した）
 - 期待ファイルを持たず専用テストから実行する fixture は `CUSTOM_FIXTURES`、import 先の補助ファイルは `HELPER_FIXTURES` に分類する
 - ファイルを触る fixture は `env("TSG_TEST_DIR")` で実行ごとの一時ディレクトリを受け取る（固定パスを共有しない）
 - 子プロセスは必ず制限時間付きで待つため、停止しないコードは失敗として検出される
@@ -431,8 +431,8 @@ let f = fn(x) x * 2 end
 
 ### 既知のトレードオフ
 
-- 関数値の等価性は同一性比較（`Rc::ptr_eq`）とし、反射律（`f == f`が`true`）を保つ。同じ`fn`から別々に作ったクロージャは等しくない。構造比較や呼び出し結果の比較は行わない（AUD-014で確定）
-- 同一性の粒度がengine間で揃っていない: treeは`Value::Fn`の`def: Rc<FnDef>`を定義式の評価ごとに作るため別インスタンスは常に不等になる。一方VMの`Value::VmFn`はcompile時に共有される`Rc<Chunk>`とupvalue cellで比較するため、upvalueを持たない関数値では同じ`fn`式から生成した別インスタンスが等しくなる（AUD-048）
+- 関数値の等価性は`FunctionId`による同一性比較とし、反射律（`f == f`が`true`）を保つ。同じ`fn`から別々に作ったクロージャは等しくない。構造比較や呼び出し結果の比較は行わない（AUD-014で確定）
+- 同一性の発番はengine間で統一済み（AUD-048）: 関数式・関数定義を評価して値を生成するたびに、実行系内で単調増加する`FunctionId(u64)`を1つ割り当てる。clone・代入・引数渡し・collection格納では同じIDを保つ。treeは`Value::Fn`、VMは`Value::VmFn`にそれぞれ`id: FunctionId`を持ち、`PartialEq`はID比較だけを行う。VMは定数テーブルに`id`が未確定のプロトタイプ`VmFn`を置き、capture 0件でも必ず`MakeClosure`を通して実行時に一意IDを発番する。IDは実行内の比較専用で、rollbackしても再利用しない
 - 循環参照: `Rc<RefCell>`にはcycle collectorがなく、捕捉変数のListへその変数を捕捉したclosureを`push`すると、`cell → List → closure → cell`の循環を言語コードから構成できる。短命なscriptでは影響が限定的でも、REPLや長時間実行では解放されないメモリが累積し得る
 - 捕捉範囲: treeは本体が言及する名前のセルを共有し、VMは自由変数だけをupvalue化する（AUD-042で可視binding全捕捉から変更）。treeの判定は厳密な自由変数解析ではなく保守的な近似で、`let`・parameter・`for`変数・`catch`変数のように本体で束縛される名前も集める。そのため同名の外側bindingがある場合、本体がそれを読まなくてもセルを保持し、VMのupvalue集合より広くなることがある。観測可能な挙動は変わらないが、生存量ではこの差が残る
 - 意味論の重複: 共通Resolver/HIRはなく、scope・名前解決・call・比較・mutation・importの規則をEvaluatorとCompiler/VMが別々に実装する。拡張時はdifferential testで両engineの観測可能な挙動を固定する必要がある
@@ -506,7 +506,7 @@ Parserはプログラム直下とblock内の文を区別し、block内のimport�
 ### 概要
 
 ツリーウォークインタプリタに加え、バイトコードコンパイラ + スタックVMを並行実装する。
-`--vm`フラグで実行方式を切り替え可能。Lexer・Parser・ASTは共有し、両方式が同じ規範仕様を満たすことを目標とする。比較（AUD-014）、index代入（AUD-013）、context依存builtin（AUD-012）、import解決時点（AUD-030）、error kind・message・line（AUD-019）はいずれも統一済みである。ただし意味解析以降は別実装のため、同一scopeの`let`再宣言でのcell identity（AUD-016）、捕捉のない関数値の同一性（AUD-048）、未捕捉エラー後のREPL状態（AUD-024）に既知の差が残る。現時点のVMは互換性・性能ともに実験的backendとして扱い、非適合は`roadmap.md`で管理する。
+`--vm`フラグで実行方式を切り替え可能。Lexer・Parser・ASTは共有し、両方式が同じ規範仕様を満たすことを目標とする。比較（AUD-014）、index代入（AUD-013）、context依存builtin（AUD-012）、import解決時点（AUD-030）、error kind・message・line（AUD-019）、関数値の同一性（AUD-048）はいずれも統一済みである。ただし意味解析以降は別実装のため、同一scopeの`let`再宣言でのcell identity（AUD-016）、未捕捉エラー後のREPL状態（AUD-024）に既知の差が残る。現時点のVMは互換性・性能ともに実験的backendとして扱い、非適合は`roadmap.md`で管理する。
 
 ### 動機
 
@@ -779,6 +779,20 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 **互換性と境界:** デフォルトのtreeで観測挙動が変わる破壊的変更である。`==`の型エラーに依存して型検査を代替していたコードは、`type(x)`による明示的な判定へ移行する必要がある。VMでも`1 == 1.0`が`false`から`true`へ、`f == f`が`false`から`true`へ変わる。`contains`など等価判定を使う組み込み関数も同じ規則に従う。コレクション以外へのindex（`n[0]`）のerror kindがtreeとVMで異なる問題は本件の対象外で、AUD-019として残る。
 
 **回帰テスト:** golden fixture `comparison_semantics`をtree/VM両方で実行し、同型・異型・数値混在・NaN・ネスト構造・関数の同一性・`contains`との共有・大小比較の型エラー・被演算子による種別ぶれを固定した。加えて486ケースの網羅行列を両engineで実行し、差分が0件であること、エラー種別がすべて`type`になることを確認した。
+
+### 2026-09-03: 関数値の同一性を FunctionId で統一（AUD-048）
+
+**問題:** AUD-014は「関数値は同一の関数値とだけ等しい」を規範としたが、同一性の粒度がengine間で揃っていなかった。treeの`Value::Fn`は定義式の評価ごとに新しい`Rc<FnDef>`を作るため別インスタンスは常に不等になる一方、VMの`Value::VmFn`はcompile時に共有される`Rc<Chunk>`とupvalueセルで比較するため、upvalueを持たない関数値では同じ`fn`式から生成した別インスタンスが等しくなった。`fn make() return fn(x) x end end`に対する`make() == make()`がtreeで`false`、VMで`true`になる。捕捉なし名前付き関数の2回生成、ループ内で同じlambda式を2回評価した2値でも同じ差が出た。AUD-014の486ケース網羅行列は型の組み合わせを対象としたため、同一sourceから複数インスタンスを作る形を含んでおらず検出できなかった。
+
+**決定:** 関数式・関数定義を評価して値を生成するたびに、実行系内で単調増加する`FunctionId(u64)`を1つ割り当てる。clone・代入・引数渡し・collection格納では同じIDを保つ。関数等価性は`FunctionId`だけで判定する。captureの有無やbackendに関係なく、同じIDの値だけが等しい。aliasは等しく、同じ`fn`式を複数回評価した別インスタンスは不等になる。IDは実行内の比較専用で、scriptやauditへ生値を公開せず、rollbackしても再利用しない。
+
+**実装:** `src/value.rs`に`FunctionId(u64)`を新設し、`Value::Fn` / `Value::VmFn`へ`id`を追加。`PartialEq`の関数armを、`Rc::ptr_eq`・upvalue比較からID比較（`id_a == id_b`）へ置き換えた。treeは`Evaluator`、VMは`Vm`に`next_function_id`カウンタを持ち、`allocate_function_id`で発番する（u64を使い切ると`internal` / 「内部エラー: FunctionId を割り当てできません」）。treeはFnDef文・Lambda式の評価時に発番する。VMは定数テーブルに`id`が未確定（placeholder）のプロトタイプ`VmFn`を置き、capture 0件でも必ず`MakeClosure`をemitして、実行時に新IDを付与した`VmFn`を生成する。REPLの入力rollbackは`next_function_id`を復元対象に含めないため、失敗入力をまたいでもIDは単調増加を維持する。
+
+**不採用案:** AST/Chunkのpointer identityで比較する案は、VMのcaptureなし関数で生成インスタンスを区別できない。capture cell列も比較する案は、closure identityと環境の構造比較を混同する。関数を常に不等とする案は反射律（`f == f`）を壊す。rollback時にcounterを戻す案は、失敗入力とauditで一度使ったIDを再利用してしまう。
+
+**互換性と境界:** VMでcaptureなしの同じ`fn`式を複数回評価した値が`true`だった非適合が`false`になる破壊的変更である。tree側の観測挙動は変わらない。backend別期待ファイル`comparison_semantics.expected.vm`を削除し、tree/VMとも共通の`comparison_semantics.expected`（末尾5行がすべて`false`）を使う。仕様revisionを0.13へ上げた。
+
+**回帰テスト:** golden fixture `comparison_semantics`（named/lambda/free/factory/loop/alias/upvalue/`contains`）と`function_id_import`（import経由の名前付き関数・ファクトリの同一性、collection格納、ローカル同形関数との不等）をtree/VM両方で実行して固定した。REPLでは、未捕捉エラーで入力がrollbackされた後に生成した関数値が、rollback前の関数値と別の同一性を持つことを両engineで検証した（`function_id_is_not_reused_after_repl_rollback`）。counterのoverflowは、u64を使い切ると`internal`エラーを返すfault injection unit testをtree/VM両方に追加した。
 
 ### 2026-08-28: コレクション読み取りの複製を除去（AUD-041）
 

@@ -30,7 +30,7 @@ impl Evaluator {
             ));
         }
         match func {
-            Value::Fn { def, captured } => {
+            Value::Fn { def, captured, .. } => {
                 // Rcを複製して以降の借用から切り離す（値の複製は起きない）
                 let def = std::rc::Rc::clone(def);
                 let captured = std::rc::Rc::clone(captured);
