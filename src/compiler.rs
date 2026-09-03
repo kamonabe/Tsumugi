@@ -8,7 +8,7 @@ use crate::ast::{
 use crate::chunk::Chunk;
 use crate::error::TsumugiError;
 use crate::opcode::{MutationTarget, OpCode};
-use crate::value::Value;
+use crate::value::{FunctionId, Value};
 
 /// ローカル変数の情報
 #[derive(Debug, Clone)]
@@ -919,8 +919,11 @@ impl Compiler {
         // 子の is_local=false upvalue を解決（親が中間キャプチャを行う）
         self.resolve_child_upvalues(&mut upvalues);
 
-        // VmFn 値を定数テーブルに追加してロード
+        // VmFn プロトタイプを定数テーブルに追加してロードする。
+        // 定数の id は placeholder（FunctionId(0)）で、実行時に MakeClosure が
+        // 新しい FunctionId を発番して差し替える（AUD-048）。
         let fn_value = Value::VmFn {
+            id: FunctionId(0),
             name: name.to_string(),
             arity: params.len(),
             params: params.to_vec(),
@@ -929,19 +932,17 @@ impl Compiler {
         };
         self.chunk.emit_constant(fn_value, line);
 
-        if upvalues.is_empty() {
-            // upvalue なし: そのまま関数値として使う
-        } else {
-            // upvalue あり: 外側の変数値をスタックに積んで MakeClosure
-            for uv in &upvalues {
-                if uv.is_local {
-                    self.chunk.emit(OpCode::GetLocal(uv.slot), line);
-                } else {
-                    self.chunk.emit(OpCode::GetUpvalue(uv.slot), line);
-                }
+        // upvalue の有無に関わらず必ず MakeClosure を通す（AUD-048）。
+        // capture 0 件でも実行時に一意な FunctionId を持つ新インスタンスを生成し、
+        // 同じ fn 式を複数回評価した値が別物になるようにする。
+        for uv in &upvalues {
+            if uv.is_local {
+                self.chunk.emit(OpCode::GetLocal(uv.slot), line);
+            } else {
+                self.chunk.emit(OpCode::GetUpvalue(uv.slot), line);
             }
-            self.chunk.emit(OpCode::MakeClosure(upvalues.len()), line);
         }
+        self.chunk.emit(OpCode::MakeClosure(upvalues.len()), line);
 
         // 関数名を現在のscopeへ登録する。script top-levelならruntime globalにも公開する。
         self.declare_local(name.to_string(), line);
@@ -980,7 +981,9 @@ impl Compiler {
         // 子の is_local=false upvalue を解決（親が中間キャプチャを行う）
         self.resolve_child_upvalues(&mut upvalues);
 
+        // VmFn プロトタイプ（id は placeholder。実行時に MakeClosure が発番する。AUD-048）
         let fn_value = Value::VmFn {
+            id: FunctionId(0),
             name: "<lambda>".to_string(),
             arity: params.len(),
             params: params.to_vec(),
@@ -989,16 +992,15 @@ impl Compiler {
         };
         self.chunk.emit_constant(fn_value, line);
 
-        if !upvalues.is_empty() {
-            for uv in &upvalues {
-                if uv.is_local {
-                    self.chunk.emit(OpCode::GetLocal(uv.slot), line);
-                } else {
-                    self.chunk.emit(OpCode::GetUpvalue(uv.slot), line);
-                }
+        // capture 0 件でも必ず MakeClosure を通し、評価ごとに一意な FunctionId を得る（AUD-048）
+        for uv in &upvalues {
+            if uv.is_local {
+                self.chunk.emit(OpCode::GetLocal(uv.slot), line);
+            } else {
+                self.chunk.emit(OpCode::GetUpvalue(uv.slot), line);
             }
-            self.chunk.emit(OpCode::MakeClosure(upvalues.len()), line);
         }
+        self.chunk.emit(OpCode::MakeClosure(upvalues.len()), line);
 
         Ok(())
     }

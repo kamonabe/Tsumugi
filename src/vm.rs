@@ -8,7 +8,7 @@ use crate::chunk::Chunk;
 use crate::error::TsumugiError;
 use crate::limits::MAX_USER_CALL_DEPTH;
 use crate::opcode::{MutationTarget, OpCode};
-use crate::value::{SharedValue, Value};
+use crate::value::{FunctionId, SharedValue, Value};
 
 /// 演算・比較の型エラーを作る（AUD-014）
 ///
@@ -105,6 +105,10 @@ pub struct Vm {
 
     /// 例外ハンドラスタック（try/catch）
     try_handlers: Vec<TryHandler>,
+
+    /// 関数値へ発番する次の FunctionId（AUD-048）。単調増加し、
+    /// REPL の失敗入力でも巻き戻さない。
+    next_function_id: u64,
 }
 
 impl Vm {
@@ -124,6 +128,7 @@ impl Vm {
             steps: 0,
             max_steps: vm_resolve_max_steps(),
             try_handlers: Vec::new(),
+            next_function_id: 0,
         }
     }
 
@@ -137,7 +142,21 @@ impl Vm {
             steps: 0,
             max_steps: vm_resolve_max_steps(),
             try_handlers: Vec::new(),
+            next_function_id: 0,
         }
+    }
+
+    /// 関数値へ新しい FunctionId を発番する（AUD-048）。
+    ///
+    /// MakeClosure 実行のたびに呼ぶ。u64 を使い切った場合は internal error を返す
+    /// （通常運用では到達不能）。
+    fn allocate_function_id(&mut self, line: usize) -> Result<FunctionId, TsumugiError> {
+        let id = self.next_function_id;
+        self.next_function_id = self
+            .next_function_id
+            .checked_add(1)
+            .ok_or_else(|| TsumugiError::internal(line, "FunctionId を割り当てできません"))?;
+        Ok(FunctionId(id))
     }
 
     /// root script frame を除いた、現在 active な user 定義呼び出しフレーム数。
@@ -1000,7 +1019,11 @@ impl Vm {
                     ..
                 } = fn_value
                 {
+                    // 定数の id は placeholder。ここで新しい FunctionId を発番して
+                    // 関数式の評価ごとに一意な同一性を与える（AUD-048）。
+                    let id = self.allocate_function_id(line)?;
                     self.stack.push(Value::VmFn {
+                        id,
                         name,
                         arity,
                         params,
@@ -1775,6 +1798,7 @@ mod tests {
         recursive.emit(OpCode::ReturnValue, 1);
 
         let function = Value::VmFn {
+            id: FunctionId(0),
             name: "malformed_recursive".to_string(),
             arity: 0,
             params: Vec::new(),
@@ -1833,6 +1857,36 @@ mod tests {
         assert_eq!(error.error_type(), "internal");
         assert!(
             error.message().contains("local slotが不正です"),
+            "想定外のメッセージ: {}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn function_id_is_monotonic_and_starts_at_zero() {
+        // AUD-048: allocate_function_id は 0 から単調増加する
+        let mut vm = Vm::new(Chunk::new());
+        assert_eq!(vm.allocate_function_id(1).unwrap(), FunctionId(0));
+        assert_eq!(vm.allocate_function_id(1).unwrap(), FunctionId(1));
+        assert_eq!(vm.allocate_function_id(1).unwrap(), FunctionId(2));
+    }
+
+    #[test]
+    fn function_id_overflow_reports_internal_error() {
+        // AUD-048: u64 を使い切ったら internal error を返す
+        let mut vm = Vm::new(Chunk::new());
+        vm.next_function_id = u64::MAX - 1;
+        assert_eq!(
+            vm.allocate_function_id(7).unwrap(),
+            FunctionId(u64::MAX - 1)
+        );
+        let error = vm
+            .allocate_function_id(7)
+            .expect_err("FunctionId overflow が成功しました");
+        assert_eq!(error.error_type(), "internal");
+        assert_eq!(error.line(), 7);
+        assert!(
+            error.message().contains("FunctionId を割り当てできません"),
             "想定外のメッセージ: {}",
             error.message()
         );

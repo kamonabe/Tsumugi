@@ -9,6 +9,15 @@ use crate::chunk::Chunk;
 /// 共有可能な変数セル（参照キャプチャ用）
 pub type SharedValue = Rc<RefCell<Value>>;
 
+/// 関数値の同一性を表す識別子（AUD-048）
+///
+/// 関数式・関数定義を実行して値を生成するたびに、ExecutionContext 内で
+/// 単調増加する値を 1 つ割り当てる。clone・変数代入・引数渡し・collection 格納では
+/// 同じ ID を保持する。tree/VM の関数等価性は FunctionId だけで判定する。
+/// ID は実行内の比較専用で、script や audit event へ生値を公開しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FunctionId(pub u64);
+
 /// ツリーウォーク用関数の不変部分
 ///
 /// 呼び出しごとに本体ASTを複製しないよう `Rc` で共有する。
@@ -34,6 +43,8 @@ pub enum Value {
     /// 関数値（ツリーウォーク用: ユーザー定義関数を値として扱う）
     /// `Rc` により関数呼び出し・self-binding・クロージャ生成時のディープコピーを回避
     Fn {
+        /// 関数値の同一性（AUD-048）。生成のたびに新規発番、clone では保持
+        id: FunctionId,
         /// 定義時に確定する不変部分（名前・引数・本体）
         def: Rc<FnDef>,
         /// 定義時にキャプチャした変数セル。セル自体は参照共有される
@@ -42,6 +53,8 @@ pub enum Value {
     /// VM用関数値（コンパイル済みバイトコード）
     /// Rc<Chunk> により関数呼び出し・クロージャ生成時のディープコピーを回避
     VmFn {
+        /// 関数値の同一性（AUD-048）。生成のたびに新規発番、clone では保持
+        id: FunctionId,
         name: String,
         arity: usize,
         params: Vec<String>,
@@ -77,40 +90,12 @@ impl PartialEq for Value {
             (Value::Null, Value::Null) => true,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Dict(a), Value::Dict(b)) => a == b,
-            // 関数値は同一性で比較する（AUD-014）。
-            // treeの`def`は定義式の評価ごとに作られるため、同じ`fn`から作った別の
-            // クロージャは等しくならない。これが規範の挙動である。
-            (
-                Value::Fn {
-                    def: def_a,
-                    captured: captured_a,
-                },
-                Value::Fn {
-                    def: def_b,
-                    captured: captured_b,
-                },
-            ) => Rc::ptr_eq(def_a, def_b) && Rc::ptr_eq(captured_a, captured_b),
-            // `chunk`はcompile時に一度作って共有するため、upvalueを持たない関数値では
-            // 同じ`fn`式から生成した別インスタンスが等しくなる。treeとの既知の差（AUD-048）。
-            (
-                Value::VmFn {
-                    chunk: chunk_a,
-                    upvalues: upvalues_a,
-                    ..
-                },
-                Value::VmFn {
-                    chunk: chunk_b,
-                    upvalues: upvalues_b,
-                    ..
-                },
-            ) => {
-                Rc::ptr_eq(chunk_a, chunk_b)
-                    && upvalues_a.len() == upvalues_b.len()
-                    && upvalues_a
-                        .iter()
-                        .zip(upvalues_b.iter())
-                        .all(|(a, b)| Rc::ptr_eq(a, b))
-            }
+            // 関数値は FunctionId だけで同一性を判定する（AUD-048）。
+            // ID は関数式・関数定義を評価して値を生成するたびに新規発番され、
+            // clone・代入・引数渡し・collection 格納では保持される。
+            // capture の有無や backend（tree/VM）に関係なく、同じ ID の値だけが等しい。
+            (Value::Fn { id: id_a, .. }, Value::Fn { id: id_b, .. }) => id_a == id_b,
+            (Value::VmFn { id: id_a, .. }, Value::VmFn { id: id_b, .. }) => id_a == id_b,
             (
                 Value::Error {
                     error_type: t1,

@@ -17,9 +17,9 @@ Tsumugiは、プログラミング言語処理系への理解を深めるため�
 
 現在のTsumugiはRuby風の文法を持つ動的型付け言語である。Lexer・Parser・ASTを共有し、デフォルトのツリーウォーク評価器、またはバイトコードコンパイラ + スタックVM（`--vm`）で実行する。
 
-現在は**教育・実験用途のalpha版**であり、言語仕様・組み込みAPI・CLIの後方互換性は保証していない。crate root には、デフォルトのツリーウォークを利用する最小の埋め込み facade（`Engine`、`CompiledScript`、`ExecutionContext`、`ExecutionOutcome`）がある。これはCLIも利用する入口だが、stable Engine APIからのVM利用、host I/Oの注入、deny-by-default capability、包括的な実行予算、監査 event は未実装である。`--vm`は処理系比較のための実験的backendで、同一スコープでの`let`再宣言、捕捉のない関数値の同一性、error種別・メッセージ、未捕捉エラー後のREPL状態にデフォルト実行系との既知の差が残る。現在利用できる観測仕様は[言語仕様](docs/language-spec.md)、現行アーキテクチャは[設計ドキュメント](docs/design.md)を正本とする。Phase 0〜7の次期実装契約は後述の7設計正本で確定済みだが、設計確定は実装完了を意味しない。実装差の一覧と進捗は[ロードマップ](docs/roadmap.md)を参照すること。
+現在は**教育・実験用途のalpha版**であり、言語仕様・組み込みAPI・CLIの後方互換性は保証していない。crate root には、デフォルトのツリーウォークを利用する最小の埋め込み facade（`Engine`、`CompiledScript`、`ExecutionContext`、`ExecutionOutcome`）がある。これはCLIも利用する入口だが、stable Engine APIからのVM利用、host I/Oの注入、deny-by-default capability、包括的な実行予算、監査 event は未実装である。`--vm`は処理系比較のための実験的backendで、同一スコープでの`let`再宣言、未捕捉エラー後のREPL状態にデフォルト実行系との既知の差が残る。現在利用できる観測仕様は[言語仕様](docs/language-spec.md)、現行アーキテクチャは[設計ドキュメント](docs/design.md)を正本とする。Phase 0〜7の次期実装契約は後述の7設計正本で確定済みだが、設計確定は実装完了を意味しない。実装差の一覧と進捗は[ロードマップ](docs/roadmap.md)を参照すること。
 
-組み込みのステップ上限やfilesystem制限はdefense-in-depthであり、非信頼コードを隔離するsecurity sandboxではない。また、現行CLIは`--help` / `--version`とスクリプトへの追加引数に未対応である。Cargo package / REPLの`0.1.0`と[言語仕様](docs/language-spec.md)の`0.12`は、それぞれ実装版と仕様revisionを表す独立した番号として管理している。
+組み込みのステップ上限やfilesystem制限はdefense-in-depthであり、非信頼コードを隔離するsecurity sandboxではない。また、現行CLIは`--help` / `--version`とスクリプトへの追加引数に未対応である。Cargo package / REPLの`0.1.0`と[言語仕様](docs/language-spec.md)の`0.13`は、それぞれ実装版と仕様revisionを表す独立した番号として管理している。
 
 ## 組み込み API（tree-walk）
 

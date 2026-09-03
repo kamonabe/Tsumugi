@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use tsumugi::chunk::Chunk;
 use tsumugi::opcode::OpCode;
-use tsumugi::value::Value;
+use tsumugi::value::{FunctionId, Value};
 use tsumugi::vm::Vm;
 
 /// 不正なChunkを実行し、`internal` エラーのメッセージを返す
@@ -119,6 +119,7 @@ fn make_closure_at_function_start_returns_internal_error() {
     body.emit(OpCode::Return, 1);
 
     let function = Value::VmFn {
+        id: FunctionId(0),
         name: "malformed_closure".to_string(),
         arity: 0,
         params: Vec::new(),

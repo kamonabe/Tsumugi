@@ -1,0 +1,18 @@
+# import 先で定義した関数値の同一性（AUD-048）
+# import はリンク時に一度だけ解決され、関数値は実行時に一意な FunctionId を得る。
+import "function_id_import_lib.tsg"
+
+# import した名前付き関数を別名へ束縛しても同じ関数値（同一性を保つ）
+let aliased = lib_named
+print(lib_named == aliased)
+
+# import 先のファクトリは呼ぶたびに新しい関数値を返すため、別インスタンスは不等
+print(lib_make() == lib_make())
+
+# import した関数値を collection へ入れても同一性を保つ
+let stored = [lib_named]
+print(contains(stored, aliased))
+
+# import 先の関数と、ローカルで同形に書いた関数は別のソースなので不等
+let local_named = fn(x) return x end
+print(lib_named == local_named)

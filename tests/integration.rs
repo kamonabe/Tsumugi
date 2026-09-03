@@ -354,6 +354,7 @@ fixture_tests!(
         for_loop,
         format_time_extreme,
         fstring,
+        function_id_import,
         hello,
         higher_order,
         import_basic,
@@ -421,6 +422,7 @@ const CUSTOM_FIXTURES: &[&str] = &[
 
 /// 他の fixture から import される補助ファイル（単体では実行しない）。
 const HELPER_FIXTURES: &[&str] = &[
+    "function_id_import_lib",
     "import_bad_syntax",
     "import_circular_a",
     "import_circular_b",
@@ -976,6 +978,36 @@ fn runtime_globals_resolve_across_repl_submissions() {
             visible_output,
             ["repl-later", "repl-after", "true"],
             "{mode}で入力間forward globalまたはmutual recursionが不正: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn function_id_is_not_reused_after_repl_rollback() {
+    // AUD-048: 未捕捉エラーで入力がrollbackされても、FunctionId counterは巻き戻さない。
+    // rollback後に生成した関数値は、rollback前の関数値と別の同一性を持つ。
+    let source = concat!(
+        "let saved = fn(x) return x end\n",
+        // この入力は未捕捉エラーでrollbackされる（bindingは残らない）
+        "let boom = undefined_variable\n",
+        // rollback後に新しい関数値を生成する
+        "let again = fn(x) return x end\n",
+        "print(saved == saved)\n",
+        "print(saved == again)\n",
+    );
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+        let visible_output = repl_visible_lines(&stdout, use_vm);
+
+        // 未捕捉エラーの診断はstderrへ出るが、REPLは後続入力を続行して正常終了する
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert_eq!(
+            visible_output,
+            ["true", "false"],
+            "{mode}でrollback後にFunctionIdが再利用された疑い: {stdout}"
         );
     }
 }
