@@ -777,6 +777,20 @@ sourceの観測挙動は変えない。libraryで `Value::List(Vec<_>)` / `Dict(
 - AUD-041で残った複雑index/upvalueの二次確保を解消する。
 - paired goldenとallocation scaling gateが通る。
 
+### 11.10 実装状況
+
+✅ 実装済み。`src/value.rs` の `Value::List` を `Rc<Vec<Value>>`、`Value::Dict` を
+`Rc<BTreeMap<String, Value>>` へ変更した。全 mutation 経路（`builtin_core::assign_index`・
+`builtin_push` / `builtin_pop` / `builtin_pop_update`、VM の `ListPush` / `DictInsert`
+opcode）は検査後に `Rc::make_mut` で detach する。`PartialEq` に `Rc::ptr_eq` の高速パスを
+足したが等価性の結果は変えていない。for は `(**list).clone()` で開始時点の要素を snapshot
+する。観測挙動は不変で、既存の paired golden・error inventory・defensive test はすべて通る。
+受入基準の alias 分離と snapshot は golden fixture `collection_cow_alias`（代入・引数・
+返り値・nested・closure 共有 cell・equality）と既存の `for_iteration_snapshot` で固定し、
+`d[to_str(i)]`（関数呼び出しを含む index 読み）と upvalue 経由 `xs[i]` の確保量が線形に
+収まることを `tests/scaling.rs` の `cow_read_allocation_stays_linear_in_both_engines` で
+固定した。総 heap budget の allocation 課金統合は Phase 3（[実行予算・協調実行仕様](execution-control.md)）で別途扱う。
+
 ## 12. FunctionIdによる関数同一性（AUD-048）
 
 ### 12.1 採用判断

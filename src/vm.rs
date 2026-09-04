@@ -1170,7 +1170,7 @@ impl Vm {
                         v.len().saturating_add(1),
                         line,
                     )?;
-                    v.push(value);
+                    Rc::make_mut(v).push(value);
                 } else {
                     return Err(internal_error(
                         line,
@@ -1195,7 +1195,7 @@ impl Vm {
                                 line,
                             )?;
                         }
-                        map.insert(k, value);
+                        Rc::make_mut(map).insert(k, value);
                     } else {
                         return Err(TsumugiError::dict_key_type(line, &key));
                     }
@@ -1220,12 +1220,14 @@ impl Vm {
                     }
                     Value::Dict(ref map) => {
                         crate::builtin_core::check_collection_size_public(map.len(), line)?;
-                        Value::List(map.keys().map(|k| Value::Str(k.clone())).collect())
+                        Value::List(Rc::new(map.keys().map(|k| Value::Str(k.clone())).collect()))
                     }
                     Value::Str(ref s) => {
                         let size = s.chars().count();
                         crate::builtin_core::check_collection_size_public(size, line)?;
-                        Value::List(s.chars().map(|c| Value::Str(c.to_string())).collect())
+                        Value::List(Rc::new(
+                            s.chars().map(|c| Value::Str(c.to_string())).collect(),
+                        ))
                     }
                     _ => {
                         return Err(TsumugiError::not_iterable(line, &value));
@@ -1498,14 +1500,14 @@ impl Vm {
                     .map(Value::Str)
                     .collect();
                 crate::builtin_core::check_collection_size_public(argv.len(), line)?;
-                Ok(Value::List(argv))
+                Ok(Value::List(Rc::new(argv)))
             }
             "map" => {
                 crate::builtin_core::check_arity(name, &args, 2, line)?;
                 if let Value::List(list) = &args[0] {
                     let func = args[1].clone();
                     let mut result = Vec::new();
-                    for item in list {
+                    for item in list.iter() {
                         let value =
                             self.call_fn_value("map", func.clone(), vec![item.clone()], line)?;
                         crate::builtin_core::check_collection_size_public(
@@ -1514,7 +1516,7 @@ impl Vm {
                         )?;
                         result.push(value);
                     }
-                    Ok(Value::List(result))
+                    Ok(Value::List(Rc::new(result)))
                 } else {
                     Err(TsumugiError::builtin_arg_type(
                         line, "map", 1, "List", &args[0],
@@ -1526,7 +1528,7 @@ impl Vm {
                 if let Value::List(list) = &args[0] {
                     let func = args[1].clone();
                     let mut result = Vec::new();
-                    for item in list {
+                    for item in list.iter() {
                         let cond =
                             self.call_fn_value("filter", func.clone(), vec![item.clone()], line)?;
                         if cond.is_truthy() {
@@ -1537,7 +1539,7 @@ impl Vm {
                             result.push(item.clone());
                         }
                     }
-                    Ok(Value::List(result))
+                    Ok(Value::List(Rc::new(result)))
                 } else {
                     Err(TsumugiError::builtin_arg_type(
                         line, "filter", 1, "List", &args[0],
@@ -1548,7 +1550,7 @@ impl Vm {
                 crate::builtin_core::check_arity(name, &args, 2, line)?;
                 if let Value::List(list) = &args[0] {
                     let func = args[1].clone();
-                    for item in list {
+                    for item in list.iter() {
                         self.call_fn_value("each", func.clone(), vec![item.clone()], line)?;
                     }
                     Ok(Value::Null)

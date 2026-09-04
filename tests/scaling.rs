@@ -6,6 +6,7 @@
 //! 検証している性質:
 //! - `for` の反復コストが要素数に線形であること（AUD-038で修正した退行）
 //! - コレクション読み取りのコストが要素数に線形であること（AUD-041で修正した退行）
+//! - 関数呼び出しを含むindex読み取り・upvalue経由の読み取りが線形であること（AUD-047のCOW）
 //! - 関数呼び出しのコストが関数body長に依存しないこと（AUD-040で修正した退行）
 //! - クロージャ定義のコストが可視bindingの数に依存しないこと（AUD-042）
 //! - コレクションへ溜めたクロージャが解放されること（AUD-042の参照循環）
@@ -387,6 +388,65 @@ fn collection_read_allocation_stays_linear_in_both_engines() {
             assert!(
                 ratio < LIMIT,
                 "{mode}/{label}: コレクション読み取りの確保量が線形を超えて増えています。\
+                 n={SMALL}で{small}バイト, n={LARGE}で{large}バイト（比 {ratio:.2} >= {LIMIT}）。\
+                 読み取りのたびにコレクション全体を複製していないか確認してください"
+            );
+        }
+    }
+}
+
+/// AUD-041 の参照読みが効かない読み取り経路（AUD-047 の COW が担当する）
+///
+/// AUD-041 は「副作用のない識別子 index」だけを参照読みにしたため、次の2経路は
+/// 従来コレクション全体を複製し O(n^2) になっていた。COW 化で読み取りは共有 Rc の
+/// ハンドル clone（O(1)）＋要素 clone だけになり、線形に収まる。
+/// - `d[to_str(i)]`: index 式に関数呼び出しを含むため参照読みの対象外だった
+/// - `xs[i]`（upvalue 経由）: capture したコレクションの読み取りは `GetUpvalue` の
+///   clone でコレクション全体を複製していた
+fn cow_read_sources(n: usize) -> [(&'static str, String); 2] {
+    [
+        (
+            "dict-index-with-call",
+            format!(
+                "let d = {{}}\nfor i in range(0, {n})\n    d[to_str(i)] = i\nend\nlet total = 0\nfor i in range(0, {n})\n    total = total + d[to_str(i)]\nend\n"
+            ),
+        ),
+        (
+            "upvalue-list-index",
+            format!(
+                "let xs = range(0, {n})\nlet read = fn(i) xs[i] end\nlet total = 0\nfor i in range(0, {n})\n    total = total + read(i)\nend\n"
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn cow_read_allocation_stays_linear_in_both_engines() {
+    // 入力を2倍にしたときの確保量の伸び。線形なら約2倍、二次なら約4倍になる。
+    // COW 前はコレクション全体の複製で約4倍（O(n^2)）だった。
+    const LIMIT: f64 = 3.0;
+    const SMALL: usize = 500;
+    const LARGE: usize = 1_000;
+
+    // 他の測定が失敗してもロックを使い続けられるようにpoisonは無視する
+    let _guard = MEASURE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let small_sources = cow_read_sources(SMALL);
+    let large_sources = cow_read_sources(LARGE);
+
+    for ((label, small_source), (_, large_source)) in small_sources.iter().zip(large_sources.iter())
+    {
+        for use_vm in [false, true] {
+            let mode = if use_vm { "VM" } else { "tree-walk" };
+            let small = execute_bytes(small_source, use_vm);
+            let large = execute_bytes(large_source, use_vm);
+            assert!(small > 0, "{mode}/{label}: 確保量が計測できていません");
+
+            let ratio = large as f64 / small as f64;
+            assert!(
+                ratio < LIMIT,
+                "{mode}/{label}: COW 対象の読み取りの確保量が線形を超えて増えています。\
                  n={SMALL}で{small}バイト, n={LARGE}で{large}バイト（比 {ratio:.2} >= {LIMIT}）。\
                  読み取りのたびにコレクション全体を複製していないか確認してください"
             );

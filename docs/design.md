@@ -113,10 +113,12 @@ for ループはイテレーション対象のコレクションを **開始時�
 
 ```rust
 let items: Vec<Value> = match &collection {
-    Value::List(list) => list.clone(),  // ← 全要素のコピー
+    Value::List(list) => (**list).clone(),  // ← 開始時点の要素を snapshot
     ...
 };
 ```
+
+`Value::List` は `Rc<Vec<Value>>` の copy-on-write（AUD-047）なので、`Value` レベルの clone はハンドル共有で O(1) だが、for は要素列を snapshot したいので `(**list).clone()` で Vec を複製する。ループ本体で元の binding を変更しても `Rc::make_mut` が detach するため、snapshot 済みの要素列は変わらない。
 
 検討した選択肢:
 1. **スナップショット方式（clone）** — 採用。ループ開始時の状態を保持して走査する
@@ -802,7 +804,7 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 **実装:** `ast.rs`に`is_side_effect_free`を追加し、両engineで同じ判定を共有する。VMのCompilerは`Expr::Index`のobjectが識別子でローカルに解決でき、index式が副作用なしなら`IndexLocal(slot)`へloweringする（indexを積んでからローカルを参照読みする既存opcode）。`len(識別子)`も同様に`LenLocal(slot)`へ落とす。treeは`Expr::Index`で変数セルを取得し、index式を評価してからセルを`borrow()`して読む。`len`も同じく識別子ならセルを参照して長さだけ取る。`LenLocal`の判定とエラーは`builtin_core::builtin_len`へ委譲し、VM専用だった`value_len`を削除した。これで`len(42)`のエラーは両engineで従来どおり`builtin_type`のまま一致する。
 
-**不採用案:** index式の種類を問わず参照読みへ寄せる案は、`xs[grow()]`のようにindex式がコレクションを変更する場合に読む対象が変わるため不採用。コレクションを`Rc<Vec>` / `Rc<BTreeMap>`のcopy-on-writeにする案は、関数呼び出しを含むindex式も含めて構造的に複製を減らせるが、`Value`の表現と破壊的更新の実装に広く影響するため、AUD-047として分離した。upvalue経由の読み取り（`GetUpvalue`のclone）は今回の対象外で、専用opcodeが必要になる。
+**不採用案:** index式の種類を問わず参照読みへ寄せる案は、`xs[grow()]`のようにindex式がコレクションを変更する場合に読む対象が変わるため不採用。コレクションを`Rc<Vec>` / `Rc<BTreeMap>`のcopy-on-writeにする案は、関数呼び出しを含むindex式も含めて構造的に複製を減らせるが、`Value`の表現と破壊的更新の実装に広く影響するため、AUD-047として分離した（AUD-041時点では未着手）。AUD-047は後に実装済みで、`Value::List` / `Value::Dict`は`Rc`のcopy-on-writeになった。関数呼び出しを含むindex読みとupvalue経由の読み取りは、AUD-041の参照読みの対象外だが、COW化により意味論を変えずに複製が解消された。
 
 **互換性と境界:** 観測可能な挙動は変わらない。goldenフィクスチャで、list/dict/strの読み取り、負index、範囲外・型エラー、shadowing、変更の反映、captured collection、parameter・global経由の読み取り、副作用を持つindex式の順序、`len`の各型とエラーを両engineで固定した。`n[0]`のようにコレクション以外へindexした場合のerror kindは、tree（`runtime`）とVM（`type`）で以前から異なる。本変更の前後で同一であることを確認し、期待値ファイルを分けて明示した。解消はAUD-019で扱う。
 
@@ -914,9 +916,9 @@ n=1000の絶対値では、`xs[i]`がtree 88,518,619→518,619バイト、VM 88,
 
 **実装:** `OpCode::Len`を`LenLocal(usize)`へ置き換え、`IndexLocal(usize)`を追加した。どちらもVMの`with_local_ref`でcell化済みならcell、未cell化ならstack slotを参照し、長さまたは要素だけをpushする。`eval_index`はコレクションを参照で受け取る形に変え、`value_len`を共通ヘルパーへ切り出した。イテレーション対象は`ToIterList`が開始時にスナップショットする既存仕様のままで、意味論は変わらない。
 
-**不採用案:** `Value::List` / `Dict`の内部を`Rc`共有にする案は、複製が安くなる一方で値意味論とエイリアシングを変えるため、言語仕様の変更になる。一般の`xs[i]`読み取りまで参照読みへ広げる案は、index式が同じbindingを変更した場合の評価順がtreeと変わるため、AUD-013と同種の仕様判断としてAUD-041へ分離した。実時間で回帰ゲートを組む案はCIランナーの負荷で揺れるため採用しない。
+**不採用案:** AUD-041の時点では`Value::List` / `Dict`の内部を`Rc`共有にする案を見送り、AUD-047へ分離した（`Value`表現と破壊的更新への影響が広いため）。なおAUD-047の`Rc::make_mut`によるcopy-on-writeは、書き込み時に共有backingをdetachするため値意味論・エイリアシングを変えずに複製を減らせることが後に確認され、実装済みである。一般の`xs[i]`読み取りまで参照読みへ広げる案は、index式が同じbindingを変更した場合の評価順がtreeと変わるため、AUD-013と同種の仕様判断としてAUD-041へ分離した。実時間で回帰ゲートを組む案はCIランナーの負荷で揺れるため採用しない。
 
-**互換性と境界:** 言語の観測可能な挙動は変わらない。ベンチマークのグループ名が変わるため、既存のCriterionベースラインとは比較できない。`for`の反復コストは要素数に線形になったが、ループ内での`d[k]`のような読み取りは依然コレクションを複製する（AUD-041）。tree側の呼び出しコストはAUD-037のself-bindingによる`Value::Fn`複製で増えており、AUD-040として追跡する。
+**互換性と境界:** 言語の観測可能な挙動は変わらない。ベンチマークのグループ名が変わるため、既存のCriterionベースラインとは比較できない。`for`の反復コストは要素数に線形になった。AUD-041の時点ではループ内での`d[to_str(i)]`のような（関数呼び出しを含む）読み取りは依然コレクションを複製していたが、後続のAUD-047のcopy-on-writeで解消した。tree側の呼び出しコストはAUD-037のself-bindingによる`Value::Fn`複製で増えており、AUD-040として追跡する。
 
 **回帰テスト:** `tests/scaling.rs`がカウントアロケータで確保バイト数を測り、入力を2倍にしたときの伸びが3倍未満であることを両engineで検証する（線形なら約2倍、二次なら約4倍）。実時間に依存しないため決定的で、旧loweringへ戻すと比4.00で失敗することを確認した。paired golden fixture `for_iteration_snapshot`では、list/dict/str/空コレクションの反復、ネスト、break/continue、反復中の再代入と破壊的更新に対するスナップショット維持、反復ごとのfresh cell、ループ変数のcell昇格経路、負index・範囲外を検証する。
 

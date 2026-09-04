@@ -651,15 +651,18 @@ impl Compiler {
                 self.compile_user_call(callee, args, line)?;
             }
             Expr::List(elements) => {
-                self.chunk.emit_constant(Value::List(Vec::new()), line);
+                self.chunk
+                    .emit_constant(Value::List(Rc::new(Vec::new())), line);
                 for elem in elements {
                     self.compile_expr(elem, line)?;
                     self.chunk.emit(OpCode::ListPush, line);
                 }
             }
             Expr::Dict(pairs) => {
-                self.chunk
-                    .emit_constant(Value::Dict(std::collections::BTreeMap::new()), line);
+                self.chunk.emit_constant(
+                    Value::Dict(Rc::new(std::collections::BTreeMap::new())),
+                    line,
+                );
                 for (key, val) in pairs {
                     self.compile_expr(key, line)?;
                     self.compile_expr(val, line)?;

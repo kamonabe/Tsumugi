@@ -9,6 +9,7 @@ use crate::error::TsumugiError;
 use crate::value::Value;
 
 use std::io::{self, BufRead};
+use std::rc::Rc;
 
 use super::Evaluator;
 
@@ -210,7 +211,7 @@ impl Evaluator {
                     .map(|arg| Value::Str(arg.to_string_lossy().into_owned()))
                     .collect();
                 crate::builtin_core::check_collection_size_public(argv.len(), line)?;
-                Ok(Some(Value::List(argv)))
+                Ok(Some(Value::List(Rc::new(argv))))
             }
             "exit" => {
                 if args.len() > 1 {
@@ -292,7 +293,7 @@ impl Evaluator {
                     }
                 };
                 let mut result = Vec::new();
-                for item in list {
+                for item in list.iter().cloned() {
                     let val = self.call_fn_value("map", &func, vec![item], line)?;
                     crate::builtin_core::check_collection_size_public(
                         result.len().saturating_add(1),
@@ -300,7 +301,7 @@ impl Evaluator {
                     )?;
                     result.push(val);
                 }
-                Ok(Some(Value::List(result)))
+                Ok(Some(Value::List(Rc::new(result))))
             }
             "filter" => {
                 let list_value = self.eval_expr(&args[0], line)?;
@@ -314,7 +315,7 @@ impl Evaluator {
                     }
                 };
                 let mut result = Vec::new();
-                for item in list {
+                for item in list.iter().cloned() {
                     let val = self.call_fn_value("filter", &func, vec![item.clone()], line)?;
                     if val.is_truthy() {
                         crate::builtin_core::check_collection_size_public(
@@ -324,7 +325,7 @@ impl Evaluator {
                         result.push(item);
                     }
                 }
-                Ok(Some(Value::List(result)))
+                Ok(Some(Value::List(Rc::new(result))))
             }
             "each" => {
                 let list_value = self.eval_expr(&args[0], line)?;
@@ -337,7 +338,7 @@ impl Evaluator {
                         ));
                     }
                 };
-                for item in list {
+                for item in list.iter().cloned() {
                     self.call_fn_value("each", &func, vec![item], line)?;
                 }
                 Ok(Some(Value::Null))

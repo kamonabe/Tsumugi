@@ -22,6 +22,7 @@
 use crate::error::TsumugiError;
 use crate::value::Value;
 
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 // =============================================================================
@@ -182,7 +183,9 @@ pub fn assign_index(
             if actual_idx < 0 || actual_idx >= len {
                 return Err(TsumugiError::list_index_out_of_range(line, i, list.len()));
             }
-            list[actual_idx as usize] = value;
+            // 検査後に detach（copy-on-write）。共有中の backing は複製され、
+            // 別 binding から見た元の値は変化しない（AUD-047）。
+            Rc::make_mut(list)[actual_idx as usize] = value;
             Ok(())
         }
         Value::Dict(map) => {
@@ -195,7 +198,7 @@ pub fn assign_index(
             if !map.contains_key(&key) {
                 check_collection_size(map.len().saturating_add(1), line)?;
             }
-            map.insert(key, value);
+            Rc::make_mut(map).insert(key, value);
             Ok(())
         }
         other => Err(TsumugiError::index_assign_unsupported(line, other)),
@@ -207,7 +210,7 @@ pub fn builtin_push(args: &[Value], line: usize) -> Result<Value, TsumugiError> 
     let mut list = args[0].clone();
     if let Value::List(ref mut v) = list {
         check_collection_size(v.len().saturating_add(1), line)?;
-        v.push(args[1].clone());
+        Rc::make_mut(v).push(args[1].clone());
         Ok(list)
     } else {
         Err(TsumugiError::builtin_arg_type(
@@ -223,7 +226,7 @@ pub fn builtin_pop(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
         if v.is_empty() {
             Err(TsumugiError::pop_empty_list(line))
         } else {
-            Ok(v.pop().unwrap())
+            Ok(Rc::make_mut(v).pop().unwrap())
         }
     } else {
         Err(TsumugiError::builtin_arg_type(
@@ -237,7 +240,7 @@ pub fn builtin_pop_update(args: &[Value], line: usize) -> Result<Value, TsumugiE
     let mut list = args[0].clone();
     if let Value::List(ref mut v) = list {
         if !v.is_empty() {
-            v.pop();
+            Rc::make_mut(v).pop();
         }
         Ok(list)
     } else {
@@ -250,7 +253,7 @@ pub fn builtin_keys(args: &[Value], line: usize) -> Result<Value, TsumugiError> 
     if let Value::Dict(map) = &args[0] {
         check_collection_size(map.len(), line)?;
         let keys: Vec<Value> = map.keys().map(|k| Value::Str(k.clone())).collect();
-        Ok(Value::List(keys))
+        Ok(Value::List(Rc::new(keys)))
     } else {
         Err(TsumugiError::builtin_arg_type(
             line, "keys", 1, "Dict", &args[0],
@@ -263,7 +266,7 @@ pub fn builtin_values(args: &[Value], line: usize) -> Result<Value, TsumugiError
     if let Value::Dict(map) = &args[0] {
         check_collection_size(map.len(), line)?;
         let vals: Vec<Value> = map.values().cloned().collect();
-        Ok(Value::List(vals))
+        Ok(Value::List(Rc::new(vals)))
     } else {
         Err(TsumugiError::builtin_arg_type(
             line, "values", 1, "Dict", &args[0],
@@ -327,9 +330,9 @@ pub fn builtin_slice(args: &[Value], line: usize) -> Result<Value, TsumugiError>
             let e = end.min(v.len());
             // start > end の場合は空リストを返す（パニックしない）
             if s > e {
-                return Ok(Value::List(Vec::new()));
+                return Ok(Value::List(Rc::new(Vec::new())));
             }
-            Ok(Value::List(v[s..e].to_vec()))
+            Ok(Value::List(Rc::new(v[s..e].to_vec())))
         }
         Value::Str(s) => {
             let chars: Vec<char> = s.chars().collect();
@@ -378,9 +381,9 @@ pub fn builtin_contains(args: &[Value], line: usize) -> Result<Value, TsumugiErr
 pub fn builtin_sort(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("sort", args, 1, line)?;
     if let Value::List(list) = &args[0] {
-        let mut sorted = list.clone();
+        let mut sorted = (**list).clone();
         sorted.sort_by_key(|a| a.to_string());
-        Ok(Value::List(sorted))
+        Ok(Value::List(Rc::new(sorted)))
     } else {
         Err(TsumugiError::builtin_arg_type(
             line, "sort", 1, "List", &args[0],
@@ -392,9 +395,9 @@ pub fn builtin_reverse(args: &[Value], line: usize) -> Result<Value, TsumugiErro
     check_arity("reverse", args, 1, line)?;
     match &args[0] {
         Value::List(list) => {
-            let mut rev = list.clone();
+            let mut rev = (**list).clone();
             rev.reverse();
-            Ok(Value::List(rev))
+            Ok(Value::List(Rc::new(rev)))
         }
         Value::Str(s) => Ok(Value::Str(s.chars().rev().collect())),
         other => Err(TsumugiError::builtin_arg_type(
@@ -432,7 +435,7 @@ pub fn builtin_range(args: &[Value], line: usize) -> Result<Value, TsumugiError>
     };
     check_collection_size(size, line)?;
     let list: Vec<Value> = (start..end).map(Value::Int).collect();
-    Ok(Value::List(list))
+    Ok(Value::List(Rc::new(list)))
 }
 
 // =============================================================================
@@ -448,7 +451,7 @@ pub fn builtin_split(args: &[Value], line: usize) -> Result<Value, TsumugiError>
         check_collection_size(parts.len().saturating_add(1), line)?;
         parts.push(Value::Str(part.to_string()));
     }
-    Ok(Value::List(parts))
+    Ok(Value::List(Rc::new(parts)))
 }
 
 pub fn builtin_join(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
@@ -757,7 +760,7 @@ pub fn builtin_read_lines(args: &[Value], line: usize) -> Result<Value, TsumugiE
                     check_collection_size(lines.len().saturating_add(1), line)?;
                     lines.push(Value::Str(content_line.to_string()));
                 }
-                Ok(Value::List(lines))
+                Ok(Value::List(Rc::new(lines)))
             }
             Err(_) => Ok(Value::Null),
         }
@@ -1006,7 +1009,7 @@ pub fn builtin_list_dir(args: &[Value], line: usize) -> Result<Value, TsumugiErr
                     names.push(Value::Str(entry.file_name().to_string_lossy().to_string()));
                 }
                 names.sort_by_key(|v| v.to_string());
-                Ok(Value::List(names))
+                Ok(Value::List(Rc::new(names)))
             }
             Err(_) => Ok(Value::Null),
         }

@@ -1,0 +1,66 @@
+# List/Dict は copy-on-write（AUD-047）。値 snapshot 意味論を維持する。
+# 代入直後は backing を共有してよいが、片方への mutation は他方に漏れない。
+# tree/VM の両方でこの観測挙動が一致することを固定する。
+
+# --- List: 代入で別 binding にしても mutation は分離する ---
+let a = [1, 2, 3]
+let b = a
+push(b, 4)
+print(len(a))
+print(len(b))
+print(a[0])
+
+# 元を変更しても既存の別名は影響を受けない
+push(a, 99)
+print(len(a))
+print(len(b))
+
+# --- Dict: 同様に分離する ---
+let d = {"x": 1}
+let e = d
+e["y"] = 2
+print(has_key(d, "y"))
+print(has_key(e, "y"))
+d["z"] = 3
+print(has_key(e, "z"))
+
+# --- 関数引数として渡しても、呼び出し側の値は変わらない ---
+fn append_local(xs)
+    push(xs, 100)
+    return len(xs)
+end
+let arg = [1, 2]
+print(append_local(arg))
+print(len(arg))
+
+# --- 関数から返した値を変更しても、内部で作った値だけが変わる ---
+fn make_pair()
+    return [10, 20]
+end
+let p1 = make_pair()
+let p2 = make_pair()
+push(p1, 30)
+print(len(p1))
+print(len(p2))
+
+# --- ネストしたコレクション: 外側を代入で共有しても内側の分離は保たれる ---
+let outer = [[1], [2]]
+let alias = outer
+push(alias, [3])
+print(len(outer))
+print(len(alias))
+
+# --- closure が共有する cell への mutation は全 closure から見える（alias ではなく同一 cell）---
+let shared = [1]
+let reader = fn() return len(shared) end
+push(shared, 2)
+print(reader())
+
+# --- equality: 共有・分離いずれも構造が同じなら等しい ---
+let base = [1, 2]
+let same = base
+print(base == same)
+push(same, 3)
+let rebuilt = [1, 2, 3]
+print(same == rebuilt)
+print(base == rebuilt)
