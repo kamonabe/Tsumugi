@@ -221,7 +221,9 @@ impl Evaluator {
                 let items: Vec<Value> = match &collection {
                     Value::List(list) => {
                         crate::builtin_core::check_collection_size_public(list.len(), *line)?;
-                        list.clone()
+                        // 開始時点の要素を snapshot する。ループ本体で元 binding を
+                        // 変更しても make_mut が detach するため反復列は不変（AUD-047）。
+                        (**list).clone()
                     }
                     Value::Dict(map) => {
                         crate::builtin_core::check_collection_size_public(map.len(), *line)?;
@@ -366,7 +368,7 @@ impl Evaluator {
                     )?;
                     values.push(value);
                 }
-                Ok(Value::List(values))
+                Ok(Value::List(Rc::new(values)))
             }
 
             Expr::Dict(pairs) => {
@@ -387,7 +389,7 @@ impl Evaluator {
                     }
                     map.insert(key, val);
                 }
-                Ok(Value::Dict(map))
+                Ok(Value::Dict(Rc::new(map)))
             }
 
             Expr::Ident(name) => self

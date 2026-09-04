@@ -38,8 +38,11 @@ pub enum Value {
     Str(String),
     Bool(bool),
     Null,
-    List(Vec<Value>),
-    Dict(BTreeMap<String, Value>),
+    /// リスト。copy-on-write（AUD-047）。clone はハンドル共有で O(1)、
+    /// mutation は `Rc::make_mut` を通して書き込み時だけ backing を複製する。
+    List(Rc<Vec<Value>>),
+    /// 辞書。copy-on-write（AUD-047）。List と同じく mutation は `Rc::make_mut` 経由。
+    Dict(Rc<BTreeMap<String, Value>>),
     /// 関数値（ツリーウォーク用: ユーザー定義関数を値として扱う）
     /// `Rc` により関数呼び出し・self-binding・クロージャ生成時のディープコピーを回避
     Fn {
@@ -88,8 +91,9 @@ impl PartialEq for Value {
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Null, Value::Null) => true,
-            (Value::List(a), Value::List(b)) => a == b,
-            (Value::Dict(a), Value::Dict(b)) => a == b,
+            // 共有 backing（同じ Rc）なら要素比較を省く。分離済みでも要素で比較する。
+            (Value::List(a), Value::List(b)) => Rc::ptr_eq(a, b) || a == b,
+            (Value::Dict(a), Value::Dict(b)) => Rc::ptr_eq(a, b) || a == b,
             // 関数値は FunctionId だけで同一性を判定する（AUD-048）。
             // ID は関数式・関数定義を評価して値を生成するたびに新規発番され、
             // clone・代入・引数渡し・collection 格納では保持される。
@@ -210,8 +214,8 @@ mod tests {
         assert!(Value::Int(-1).is_truthy());
         assert!(Value::Float(0.1).is_truthy());
         assert!(Value::Str("hello".to_string()).is_truthy());
-        assert!(Value::List(vec![Value::Int(1)]).is_truthy());
-        assert!(Value::Dict(BTreeMap::from([("a".into(), Value::Int(1))])).is_truthy());
+        assert!(Value::List(Rc::new(vec![Value::Int(1)])).is_truthy());
+        assert!(Value::Dict(Rc::new(BTreeMap::from([("a".into(), Value::Int(1))]))).is_truthy());
     }
 
     #[test]
@@ -221,8 +225,8 @@ mod tests {
         assert!(!Value::Int(0).is_truthy());
         assert!(!Value::Float(0.0).is_truthy());
         assert!(!Value::Str("".to_string()).is_truthy());
-        assert!(!Value::List(vec![]).is_truthy());
-        assert!(!Value::Dict(BTreeMap::new()).is_truthy());
+        assert!(!Value::List(Rc::new(vec![])).is_truthy());
+        assert!(!Value::Dict(Rc::new(BTreeMap::new())).is_truthy());
     }
 
     #[test]
@@ -233,11 +237,11 @@ mod tests {
         assert_eq!(Value::Bool(true).to_string(), "true");
         assert_eq!(Value::Null.to_string(), "null");
         assert_eq!(
-            Value::List(vec![Value::Int(1), Value::Str("a".into())]).to_string(),
+            Value::List(Rc::new(vec![Value::Int(1), Value::Str("a".into())])).to_string(),
             "[1, \"a\"]"
         );
         assert_eq!(
-            Value::Dict(BTreeMap::from([("x".into(), Value::Int(10))])).to_string(),
+            Value::Dict(Rc::new(BTreeMap::from([("x".into(), Value::Int(10))]))).to_string(),
             "{\"x\": 10}"
         );
     }
