@@ -1,0 +1,62 @@
+# let/fn 再宣言のbinding identity（AUD-016）
+# 同一scopeでの再宣言は必ず新しいcellを割り当てる。再宣言前に作った
+# closureは旧cell（旧値）を保持し、再宣言後のreadと新closureは新cellを見る。
+# ツリーウォーク版・VM版で観測結果が一致することを固定する。
+
+# --- top-level scope ---
+let x = 1
+let before = fn() x end
+let x = 2
+let after = fn() x end
+print(before())    # 1（旧cell）
+print(after())     # 2（新cell）
+print(x)           # 2
+
+# 通常代入は解決済みcellを書き換えるため、最新closureに反映される
+x = 3
+print(after())     # 3
+print(before())    # 1（旧cellは影響を受けない）
+
+# --- function scope ---
+fn make()
+    let a = 10
+    let get_old = fn() a end
+    let a = 20
+    let get_new = fn() a end
+    return [get_old(), get_new(), a]
+end
+let r = make()
+print(r[0])        # 10
+print(r[1])        # 20
+print(r[2])        # 20
+
+# --- block scope（if はブロックscopeを作る） ---
+let out = []
+if true
+    let b = 100
+    let cap = fn() b end
+    let b = 200
+    push(out, cap())    # 100
+    push(out, b)        # 200
+end
+print(out[0])
+print(out[1])
+
+# --- fn 再宣言：旧closureは旧関数値に束縛されたまま ---
+fn greet()
+    return "hi"
+end
+let g_old = greet
+fn greet()
+    return "yo"
+end
+print(g_old())     # hi
+print(greet())     # yo
+
+# --- let で関数値を再宣言しても同じ規則が適用される ---
+# call_h は定義時点で見えていた旧 h のcellを捕捉するため、再宣言後も旧値を呼ぶ
+let h = fn() return "one" end
+let call_h = fn() return h() end
+let h = fn() return "two" end
+print(call_h())    # one（旧cellを捕捉）
+print(h())         # two（再宣言後のreadは新cell）

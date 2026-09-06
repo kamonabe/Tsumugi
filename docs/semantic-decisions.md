@@ -212,6 +212,8 @@ error messageやkindを文字列比較するscript・hostは更新が必要に�
 
 ## 4. `let`再宣言のbinding identity（AUD-016）
 
+> **実装状況（2026-09-06）:** ✅ 実装完了。VM Compilerの`Stmt::Let`再宣言でのslot再利用を廃止し、全scopeで新slotを割り当てるよう統一した。観測挙動を変更したため`language-spec.md`へ規範として反映し、仕様revisionを0.14へ上げた。
+
 ### 4.1 採用判断
 
 同一scopeで同名を `let` 再宣言した場合も、**必ず新しいcellを作る**。そのscopeの名前解決は新cellへ切り替わるが、再宣言前に作られたclosureは旧cellを保持し、旧値を見る。現行tree-walk版へ統一する。
