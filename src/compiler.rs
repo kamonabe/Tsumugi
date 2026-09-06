@@ -139,13 +139,11 @@ impl Compiler {
         match stmt {
             Stmt::Let { name, value, line } => {
                 self.compile_expr(value, *line)?;
-                // 同じスコープに同名の変数が既にあれば上書き（ツリーウォーク版互換）
-                if let Some(slot) = self.find_local_in_current_scope(name) {
-                    self.chunk.emit(OpCode::SetLocal(slot), *line);
-                    self.chunk.emit(OpCode::Pop, *line);
-                } else {
-                    self.declare_local(name.clone(), *line);
-                }
+                // AUD-016: 同一scopeでの再宣言も必ず新しいslot（=新しいcell）を割り当てる。
+                // 既存slotへのSetLocalはcell経由で過去のclosureへ波及するため使わない。
+                // resolve_localは末尾から探索するため、以後のreadは新slotへ解決され、
+                // 再宣言前に作られたclosureは旧slotのcellを保持し続ける（ツリーウォーク版と一致）。
+                self.declare_local(name.clone(), *line);
             }
             Stmt::Assign { name, value, line } => {
                 self.compile_expr(value, *line)?;
@@ -1024,19 +1022,6 @@ impl Compiler {
             name,
             depth: self.scope_depth,
         });
-    }
-
-    /// 同じスコープ深さに同名の変数があればそのスロットを返す
-    fn find_local_in_current_scope(&self, name: &str) -> Option<usize> {
-        for (i, local) in self.locals.iter().enumerate().rev() {
-            if local.depth < self.scope_depth {
-                break;
-            }
-            if local.name == name {
-                return Some(i);
-            }
-        }
-        None
     }
 
     fn resolve_local(&self, name: &str, line: usize) -> Result<usize, TsumugiError> {

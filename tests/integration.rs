@@ -364,6 +364,7 @@ fixture_tests!(
         import_static_resolution,
         index_assign_binding,
         index_read_lowering,
+        let_redeclaration_fresh_cell,
         list_dict,
         local_utils,
         logic,
@@ -1086,6 +1087,50 @@ fn vm_repl_for_closure_cells_survive_slot_reuse() {
         ["reused-var", "1", "2", "3", "changed-var", "1", "2", "3"],
         "loop slotの再利用でescaping closureのcellが変化: {stdout}"
     );
+}
+
+#[test]
+fn repl_let_redeclaration_uses_fresh_cell_across_submissions() {
+    // AUD-016: REPL入力を跨いだ再宣言も新しいcellを割り当てる。
+    // 再宣言前に作ったclosureは旧cell（旧値）を保持し、再宣言後のreadと
+    // 新closureは新cellを見る。未捕捉error後のrollbackでstale bindingが
+    // 残らないこと（次入力で旧cellの値が見えること）も固定する。
+    let source = concat!(
+        "let x = 1\n",
+        "let before = fn() x end\n",
+        "let x = 2\n",
+        "let after = fn() x end\n",
+        "print(before())\n", // 1（旧cell）
+        "print(after())\n",  // 2（新cell）
+        "print(x)\n",        // 2
+        "let x = 1 / 0\n",   // 未捕捉error → この入力はrollback
+        "print(x)\n",        // 2（rollback後、再宣言は公開されない）
+        "print(before())\n", // 1（旧cellは不変）
+        "print(after())\n",  // 2
+    );
+    let expected_output = ["1", "2", "2", "2", "1", "2"];
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+        let visible_output = repl_visible_lines(&stdout, use_vm);
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert_eq!(
+            stderr.matches("ゼロ除算").count(),
+            1,
+            "{mode}で元のruntime errorが正確に報告されていない: {stderr}"
+        );
+        assert_eq!(
+            visible_output, expected_output,
+            "{mode}で再宣言のcell identityまたはrollbackが不正: {stdout}"
+        );
+        assert!(
+            !stderr.contains("panicked at"),
+            "{mode} host panic: {stderr}"
+        );
+    }
 }
 
 #[test]
