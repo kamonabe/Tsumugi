@@ -72,14 +72,22 @@ enum BindingStorage {
     Stack(usize),
 }
 
-/// REPL入力の開始時点にあったスタック値を、変更されたslotだけ記録するjournal。
+/// REPL入力の開始時点にあった言語状態を、変更された箇所だけ記録するjournal（AUD-024）。
 ///
 /// 通常の入力は既存のtop-level bindingを読むだけなので、保持中のList/Dictを
-/// 入力ごとに深く複製しない。既存slotの書換・削除が発生した場合だけ、
-/// rollback用にその時点の値を複製する。
+/// 入力ごとに深く複製しない。既存slotの書換・削除、cellの書換、stack slotの
+/// cell昇格が発生した場合だけ、rollback用にその時点の情報を記録する。
 struct ReplStackCheckpoint {
+    /// 入力開始時点のvalue stack長。
     stack_len: usize,
+    /// 書換・削除された既存stack slotの、最初の値。
     originals: HashMap<usize, Value>,
+    /// 書換されたcellの、最初の値。cellのRcポインタ同一性で1回だけ記録する。
+    ///
+    /// cell（`Rc<RefCell<Value>>`）は既存closureやtop-level変数と共有され、
+    /// `frames` checkpointを戻してもcellの中身は戻らない。破壊的更新の前に
+    /// 元値を記録し、未捕捉エラー時に復元する（AUD-024）。
+    cell_originals: HashMap<usize, (SharedValue, Value)>,
 }
 
 /// スタックベースの仮想マシン
@@ -189,6 +197,7 @@ impl Vm {
         self.repl_stack_checkpoint = Some(ReplStackCheckpoint {
             stack_len: self.stack.len(),
             originals: HashMap::new(),
+            cell_originals: HashMap::new(),
         });
 
         // top-levelでcell化された変数は入力間でも同じcellを使う。
@@ -540,6 +549,7 @@ impl Vm {
             // locals_cells にセルがあればそこに書く
             if let Some(Some(cell)) = frame.locals_cells.get(slot) {
                 let cell = Rc::clone(cell);
+                self.checkpoint_cell(&cell);
                 *cell.borrow_mut() = value;
                 return Ok(());
             }
@@ -711,6 +721,7 @@ impl Vm {
             )
         };
         if let Some(cell) = cell {
+            self.checkpoint_cell(&cell);
             *cell.borrow_mut() = value;
             return Ok(());
         }
@@ -954,6 +965,7 @@ impl Vm {
                     .cloned()
                     .ok_or_else(|| internal_error(line, "内部エラー: スタックが空です"))?;
                 let cell = self.upvalue_cell(index, line)?;
+                self.checkpoint_cell(&cell);
                 *cell.borrow_mut() = value;
             }
             OpCode::MakeClosure(upvalue_count) => {
@@ -1329,7 +1341,7 @@ impl Vm {
         self.stack.truncate(len);
     }
 
-    /// 変更済みslotを復元し、REPL開始後に積まれた一時値を破棄する。
+    /// 変更済みslot・cellを復元し、REPL開始後に積まれた一時値を破棄する。
     fn restore_repl_stack(&mut self, checkpoint: ReplStackCheckpoint) {
         self.stack.truncate(checkpoint.stack_len);
         if self.stack.len() < checkpoint.stack_len {
@@ -1338,6 +1350,29 @@ impl Vm {
         for (index, value) in checkpoint.originals {
             self.stack[index] = value;
         }
+        // cellの中身を入力開始時点へ戻す（AUD-024）。frames checkpointでは
+        // 戻せない、共有cellの破壊的更新を復元する。
+        for (_, (cell, original)) in checkpoint.cell_originals {
+            *cell.borrow_mut() = original;
+        }
+    }
+
+    /// cellの中身を書き換える前に、その元値をREPL journalへ記録する（AUD-024）。
+    ///
+    /// cellのRcポインタ同一性で判定し、1入力につき最初の1回だけ記録する。
+    /// REPL transaction中でなければ何もしない。
+    fn checkpoint_cell(&mut self, cell: &SharedValue) {
+        let Some(checkpoint) = self.repl_stack_checkpoint.as_mut() else {
+            return;
+        };
+        let id = Rc::as_ptr(cell) as usize;
+        if checkpoint.cell_originals.contains_key(&id) {
+            return;
+        }
+        let original = cell.borrow().clone();
+        checkpoint
+            .cell_originals
+            .insert(id, (Rc::clone(cell), original));
     }
 
     /// スタックからpop
@@ -1425,6 +1460,7 @@ impl Vm {
     ) -> Result<(), TsumugiError> {
         match self.resolve_binding_storage(target, line)? {
             BindingStorage::Cell(cell) => {
+                self.checkpoint_cell(&cell);
                 crate::builtin_core::assign_index(&mut cell.borrow_mut(), index, value, line)
             }
             BindingStorage::Stack(stack_index) => {

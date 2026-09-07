@@ -1,8 +1,8 @@
 # Tsumugi 言語仕様
 
-バージョン: 0.14
+バージョン: 0.15
 
-最終更新: 2026-09-06
+最終更新: 2026-09-07
 
 この番号は言語仕様のrevisionであり、Cargo package / REPLの実装バージョン `0.1.0` とは独立して管理する。
 
@@ -12,11 +12,7 @@
 
 以下の挙動へ依存するコードは移植可能とみなさない。詳細と修正状況は[`roadmap.md`](roadmap.md)の該当IDを参照する。
 
-両engine差:
-
-| 項目 | 内容 | ID |
-|---|---|---|
-| 未捕捉REPLエラー後の状態 | エラー前の代入・コレクション変更をcommitするかrollbackするかが未統一 | AUD-024 |
+両engine差: 現在なし。
 
 両engine共通の仕様違反:
 
@@ -266,7 +262,7 @@ print(result)     # block local
 - scopeは正常終了、ランタイムエラー、`return`、`break`、`continue`のどの経路でも解放される
 - block localをキャプチャしたクロージャが外へ保存された場合、変数名はblock外から参照できないが、キャプチャされた変数セルはクロージャが保持する
 - 正常終了または同一実行内でcatchされたエラーでは、scope解放自体はトランザクションrollbackを行わない。外側変数への代入、外側コレクションの変更、外部I/Oは保持される
-- 未捕捉エラーで終了したREPL入力のcommit/rollback方針は両engineで未統一であり、AUD-024で継続する
+- 未捕捉ランタイムエラーで終了したREPL入力は、その入力が加えた全language-state（binding、変数セルの値、index代入、push/pop、import marker）を入力開始時点へrollbackする。正常完了と、入力内でcatchされて最終的に正常完了したエラーはcommitする。stdout・ファイル書き込み等の完了済み外部効果はrollbackしない。tree/VMで一致する（AUD-024）
 
 ### 名前の可視性と解決時期
 

@@ -452,6 +452,15 @@ help、version、unknown option、missing file、stdin read error、非UTF-8が�
 
 ## 7. REPL submission transaction（AUD-024）
 
+> **実装状況（2026-09-07）:** ✅ 実装完了。tree/VM両engineで、未捕捉ランタイムエラーで
+> 終了したREPL入力が変更した language-state（binding、cell の値、index 代入、push/pop、
+> import marker）を入力開始時点へ巻き戻すようにした。正常完了と catch されて完了した入力は
+> commit する。stdout・ファイル書き込み等の外部効果は巻き戻さない。FunctionId は rollback
+> しても再利用しない（AUD-048）。observable挙動が変わるため `language-spec.md` へ反映し、
+> 仕様revisionを0.15へ上げた。7.5節の journal 方式（first-write undo log、cell は Rc
+> ポインタ同一性で1回だけ記録）で実装し、記録量は変更した箇所の数に比例する。deadline/
+> budget/cancellation は未実装のため、それらに伴う rollback は本 phase の対象外。
+
 ### 7.1 採用判断
 
 未捕捉runtime errorで終了したREPL入力は、その入力が変更した**全language-stateを入力開始時点へrollback**する。正常完了と、入力内でcatchされ最終的に正常完了したerrorはcommitする。外部I/Oはrollbackせず、rollback後も「partial effectsあり」とauditへ記録する。

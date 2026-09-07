@@ -1770,3 +1770,271 @@ fn repl_resolves_imports_before_execution_in_both_engines() {
         "treeとVMでimportの観測結果が異なります"
     );
 }
+
+// =============================================================
+// AUD-024: REPL submission transaction
+//
+// 未捕捉ランタイムエラーで終了した入力は、その入力が変更した全 language-state を
+// 入力開始時点へ巻き戻す。正常完了と catch されて完了した入力は commit する。
+// stdout・ファイル書き込み等の外部効果は巻き戻さない。tree/VM で挙動を揃える。
+//
+// 1入力を1 submission にするため、変更文と失敗文を `if true ... end` ブロックへ
+// まとめる（REPL は未閉じブロックを継続入力として1 submission に束ねる）。
+// =============================================================
+
+/// 未捕捉エラーが binding（新規let・再宣言・代入・fn）の変更を巻き戻す。
+#[test]
+fn aud024_repl_rolls_back_bindings_on_uncaught_error() {
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let output = run_repl_process(
+            "let x = 1\n\
+             let y = 10\n\
+             fn f()\n    return 100\nend\n\
+             if true\n\
+                 x = 2\n\
+                 let y = 20\n\
+                 fn f()\n    return 200\nend\n\
+                 let z = 3\n\
+                 let bad = undefined_var\n\
+             end\n\
+             print(x)\n\
+             print(y)\n\
+             print(f())\n",
+            use_vm,
+            &[],
+        );
+        let (stdout, stderr) = output_text(&output);
+        let visible = repl_visible_lines(&stdout, use_vm);
+
+        assert!(output.status.success(), "{mode}: REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("未定義の変数または関数: undefined_var"),
+            "{mode}: 元のruntime errorがない: {stderr}"
+        );
+        assert!(
+            !stderr.contains("panicked at"),
+            "{mode}: host panicが発生: {stderr}"
+        );
+        // 代入・再宣言・fn再定義がすべて巻き戻る。新規let zは公開されない。
+        assert_eq!(
+            visible,
+            vec!["1", "10", "100"],
+            "{mode}: bindingが巻き戻っていない: {stdout}"
+        );
+    }
+}
+
+/// 未捕捉エラーが collection（list/dict/index代入/push/pop/ネスト）の変更を巻き戻す。
+#[test]
+fn aud024_repl_rolls_back_collections_on_uncaught_error() {
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let output = run_repl_process(
+            "let xs = [1, 2, 3]\n\
+             let d = {\"a\": 1}\n\
+             let nested = [[0], [0]]\n\
+             if true\n\
+                 xs[0] = 99\n\
+                 push(xs, 4)\n\
+                 pop(xs)\n\
+                 d[\"b\"] = 2\n\
+                 nested[0][0] = 5\n\
+                 let bad = undefined_var\n\
+             end\n\
+             print(xs)\n\
+             print(d)\n\
+             print(nested)\n",
+            use_vm,
+            &[],
+        );
+        let (stdout, stderr) = output_text(&output);
+        let visible = repl_visible_lines(&stdout, use_vm);
+
+        assert!(output.status.success(), "{mode}: REPLが異常終了: {stderr}");
+        assert!(
+            !stderr.contains("panicked at"),
+            "{mode}: host panicが発生: {stderr}"
+        );
+        assert_eq!(
+            visible,
+            vec!["[1, 2, 3]", "{\"a\": 1}", "[[0], [0]]"],
+            "{mode}: collectionが巻き戻っていない: {stdout}"
+        );
+    }
+}
+
+/// 未捕捉エラーが closure と共有する cell（captured/upvalue）の変更を巻き戻す。
+/// binding と closure の両方が入力開始時点の値を見る。
+#[test]
+fn aud024_repl_rolls_back_captured_cell_on_uncaught_error() {
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let output = run_repl_process(
+            "let count = 0\n\
+             let get = fn() count end\n\
+             if true\n\
+                 count = 100\n\
+                 let bad = undefined_var\n\
+             end\n\
+             print(count)\n\
+             print(get())\n",
+            use_vm,
+            &[],
+        );
+        let (stdout, stderr) = output_text(&output);
+        let visible = repl_visible_lines(&stdout, use_vm);
+
+        assert!(output.status.success(), "{mode}: REPLが異常終了: {stderr}");
+        assert!(
+            !stderr.contains("panicked at"),
+            "{mode}: host panicが発生: {stderr}"
+        );
+        assert_eq!(
+            visible,
+            vec!["0", "0"],
+            "{mode}: 共有cellが巻き戻らず、bindingとclosureで値がずれた: {stdout}"
+        );
+    }
+}
+
+/// catch されて正常完了した入力は commit する（binding・collection とも保持）。
+#[test]
+fn aud024_repl_commits_caught_then_completed() {
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let output = run_repl_process(
+            "let xs = [1, 2, 3]\n\
+             let a = 10\n\
+             try\n\
+                 xs[0] = 99\n\
+                 a = 999\n\
+                 let bad = undefined_var\n\
+             catch e\n\
+                 a = 555\n\
+             end\n\
+             print(xs)\n\
+             print(a)\n",
+            use_vm,
+            &[],
+        );
+        let (stdout, stderr) = output_text(&output);
+        let visible = repl_visible_lines(&stdout, use_vm);
+
+        assert!(output.status.success(), "{mode}: REPLが異常終了: {stderr}");
+        assert!(
+            stderr.is_empty(),
+            "{mode}: 捕捉済みエラー以外が発生: {stderr}"
+        );
+        // catch前の変更(xs[0]=99)もcatch内の代入(a=555)も残る。
+        assert_eq!(
+            visible,
+            vec!["[99, 2, 3]", "555"],
+            "{mode}: caught後の状態がcommitされていない: {stdout}"
+        );
+    }
+}
+
+/// 正常完了した入力は commit し、次入力から変更が見える。
+#[test]
+fn aud024_repl_commits_normal_completion() {
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let output = run_repl_process(
+            "let x = [1, 2, 3]\n\
+             x[0] = 42\n\
+             push(x, 4)\n\
+             print(x)\n",
+            use_vm,
+            &[],
+        );
+        let (stdout, stderr) = output_text(&output);
+        let visible = repl_visible_lines(&stdout, use_vm);
+
+        assert!(output.status.success(), "{mode}: REPLが異常終了: {stderr}");
+        assert!(stderr.is_empty(), "{mode}: 予期しないエラー: {stderr}");
+        assert_eq!(
+            visible,
+            vec!["[42, 2, 3, 4]"],
+            "{mode}: 正常入力がcommitされていない: {stdout}"
+        );
+    }
+}
+
+/// 関数呼び出し内で発生した未捕捉エラーも、呼び出し前の top-level 変更を巻き戻す。
+#[test]
+fn aud024_repl_rolls_back_when_error_in_function_call() {
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let output = run_repl_process(
+            "let g = 1\n\
+             fn boom()\n    let bad = 1 / 0\nend\n\
+             if true\n\
+                 g = 2\n\
+                 boom()\n\
+             end\n\
+             print(g)\n",
+            use_vm,
+            &[],
+        );
+        let (stdout, stderr) = output_text(&output);
+        let visible = repl_visible_lines(&stdout, use_vm);
+
+        assert!(output.status.success(), "{mode}: REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("ゼロ除算"),
+            "{mode}: runtime errorがない: {stderr}"
+        );
+        assert!(
+            !stderr.contains("panicked at"),
+            "{mode}: host panicが発生: {stderr}"
+        );
+        assert_eq!(
+            visible,
+            vec!["1"],
+            "{mode}: 呼び出し前のtop-level変更が巻き戻っていない: {stdout}"
+        );
+    }
+}
+
+/// 外部効果（stdout）は巻き戻さない。失敗入力中の print 出力は残る。
+#[test]
+fn aud024_repl_does_not_roll_back_external_effects() {
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let output = run_repl_process(
+            "let x = 1\n\
+             if true\n\
+                 print(\"SIDE_EFFECT\")\n\
+                 x = 2\n\
+                 let bad = undefined_var\n\
+             end\n\
+             print(x)\n",
+            use_vm,
+            &[],
+        );
+        let (stdout, stderr) = output_text(&output);
+        let visible = repl_visible_lines(&stdout, use_vm);
+
+        assert!(output.status.success(), "{mode}: REPLが異常終了: {stderr}");
+        assert!(
+            !stderr.contains("panicked at"),
+            "{mode}: host panicが発生: {stderr}"
+        );
+        // language-state（x）は巻き戻るが、既に出力したstdoutは残る。
+        // SIDE_EFFECT は継続入力中の print なので継続プロンプトと同じ行に出る。
+        // 行分割せず stdout 全体で出力の有無を確認する。
+        assert!(
+            stdout.contains("SIDE_EFFECT"),
+            "{mode}: 完了済みの外部効果が消えた: {stdout}"
+        );
+        assert!(
+            visible.contains(&"1"),
+            "{mode}: language-stateが巻き戻っていない: {stdout}"
+        );
+        assert!(
+            !visible.contains(&"2"),
+            "{mode}: 失敗入力の変更が残留: {stdout}"
+        );
+    }
+}

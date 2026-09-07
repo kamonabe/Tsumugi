@@ -15,6 +15,35 @@ pub struct CallFrame {
     scope_len: usize,
 }
 
+/// REPL入力（submission）が加えた言語状態の変更を、入力開始時点へ
+/// 巻き戻すためのundo journal（AUD-024）。
+///
+/// 記録するのは「最初の書き換え時点」の元値だけで、同じ場所を複数回変更しても
+/// 元値は一度しか積まない。COW（AUD-047）により List/Dict の値クローンは
+/// ハンドル共有O(1)なので、記録量は変更した場所の数に比例する。
+#[derive(Debug, Default, Clone)]
+struct SubmissionJournal {
+    /// undo 操作を後ろから順に適用する。
+    undo_log: Vec<UndoEntry>,
+    /// 元値を記録済みのcell（Rcポインタ同一性で判定）。
+    seen_cells: HashSet<usize>,
+    /// 元エントリを記録済みのscope binding（scope index と名前）。
+    seen_scope_entries: HashSet<(usize, String)>,
+}
+
+/// journal に積む1件のundo操作。
+#[derive(Debug, Clone)]
+enum UndoEntry {
+    /// scope の binding を元へ戻す。`original` が `None` なら削除する。
+    ScopeEntry {
+        scope: usize,
+        name: String,
+        original: Option<SharedValue>,
+    },
+    /// cell の中身を元の値へ戻す。
+    CellValue { cell: SharedValue, original: Value },
+}
+
 /// 変数のスコープを管理する環境
 #[derive(Debug, Clone)]
 pub struct Env {
@@ -27,6 +56,9 @@ pub struct Env {
     /// グローバルスコープ（index 0）だけにする。間にある呼び出し元の
     /// ローカルスコープは見えない。
     frame_base: usize,
+    /// REPL submission 中だけ有効な undo journal（AUD-024）。
+    /// `None` のときは記録しない（ファイル実行など非トランザクション実行）。
+    journal: Option<SubmissionJournal>,
 }
 
 impl Env {
@@ -34,7 +66,93 @@ impl Env {
         Self {
             scopes: vec![HashMap::new()], // グローバルスコープ
             frame_base: 0,
+            journal: None,
         }
+    }
+
+    /// REPL submission のトランザクションを開始する（AUD-024）。
+    ///
+    /// 以降の binding 追加・cell 書き換えは undo journal に記録され、
+    /// `rollback_submission` で入力開始時点へ戻せる。
+    pub fn begin_submission(&mut self) {
+        self.journal = Some(SubmissionJournal::default());
+    }
+
+    /// submission を確定し、journal を破棄する（AUD-024）。
+    pub fn commit_submission(&mut self) {
+        self.journal = None;
+    }
+
+    /// submission を巻き戻し、記録した全 binding・cell を入力開始時点へ戻す（AUD-024）。
+    ///
+    /// undo_log を逆順に適用する。同じ場所への複数回の変更は最初の元値だけを
+    /// 記録しているため、逆順適用で開始時点の値に戻る。
+    pub fn rollback_submission(&mut self) {
+        let Some(journal) = self.journal.take() else {
+            return;
+        };
+        for entry in journal.undo_log.into_iter().rev() {
+            match entry {
+                UndoEntry::ScopeEntry {
+                    scope,
+                    name,
+                    original,
+                } => {
+                    if let Some(map) = self.scopes.get_mut(scope) {
+                        match original {
+                            Some(cell) => {
+                                map.insert(name, cell);
+                            }
+                            None => {
+                                map.remove(&name);
+                            }
+                        }
+                    }
+                }
+                UndoEntry::CellValue { cell, original } => {
+                    *cell.borrow_mut() = original;
+                }
+            }
+        }
+    }
+
+    /// scope の binding を書き換える前に、その位置の元の cell を journal へ記録する。
+    fn journal_scope_entry(&mut self, scope: usize, name: &str) {
+        let Some(journal) = self.journal.as_mut() else {
+            return;
+        };
+        let key = (scope, name.to_string());
+        if !journal.seen_scope_entries.insert(key) {
+            return;
+        }
+        let original = self
+            .scopes
+            .get(scope)
+            .and_then(|map| map.get(name).cloned());
+        journal.undo_log.push(UndoEntry::ScopeEntry {
+            scope,
+            name: name.to_string(),
+            original,
+        });
+    }
+
+    /// cell の中身を書き換える前に、その cell の元の値を journal へ記録する。
+    ///
+    /// index 代入・push・pop など `Env` の外で `borrow_mut` するコードは、
+    /// 変更前に必ずこれを呼ぶ。COW により Value クローンはハンドル共有O(1)。
+    pub fn journal_cell(&mut self, cell: &SharedValue) {
+        let Some(journal) = self.journal.as_mut() else {
+            return;
+        };
+        let id = Rc::as_ptr(cell) as usize;
+        if !journal.seen_cells.insert(id) {
+            return;
+        }
+        let original = cell.borrow().clone();
+        journal.undo_log.push(UndoEntry::CellValue {
+            cell: Rc::clone(cell),
+            original,
+        });
     }
 
     /// 現在のcall frameから見えるスコープを内側→外側の順に返す
@@ -59,15 +177,18 @@ impl Env {
 
     /// 現在のスコープに変数を定義（新しい SharedValue セルを作成）
     pub fn set(&mut self, name: &str, value: Value) {
-        if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name.to_string(), Rc::new(RefCell::new(value)));
+        if let Some(scope) = self.scopes.len().checked_sub(1) {
+            // binding の追加・置換前に元エントリを journal へ記録する（AUD-024）。
+            self.journal_scope_entry(scope, name);
+            self.scopes[scope].insert(name.to_string(), Rc::new(RefCell::new(value)));
         }
     }
 
     /// 現在のスコープに既存の SharedValue セルを直接挿入（クロージャの参照共有用）
     pub fn set_shared(&mut self, name: &str, cell: SharedValue) {
-        if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name.to_string(), cell);
+        if let Some(scope) = self.scopes.len().checked_sub(1) {
+            self.journal_scope_entry(scope, name);
+            self.scopes[scope].insert(name.to_string(), cell);
         }
     }
 
@@ -76,6 +197,8 @@ impl Env {
     pub fn update(&mut self, name: &str, value: Value) -> Result<(), ()> {
         match self.get_cell(name) {
             Some(cell) => {
+                // cell の元値を journal へ記録してから書き換える（AUD-024）。
+                self.journal_cell(&cell);
                 *cell.borrow_mut() = value;
                 Ok(())
             }
@@ -322,5 +445,98 @@ mod tests {
 
         // 共有セル経由でも最新の値が見える
         assert_eq!(*cell.borrow(), Value::Int(42));
+    }
+
+    // --- AUD-024: submission transaction ---
+
+    #[test]
+    fn rollback_reverts_new_binding_and_assignment() {
+        let mut env = Env::new();
+        env.set("x", Value::Int(1));
+
+        env.begin_submission();
+        env.update("x", Value::Int(2)).unwrap(); // 既存cellの書換
+        env.set("y", Value::Int(9)); // 新規binding
+        env.rollback_submission();
+
+        assert_eq!(env.get("x"), Some(Value::Int(1)), "代入が巻き戻っていない");
+        assert_eq!(env.get("y"), None, "新規bindingが公開されたまま");
+    }
+
+    #[test]
+    fn commit_keeps_changes() {
+        let mut env = Env::new();
+        env.set("x", Value::Int(1));
+
+        env.begin_submission();
+        env.update("x", Value::Int(2)).unwrap();
+        env.set("y", Value::Int(9));
+        env.commit_submission();
+
+        assert_eq!(env.get("x"), Some(Value::Int(2)));
+        assert_eq!(env.get("y"), Some(Value::Int(9)));
+    }
+
+    #[test]
+    fn rollback_reverts_redeclaration_to_original_cell() {
+        // 再宣言は新cellを作る（AUD-016）。rollbackで元cellへ戻す。
+        let mut env = Env::new();
+        env.set("x", Value::Int(1));
+        let original = env.get_cell("x").unwrap();
+
+        env.begin_submission();
+        env.set("x", Value::Int(2)); // 再宣言 = 新cell
+        assert!(!Rc::ptr_eq(&original, &env.get_cell("x").unwrap()));
+        env.rollback_submission();
+
+        let restored = env.get_cell("x").unwrap();
+        assert!(
+            Rc::ptr_eq(&original, &restored),
+            "rollbackで元のcellへ戻っていない"
+        );
+        assert_eq!(*restored.borrow(), Value::Int(1));
+    }
+
+    #[test]
+    fn rollback_reverts_shared_cell_seen_by_closure() {
+        // closureが共有するcellの破壊的更新も巻き戻す。
+        let mut env = Env::new();
+        env.set("count", Value::Int(0));
+        let captured = env.get_cell("count").unwrap();
+
+        env.begin_submission();
+        env.update("count", Value::Int(100)).unwrap();
+        assert_eq!(*captured.borrow(), Value::Int(100));
+        env.rollback_submission();
+
+        assert_eq!(
+            *captured.borrow(),
+            Value::Int(0),
+            "共有cellが巻き戻っていない"
+        );
+    }
+
+    #[test]
+    fn journal_records_original_only_once_per_cell() {
+        // 同じcellを複数回変更しても、最初の元値へ戻る。
+        let mut env = Env::new();
+        env.set("x", Value::Int(1));
+
+        env.begin_submission();
+        env.update("x", Value::Int(2)).unwrap();
+        env.update("x", Value::Int(3)).unwrap();
+        env.rollback_submission();
+
+        assert_eq!(env.get("x"), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn no_journal_outside_submission() {
+        // トランザクション外の変更は記録されず、rollbackは何もしない。
+        let mut env = Env::new();
+        env.set("x", Value::Int(1));
+        env.update("x", Value::Int(2)).unwrap();
+        env.rollback_submission(); // journalなし: no-op
+        assert_eq!(env.get("x"), Some(Value::Int(2)));
     }
 }
