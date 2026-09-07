@@ -144,8 +144,9 @@ fn run_repl() {
         }
 
         // 実行。ステップ予算はREPL入力ごとに独立させる。
+        // 未捕捉エラーは入力が変更した language-state を巻き戻す（AUD-024）。
         context.reset_step_budget();
-        if let Err(errors) = execute(&engine, &input, &mut context) {
+        if let Err(errors) = execute_repl(&engine, &input, &mut context) {
             for e in &errors {
                 eprintln!("  エラー: {}", e);
             }
@@ -166,6 +167,22 @@ fn execute(
     let script = engine.compile(source)?;
     engine
         .execute(&script, context)
+        .map(|_| ())
+        .map_err(|error| vec![error])
+}
+
+/// REPL の1入力を実行する CLI 用アダプター（AUD-024）。
+///
+/// 未捕捉ランタイムエラーで終了した入力は、その入力が加えた language-state の変更を
+/// 入力開始時点へ巻き戻す。外部効果（stdout・ファイル書き込み等）は巻き戻さない。
+fn execute_repl(
+    engine: &Engine,
+    source: &str,
+    context: &mut ExecutionContext,
+) -> Result<(), Vec<TsumugiError>> {
+    let script = engine.compile(source)?;
+    engine
+        .execute_repl_submission(&script, context)
         .map(|_| ())
         .map_err(|error| vec![error])
 }

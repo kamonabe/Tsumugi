@@ -49,6 +49,20 @@ impl Engine {
         context.evaluator.run(&script.program)?;
         Ok(ExecutionOutcome::Completed)
     }
+
+    /// REPL の1入力をトランザクションとして実行する（AUD-024）。
+    ///
+    /// 未捕捉ランタイムエラーで終了した入力は、その入力が変更した全 language-state を
+    /// 入力開始時点へ巻き戻す。正常完了と catch されて完了した入力は commit する。
+    /// stdout やファイル書き込みなどの外部効果は巻き戻さない。
+    pub fn execute_repl_submission(
+        &self,
+        script: &CompiledScript,
+        context: &mut ExecutionContext,
+    ) -> Result<ExecutionOutcome, TsumugiError> {
+        context.evaluator.run_repl_submission(&script.program)?;
+        Ok(ExecutionOutcome::Completed)
+    }
 }
 
 /// パース済みで、実行可能な Tsumugi スクリプト。

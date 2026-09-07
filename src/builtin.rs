@@ -263,6 +263,8 @@ impl Evaluator {
                 let target_value = cell.borrow().clone();
                 let value = self.eval_expr(&args[1], line)?;
                 let updated = crate::builtin_core::builtin_push(&[target_value, value], line)?;
+                // 書き戻し前に元値を記録する（AUD-024）。
+                self.env.journal_cell(&cell);
                 *cell.borrow_mut() = updated;
                 Ok(Some(Value::Null))
             }
@@ -278,6 +280,8 @@ impl Evaluator {
                 let value =
                     crate::builtin_core::builtin_pop(std::slice::from_ref(&target_value), line)?;
                 let updated = crate::builtin_core::builtin_pop_update(&[target_value], line)?;
+                // 書き戻し前に元値を記録する（AUD-024）。
+                self.env.journal_cell(&cell);
                 *cell.borrow_mut() = updated;
                 Ok(Some(value))
             }

@@ -110,6 +110,38 @@ impl Evaluator {
         result
     }
 
+    /// REPL の1入力をトランザクションとして実行する（AUD-024）。
+    ///
+    /// 未捕捉ランタイムエラーで終了した入力は、その入力が変更した全 language-state
+    /// （binding、cell の値、index 代入、push/pop、import marker）を入力開始時点へ
+    /// 巻き戻す。正常完了と、入力内で catch されて最終的に正常完了したエラーは commit
+    /// する。stdout やファイル書き込みなどの外部効果は巻き戻さない。
+    ///
+    /// link 失敗（読み込み・parse・sandbox・深度）は最初の文を実行する前に報告され、
+    /// この場合 language-state は変化していないため journal は空のまま破棄される。
+    pub fn run_repl_submission(&mut self, program: &Program) -> Result<(), TsumugiError> {
+        self.env.begin_submission();
+        let (linked, newly_loaded) = match self.loader.link(program) {
+            Ok(linked) => linked,
+            Err(e) => {
+                // link はまだ language-state を変えていない。journal を破棄する。
+                self.env.commit_submission();
+                return Err(e);
+            }
+        };
+        let target = linked.as_ref().unwrap_or(program);
+        let result = self.exec_program(target);
+        if result.is_err() {
+            // language-state を入力開始時点へ戻す。
+            self.env.rollback_submission();
+            // 実行が完了しなかったmoduleは解決済みにしない（同じパスを再試行できる）。
+            self.loader.forget(&newly_loaded);
+        } else {
+            self.env.commit_submission();
+        }
+        result
+    }
+
     fn exec_program(&mut self, program: &Program) -> Result<(), TsumugiError> {
         validate_program_depth(program)?;
         for stmt in program {
@@ -159,6 +191,8 @@ impl Evaluator {
                 let idx = self.eval_expr(index, *line)?;
                 let val = self.eval_expr(value, *line)?;
 
+                // REPL transaction のため、cellのin-place変更前に元値を記録する（AUD-024）。
+                self.env.journal_cell(&cell);
                 // 更新はcellへのin-place代入。index/valueの評価中に同じbindingが
                 // 変更されていても、その最新状態に対して書き込む。
                 crate::builtin_core::assign_index(&mut cell.borrow_mut(), &idx, val, *line)?;

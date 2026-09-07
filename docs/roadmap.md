@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-09-03
+最終更新: 2026-09-07
 
 ## プロジェクトの方向性
 
@@ -51,7 +51,7 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 |---|---|---|---|
 | AUD-004 | VMの`locals_cells`をREPL入力・try unwindで正しく保存／復元する | 入力ごとにtop-level cell対応が消え、closureと変数が別値になる。try内localのcellがcatch変数slotと衝突する | ✅ 完了（cell同一性・catch回帰テスト追加） |
 | AUD-005 | treeのwhile/forでエラー時もscopeを必ず解放する | ループ内エラーをcatchすると反復localが後続処理・次REPL入力から見える | ✅ 完了（caught error回帰テスト追加） |
-| AUD-006 | import失敗時の`base_dir`・loading/loaded marker・compiler状態を復元する | 同一fileの再試行がsilent skip。VMでは次の相対import基準やlocalsも汚染する | ✅ 失敗rollback完了。import・REPLの状態commit方針はAUD-024で継続 |
+| AUD-006 | import失敗時の`base_dir`・loading/loaded marker・compiler状態を復元する | 同一fileの再試行がsilent skip。VMでは次の相対import基準やlocalsも汚染する | ✅ 失敗rollback完了。import・REPLの状態commit方針もAUD-024で完了（未捕捉errorで全language-stateをrollback、正常・catch済み完了はcommit） |
 | AUD-007 | 非トップレベルimportの意味論を統一する | VMはcompile-time inlineのためfalse branchでもloaded扱い、loopでは複数実行、関数内relative path/control-flowもtreeと異なる | ✅ トップレベル限定として統一（全ネスト構文のparserテスト・tree/VM回帰テスト追加） |
 | AUD-008 | `if` / `try` / `catch`のscope仕様を確定し両engineを統一する | treeではblock内`let`が外から可視、VMではcompile error。公開ガイドの「ifはscopeを作らない」とVMが不一致 | ✅ 独立block scopeへ統一（shadowing・error/control-flow・closure・REPL回帰テスト追加） |
 | AUD-009 | tree REPLのstep予算を入力単位でresetする | step数がセッション全体で累積し、一度上限に達すると以後の入力も失敗。VMと不一致 | ✅ 完了（入力間回帰テスト追加） |
@@ -79,7 +79,7 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 | AUD-021 | language-spec / LANG_GUIDE / designのdriftを解消する | engine parity・Float完全一致・全module unit test・coverage/benchmark gate等の記載が現実装やAUD残件と矛盾する | 🟡 規範仕様と既知非適合、VMの実験的位置付け、sandbox制約、予約語、循環参照を更新。意味論確定後の更新は継続 |
 | AUD-022 | REPL・differential・limit境界・defensive VMテストを追加する | subprocess timeoutなし、error goldenが部分一致、fixture登録が手動、tree/VMが固定`/tmp`を共有して並列raceする。厳密なstderr/stdout副作用比較も不足 | 🟡 設計確定・部分実装（harness、timeout、完全一致、temp分離は完了。[検証・リリース・運用設計](verification-release-operations.md)のmatrix/fuzz/stressは未実装） |
 | AUD-023 | VMのunchecked index/`unwrap()`を構造化internal errorへ置換する | compiler/VM invariantが崩れるとhost panic。AUD-001/002でユーザー入力から到達可能だった。`Vm::new` / `run_repl_chunk`は任意の`Chunk`を受け取るため、library利用では範囲外のslot・定数・upvalue・行番号表の不足・operandのunderflowでindex panicへ到達した | ✅ 完了（frame/stack/upvalue/定数/命令参照を検査付きヘルパー経由にし、`unreachable!`も含め本番コードから`unwrap`を排除。公開APIだけで書いた`tests/defensive_vm.rs`で8ケースを固定し、修正前はindex panicで失敗することを確認） |
-| AUD-024 | import・REPLの状態commit方針を明文化する | 未捕捉error前の代入/list mutation/upvalue更新を保持するかrollbackするか未定義。外部I/Oはrollback不能 | 🟡 設計確定・未実装（[次期意味論・実装決定](semantic-decisions.md)第7節・[実行予算・協調実行仕様](execution-control.md)第10節。`Completed` / `Exited`だけ全language-stateをcommitし、その他terminalは開始時点へrollback。完了済み外部効果はrollbackしない） |
+| AUD-024 | import・REPLの状態commit方針を明文化する | 未捕捉error前の代入/list mutation/upvalue更新を保持するかrollbackするか未定義。外部I/Oはrollback不能 | ✅ 完了（tree/VMとも未捕捉errorで全language-state（binding・cell値・index代入・push/pop・import marker）を入力開始時点へrollback。正常完了とcatch済み完了はcommit。外部効果はrollbackしない。first-write undo logで実装し記録量は変更箇所数に比例。仕様revisionを0.15へ。deadline/budget/cancel由来のrollbackはPhase 3/4で別追跡） |
 | AUD-025 | VM REPL checkpointの複製コストを削減する | 入力ごとの`stack.clone()`が保持中List/Dictをdeep cloneし、時間・一時メモリがREPL状態量に比例する | ✅ 完了（stack全体cloneを初期長と変更済みslotのmutation logへ置換。通常入力は保持中List/Dictを複製せず、既存slotの書換・削除時だけrollback用の元値を記録して未捕捉エラー時に復元） |
 | AUD-033 | 未完結REPL入力のEOFを診断する | `if true`等の継続入力中にEOFを送ると、tree/VMとも構文エラーを出さずbufferを破棄して終了コード0になる | 🟡 設計確定・未実装（両engineで再現済み。[次期意味論・実装決定](semantic-decisions.md)第8節） |
 | AUD-034 | `path_join`の引数型契約を厳格化する | `path_join("a", 123, "b")`が型エラーにならず`a/b`を返し、非文字列argumentを無言で欠落させる | 🟡 設計確定・未実装（同第9節: 全argumentをStrとして検査） |
@@ -239,7 +239,7 @@ tree側は旧スナップショットより遅くなっている（`fib_20` 14.9
 | AUD-019 | 確定済み | operation別の単一constructorからcanonical kind/message/line/traceを生成し、backend固有診断とmessage推測を廃止 | [次期意味論・実装決定](semantic-decisions.md)第3節 | ✅ 完了（language core分）。operation別constructorへ全移行、`classify_runtime_error`削除、tree/VM完全一致をinventory/pairedテストで固定。host adapter error（HostErrorSpec）はPhase 2で別追跡 |
 | AUD-020 | 確定済み | Tsumugi単体をsecurity boundaryとせず、filesystemはportable path-handleで認可と利用をbindし、TOCTOU・oracle・dangling symlinkを受入試験化 | [脅威モデル](threat-model.md) TM-002〜004・第11節、[Capability Model仕様](capability-model.md)第8節・CAP-AT-10〜14 | 部分実装。現行制約の文書化のみ完了、path-handle未実装 |
 | AUD-022 | 確定済み | timeout/golden/differential/limit/defensive matrixに加え、fuzz・stress・failure injection・資源制約gateを段階導入 | [検証・リリース・運用設計](verification-release-operations.md)第4〜6・17節 | 部分実装。harness、timeout、完全一致、temp分離は完了。matrix/fuzz/stressは未実装 |
-| AUD-024 | 確定済み | `Completed` / `Exited`だけ全language-stateをcommitし、その他terminalはexecution開始時点へrollbackする。catch済みerror後に最終完了した実行はcommitする。stdout/filesystem/network/DB/host function等の完了済み外部効果はrollbackしない | [次期意味論・実装決定](semantic-decisions.md)第7節、[実行予算・協調実行仕様](execution-control.md)第10節、[組み込みAPI仕様](embedding-api.md)第10節 | 未実装。現行REPLの内部構造rollbackだけ実装済みで、全language-state契約は未達 |
+| AUD-024 | 確定済み | `Completed` / `Exited`だけ全language-stateをcommitし、その他terminalはexecution開始時点へrollbackする。catch済みerror後に最終完了した実行はcommitする。stdout/filesystem/network/DB/host function等の完了済み外部効果はrollbackしない | [次期意味論・実装決定](semantic-decisions.md)第7節、[実行予算・協調実行仕様](execution-control.md)第10節、[組み込みAPI仕様](embedding-api.md)第10節 | ✅ 完了（REPL submissionの未捕捉errorで全language-stateをrollback、正常完了・catch済み完了はcommit、外部効果はrollbackしない。first-write undo logで記録量は変更箇所数に比例。deadline/budget/cancel terminalはPhase 3/4で別追跡） |
 | AUD-034 | 確定済み | `path_join`は全argumentをStrとして検査し、非Strを無言で欠落させない | [次期意味論・実装決定](semantic-decisions.md)第9節 | 未実装。なおglobalを含む同一scopeの`let`再宣言をfresh cellにする決定（同文書第4節のAUD-016）は✅実装完了済み |
 | AUD-036 | 確定済み | `exit`、file size、Float→Intのlossy変換を共通checked helperで拒否し、valid `exit`は構造化`Exited`にする | [次期意味論・実装決定](semantic-decisions.md)第10節 | 未実装。なおloop変数をiterationごとのfresh cellにする意味論はAUD-010で実装・完了済み |
 | AUD-045 | 確定済み | MSRVをRust 1.97とし、stable/MSRV CI、install/release、6 platform artifact、署名・SBOM・OCI、参照用Kubernetes Jobの順序とgateを固定 | [検証・リリース・運用設計](verification-release-operations.md)第3〜10・17〜18節 | 未実装。現行はrolling stable、release/install workflow・OCI・manifestなし |
@@ -250,7 +250,7 @@ tree側は旧スナップショットより遅くなっている（`fib_20` 14.9
 ### 設計sliceに沿う推奨実装順
 
 1. **基準固定:** [次期意味論・実装決定](semantic-decisions.md)第17節の基準固定と、現行非適合fixtureを維持する。文書の設計確定を実装完了として扱わない。
-2. **意味論基盤:** 内部refactor → ~~AUD-050/017深度統合~~（✅ 完了） → ~~AUD-049単一BuiltinSpec~~（✅ 完了） → ~~AUD-019 canonical error~~（✅ 完了） → ~~AUD-047 COW~~（✅ 完了）/~~AUD-048 FunctionId~~（✅ 完了） → ~~AUD-016 binding~~（✅ 完了）/AUD-024 transaction → AUD-034/036/018/033境界挙動の順で進める。
+2. **意味論基盤:** 内部refactor → ~~AUD-050/017深度統合~~（✅ 完了） → ~~AUD-049単一BuiltinSpec~~（✅ 完了） → ~~AUD-019 canonical error~~（✅ 完了） → ~~AUD-047 COW~~（✅ 完了）/~~AUD-048 FunctionId~~（✅ 完了） → ~~AUD-016 binding~~（✅ 完了）/~~AUD-024 transaction~~（✅ 完了） → AUD-034/036/018/033境界挙動の順で進める。
 3. **Phase 1 embedding:** [組み込みAPI仕様](embedding-api.md) E1〜E6→E8a。最終terminal型のsubsetを使い、先行公開型を作らない。
 4. **Phase 2 capability:** E7→E8bと[Capability Model仕様](capability-model.md) C1→C2、C3/C4/C5/C7、C6、C8、最後にC9/C10。現行ambient accessを削除するまで完了扱いにしない。
 5. **Phase 3/4 control:** E11/C11で有限budget・transactionを完成し、その後E12/C12でcooperative state machine、yield/pause/resume、admission/backpressureを実装する。
