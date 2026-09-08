@@ -1,6 +1,6 @@
 # Tsumugi — 次期意味論・実装決定
 
-最終更新: 2026-08-31
+最終更新: 2026-09-08
 
 設計ステータス: **次期仕様確定・未実装**
 
@@ -1482,26 +1482,400 @@ HTTPは新規optional機能であり、adapter未登録contextでは名前未定
 - canonical host call lifecycle、capability decision、terminalのaudit欠落がなく、sink failure時にfail-closedとなる。
 - default context/CLIからnetworkへ到達できない。
 
-## 17. 実装順
+## 17. 詳細レビュー由来の追加設計（REV-003 / 004 / 005 / 009 / 012 / 021）
+
+本節は [`semantic-review/Tsumugi-detailed-review-20260907.md`](../semantic-review/Tsumugi-detailed-review-20260907.md) の指摘のうち、レビュー時点で**設計が不足していた（設計欄が △ または ×）6件**の次期実装仕様を定める。レビューが「検討◎/設計◎、実装のみ未」とした指摘（REV-001/002/006/007/013/014/015/016/017/018/019/020/022/023/024/025）は、既存の各設計文書と本書の該当節を正本とし、実装バックログへ直結させる。それらへ本節で新しい決定を追加しない。
+
+レビュー第9.3節の方針に従い、既存 AUD 番号を再割り当てせず、本節の各項目を REV 由来の新規追跡項目として扱う。REV-012 だけは既存の第5節（AUD-017）が正本であり、本節は第5節との整合と status/doc drift の解消のみを扱う。
+
+### 17.1 数値の厳密比較（REV-003）
+
+#### 17.1.1 採用判断
+
+Int–Float の比較と等価判定は、Int を `f64` へ丸めず、**数学的に厳密な順序**を返す。tree・VM・`PartialEq`・関係演算子・`contains`・`min`・`max`・sort key 生成が、共通の 1 実装 `NumericOrder` を経由する。
+
+```text
+NumericOrder::compare(&Value, &Value) -> Result<NumericOrdering, TypeError>
+NumericOrdering = Less | Equal | Greater | UnorderedNaN
+```
+
+規範挙動は次のとおり。
+
+- `Int(a)` と `Int(b)` は整数として比較する。
+- `Float(a)` と `Float(b)` は IEEE 754 binary64 として比較し、NaN が絡む比較は `UnorderedNaN`。
+- `Int(a)` と `Float(b)` は、Float を「符号・指数・仮数」へ分解して、丸めなしで整数側と厳密比較する。有限 Float は数学的実数値として、`±Infinity` は全ての有限 Int より大小が確定、NaN は `UnorderedNaN`。
+- 等価は `compare` が `Equal` を返す場合だけ true。`UnorderedNaN` は等価でも大小でもない。
+- `min` / `max` は比較後に**選択された元の operand を、その型のまま**返す（Int を Float へ変換して返さない）。同値時は第 1 引数を返す。入力に NaN を含む場合は canonical NaN（`Float(f64::NAN)`）を返す。
+
+これにより `2^53` 近傍で `a == f` かつ `f == b` だが `a != b` となる非推移性（レビュー REV-003 の例）が解消し、等価は対称・推移的、比較は反対称になる。
+
+#### 17.1.2 却下案
+
+- **現行どおり `i64 as f64` で比較する**: `2^53` 超で桁落ちし、等価の推移性と比較の反対称性が崩れるため却下する。
+- **Int を常に Float 化した値で `min/max` の結果も返す**: 正確な Int operand の値を失うため却下する。
+- **`f64 as i64` で Float 側を丸めてから整数比較する**: 小数部・範囲外・NaN/Inf の順序が壊れるため却下する。
+
+#### 17.1.3 データモデル / アルゴリズム
+
+`i64` と `f64` の厳密比較は次で行う。丸め・浮動小数演算を経由しない。
+
+```text
+compare_int_float(i: i64, f: f64) -> NumericOrdering:
+  f が NaN               -> UnorderedNaN
+  f が +Infinity         -> Less        # i < +inf
+  f が -Infinity         -> Greater     # i > -inf
+  f を (sign, mantissa_int, exponent) へ分解し、
+  f == trunc(f) でなければ、trunc(f) と i を整数比較して、
+    等しければ小数部の符号で決着（正の小数部なら f>trunc、負なら f<trunc）
+  f == trunc(f) なら trunc(f) を i128/u128 magnitude で表現し i と厳密比較
+```
+
+実装は `f64::to_bits()` から `sign / exponent / significand` を取り出し、`f.fract()` と `f.trunc()` を使って整数部と小数部を分離してよい（丸めではなく分離であり厳密）。`i64` は `i128` へ widen して比較する。中間に `f64` へ戻す経路を持たない。
+
+#### 17.1.4 tree / VM 変更箇所
+
+- `src/value.rs`: `PartialEq` の `Int×Float` / `Float×Int` 分岐を `NumericOrder::compare` の `Equal` 判定へ置換する。
+- 新規 `NumericOrder`（`src/value.rs` もしくは専用 module）: tree・VM・builtin から参照する単一実装。
+- `src/eval.rs`: 関係演算子（`<`,`<=`,`>`,`>=`）の混合数値比較を共通 helper へ。
+- `src/vm.rs`: relational opcode の混合数値比較を同じ helper へ。
+- `src/builtin_core.rs`: `contains` の要素一致、`min` / `max` の比較と戻り値選択、sort key 生成の数値比較を共通 helper へ。
+
+#### 17.1.5 error
+
+比較不能な型組合せ（数値でない型どうしの大小比較など）は既存の第3.4節「大小比較の対象型不正」の `type` error を維持する。等価比較は従来どおり型エラーにせず、異型は非等価。NaN 比較は error ではなく `false`（大小・等価とも）。
+
+#### 17.1.6 移行
+
+`2^53` を超える Int と Float を等価・大小比較していた source は結果が変わる（従来 true だったものが false になり得る）。厳密値へ移行する。`min` / `max` の戻り値型が「Int を渡せば Int のまま」返るようになる点も移行対象。
+
+#### 17.1.7 テスト行列
+
+- 値境界: `±(2^53-1)`, `±2^53`, `±(2^53+1)`, `i64::MIN`, `i64::MAX`
+- 各整数近傍の `next_up` / `next_down` 相当 Float
+- `-0.0`, `0.0`, NaN, `±Infinity`
+- property: 等価の対称性・推移性、comparator の反対称性
+- `min`/`max` の戻り値型と tie 規則、NaN 入力
+- tree / VM / `PartialEq` / relational / contains / min / max / sort で結果一致
+
+#### 17.1.8 受入基準
+
+- 対象経路に `i64 as f64` / `f64 as i64` の混合比較 cast がない。
+- 等価が対称・推移的、比較が反対称であることを property test が示す。
+- tree / VM の値・error・sort 順が全境界で一致する。
+
+### 17.2 `Chunk::patch_jump` の fallible 化と builder 封印（REV-004）
+
+#### 17.2.1 採用判断
+
+`Chunk` の可変 builder API（`emit` / `emit_jump` / `patch_jump` / `add_constant` 等）を公開 panic 面から外す。二段構えとする。
+
+1. **最終形**: `ChunkBuilder` を `pub(crate)` にし、公開する `Chunk` は immutable かつ検証済み（REV-005/006 の `VerifiedChunk` へ接続）とする。raw builder は `unstable-bytecode` feature でのみ公開する。
+2. **最小修正（先行可）**: `patch_jump` を `panic!` しない `Result` へ変更する。
+
+```text
+patch_jump(&mut self, offset: usize) -> Result<(), ChunkBuildError>
+  code.get_mut(offset) が None            -> Err(BadOffset)
+  対象が Jump 系 opcode でない            -> Err(NotAJump)
+  それ以外                                -> addr を現在位置へ設定して Ok
+```
+
+`ChunkBuildError` は `BadOffset` / `NotAJump` を持つ列挙型とし、builder エラーは呼び出し元 compiler が内部エラーとして扱う（script からは到達しない）。
+
+#### 17.2.2 却下案
+
+- **`patch_jump` の panic を維持する**: 公開 API から host を panic させられ、`tests/defensive_vm.rs` の「公開 API へ任意 Chunk を渡しても host panic しない」方針に反するため却下する。
+- **`offset` を無検査 index のまま assert だけ足す**: release build で assert が消え未定義寄りの挙動になるため却下する。
+
+#### 17.2.3 tree / VM 変更箇所
+
+- `src/chunk.rs`: `patch_jump` を `Result` 化。builder 系メソッドの可視性を段階的に `pub(crate)` へ縮小する。
+- `src/compiler.rs`: `patch_jump` の呼び出しを `?` 伝播へ変更し、builder エラーを compiler 内部エラーへ写像する。
+- `src/lib.rs`: `chunk` module の公開範囲を縮小し、raw builder は feature gate 下へ移す（REV-018 と共通の封印作業）。
+
+#### 17.2.4 error
+
+builder エラーが VM 実行時まで漏れた場合（防御的経路）は第3.4節「VM/Compiler 不変条件違反」の `internal` / `内部エラー: {stable_detail}` を用いる。`{stable_detail}` に offset 生値を入れない。
+
+#### 17.2.5 テスト行列
+
+- `offset == len`, `usize::MAX`, 通常 opcode, 全 jump variant
+- `catch_unwind` で panic が発生しないこと
+- builder error 発生時に `code` / `lines` が部分破損しないこと
+
+#### 17.2.6 受入基準
+
+- 公開経路から `patch_jump` で panic しない。
+- 不正 offset / 非 jump opcode が `Result::Err` になる。
+- builder 縮小後、通常 compile 経路の観測挙動が変わらない。
+
+### 17.3 `MakeClosure` capture 記述子の明示化（REV-005）
+
+#### 17.3.1 採用判断
+
+closure の capture を、`MakeClosure` 直前の隣接 opcode 列から逆算する現行方式をやめ、**関数プロトタイプが capture 記述子を明示的に持つ**方式へ変更する。
+
+```text
+FunctionPrototype {
+    chunk: Rc<VerifiedChunk>,
+    captures: Box<[CaptureDesc]>,
+}
+CaptureDesc = Local(u32) | Upvalue(u32)
+```
+
+`MakeClosure` はプロトタイプ index だけを operand に持ち、capture の解釈は記述子から直接行う。現行の `(true, usize::MAX)` フォールバック（不正 operand を Null cell として黙認する経路）を廃止し、記述子が local/upvalue 範囲外・不整合なら即 `internal` error とする。範囲検証は REV-006 の verifier が担い、VM 実行時は defense-in-depth として再検査する。
+
+#### 17.3.2 却下案
+
+- **隣接 opcode からの逆算を維持し、不一致だけ error にする**: 命令列の並びに依存する暗黙契約が残り、verifier と二重管理になるため却下する。
+- **不正記述子を現行どおり Null cell で握りつぶす**: 壊れた capture を持つ closure が「成功」してしまい、観測挙動が未定義化するため却下する。
+
+#### 17.3.3 データモデル / 状態遷移
+
+compiler は各関数定義について capture 集合を確定し、`FunctionPrototype.captures` へ格納する。VM は `MakeClosure(proto_index)` で:
+
+```text
+proto = current_chunk.prototypes[proto_index]   # 範囲は verifier 済み
+for cap in proto.captures:
+  Local(slot)    -> 親フレームの local cell を共有（slot は verifier 済み）
+  Upvalue(index) -> 親フレームの upvalue cell を共有（index は verifier 済み）
+Null フォールバックは持たない
+```
+
+#### 17.3.4 tree / VM 変更箇所
+
+- `src/opcode.rs`: `MakeClosure` の operand を「upvalue 数」から「プロトタイプ index」へ変更する。
+- `src/value.rs`（VmFn 表現）: 関数値がプロトタイプ / capture 記述子を参照する形へ変更する。
+- `src/compiler.rs`: capture 記述子を明示生成し、`GetLocal`/`GetUpvalue` 列の暗黙契約を廃止する。
+- `src/vm.rs`: `MakeClosure` 処理を記述子ベースへ置換し、`usize::MAX` フォールバックと Null cell 生成を削除する。tree 版 closure 生成と観測挙動を一致させる。
+
+これは opcode と関数値表現の変更を伴うため、REV-006（verifier / VerifiedChunk）と同一マイルストーンで実施する。
+
+#### 17.3.5 error
+
+記述子不正が実行時まで到達した場合は第3.4節「VM/Compiler 不変条件違反」の `internal` を用いる。capture 範囲外は verifier が compile/link 段で拒否する。
+
+#### 17.3.6 テスト行列
+
+- 正常系: 0 capture / 単一 local / 単一 upvalue / 多段 upvalue / 複数 capture
+- 異常系（raw bytecode）: 記述子の local/upvalue 範囲外、記述子順序不正、対応する cell が無い
+- 不正列が「成功」も「Null 補完」もされないこと
+- tree / VM で closure の観測挙動一致
+
+#### 17.3.7 受入基準
+
+- capture が隣接 opcode 列でなく明示記述子で決まる。
+- 不正記述子が Null cell へ黙殺されず、verifier または内部 error で止まる。
+- 正常な多段 capture が tree / VM 一致する。
+
+### 17.4 `list_dir` の部分失敗と非 UTF-8 名の扱い（REV-009）
+
+#### 17.4.1 採用判断
+
+`list_dir` は、ディレクトリ列挙開始後の**個別 entry 取得失敗を黙殺しない**。safe profile では entry error が 1 件でもあれば、部分結果を成功 List として返さず、構造化した host error にする。非 UTF-8 の entry 名を lossy 変換して同一視しない。
+
+- 個別 entry 取得失敗: `host` error（category は `directory_read`）。
+- 非 UTF-8 の entry 名: safe profile では entry 名を String として返せないため、`host` error（category は `invalid_encoding`）とする。将来 opaque entry ID / Bytes 型を導入する場合はそちらで表現する。
+- legacy profile では現行互換（失敗時 Null、lossy 名）を adapter 層で提供してよいが、capability denial を Null へ畳まない。
+- 列挙は snapshot とし、ordering・件数・bytes budget を adapter 契約に含める（budget は REV-015 / execution-control 側の実装に接続）。
+
+これは次期 Capability Model の `DirectoryEntry.name`（検証済み String, `capability-model.md`）とも整合させる。
+
+#### 17.4.2 却下案
+
+- **`entries.flatten()` のまま部分結果を返す**: 「存在しない」という誤認を成功として返すため却下する。
+- **非 UTF-8 名を `to_string_lossy` で返し続ける**: 異なる byte 名が同一表示へ写像され、path identity・audit・replay が壊れるため却下する。
+- **部分結果を `{ entries, incomplete }` として通常 List に見せる**: 通常 List への偽装であり、業務処理が incomplete を見落とすため却下する（構造化する場合は明示型で返す）。
+
+#### 17.4.3 データモデル / 状態遷移
+
+```text
+list_dir(path):
+  authorize(path)                 # capability 拒否は sandbox/capability error（Null にしない）
+  read_dir 失敗                    -> safe: host(directory_read) / legacy: Null
+  各 entry:
+    取得失敗                       -> safe: host(directory_read) / legacy: skip
+    file_name が非 UTF-8           -> safe: host(invalid_encoding) / legacy: lossy 文字列
+    件数/bytes budget 超過         -> collection_limit / budget（既存契約）
+  snapshot を確定し ordering 済み List を返す
+```
+
+#### 17.4.4 tree / VM 変更箇所
+
+- `src/builtin_core.rs`: `builtin_list_dir` の `entries.flatten()` を、各 entry の `Result` を検査する形へ変更する。`to_string_lossy` を廃し、非 UTF-8 は profile に応じて error か legacy 変換にする。
+- profile 判定は capability / ExecutionContext 側の safe/legacy に接続する（REV-014 の request 化と同一基盤）。
+- tree / VM は同じ registry / handler（AUD-049）を共有し固有処理を持たない。
+
+#### 17.4.5 error
+
+- entry 取得失敗: `host` / `host function の実行に失敗しました: list_dir (directory_read)`
+- 非 UTF-8 名（safe）: `host` / `host function の実行に失敗しました: list_dir (invalid_encoding)`
+- line は `list_dir(...)` call 式。OS の生 message を埋め込まない。
+
+第3.4節の host error inventory へ上記 category を追記する。
+
+#### 17.4.6 移行
+
+「一部 entry が欠けた List が成功で返る」挙動、および非 UTF-8 名が置換文字列で返る挙動に依存した source は変わる。legacy profile で当面の互換を取る。
+
+#### 17.4.7 テスト行列
+
+- 個別 entry error を 2 件目だけ注入（adapter fake）
+- Unix の異なる invalid-byte 名が同じ lossy 文字列になる case
+- partial success を成功 List として返さないこと
+- ordering と budget N / N+1
+- safe / legacy profile 差
+- tree / VM 一致
+
+#### 17.4.8 受入基準
+
+- entry error が 1 件でもあれば safe profile で成功 List を返さない。
+- 非 UTF-8 名を lossy 変換して同一視しない。
+- capability denial を Null へ畳まない。
+- tree / VM の結果・error・ordering が一致する。
+
+### 17.5 user call 評価順の整合と status drift 解消（REV-012）
+
+#### 17.5.1 位置づけ
+
+user call の最終評価順の正本は第5節（AUD-017）§5.1 および第3.7節 error precedence 表であり、本節はそれらを**新しく変更しない**。REV-012 が指摘するのは実装ではなく、次の drift である。
+
+1. 現行 `language-spec.md`・現行実装は「step/depth 検査 → callee 評価」（callee 評価前に検査）である。
+2. `src/limits.rs` の doc comment と本書 §5.1/§5.6・第3.7節は「callee を先に評価・分類し、user callable だけ step/depth 検査」（callee 先行）を次期契約とする。
+3. `roadmap.md` は AUD-017 / AUD-050 を「完了」と表示するが、これは深度計数値（127→128）の統一を指し、error precedence の callee 先行化は未実装である。
+
+つまり「境界値の統一は実装済み」「callee 先行への precedence 変更は未実装」の 2 つが 1 つの完了表示に畳まれていることが問題である。
+
+#### 17.5.2 決定
+
+- 最終意味論は第5節どおり **callee 先行**を維持する（builtin/host function を user 深度で拒否せず、動的 callee の種類を確定してから適切な budget を選べるため）。これは callee の副作用が limit error より前に発生し得る破壊的変更であり、`LanguageRevision` を上げて実施する。
+- `src/limits.rs` の doc comment は「current（callee 評価前検査）」と「target（callee 先行）」を混在させず、どちらの revision の契約かを明記する。実装が現行のうちは current を、切替 commit で target へ更新する。
+- roadmap の AUD-017 / AUD-050 status を、単一の「完了」から次の 2 sub-status へ分割する。
+  - `depth-counting`（128 user frame 統一）: verified
+  - `callee-precedence`（callee 先行への precedence 変更）: planned
+- tree / compiler / VM / callback の評価順切替は同一 commit で行い、backend 差を残さない。
+
+status 表現は §19（文書全体の最終受入基準）および REV-011（メタデータ単一正本、`roadmap.md`）の機械可読 status で管理し、手作業同期の再 drift を避ける。
+
+#### 17.5.3 tree / VM 変更箇所
+
+- `src/limits.rs`: doc comment を current/target 明記へ修正する。
+- `src/eval.rs` / `src/compiler.rs` / `src/vm.rs`: callee 先行化を実施する commit で、callee 評価 → callable 分類 → user callable だけ step/depth → arity → args 左→右 → frame/body の順へ揃える。
+- `docs/roadmap.md`: AUD-017 / AUD-050 の status を `depth-counting=verified` / `callee-precedence=planned` へ分割する。
+
+#### 17.5.4 error
+
+precedence 変更後も error kind/message/line は第3.4・3.5・3.7節どおり。深度上限は `overflow` / `スタックオーバーフロー: 再帰が深すぎます (上限: 128)`、line は拒否された call 式。
+
+#### 17.5.5 移行
+
+callee の副作用が limit error より前に発生する（従来は検査で先に止まっていた）。callee 式の副作用順に依存する source はこの規則へ移行する。builtin / host function 呼び出しは user depth 128 でも拒否されない点も §5.6 のとおり。
+
+#### 17.5.6 テスト行列
+
+- callee に counter 更新を持つ式（budget 0 / depth 128 で callee 副作用の有無）
+- non-callable / wrong arity で argument 非評価
+- builtin / host function / callback の分類
+- tree / VM の stdout・state・error kind/message/line 完全一致
+
+#### 17.5.7 受入基準
+
+- tree / VM が callee 先行の同一順序で評価する。
+- `limits.rs` doc comment が current/target を混在させない。
+- roadmap の AUD-017 / AUD-050 status が 2 sub-status へ分かれ、`callee-precedence` が verified になるまで「完了」と表示しない。
+
+### 17.6 `remove_dir` の再帰削除と capability の整合（REV-021）
+
+#### 17.6.1 採用判断
+
+現行 `remove_dir` は `std::fs::remove_dir_all`（中身ごと再帰削除）だが、次期 Capability Model は `remove_dir` を `RemoveKind::EmptyDirectory` へ割り当てている。この不整合を、`EmptyDirectory` 権限で再帰削除を許してしまう（過大権限）／非空で突然失敗する（契約違反）のどちらにもしないため、**操作を分割する**。
+
+- 次期 revision で `remove_dir(path)` を**空ディレクトリのみ**削除へ変更する（`std::fs::remove_dir` 相当）。非空なら error。必要 capability は `EmptyDirectory`。
+- 再帰削除は新規 builtin `remove_tree(path)` として分離し、専用 capability `RecursiveDelete` を要求する。`remove_dir` へ `EmptyDirectory` から暗黙昇格させない。
+- `remove_tree` は entry 件数 / depth / bytes / fuel / deadline / cancel / audit を持つ（budget・cancel は REV-015 / execution-control 側に接続）。final symlink と中間 symlink の扱いを明示する（symlink 自体を削除し、リンク先を辿って再帰削除しない）。
+
+互換を優先する代替として「`RemoveKind::RecursiveTree` を明示追加して `remove_dir` へ割り当てる」案もあるが、`remove_dir` の名前と再帰削除の危険度が一致しないため、分割案を第一候補とする。
+
+#### 17.6.2 却下案
+
+- **現行 `remove_dir_all` のまま `EmptyDirectory` capability へ接続する**: 空ディレクトリ権限で再帰削除を許す過大権限になるため却下する。
+- **`remove_dir` を空のみへ変えるが再帰削除手段を用意しない**: 既存の再帰削除ユースケースを失うため、`remove_tree` を同時に用意する。
+- **`EmptyDirectory` へ暗黙で再帰権限を含める**: capability の最小付与原則に反するため却下する。
+
+#### 17.6.3 データモデル / 状態遷移
+
+```text
+remove_dir(path):
+  authorize(path, EmptyDirectory)
+  std::fs::remove_dir(safe_path)      # 非空なら OS error -> 契約に従い false もしくは host error
+  symlink は remove_dir で扱わず remove（FileOrSymlink）側の責務
+
+remove_tree(path):
+  authorize(path, RecursiveDelete)
+  walk しながら entry 件数/depth/bytes/fuel/deadline/cancel を消費
+  中間・final symlink はリンクを辿らずリンク自体を削除
+  audit に削除対象数と partial effect を記録
+```
+
+戻り値契約（Null/false vs 構造化 error）は REV-022 の profile 方針に従い、safe profile では denial と OS 失敗を区別する。
+
+#### 17.6.4 tree / VM 変更箇所
+
+- `src/builtin_core.rs`: `builtin_remove_dir` を `remove_dir_all` から `remove_dir`（空のみ）へ変更する。新規 `builtin_remove_tree` を追加する。
+- capability 層（次期 `FilesystemCapability`）: `remove_dir`→`EmptyDirectory`、`remove_tree`→`RecursiveDelete` を割り当てる。
+- `docs/capability-model.md` / `docs/language-spec.md`: `remove_dir` の意味論変更と `remove_tree` 追加を反映する（実装完了・受入通過後）。
+- tree / VM は同じ registry / handler を共有する。
+
+#### 17.6.5 error
+
+- 非空ディレクトリへの `remove_dir`: safe profile では `host`（category `directory_not_empty`）。legacy では現行どおり false。
+- capability 拒否: 第3.4節「filesystem capability 拒否」の `sandbox`。
+- `remove_tree` の budget / cancel: `budget` / `cancelled`（catch 不能）。
+
+第3.4節の host error inventory へ `directory_not_empty` category を追記する。
+
+#### 17.6.6 移行
+
+`remove_dir` が非空ディレクトリを再帰削除しなくなる。再帰削除が必要な source は `remove_tree` へ移行し、host は `RecursiveDelete` capability を明示付与する。これは破壊的変更のため `LanguageRevision` を上げる。
+
+#### 17.6.7 テスト行列
+
+- 空 / 非空ディレクトリ
+- nested tree（`remove_tree`）
+- final symlink と中間 symlink
+- partial failure / permission change / cancel（`remove_tree`）
+- capability 隣接操作の deny（`EmptyDirectory` で `remove_tree` 不可、その逆も）
+- audit で削除対象数と partial effect を記録
+- tree / VM 一致
+
+#### 17.6.8 受入基準
+
+- `remove_dir` が空ディレクトリのみを削除し、`EmptyDirectory` capability で再帰削除できない。
+- `remove_tree` が `RecursiveDelete` capability を要求し、budget / cancel / audit を持つ。
+- symlink をリンク先まで辿って削除しない。
+- tree / VM の結果・error が一致する。
+
+## 18. 実装順
 
 次期revisionは以下の順で進める。各段階でfmt、Clippy、全test、paired golden、defensive testを通し、意味論変更と内部リファクタを同じcommitへ混在させない。
 
 1. **基準固定**: 本書のerror templates・line/trace・評価順をtest helperへ定義する。現行非適合fixtureを明示する。
 2. **内部リファクタ**: VM dispatch分割、tree `exec_stmt` 分割。観測挙動は変えない。
-3. **上限統合**: AUD-050の `limits.rs` 集約とAUD-017の128 user frame統一。
-4. **Builtin/error基盤**: AUD-049単一registry、AUD-019共通error constructorと完全一致test。
+3. **上限統合**: AUD-050の `limits.rs` 集約とAUD-017の128 user frame統一。§17.5（REV-012）のcallee先行precedenceへの切替と `limits.rs` doc comment のcurrent/target明記、roadmap statusの2分割もここへ含める。
+4. **Builtin/error基盤**: AUD-049単一registry、AUD-019共通error constructorと完全一致test。§17.1（REV-003）の `NumericOrder` 集約、および §17.4（REV-009）・§17.6（REV-021）で追加するhost error category（`directory_read` / `invalid_encoding` / `directory_not_empty`）のinventory登録もここで行う。
 5. **値表現**: AUD-047 List/Dict COW、続けてAUD-048 FunctionId。scaling/identity testを先に追加する。
 6. **binding/transaction**: AUD-016 VM fresh cell、AUD-024全language-state REPL journal。FunctionId counterをrollback対象外に固定する。
-7. **境界挙動**: AUD-034 `path_join`、AUD-036 checked変換/Exited、AUD-018 CLI args/stdin、AUD-033 EOF診断。
-8. **capability縦切り**: sandbox OnceLockをExecutionContext FilesystemCapabilityへ移し、tree/VM/importを同じpolicyへ接続する。
-9. **検証基盤**: cargo-fuzzのfrontend/compiler/vm_chunk、続いてcapability完成後にevaluator/differential target。
-10. **次期仕様反映**: 全受入基準通過後にだけ `language-spec.md`、`LANG_GUIDE.md`、設計文書、revisionを更新する。
-11. **クラス**: 上記基盤と総heap budget完成後、低優先度機能としてlexer→AST→tree→VM→paired testの順で実装する。継承は含めない。
-12. **HTTP**: 現在の実装順には含めない。Phase 1–6完了と具体ユースケース承認後にgateを再評価し、承認された場合だけ別計画を作る。
+7. **bytecode検証面**: §17.2（REV-004）の `patch_jump` fallible化とbuilder封印、§17.3（REV-005）の `MakeClosure` capture記述子化を、REV-006の `VerifiedChunk`/verifier と同一マイルストーンで実施する。opcodeと関数値表現の変更を伴うため境界挙動より前に置く。
+8. **境界挙動**: AUD-034 `path_join`、AUD-036 checked変換/Exited、AUD-018 CLI args/stdin、AUD-033 EOF診断。§17.1（REV-003）の混合数値比較の観測挙動変更もここでrevisionを上げる。
+9. **capability縦切り**: sandbox OnceLockをExecutionContext FilesystemCapabilityへ移し、tree/VM/importを同じpolicyへ接続する。§17.4（REV-009）の `list_dir` 部分失敗/非UTF-8、§17.6（REV-021）の `remove_dir`（空のみ）/`remove_tree`（`RecursiveDelete`）分割をこのcapability面で実装する。
+10. **検証基盤**: cargo-fuzzのfrontend/compiler/vm_chunk、続いてcapability完成後にevaluator/differential target。
+11. **次期仕様反映**: 全受入基準通過後にだけ `language-spec.md`、`LANG_GUIDE.md`、設計文書、revisionを更新する。
+12. **クラス**: 上記基盤と総heap budget完成後、低優先度機能としてlexer→AST→tree→VM→paired testの順で実装する。継承は含めない。
+13. **HTTP**: 現在の実装順には含めない。Phase 1–6完了と具体ユースケース承認後にgateを再評価し、承認された場合だけ別計画を作る。
 
-## 18. 文書全体の最終受入基準
+## 19. 文書全体の最終受入基準
 
 - AUD-016/017/018/019/024/033/034/036/047/048/049/050の採用判断、却下案、規範挙動、状態、変更箇所、error、移行、test、受入基準が実装PRから追跡できる。
+- §17のREV-003/004/005/009/012/021についても、同じ8観点（採用判断・却下案・データモデル・変更箇所・error・移行・test・受入基準）が実装PRから追跡できる。REV-012は既存の第5節（AUD-017）を正本とし、本書で新しい意味論を追加しない。
 - tree/VMで意図しないbackend別期待値が残らない。
 - 現行 `language-spec.md` は実装完了まで変更せず、現行挙動の正本として維持する。
 - クラスは「設計済み・低優先度」、HTTPは「設計済み・着手禁止」として扱われる。
