@@ -2,6 +2,66 @@
 
 最終更新: 2026-09-07
 
+## 現在の作業状況（サマリ）
+
+> このセクションは「今どこにいて、次に何をやるか」を1か所に集約した早見表である。詳細・根拠は各 AUD / REV 項目と設計正本を参照する。**設計確定は実装完了ではない**（受入gate未達なら未完了扱い）。open 項目を増減したらこの表も更新する。
+
+### 現在地
+
+- **フェーズ:** 意味論基盤（下記「設計sliceに沿う推奨実装順」のステップ2）を進行中。ステップ2の完了済み項目は AUD-050/017・049・019・047・048・016・024・034。Phase 1（embedding）以降は未着手。
+- **仕様 revision:** language-spec 0.16（実装版 package は 0.1.0。番号体系は別管理）。
+- **完了の中心:** 2026-08-26 深層監査（AUD-001〜050）の大半は実装済み。残る open は下表のとおり。
+- **新規入力:** 2026-09-07 詳細レビュー（REV-001〜025）は全件が実装バックログ（設計は6件が §17 で確定、他は既存正本を参照）。
+
+### 次に着手すべき順（先頭ほど優先）
+
+「設計sliceに沿う推奨実装順」の未完了部分を抜き出したもの。詳細は同節を参照。
+
+1. **境界挙動（意味論基盤の残り）:** AUD-036（checked変換・構造化`Exited`）→ AUD-018（CLI script引数）→ AUD-033（未完結REPL入力のEOF診断）。あわせて §17 の REV-003（数値厳密比較）で観測挙動を変える revision を上げる。
+2. **bytecode検証・API封印（基盤・境界挙動より前に置く）:** REV-006（`VerifiedChunk`/verifier）と同一マイルストーンで REV-004（`patch_jump` fallible化）・REV-005（`MakeClosure` capture記述子化）・REV-018（internal module封印）。
+3. **包括budget（P0 基盤）:** REV-015（source/string/heap/I-O budget・deadline・cancel）に REV-001（共有DAGの指数時間/出力）の受入条件を含める。REV-023（`exit()`のprocess終了廃止）も同基盤。
+4. **Phase 1 embedding:** [組み込みAPI仕様](embedding-api.md) E1〜E6 → E8a。REV-007/008/011/013/014/020 はこの Phase 1〜2 で解消する。
+5. **Phase 2 capability:** E7 → E8b と Capability C1〜C10。REV-002/009/019/021/022 はこの capability 面で実装（sandbox の process-global を ExecutionContext へ移す）。
+
+### open 項目一覧（未完了のみ・優先度順）
+
+未完了（🟡 部分実装 / ⬜ 未実装）だけを AUD・REV 横断で並べたもの。✅ 完了項目は各バックログ節を参照。
+
+| 優先度 | ID | 概要 | 状態 | 詳細 |
+|---|---|---|---|---|
+| P0 | REV-001 | 共有DAGの比較・表示が指数時間／出力 | ⬜ | REV表 P0 |
+| P0 | REV-002 | 非UTF-8 canonical import pathでsandbox認可がすり替わる | ⬜ | REV表 P0 |
+| P0 | REV-006 | 未検証bytecodeでstep/call課金を迂回し無期限実行 | ⬜ | REV表 P0 |
+| P0 | REV-015 | source/string/heap/I-O/bulk workが未有限化 | ⬜ | REV表 P0 |
+| P0 | REV-023 | `exit()`がホストプロセスを終了する | ⬜ | REV表 P0 |
+| P1 | REV-003 | Int–Float比較が2^53超で誤り、`==`が非推移的 | ⬜ | REV表 P1（§17.1 設計確定） |
+| P1 | REV-004 | 公開`Chunk::patch_jump`がpanic | ⬜ | REV表 P1（§17.2 設計確定） |
+| P1 | REV-005 | 不正`MakeClosure` descriptorをNull captureで黙認 | ⬜ | REV表 P1（§17.3 設計確定） |
+| P1 | REV-007 | `ExecutionContext`がsession stateとrun meterを混在 | ⬜ | REV表 P1 |
+| P1 | REV-008 | stable `Engine::execute`がtransactionでない | 🟡 | REV表 P1（REPLのみ実装） |
+| P1 | REV-011 | revision・engine差・実装statusが文書drift | ⬜ | REV表 P1 |
+| P1 | REV-012 | call評価順のstatus/doc drift（意味論正本はAUD-017） | 🟡 | REV表 P1（§17.5 設計確定） |
+| P1 | REV-013 | `args()`がhost process argvを読む | ⬜ | REV表 P1 |
+| P1 | REV-014 | sandbox/env/limits/stdio/clockがprocess-global | ⬜ | REV表 P1 |
+| P1 | REV-018 | internal module／raw bytecode公開が安全境界を弱める | ⬜ | REV表 P1 |
+| P1 | REV-020 | import先parse errorの原因を捨てる | ⬜ | REV表 P1 |
+| P1 | REV-021 | `remove_dir`の再帰削除とcapabilityの不整合 | ⬜ | REV表 P1（§17.6 設計確定） |
+| P1 | AUD-018 | CLIからscript引数を渡せない | 🟡 | AUD crosswalk（Embedding E8a） |
+| P1 | AUD-021 | language-spec/LANG_GUIDE/design drift継続 | 🟡 | AUD P2表（意味論確定後に継続更新） |
+| P2 | REV-009 | `list_dir`の部分失敗黙殺と非UTF-8名衝突 | ⬜ | REV表 P2（§17.4 設計確定） |
+| P2 | REV-010 | 32-bitで`i64 as usize`がwrap | ⬜ | REV表 P2 |
+| P2 | REV-016 | Rc cycleと長寿命contextのheap残留 | ⬜ | REV表 P2 |
+| P2 | REV-017 | 表示・repr・sort orderの結合 | ⬜ | REV表 P2 |
+| P2 | REV-019 | `now()`のepoch前/error 0化と未検査cast | ⬜ | REV表 P2 |
+| P2 | REV-022 | EOF/I-O error/permissionをNull/falseへ畳む | ⬜ | REV表 P2 |
+| P2 | REV-024 | CIがrolling stable・fuzz/stress/MSRVなし | 🟡 | REV表 P2 |
+| P2 | REV-025 | parse diagnostic件数に上限がない | ⬜ | REV表 P2 |
+| P2 | AUD-020 | sandbox TOCTOU/path-handle未実装 | 🟡 | AUD crosswalk |
+| P2 | AUD-022 | fuzz/stress/matrix未実装 | 🟡 | AUD crosswalk |
+| P2 | AUD-033 | 未完結REPL入力のEOF診断 | 🟡 | AUD P2表（§8 設計確定） |
+| P2 | AUD-036 | lossy数値・OS境界変換の検証 | 🟡 | AUD crosswalk（§10 設計確定） |
+| P2 | AUD-045 | MSRV/release/install/OCI未実装 | 🟡 | AUD crosswalk |
+
 ## プロジェクトの方向性
 
 Tsumugiは、学習用の言語処理系として得た知見を発展させ、実運用を見据えた、制御可能な組み込みスクリプト言語を目指す。価値基準と非目標の正本は[Tsumugi Manifesto](manifesto.md)とし、本ロードマップは現在地からその目標へ進む順序を管理する。
