@@ -608,6 +608,8 @@ lineはLexerが生成するEOF tokenの行。未閉じblockのcanonical message�
 
 ## 9. `path_join` 型契約（AUD-034）
 
+> 実装状況: ✅ 実装完了（仕様revision 0.16で `language-spec.md` へ統合済み）。`src/builtin_core.rs` の `builtin_path_join` が全引数を左から右へStr検査し、最初の非Strで `builtin_type` エラーを返す。tree/VMはAUD-049の共有registry/handlerを使うため差はない。`tests/canonical_error_inventory.rs`（tree/VM一致）と `tests/path_join_contract.rs`（OS依存期待値をRust `PathBuf` から構築）で固定した。
+
 ### 9.1 採用判断
 
 `path_join` は可変長引数で、**全引数がStrでなければならない**。
@@ -1865,7 +1867,7 @@ remove_tree(path):
 5. **値表現**: AUD-047 List/Dict COW、続けてAUD-048 FunctionId。scaling/identity testを先に追加する。
 6. **binding/transaction**: AUD-016 VM fresh cell、AUD-024全language-state REPL journal。FunctionId counterをrollback対象外に固定する。
 7. **bytecode検証面**: §17.2（REV-004）の `patch_jump` fallible化とbuilder封印、§17.3（REV-005）の `MakeClosure` capture記述子化を、REV-006の `VerifiedChunk`/verifier と同一マイルストーンで実施する。opcodeと関数値表現の変更を伴うため境界挙動より前に置く。
-8. **境界挙動**: AUD-034 `path_join`、AUD-036 checked変換/Exited、AUD-018 CLI args/stdin、AUD-033 EOF診断。§17.1（REV-003）の混合数値比較の観測挙動変更もここでrevisionを上げる。
+8. **境界挙動**: ~~AUD-034 `path_join`~~（✅ 完了、revision 0.16）、AUD-036 checked変換/Exited、AUD-018 CLI args/stdin、AUD-033 EOF診断。§17.1（REV-003）の混合数値比較の観測挙動変更もここでrevisionを上げる。
 9. **capability縦切り**: sandbox OnceLockをExecutionContext FilesystemCapabilityへ移し、tree/VM/importを同じpolicyへ接続する。§17.4（REV-009）の `list_dir` 部分失敗/非UTF-8、§17.6（REV-021）の `remove_dir`（空のみ）/`remove_tree`（`RecursiveDelete`）分割をこのcapability面で実装する。
 10. **検証基盤**: cargo-fuzzのfrontend/compiler/vm_chunk、続いてcapability完成後にevaluator/differential target。
 11. **次期仕様反映**: 全受入基準通過後にだけ `language-spec.md`、`LANG_GUIDE.md`、設計文書、revisionを更新する。

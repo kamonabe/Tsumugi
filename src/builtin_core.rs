@@ -923,7 +923,19 @@ pub fn builtin_path_exists(args: &[Value], line: usize) -> Result<Value, Tsumugi
 }
 
 pub fn builtin_path_join(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    let _ = line;
+    // 全引数を左から右へ Str として検査し、非 Str を1つでも見つけたら結合を開始しない。
+    // 非 Str を無言で欠落させない（AUD-034, semantic-decisions.md §9）。
+    for (index, arg) in args.iter().enumerate() {
+        if !matches!(arg, Value::Str(_)) {
+            return Err(TsumugiError::builtin_arg_type(
+                line,
+                "path_join",
+                index + 1,
+                "Str",
+                arg,
+            ));
+        }
+    }
     let mut path = std::path::PathBuf::new();
     for arg in args {
         if let Value::Str(s) = arg {
