@@ -303,6 +303,13 @@ fn cases() -> Vec<Case> {
             message: "List のインデックスは Int である必要があります: Str",
             line: 2,
         },
+        Case {
+            label: "path_joinの非Str引数(第2引数)",
+            source: "path_join(\"a\", 123, \"b\")\n",
+            kind: ErrorKind::BuiltinType,
+            message: "path_join の第 2 引数は Str である必要があります: Int",
+            line: 1,
+        },
     ]
 }
 
@@ -343,7 +350,7 @@ fn tree_and_vm_produce_identical_canonical_errors() {
 #[test]
 fn inventory_covers_reachable_operations() {
     assert!(
-        cases().len() >= 34,
+        cases().len() >= 35,
         "inventory ケースが想定より少ない: {}",
         cases().len()
     );

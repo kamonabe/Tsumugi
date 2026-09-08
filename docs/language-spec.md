@@ -1,8 +1,8 @@
 # Tsumugi 言語仕様
 
-バージョン: 0.15
+バージョン: 0.16
 
-最終更新: 2026-09-07
+最終更新: 2026-09-08
 
 この番号は言語仕様のrevisionであり、Cargo package / REPLの実装バージョン `0.1.0` とは独立して管理する。
 
@@ -14,11 +14,7 @@
 
 両engine差: 現在なし。
 
-両engine共通の仕様違反:
-
-| 項目 | 内容 | ID |
-|---|---|---|
-| `path_join`の引数型 | 非文字列argumentを型エラーにせず無言で欠落させる | AUD-034 |
+両engine共通の仕様違反: 現在なし。
 
 本書の文法どおり、複数行lambdaの終端`end`は必須である。
 
@@ -847,7 +843,7 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 | `now()` | 現在のUNIXタイムスタンプ（秒）を整数で返す |
 | `format_time(timestamp, format)` | タイムスタンプをUTCでフォーマット（%Y, %m, %d, %H, %M, %S）。`timestamp` は整数のみで、Floatは `builtin_type` エラー。タイムゾーン指定は提供しない |
 | `path_exists(path)` | パスが存在すれば true |
-| `path_join(parts...)` | パーツを結合してパス文字列を返す。引数0個は空文字列。非文字列の引数を無言で欠落させる既知の仕様違反がある（「現在の既知非適合」/ AUD-034） |
+| `path_join(parts...)` | パーツを結合してパス文字列を返す。全引数はStrである必要があり、非Strは左から順に検査して最初の1つで `builtin_type` エラー（結合は開始しない）。引数0個は空文字列。正規化・存在確認はせず、separator/absolute component/prefixの扱いは実行OSのRust `PathBuf` と同じ |
 | `mkdir(path)` | ディレクトリを再帰的に作成。成功で true |
 | `remove(path)` | ファイルまたは空ディレクトリを削除。final symlinkはlink自体だけを削除する。成功で true |
 | `remove_dir(path)` | ディレクトリを中身ごと再帰削除。final symlinkはlink自体だけを削除し、targetをたどらない。成功で true |
