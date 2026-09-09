@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-09-07
+最終更新: 2026-09-09
 
 ## 現在の作業状況（サマリ）
 
@@ -17,7 +17,7 @@
 
 「設計sliceに沿う推奨実装順」の未完了部分を抜き出したもの。詳細は同節を参照。
 
-1. **境界挙動（意味論基盤の残り）:** AUD-036（checked変換・構造化`Exited`）→ AUD-018（CLI script引数）→ AUD-033（未完結REPL入力のEOF診断）。あわせて §17 の REV-003（数値厳密比較）で観測挙動を変える revision を上げる。
+1. **境界挙動（意味論基盤の残り）:** ~~AUD-036 のchecked変換~~（✅ Float→Int/file_size完了、仕様revision 0.17）→ AUD-018（CLI script引数）→ AUD-033（未完結REPL入力のEOF診断）。あわせて §17 の REV-003（数値厳密比較）で観測挙動を変える revision を上げる。AUD-036 の構造化`Exited`は REV-023 と同基盤のためステップ3へ移す。
 2. **bytecode検証・API封印（基盤・境界挙動より前に置く）:** REV-006（`VerifiedChunk`/verifier）と同一マイルストーンで REV-004（`patch_jump` fallible化）・REV-005（`MakeClosure` capture記述子化）・REV-018（internal module封印）。
 3. **包括budget（P0 基盤）:** REV-015（source/string/heap/I-O budget・deadline・cancel）に REV-001（共有DAGの指数時間/出力）の受入条件を含める。REV-023（`exit()`のprocess終了廃止）も同基盤。
 4. **Phase 1 embedding:** [組み込みAPI仕様](embedding-api.md) E1〜E6 → E8a。REV-007/008/011/013/014/020 はこの Phase 1〜2 で解消する。
@@ -59,7 +59,7 @@
 | P2 | AUD-020 | sandbox TOCTOU/path-handle未実装 | 🟡 | AUD crosswalk |
 | P2 | AUD-022 | fuzz/stress/matrix未実装 | 🟡 | AUD crosswalk |
 | P2 | AUD-033 | 未完結REPL入力のEOF診断 | 🟡 | AUD P2表（§8 設計確定） |
-| P2 | AUD-036 | lossy数値・OS境界変換の検証 | 🟡 | AUD crosswalk（§10 設計確定） |
+| P2 | AUD-036 | lossy数値・OS境界変換の検証（残: `exit`の構造化`Exited`） | 🟡 | AUD crosswalk（§10 設計確定・Float→Int/file_sizeは実装済み） |
 | P2 | AUD-045 | MSRV/release/install/OCI未実装 | 🟡 | AUD crosswalk |
 
 ## プロジェクトの方向性
@@ -144,7 +144,7 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 | AUD-033 | 未完結REPL入力のEOFを診断する | `if true`等の継続入力中にEOFを送ると、tree/VMとも構文エラーを出さずbufferを破棄して終了コード0になる | 🟡 設計確定・未実装（両engineで再現済み。[次期意味論・実装決定](semantic-decisions.md)第8節） |
 | AUD-034 | `path_join`の引数型契約を厳格化する | `path_join("a", 123, "b")`が型エラーにならず`a/b`を返し、非文字列argumentを無言で欠落させる | ✅ 完了（全引数を左から右へStr検査し、最初の非Strで`builtin_type` / 「path_join の第 {position} 引数は Str である必要があります: {型名}」を返し結合を開始しない。tree/VMはAUD-049の共有registry/handlerを使うため差はなく、`tests/canonical_error_inventory.rs`にtree/VM一致の非Strケースを追加。正常系は`tests/path_join_contract.rs`でOS依存の期待値をRust `PathBuf`から構築して照合。観測挙動が変わるため仕様revisionを0.16へ） |
 | AUD-035 | CLI・標準I/Oのhost panic経路を構造化する | REPLのthread spawn・stdout flush・stdin readに`unwrap()`があり、broken pipe/I/O障害でpanicする。`print`も`println!`のため`tsumugi script.tsg \| head -1`でpanicした。Unixの非UTF-8 argvは`std::env::args()`でもpanicし得る | ✅ 完了（`ErrorKind::Io`を追加し`print`の出力失敗を構造化エラーへ。CLIのbanner・prompt・stdin・spawn・argv検証は診断＋終了コード1へ。パイプ切断と非UTF-8 argvの回帰テストを追加） |
-| AUD-036 | lossyな数値・OS境界変換を検証する | `exit`のi64→i32、`file_size`のu64→i64、NaN/Infを含む`to_int`/`floor`/`ceil`/`round`がwrap・飽和・0化し得る | 🟡 設計確定・未実装（同第10節: checked変換と構造化`Exited`。境界回帰testも未実装） |
+| AUD-036 | lossyな数値・OS境界変換を検証する | `exit`のi64→i32、`file_size`のu64→i64、NaN/Infを含む`to_int`/`floor`/`ceil`/`round`がwrap・飽和・0化し得る | 🟡 部分実装。Float→Int（`to_int`/`floor`/`ceil`/`round`）と`file_size`を共通checked helper（`checked_float_to_i64`/`checked_file_size_to_i64`）へ集約し、NaN/±Infinity/i64範囲外を`conversion`/`int_overflow`へ。tree/VM共有handlerで一致し、`canonical_error_inventory`・`checked_conversion_contract`・`builtin_core::aud_036_tests`で固定。仕様revision 0.17。残る`exit`の構造化`Exited`は`BudgetUsage`/REV-023依存のため同基盤で別実装 |
 | AUD-038 | benchmarkをparse / compile / executeへ分離しVM退行を調査する | 現行Criterionは毎回parseし、VMはcompileも含む。aarch64 release実測でVMはfibが約2.77倍高速な一方、loop 5000回は約358倍低速で、単純な「VMは高速」という説明が成立しない | ✅ 4フェーズへ分離し退行の原因を特定・修正（VMのforが反復ごとにコレクションを複製しO(n^2)だった）。確保量ベースのスケーリングゲートを追加。副産物としてAUD-040 / AUD-041を検出 |
 | AUD-039 | binaryからlibrary moduleを利用して二重コンパイルを解消する | `main.rs`が`lib.rs`と同じ16モジュールを再宣言し、`use tsumugi::`を一切使わないため、同一ソースがlib targetとbin targetで2回コンパイルされる。単体テストも両方に取り込まれ、`cargo test`が同じテストを2回実行する（2026-08-28時点で各152件）。ビルド時間・テスト件数の解釈を歪める | ✅ 完了（binaryのローカルmodule宣言を削除し、tree-walk CLIを`Engine` facade、VM CLIをlibrary moduleの型へ移行。単体テストはlib targetで一度だけ実行） |
 | AUD-040 | treeの名前付き関数self-bindingで`Value::Fn`の複製を避ける | AUD-037の呼び出し時self-bindingが毎回`Value::Fn`（body AST含む）をcloneし、呼び出しコストが関数body長に比例する。`fib(22)`で67.0ms（該当行を無効化すると42.2ms、約1.6倍） | ✅ `Value::Fn`を`Rc<FnDef>` + `Rc<captured>`へ変更（VmFnの`Rc<Chunk>`と同じ方針）。同一条件A/Bで`fib(22)` 64.5ms→21.2ms、確保量の比 15.89→1.06。確保量ベースの回帰ゲートを追加 |
@@ -353,7 +353,7 @@ REV 由来項目の実装順は、[次期意味論・実装決定](semantic-deci
 | AUD-022 | 確定済み | timeout/golden/differential/limit/defensive matrixに加え、fuzz・stress・failure injection・資源制約gateを段階導入 | [検証・リリース・運用設計](verification-release-operations.md)第4〜6・17節 | 部分実装。harness、timeout、完全一致、temp分離は完了。matrix/fuzz/stressは未実装 |
 | AUD-024 | 確定済み | `Completed` / `Exited`だけ全language-stateをcommitし、その他terminalはexecution開始時点へrollbackする。catch済みerror後に最終完了した実行はcommitする。stdout/filesystem/network/DB/host function等の完了済み外部効果はrollbackしない | [次期意味論・実装決定](semantic-decisions.md)第7節、[実行予算・協調実行仕様](execution-control.md)第10節、[組み込みAPI仕様](embedding-api.md)第10節 | ✅ 完了（REPL submissionの未捕捉errorで全language-stateをrollback、正常完了・catch済み完了はcommit、外部効果はrollbackしない。first-write undo logで記録量は変更箇所数に比例。deadline/budget/cancel terminalはPhase 3/4で別追跡） |
 | AUD-034 | 確定済み | `path_join`は全argumentをStrとして検査し、非Strを無言で欠落させない | [次期意味論・実装決定](semantic-decisions.md)第9節 | ✅ 完了（`builtin_path_join`で全引数を左から右へStr検査し、最初の非Strで`builtin_type`エラーを返す。tree/VMは共有handlerで一致。error inventoryと`path_join_contract`テストを追加。仕様revision 0.16） |
-| AUD-036 | 確定済み | `exit`、file size、Float→Intのlossy変換を共通checked helperで拒否し、valid `exit`は構造化`Exited`にする | [次期意味論・実装決定](semantic-decisions.md)第10節 | 未実装。なおloop変数をiterationごとのfresh cellにする意味論はAUD-010で実装・完了済み |
+| AUD-036 | 確定済み | `exit`、file size、Float→Intのlossy変換を共通checked helperで拒否し、valid `exit`は構造化`Exited`にする | [次期意味論・実装決定](semantic-decisions.md)第10節 | 🟡 部分実装。Float→Intとfile_sizeのchecked変換は完了（仕様revision 0.17）。valid `exit`の構造化`Exited`は`BudgetUsage`/REV-023依存のため未実装 |
 | AUD-045 | 確定済み | MSRVをRust 1.97とし、stable/MSRV CI、install/release、6 platform artifact、署名・SBOM・OCI、参照用Kubernetes Jobの順序とgateを固定 | [検証・リリース・運用設計](verification-release-operations.md)第3〜10・17〜18節 | 未実装。現行はrolling stable、release/install workflow・OCI・manifestなし |
 | AUD-048 | 確定済み | function/lambda式の**動的評価ごと**にfresh `FunctionId`を発行し、clone/captureは同じIDを保持、rollback後もIDを再利用しない | [次期意味論・実装決定](semantic-decisions.md)第12節、[決定性・実行時監査仕様](determinism-and-audit.md)第4.7節 | ✅ 完了。tree/VMとも関数等価性を`FunctionId`比較へ統一。VMはcapture 0件でも`MakeClosure`で実行時発番し、backend別期待ファイルを削除。REPL rollback非再利用・overflow fault injectionのテストを追加 |
 | AUD-049 | 確定済み | 単一`BuiltinSpec` / callable catalogからtree、VM、compiler、arity、context metadata、生成文書を導出。HostFunction registryは別registryだが共通resolverで衝突検査 | [次期意味論・実装決定](semantic-decisions.md)第13節、[Capability Model仕様](capability-model.md)第17節・CAP-AT-20 | ✅ 完了（language core分。`src/builtin_registry.rs`の`PUBLIC_BUILTINS`をtree/VM/compiler/arity/context metadataの正本にし、`CallBuiltin`をBuiltinId化、`__pop_update`を`OpCode::PopUpdate`へ隔離。HostFunction registryとの共通resolver衝突検査はPhase 2で別追跡） |
@@ -362,7 +362,7 @@ REV 由来項目の実装順は、[次期意味論・実装決定](semantic-deci
 ### 設計sliceに沿う推奨実装順
 
 1. **基準固定:** [次期意味論・実装決定](semantic-decisions.md)第17節の基準固定と、現行非適合fixtureを維持する。文書の設計確定を実装完了として扱わない。
-2. **意味論基盤:** 内部refactor → ~~AUD-050/017深度統合~~（✅ 完了） → ~~AUD-049単一BuiltinSpec~~（✅ 完了） → ~~AUD-019 canonical error~~（✅ 完了） → ~~AUD-047 COW~~（✅ 完了）/~~AUD-048 FunctionId~~（✅ 完了） → ~~AUD-016 binding~~（✅ 完了）/~~AUD-024 transaction~~（✅ 完了） → ~~AUD-034 path_join~~（✅ 完了）/AUD-036/018/033境界挙動の順で進める。
+2. **意味論基盤:** 内部refactor → ~~AUD-050/017深度統合~~（✅ 完了） → ~~AUD-049単一BuiltinSpec~~（✅ 完了） → ~~AUD-019 canonical error~~（✅ 完了） → ~~AUD-047 COW~~（✅ 完了）/~~AUD-048 FunctionId~~（✅ 完了） → ~~AUD-016 binding~~（✅ 完了）/~~AUD-024 transaction~~（✅ 完了） → ~~AUD-034 path_join~~（✅ 完了）/AUD-036境界挙動（🟡 Float→Int/file_size完了、`exit`はREV-023へ）/018/033の順で進める。
 3. **Phase 1 embedding:** [組み込みAPI仕様](embedding-api.md) E1〜E6→E8a。最終terminal型のsubsetを使い、先行公開型を作らない。
 4. **Phase 2 capability:** E7→E8bと[Capability Model仕様](capability-model.md) C1→C2、C3/C4/C5/C7、C6、C8、最後にC9/C10。現行ambient accessを削除するまで完了扱いにしない。
 5. **Phase 3/4 control:** E11/C11で有限budget・transactionを完成し、その後E12/C12でcooperative state machine、yield/pause/resume、admission/backpressureを実装する。

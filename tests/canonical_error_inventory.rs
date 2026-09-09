@@ -310,6 +310,52 @@ fn cases() -> Vec<Case> {
             message: "path_join の第 2 引数は Str である必要があります: Int",
             line: 1,
         },
+        // AUD-036: lossy Float→Int 変換境界（semantic-decisions.md §10.5）。
+        // NaN・±Infinity・i64 範囲外を無言で 0/端値へ畳まず conversion エラーにする。
+        Case {
+            label: "to_int の NaN",
+            source: "to_int(0.0 / 0.0)\n",
+            kind: ErrorKind::Conversion,
+            message: "to_int で Int に変換できません: NaN",
+            line: 1,
+        },
+        Case {
+            label: "to_int の Infinity",
+            source: "to_int(1.0 / 0.0)\n",
+            kind: ErrorKind::Conversion,
+            message: "to_int で Int に変換できません: 非有限値",
+            line: 1,
+        },
+        Case {
+            // 指数リテラルは未対応のため、乗算で i64 範囲外の有限 Float を作る。
+            // 1e9 * 1e9 * 1e9 = 1e27 は 2^63 (≈9.22e18) を超える。
+            label: "to_int の i64 範囲外",
+            source: "to_int(1000000000.0 * 1000000000.0 * 1000000000.0)\n",
+            kind: ErrorKind::Conversion,
+            message: "to_int で Int に変換できません: i64 範囲外",
+            line: 1,
+        },
+        Case {
+            label: "floor の NaN",
+            source: "floor(0.0 / 0.0)\n",
+            kind: ErrorKind::Conversion,
+            message: "floor で Int に変換できません: NaN",
+            line: 1,
+        },
+        Case {
+            label: "ceil の Infinity",
+            source: "ceil(1.0 / 0.0)\n",
+            kind: ErrorKind::Conversion,
+            message: "ceil で Int に変換できません: 非有限値",
+            line: 1,
+        },
+        Case {
+            label: "round の i64 範囲外(負)",
+            source: "round(0.0 - 1000000000.0 * 1000000000.0 * 1000000000.0)\n",
+            kind: ErrorKind::Conversion,
+            message: "round で Int に変換できません: i64 範囲外",
+            line: 1,
+        },
     ]
 }
 
