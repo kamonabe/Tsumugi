@@ -205,10 +205,11 @@ impl Evaluator {
                 if !args.is_empty() {
                     return Err(TsumugiError::builtin_arity(line, "args", 0, args.len()));
                 }
-                // 非UTF-8のargvでもpanicさせない（AUD-035）
-                let argv: Vec<Value> = std::env::args_os()
-                    .skip(2)
-                    .map(|arg| Value::Str(arg.to_string_lossy().into_owned()))
+                // process argv ではなく実行 context の snapshot を返す（AUD-018）
+                let argv: Vec<Value> = self
+                    .script_args()
+                    .iter()
+                    .map(|arg| Value::Str(arg.clone()))
                     .collect();
                 crate::builtin_core::check_collection_size_public(argv.len(), line)?;
                 Ok(Some(Value::List(Rc::new(argv))))

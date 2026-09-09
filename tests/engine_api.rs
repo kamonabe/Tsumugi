@@ -65,3 +65,38 @@ fn context_reuse_preserves_bindings_without_leaking_between_contexts() {
         error.message()
     );
 }
+
+/// `set_script_args` で注入した snapshot を `args()` が返す（AUD-018）。
+/// process argv ではなく実行 context に属することを固定する。
+#[test]
+fn args_returns_injected_snapshot() {
+    let engine = Engine::new();
+    let script = engine
+        .compile("let a = args()\nlet joined = a[0] + \",\" + a[1]\n")
+        .unwrap_or_else(|errors| panic!("compileに失敗しました: {errors:?}"));
+
+    let mut context = ExecutionContext::new();
+    context.set_script_args(vec!["first".to_string(), "second".to_string()]);
+
+    assert_eq!(
+        engine.execute(&script, &mut context),
+        Ok(ExecutionOutcome::Completed),
+        "注入した script 引数で実行できる必要があります"
+    );
+}
+
+/// script 引数を注入しない場合、`args()` は空リストを返す（AUD-018）。
+#[test]
+fn args_is_empty_without_injection() {
+    let engine = Engine::new();
+    let script = engine
+        .compile("let empty = args()\nlet ok = len(empty) == 0\n")
+        .unwrap_or_else(|errors| panic!("compileに失敗しました: {errors:?}"));
+
+    let mut context = ExecutionContext::new();
+    assert_eq!(
+        engine.execute(&script, &mut context),
+        Ok(ExecutionOutcome::Completed),
+        "引数未注入でも空リストで実行できる必要があります"
+    );
+}
