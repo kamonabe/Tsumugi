@@ -117,6 +117,10 @@ pub struct Vm {
     /// 関数値へ発番する次の FunctionId（AUD-048）。単調増加し、
     /// REPL の失敗入力でも巻き戻さない。
     next_function_id: u64,
+
+    /// `args()` が返すスクリプト引数の snapshot（AUD-018）。
+    /// process argv ではなく実行 context に属する。
+    script_args: Vec<String>,
 }
 
 impl Vm {
@@ -137,6 +141,7 @@ impl Vm {
             max_steps: vm_resolve_max_steps(),
             try_handlers: Vec::new(),
             next_function_id: 0,
+            script_args: Vec::new(),
         }
     }
 
@@ -151,7 +156,13 @@ impl Vm {
             max_steps: vm_resolve_max_steps(),
             try_handlers: Vec::new(),
             next_function_id: 0,
+            script_args: Vec::new(),
         }
+    }
+
+    /// `args()` が返すスクリプト引数の snapshot を設定する（AUD-018）。
+    pub fn set_script_args(&mut self, args: Vec<String>) {
+        self.script_args = args;
     }
 
     /// 関数値へ新しい FunctionId を発番する（AUD-048）。
@@ -1527,13 +1538,11 @@ impl Vm {
             }
             "args" => {
                 crate::builtin_core::check_arity(name, &args, 0, line)?;
-                // 非UTF-8のargvでもpanicさせない（AUD-035）
-                let argv: Vec<Value> = std::env::args_os()
-                    .skip(1)
-                    .map(|arg| arg.to_string_lossy().into_owned())
-                    .filter(|a| a != "--vm")
-                    .skip(1) // スクリプトパスをスキップ
-                    .map(Value::Str)
+                // process argv ではなく実行 context の snapshot を返す（AUD-018）
+                let argv: Vec<Value> = self
+                    .script_args
+                    .iter()
+                    .map(|arg| Value::Str(arg.clone()))
                     .collect();
                 crate::builtin_core::check_collection_size_public(argv.len(), line)?;
                 Ok(Value::List(Rc::new(argv)))

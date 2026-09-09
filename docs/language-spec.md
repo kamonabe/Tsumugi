@@ -1,6 +1,6 @@
 # Tsumugi 言語仕様
 
-バージョン: 0.17
+バージョン: 0.18
 
 最終更新: 2026-09-09
 
@@ -844,7 +844,7 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 | `write_file(path, content)` | ファイルに書き込み（上書き）。成功で true、失敗で false |
 | `append_file(path, content)` | ファイルに追記。成功で true、失敗で false |
 | `env(name)` | 環境変数を取得。未設定なら null。`TSUMUGI_ENV_ALLOW` 設定時は許可リスト外のキーも null |
-| `args()` | コマンドライン引数をリストで返す（スクリプトパスは含まない）。現行CLIはスクリプトパスの後に引数を受け取らないため、常に空リストになる（AUD-018） |
+| `args()` | スクリプト引数を文字列リストで返す。process argv ではなく実行 context の snapshot を返し、CLIはSCRIPT（またはstdin `-`）より後ろのtokenを順序どおり渡す。埋め込み host は `ExecutionContext::set_script_args` で実行単位に注入する。引数がなければ空リスト（AUD-018） |
 | `input()` | 標準入力から1行読み取る。EOF なら null |
 | `now()` | 現在のUNIXタイムスタンプ（秒）を整数で返す |
 | `format_time(timestamp, format)` | タイムスタンプをUTCでフォーマット（%Y, %m, %d, %H, %M, %S）。`timestamp` は整数のみで、Floatは `builtin_type` エラー。タイムゾーン指定は提供しない |

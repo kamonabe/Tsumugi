@@ -98,6 +98,13 @@ impl ExecutionContext {
         self.evaluator.set_base_dir(path.as_ref());
     }
 
+    /// `args()` が返すスクリプト引数の snapshot を設定する（AUD-018）。
+    ///
+    /// process argv ではなく実行 context に属し、CLI や埋め込み host が実行単位で注入する。
+    pub fn set_script_args(&mut self, args: Vec<String>) {
+        self.evaluator.set_script_args(args);
+    }
+
     /// REPL の次の入力を実行する前にステップ予算をリセットする。
     pub fn reset_step_budget(&mut self) {
         self.evaluator.reset_step_budget();

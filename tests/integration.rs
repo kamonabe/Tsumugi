@@ -2038,3 +2038,122 @@ fn aud024_repl_does_not_roll_back_external_effects() {
         );
     }
 }
+
+// =============================================================
+// リグレッションテスト: CLI script 引数と args()（AUD-018）
+// =============================================================
+
+/// スクリプトファイルを引数付きで実行し、tree/VM 両方の stdout を返す。
+fn run_file_with_args(dir: &TestDir, source: &str, script_args: &[&str]) -> (String, String) {
+    let script = std::path::Path::new(dir.as_str()).join("prog.tsg");
+    std::fs::write(&script, source)
+        .unwrap_or_else(|error| panic!("スクリプトを書けません: {error}"));
+
+    let mut outputs = Vec::new();
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let mut command = Command::new(tsumugi_bin());
+        if use_vm {
+            command.arg("--vm");
+        }
+        command.arg(&script);
+        for arg in script_args {
+            command.arg(arg);
+        }
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("{mode}: 起動に失敗: {error}"));
+        let output = wait_with_timeout(child, DEFAULT_TIMEOUT, &format!("cli-args [{mode}]"));
+        assert!(
+            output.status.success(),
+            "{mode}: 実行に失敗しました: {}",
+            normalize(&String::from_utf8_lossy(&output.stderr))
+        );
+        outputs.push(normalize(&String::from_utf8_lossy(&output.stdout)));
+    }
+    (outputs.remove(0), outputs.remove(0))
+}
+
+/// `args()` はスクリプトパスの後ろに続く引数を順序どおり返し、tree/VM で一致する。
+#[test]
+fn args_returns_script_arguments_in_both_engines() {
+    let dir = TestDir::new("cli-args-basic");
+    let source = "let a = args()\nprint(len(a))\nfor x in a\n    print(x)\nend\n";
+    let (tree, vm) = run_file_with_args(&dir, source, &["alpha", "beta", "gamma"]);
+
+    assert_eq!(tree, "3\nalpha\nbeta\ngamma", "tree の args() が不正");
+    assert_eq!(tree, vm, "tree/VM で args() の結果が一致しません");
+}
+
+/// 引数なしのときは空リストを返す。
+#[test]
+fn args_is_empty_without_script_arguments() {
+    let dir = TestDir::new("cli-args-empty");
+    let source = "print(len(args()))\n";
+    let (tree, vm) = run_file_with_args(&dir, source, &[]);
+
+    assert_eq!(tree, "0", "引数なしで空リストになりません");
+    assert_eq!(tree, vm, "tree/VM で args() の結果が一致しません");
+}
+
+/// スクリプトパスより後ろの `--vm` は backend option ではなく script arg として渡す。
+#[test]
+fn tokens_after_script_are_passed_verbatim() {
+    let dir = TestDir::new("cli-args-verbatim");
+    let source = "for x in args()\n    print(x)\nend\n";
+    // tree で実行しつつ、script arg として "--vm" と "--" を渡す
+    let (tree, vm) = run_file_with_args(&dir, source, &["--vm", "--", "-"]);
+
+    assert_eq!(
+        tree, "--vm\n--\n-",
+        "script 後の token が verbatim に渡りません"
+    );
+    assert_eq!(tree, vm, "tree/VM で args() の結果が一致しません");
+}
+
+/// `-` は stdin から source 全体を読み、続く token を script args とする。
+#[test]
+fn dash_reads_source_from_stdin_with_args() {
+    use std::io::Write as _;
+
+    let source = "for x in args()\n    print(x)\nend\n";
+
+    let mut outputs = Vec::new();
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let mut command = Command::new(tsumugi_bin());
+        if use_vm {
+            command.arg("--vm");
+        }
+        command
+            .arg("-")
+            .arg("one")
+            .arg("two")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("{mode}: 起動に失敗: {error}"));
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(source.as_bytes())
+            .unwrap_or_else(|error| panic!("{mode}: stdin へ書けません: {error}"));
+
+        let output = wait_with_timeout(child, DEFAULT_TIMEOUT, &format!("cli-stdin [{mode}]"));
+        assert!(
+            output.status.success(),
+            "{mode}: stdin script の実行に失敗: {}",
+            normalize(&String::from_utf8_lossy(&output.stderr))
+        );
+        outputs.push(normalize(&String::from_utf8_lossy(&output.stdout)));
+    }
+
+    assert_eq!(outputs[0], "one\ntwo", "stdin script の args() が不正");
+    assert_eq!(outputs[0], outputs[1], "tree/VM で args() が一致しません");
+}

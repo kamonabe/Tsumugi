@@ -43,6 +43,9 @@ pub struct Evaluator {
     /// 関数値へ発番する次の FunctionId（AUD-048）。単調増加し、
     /// REPL の失敗入力でも巻き戻さない。
     next_function_id: u64,
+    /// `args()` が返すスクリプト引数の snapshot（AUD-018）。
+    /// process argv ではなく実行 context に属し、埋め込み host が実行単位で注入する。
+    script_args: Vec<String>,
 }
 
 impl Evaluator {
@@ -54,7 +57,18 @@ impl Evaluator {
             max_steps: resolve_max_steps(),
             loader: crate::module::ModuleLoader::new(),
             next_function_id: 0,
+            script_args: Vec::new(),
         }
+    }
+
+    /// `args()` が返すスクリプト引数の snapshot を設定する（AUD-018）。
+    pub fn set_script_args(&mut self, args: Vec<String>) {
+        self.script_args = args;
+    }
+
+    /// `args()` が返すスクリプト引数の snapshot を参照する（AUD-018）。
+    pub(crate) fn script_args(&self) -> &[String] {
+        &self.script_args
     }
 
     /// 関数値へ新しい FunctionId を発番する（AUD-048）。

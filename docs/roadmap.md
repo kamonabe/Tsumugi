@@ -17,7 +17,7 @@
 
 「設計sliceに沿う推奨実装順」の未完了部分を抜き出したもの。詳細は同節を参照。
 
-1. **境界挙動（意味論基盤の残り）:** ~~AUD-036 のchecked変換~~（✅ Float→Int/file_size完了、仕様revision 0.17）→ AUD-018（CLI script引数）→ AUD-033（未完結REPL入力のEOF診断）。あわせて §17 の REV-003（数値厳密比較）で観測挙動を変える revision を上げる。AUD-036 の構造化`Exited`は REV-023 と同基盤のためステップ3へ移す。
+1. **境界挙動（意味論基盤の残り）:** ~~AUD-036 のchecked変換~~（✅ Float→Int/file_size完了、仕様revision 0.17）→ ~~AUD-018 のE8a（CLI script引数）~~（✅ 完了、仕様revision 0.18。capability profile/optionsはE8bで別追跡）→ AUD-033（未完結REPL入力のEOF診断）。あわせて §17 の REV-003（数値厳密比較）で観測挙動を変える revision を上げる。AUD-036 の構造化`Exited`は REV-023 と同基盤のためステップ3へ移す。
 2. **bytecode検証・API封印（基盤・境界挙動より前に置く）:** REV-006（`VerifiedChunk`/verifier）と同一マイルストーンで REV-004（`patch_jump` fallible化）・REV-005（`MakeClosure` capture記述子化）・REV-018（internal module封印）。
 3. **包括budget（P0 基盤）:** REV-015（source/string/heap/I-O budget・deadline・cancel）に REV-001（共有DAGの指数時間/出力）の受入条件を含める。REV-023（`exit()`のprocess終了廃止）も同基盤。
 4. **Phase 1 embedding:** [組み込みAPI仕様](embedding-api.md) E1〜E6 → E8a。REV-007/008/011/013/014/020 はこの Phase 1〜2 で解消する。
@@ -46,7 +46,7 @@
 | P1 | REV-018 | internal module／raw bytecode公開が安全境界を弱める | ⬜ | REV表 P1 |
 | P1 | REV-020 | import先parse errorの原因を捨てる | ⬜ | REV表 P1 |
 | P1 | REV-021 | `remove_dir`の再帰削除とcapabilityの不整合 | ⬜ | REV表 P1（§17.6 設計確定） |
-| P1 | AUD-018 | CLIからscript引数を渡せない | 🟡 | AUD crosswalk（Embedding E8a） |
+| P1 | AUD-018 | CLIからscript引数を渡せない（capability profile/optionsはE8bで別追跡） | 🟡 | AUD crosswalk（E8a完了・E8b残） |
 | P1 | AUD-021 | language-spec/LANG_GUIDE/design drift継続 | 🟡 | AUD P2表（意味論確定後に継続更新） |
 | P2 | REV-009 | `list_dir`の部分失敗黙殺と非UTF-8名衝突 | ⬜ | REV表 P2（§17.4 設計確定） |
 | P2 | REV-010 | 32-bitで`i64 as usize`がwrap | ⬜ | REV表 P2 |
@@ -320,7 +320,7 @@ commit `092da35d0a01c6e3f403123df8416ec0819746d7` を対象に、production sour
 | REV-008 | 通常`Engine::execute`がtransactionでなく、エラー前のstate mutationを保持する。全stable executionへtransactionを適用する（AUD-024はREPL限定で完了） | stable facade | 設計◎（[組み込みAPI](embedding-api.md)、[実行予算・協調実行](execution-control.md)、AUD-024） | 🟡 REPLのみ実装。全execution transactionは未実装 |
 | REV-011 | language revision・engine差・実装statusが複数文書でdriftしている。機械可読な単一正本（project-metadata）から生成し、CIでstale literalを検査する | 文書・release | 設計◎（報告書に受入条件、§17との連携） | ⬜ 未実装 |
 | REV-012 | call評価順が現行仕様・実装（callee評価前検査）と次期仕様・code comment（callee先行）で矛盾し、完了表示も不整合。意味論の正本は第5節（AUD-017）で、statusとdoc driftのみ解消する | call semantics | ✅ 確定済み（[次期意味論・実装決定](semantic-decisions.md)§17.5、第5節が正本） | 🟡 depth-counting実装済み。callee-precedence切替は未実装 |
-| REV-013 | `args()`がhost process argvを読み、tree/VMで解析規則も異なる。runtime coreから`std::env::args_os()`を除去し、`ExecutionRequest.arguments`のみを公開する | embedding | 設計◎（[組み込みAPI](embedding-api.md)、AUD-018） | ⬜ 未実装 |
+| REV-013 | `args()`がhost process argvを読み、tree/VMで解析規則も異なる。runtime coreから`std::env::args_os()`を除去し、`ExecutionRequest.arguments`のみを公開する | embedding | 設計◎（[組み込みAPI](embedding-api.md)、AUD-018） | ✅ 完了（AUD-018 E8aと一体）。`src/builtin.rs`（tree）・`src/vm.rs`（VM）の`args()`から`std::env::args_os()`を除去し、`Evaluator` / `Vm`のscript_args snapshotを返すよう統一。tree/VMで解析規則差（skip 2 vs skip 1+`--vm` filter）も解消。CLIのみが`std::env::args_os()`をargv取得に使い、runtime coreからは参照しない |
 | REV-014 | sandbox/env/limits/stdio/clockがprocess-globalまたはfirst-use global。`EngineConfig`／`ExecutionRequest`へ移し、library coreが`std::env`等を直接参照しないようにする | embedding | 設計◎（[capability-model](capability-model.md)、[組み込みAPI](embedding-api.md)、AUD-014と関連） | ⬜ 未実装 |
 | REV-018 | internal module／raw bytecodeの公開が安全境界とstable surfaceを弱める。stable rootをEngine等へ限定し、internalsを`pub(crate)`にする（REV-004〜006の根因） | 公開API | 設計◎（[組み込みAPI](embedding-api.md)、§17.2と共通の封印作業） | ⬜ 未実装 |
 | REV-020 | import先parse errorの原因を捨て、wrapper messageだけを返す。原因診断を保持する | import diagnostics | 設計○（[組み込みAPI](embedding-api.md) error契約） | ⬜ 未実装 |
@@ -347,7 +347,7 @@ REV 由来項目の実装順は、[次期意味論・実装決定](semantic-deci
 
 | AUD | 設計状態 | 決定概要 | 正本 | 実装状態 |
 |---|---|---|---|---|
-| AUD-018 | 確定済み | CLIは`tsumugi [OPTIONS] [SCRIPT [ARGS...]]`とし、script引数を`ExecutionRequest.arguments` snapshotへ渡す。入口統合をE8a、profile/options移行をE8bに分離 | [次期意味論・実装決定](semantic-decisions.md)第6節、[組み込みAPI仕様](embedding-api.md)第12・14〜16節 | 未実装。現行CLIは追加引数を拒否 |
+| AUD-018 | 確定済み | CLIは`tsumugi [OPTIONS] [SCRIPT [ARGS...]]`とし、script引数を`ExecutionRequest.arguments` snapshotへ渡す。入口統合をE8a、profile/options移行をE8bに分離 | [次期意味論・実装決定](semantic-decisions.md)第6節、[組み込みAPI仕様](embedding-api.md)第12・14〜16節 | 🟡 E8a完了。CLIの`--vm` / `--` / `-`(stdin) / SCRIPT / ARGS grammar subsetを実装し、script引数を`ExecutionContext::set_script_args` snapshotへ注入。`args()`はtree/VMともprocess argvを読まずcontext snapshotを返す。非UTF-8 argvは`エラー: コマンドライン引数はUTF-8で指定してください`+終了1。parse_cli単体8件・engine_api契約2件・統合4件で固定。仕様revision 0.18。capability profile/options（`--profile` / `--allow-*` / `--fs-*`）と`--help` / `--version`のterminal action、safe/legacy移行はE8b（Phase 2）で別追跡（REV-013と同基盤） |
 | AUD-019 | 確定済み | operation別の単一constructorからcanonical kind/message/line/traceを生成し、backend固有診断とmessage推測を廃止 | [次期意味論・実装決定](semantic-decisions.md)第3節 | ✅ 完了（language core分）。operation別constructorへ全移行、`classify_runtime_error`削除、tree/VM完全一致をinventory/pairedテストで固定。host adapter error（HostErrorSpec）はPhase 2で別追跡 |
 | AUD-020 | 確定済み | Tsumugi単体をsecurity boundaryとせず、filesystemはportable path-handleで認可と利用をbindし、TOCTOU・oracle・dangling symlinkを受入試験化 | [脅威モデル](threat-model.md) TM-002〜004・第11節、[Capability Model仕様](capability-model.md)第8節・CAP-AT-10〜14 | 部分実装。現行制約の文書化のみ完了、path-handle未実装 |
 | AUD-022 | 確定済み | timeout/golden/differential/limit/defensive matrixに加え、fuzz・stress・failure injection・資源制約gateを段階導入 | [検証・リリース・運用設計](verification-release-operations.md)第4〜6・17節 | 部分実装。harness、timeout、完全一致、temp分離は完了。matrix/fuzz/stressは未実装 |
@@ -362,7 +362,7 @@ REV 由来項目の実装順は、[次期意味論・実装決定](semantic-deci
 ### 設計sliceに沿う推奨実装順
 
 1. **基準固定:** [次期意味論・実装決定](semantic-decisions.md)第17節の基準固定と、現行非適合fixtureを維持する。文書の設計確定を実装完了として扱わない。
-2. **意味論基盤:** 内部refactor → ~~AUD-050/017深度統合~~（✅ 完了） → ~~AUD-049単一BuiltinSpec~~（✅ 完了） → ~~AUD-019 canonical error~~（✅ 完了） → ~~AUD-047 COW~~（✅ 完了）/~~AUD-048 FunctionId~~（✅ 完了） → ~~AUD-016 binding~~（✅ 完了）/~~AUD-024 transaction~~（✅ 完了） → ~~AUD-034 path_join~~（✅ 完了）/AUD-036境界挙動（🟡 Float→Int/file_size完了、`exit`はREV-023へ）/018/033の順で進める。
+2. **意味論基盤:** 内部refactor → ~~AUD-050/017深度統合~~（✅ 完了） → ~~AUD-049単一BuiltinSpec~~（✅ 完了） → ~~AUD-019 canonical error~~（✅ 完了） → ~~AUD-047 COW~~（✅ 完了）/~~AUD-048 FunctionId~~（✅ 完了） → ~~AUD-016 binding~~（✅ 完了）/~~AUD-024 transaction~~（✅ 完了） → ~~AUD-034 path_join~~（✅ 完了）/AUD-036境界挙動（🟡 Float→Int/file_size完了、`exit`はREV-023へ）/~~AUD-018 E8a~~（✅ 完了）/033の順で進める。
 3. **Phase 1 embedding:** [組み込みAPI仕様](embedding-api.md) E1〜E6→E8a。最終terminal型のsubsetを使い、先行公開型を作らない。
 4. **Phase 2 capability:** E7→E8bと[Capability Model仕様](capability-model.md) C1→C2、C3/C4/C5/C7、C6、C8、最後にC9/C10。現行ambient accessを削除するまで完了扱いにしない。
 5. **Phase 3/4 control:** E11/C11で有限budget・transactionを完成し、その後E12/C12でcooperative state machine、yield/pause/resume、admission/backpressureを実装する。

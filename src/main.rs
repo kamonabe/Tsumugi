@@ -1,6 +1,6 @@
 use std::env as std_env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
 use tsumugi::{
     Engine, ExecutionContext, compiler::Compiler, error::TsumugiError, lexer::Lexer,
@@ -52,59 +52,148 @@ fn read_stdin_line(line: &mut String) -> usize {
     }
 }
 
+/// 実行 backend（ツリーウォーク / VM）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Tree,
+    Vm,
+}
+
+/// script source の取得元（AUD-018）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Source {
+    /// 引数なし → REPL
+    Repl,
+    /// `-` → 標準入力から source 全体を読む
+    Stdin,
+    /// 通常の positional → ファイルパス
+    File(String),
+}
+
+/// CLI 起動の確定結果（AUD-018, semantic-decisions §6.4 の E8a subset）。
+///
+/// capability profile / options（`--profile` / `--allow-*` / `--fs-*`）は Phase 2 (E8b)
+/// で追加するため、ここでは扱わない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CliInvocation {
+    backend: Backend,
+    source: Source,
+    script_args: Vec<String>,
+}
+
+/// argv（program 名を除く）を CLI grammar に従って解析する（AUD-018）。
+///
+/// grammar（E8a subset）:
+///
+/// ```text
+/// tsumugi [--vm] [SCRIPT [ARGS...]]
+/// SCRIPT が `-` なら stdin から source を読む。`--` は option 解析を終了する。
+/// ```
+///
+/// option 解析中の最初の positional を SCRIPT とし、それ以後の token は既知 option・
+/// 未知 option・`--` を含めて一切再解釈せず、そのまま script args とする。`--vm` は
+/// SCRIPT より前でのみ backend option として解釈する（複数回指定は idempotent）。
+fn parse_cli(argv: &[String]) -> CliInvocation {
+    let mut backend = Backend::Tree;
+    let mut iter = argv.iter();
+
+    // option 解析フェーズ: SCRIPT が確定するまで既知 option を処理する。
+    let source = loop {
+        match iter.next() {
+            None => break Source::Repl,
+            Some(token) if token == "--vm" => {
+                backend = Backend::Vm;
+            }
+            Some(token) if token == "--" => {
+                // option 解析を終了。次の token があれば SCRIPT。
+                match iter.next() {
+                    None => break Source::Repl,
+                    Some(script) if script == "-" => break Source::Stdin,
+                    Some(script) => break Source::File(script.clone()),
+                }
+            }
+            Some(token) if token == "-" => break Source::Stdin,
+            Some(token) => break Source::File(token.clone()),
+        }
+    };
+
+    // SCRIPT 確定後の残り token はすべて verbatim に script args とする。
+    let script_args: Vec<String> = iter.cloned().collect();
+
+    CliInvocation {
+        backend,
+        source,
+        script_args,
+    }
+}
+
 fn run() {
-    // 非UTF-8のargvでもpanicさせず、診断して終了する（AUD-035）
-    let args: Vec<String> = match std_env::args_os().map(|arg| arg.into_string()).collect() {
-        Ok(args) => args,
-        Err(invalid) => {
-            eprintln!("エラー: 引数がUTF-8ではありません: {:?}", invalid);
+    // 非UTF-8のargvでもpanicさせず、診断して終了する（AUD-018 / AUD-035）
+    let argv: Vec<String> = match std_env::args_os()
+        .skip(1)
+        .map(|arg| arg.into_string())
+        .collect()
+    {
+        Ok(argv) => argv,
+        Err(_) => {
+            eprintln!("エラー: コマンドライン引数はUTF-8で指定してください");
             std::process::exit(1);
         }
     };
 
-    // --vm フラグの検出
-    let use_vm = args.iter().any(|a| a == "--vm");
-    let file_args: Vec<&String> = args[1..].iter().filter(|a| *a != "--vm").collect();
+    let invocation = parse_cli(&argv);
 
-    match file_args.len() {
-        // 引数なし → REPL
-        0 => {
-            if use_vm {
-                run_repl_vm();
-            } else {
-                run_repl();
+    match invocation.source {
+        Source::Repl => match invocation.backend {
+            Backend::Tree => run_repl(),
+            Backend::Vm => run_repl_vm(),
+        },
+        Source::Stdin => {
+            let source = read_stdin_source();
+            match invocation.backend {
+                Backend::Tree => run_source(&source, "<stdin>", invocation.script_args),
+                Backend::Vm => run_source_vm(&source, "<stdin>", invocation.script_args),
             }
         }
-        // 引数あり → ファイル実行
-        1 => {
-            if use_vm {
-                run_file_vm(file_args[0]);
-            } else {
-                run_file(file_args[0]);
+        Source::File(ref path) => {
+            let source = read_source_file(path);
+            match invocation.backend {
+                Backend::Tree => run_source(&source, path, invocation.script_args),
+                Backend::Vm => run_source_vm(&source, path, invocation.script_args),
             }
-        }
-        _ => {
-            eprintln!("使い方: tsumugi [--vm] [script.tsg]");
-            std::process::exit(1);
         }
     }
 }
 
-/// ファイルを読み込んで実行
-fn run_file(path: &str) {
-    let source = match fs::read_to_string(path) {
+/// ファイルから source を読む。開けない場合は診断を出して終了する。
+fn read_source_file(path: &str) -> String {
+    match fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("エラー: ファイルを開けません: {} ({})", path, e);
             std::process::exit(1);
         }
-    };
+    }
+}
 
+/// 標準入力から source 全体を読む（`-` SCRIPT）。読めない場合は診断を出して終了する。
+fn read_stdin_source() -> String {
+    let mut source = String::new();
+    if let Err(e) = io::stdin().read_to_string(&mut source) {
+        eprintln!("エラー: 標準入力から読み取れません: {}", e);
+        std::process::exit(1);
+    }
+    source
+}
+
+/// ツリーウォーク版で source を実行する（ファイル / stdin 共通）。
+fn run_source(source: &str, script_path: &str, script_args: Vec<String>) {
     let engine = Engine::new();
     let mut context = ExecutionContext::new();
-    context.set_script_path(path);
+    context.set_script_path(script_path);
+    context.set_script_args(script_args);
 
-    if let Err(errors) = execute(&engine, &source, &mut context) {
+    if let Err(errors) = execute(&engine, source, &mut context) {
         for e in &errors {
             eprintln!("{}", e);
         }
@@ -208,17 +297,9 @@ fn is_incomplete(input: &str) -> bool {
 // VM モード
 // =============================================
 
-/// VMモードでファイルを実行
-fn run_file_vm(path: &str) {
-    let source = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("エラー: ファイルを開けません: {} ({})", path, e);
-            std::process::exit(1);
-        }
-    };
-
-    if let Err(errors) = execute_vm_with_path(&source, path) {
+/// VMモードで source を実行する（ファイル / stdin 共通）。
+fn run_source_vm(source: &str, script_path: &str, script_args: Vec<String>) {
+    if let Err(errors) = execute_vm_with_path(source, script_path, script_args) {
         for e in &errors {
             eprintln!("{}", e);
         }
@@ -303,7 +384,11 @@ fn run_repl_vm() {
 }
 
 /// VMモードの実行関数（ファイルパス付き）
-fn execute_vm_with_path(source: &str, path: &str) -> Result<(), Vec<TsumugiError>> {
+fn execute_vm_with_path(
+    source: &str,
+    path: &str,
+    script_args: Vec<String>,
+) -> Result<(), Vec<TsumugiError>> {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize();
 
@@ -319,5 +404,83 @@ fn execute_vm_with_path(source: &str, path: &str) -> Result<(), Vec<TsumugiError
     let compiler = Compiler::new();
     let chunk = compiler.compile(program).map_err(|e| vec![e])?;
     let mut vm = Vm::new(chunk);
+    vm.set_script_args(script_args);
     vm.run().map_err(|e| vec![e])
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn strs(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_args_starts_tree_repl() {
+        let inv = parse_cli(&[]);
+        assert_eq!(inv.backend, Backend::Tree);
+        assert_eq!(inv.source, Source::Repl);
+        assert!(inv.script_args.is_empty());
+    }
+
+    #[test]
+    fn vm_flag_before_script_selects_vm_backend() {
+        // tsumugi --vm app.tsg a --vm  → VMで実行、args() == ["a", "--vm"]
+        let inv = parse_cli(&strs(&["--vm", "app.tsg", "a", "--vm"]));
+        assert_eq!(inv.backend, Backend::Vm);
+        assert_eq!(inv.source, Source::File("app.tsg".to_string()));
+        assert_eq!(inv.script_args, strs(&["a", "--vm"]));
+    }
+
+    #[test]
+    fn double_dash_ends_option_parsing() {
+        // tsumugi -- app.tsg --help  → treeで実行、args() == ["--help"]
+        let inv = parse_cli(&strs(&["--", "app.tsg", "--help"]));
+        assert_eq!(inv.backend, Backend::Tree);
+        assert_eq!(inv.source, Source::File("app.tsg".to_string()));
+        assert_eq!(inv.script_args, strs(&["--help"]));
+    }
+
+    #[test]
+    fn dash_reads_stdin_source() {
+        // tsumugi - a b  → stdin script、args() == ["a", "b"]
+        let inv = parse_cli(&strs(&["-", "a", "b"]));
+        assert_eq!(inv.backend, Backend::Tree);
+        assert_eq!(inv.source, Source::Stdin);
+        assert_eq!(inv.script_args, strs(&["a", "b"]));
+    }
+
+    #[test]
+    fn double_dash_only_starts_repl() {
+        // tsumugi --  → SCRIPTなしなのでREPL
+        let inv = parse_cli(&strs(&["--"]));
+        assert_eq!(inv.source, Source::Repl);
+        assert!(inv.script_args.is_empty());
+    }
+
+    #[test]
+    fn script_after_double_dash_may_be_dash_stdin() {
+        // `--` の後の `-` は stdin script として扱う
+        let inv = parse_cli(&strs(&["--", "-", "x"]));
+        assert_eq!(inv.source, Source::Stdin);
+        assert_eq!(inv.script_args, strs(&["x"]));
+    }
+
+    #[test]
+    fn tokens_after_script_are_verbatim() {
+        // script 確定後の --vm は backend option ではなく script arg
+        let inv = parse_cli(&strs(&["app.tsg", "--vm", "--", "-"]));
+        assert_eq!(inv.backend, Backend::Tree);
+        assert_eq!(inv.source, Source::File("app.tsg".to_string()));
+        assert_eq!(inv.script_args, strs(&["--vm", "--", "-"]));
+    }
+
+    #[test]
+    fn vm_flag_is_idempotent() {
+        let inv = parse_cli(&strs(&["--vm", "--vm", "app.tsg"]));
+        assert_eq!(inv.backend, Backend::Vm);
+        assert_eq!(inv.source, Source::File("app.tsg".to_string()));
+        assert!(inv.script_args.is_empty());
+    }
 }
