@@ -510,11 +510,90 @@ pub fn builtin_replace(args: &[Value], line: usize) -> Result<Value, TsumugiErro
 // 型変換・数値系
 // =============================================================================
 
+/// Float→Int 変換の丸めモード（AUD-036）。
+#[derive(Clone, Copy)]
+enum RoundMode {
+    /// 0 方向へ切り捨て（`to_int`）
+    TowardZero,
+    /// 負の無限大方向（`floor`）
+    Floor,
+    /// 正の無限大方向（`ceil`）
+    Ceil,
+    /// 最も近い整数、中間は 0 から遠い側（`round`）
+    Nearest,
+}
+
+/// finite な Float を丸めて i64 へ変換する。NaN・±Infinity・i64 範囲外は
+/// `conversion` エラーにする（AUD-036）。lossy な `as i64` を使わず、丸め後の
+/// 数学値が半開区間 `[-2^63, 2^63)` に入ることを検査してから変換する。
+///
+/// `i64::MAX as f64` は 2^63 へ丸められるため、上端 2^63 は表現できず受理しない。
+/// 下端 `-2^63`（= `i64::MIN`）は f64 で正確に表現できるため受理する。
+fn checked_float_to_i64(
+    value: f64,
+    mode: RoundMode,
+    builtin: &str,
+    line: usize,
+) -> Result<i64, TsumugiError> {
+    if value.is_nan() {
+        return Err(TsumugiError::runtime_with_kind(
+            line,
+            crate::error::ErrorKind::Conversion,
+            format!("{builtin} で Int に変換できません: NaN"),
+        ));
+    }
+    if value.is_infinite() {
+        return Err(TsumugiError::runtime_with_kind(
+            line,
+            crate::error::ErrorKind::Conversion,
+            format!("{builtin} で Int に変換できません: 非有限値"),
+        ));
+    }
+
+    let rounded = match mode {
+        RoundMode::TowardZero => value.trunc(),
+        RoundMode::Floor => value.floor(),
+        RoundMode::Ceil => value.ceil(),
+        RoundMode::Nearest => value.round(),
+    };
+
+    // 半開区間 [-2^63, 2^63) を境界で判定する。上端 2^63 は i64 で表現できない。
+    // 定数は f64 で正確に表現できる 2 の冪なので比較は厳密。
+    const MIN: f64 = -9_223_372_036_854_775_808.0; // -2^63 = i64::MIN
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0; // 2^63（受理しない上端）
+    if !(MIN..LIMIT).contains(&rounded) {
+        return Err(TsumugiError::runtime_with_kind(
+            line,
+            crate::error::ErrorKind::Conversion,
+            format!("{builtin} で Int に変換できません: i64 範囲外"),
+        ));
+    }
+
+    Ok(rounded as i64)
+}
+
+/// OS が返す `u64` のファイルサイズを i64 へ変換する。`i64::MAX` を超える場合は
+/// wrap・負値を返さず `int_overflow` エラーにする（AUD-036）。
+fn checked_file_size_to_i64(size: u64, line: usize) -> Result<i64, TsumugiError> {
+    i64::try_from(size).map_err(|_| {
+        TsumugiError::runtime_with_kind(
+            line,
+            crate::error::ErrorKind::IntOverflow,
+            "ファイルサイズを Int で表現できません",
+        )
+    })
+}
+
 pub fn builtin_to_int(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("to_int", args, 1, line)?;
     match &args[0] {
         Value::Int(n) => Ok(Value::Int(*n)),
-        Value::Float(f) => Ok(Value::Int(*f as i64)),
+        Value::Float(f) => Ok(Value::Int(checked_float_to_i64(
+            *f,
+            RoundMode::TowardZero,
+            "to_int",
+            line,
+        )?)),
         Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
         Value::Str(s) => s.parse::<i64>().map(Value::Int).map_err(|_| {
             TsumugiError::runtime_with_kind(
@@ -634,7 +713,12 @@ pub fn builtin_max(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
 pub fn builtin_floor(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("floor", args, 1, line)?;
     match &args[0] {
-        Value::Float(f) => Ok(Value::Int(f.floor() as i64)),
+        Value::Float(f) => Ok(Value::Int(checked_float_to_i64(
+            *f,
+            RoundMode::Floor,
+            "floor",
+            line,
+        )?)),
         Value::Int(n) => Ok(Value::Int(*n)),
         other => Err(TsumugiError::builtin_arg_type(
             line,
@@ -649,7 +733,12 @@ pub fn builtin_floor(args: &[Value], line: usize) -> Result<Value, TsumugiError>
 pub fn builtin_ceil(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("ceil", args, 1, line)?;
     match &args[0] {
-        Value::Float(f) => Ok(Value::Int(f.ceil() as i64)),
+        Value::Float(f) => Ok(Value::Int(checked_float_to_i64(
+            *f,
+            RoundMode::Ceil,
+            "ceil",
+            line,
+        )?)),
         Value::Int(n) => Ok(Value::Int(*n)),
         other => Err(TsumugiError::builtin_arg_type(
             line,
@@ -664,7 +753,12 @@ pub fn builtin_ceil(args: &[Value], line: usize) -> Result<Value, TsumugiError> 
 pub fn builtin_round(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("round", args, 1, line)?;
     match &args[0] {
-        Value::Float(f) => Ok(Value::Int(f.round() as i64)),
+        Value::Float(f) => Ok(Value::Int(checked_float_to_i64(
+            *f,
+            RoundMode::Nearest,
+            "round",
+            line,
+        )?)),
         Value::Int(n) => Ok(Value::Int(*n)),
         other => Err(TsumugiError::builtin_arg_type(
             line,
@@ -1037,7 +1131,7 @@ pub fn builtin_file_size(args: &[Value], line: usize) -> Result<Value, TsumugiEr
     if let Value::Str(path) = &args[0] {
         let safe_path = crate::sandbox::check_path(path, line)?;
         match std::fs::metadata(&safe_path) {
-            Ok(meta) => Ok(Value::Int(meta.len() as i64)),
+            Ok(meta) => Ok(Value::Int(checked_file_size_to_i64(meta.len(), line)?)),
             Err(_) => Ok(Value::Null),
         }
     } else {
@@ -1195,4 +1289,56 @@ pub fn format_unix_timestamp(timestamp: i64, format: &str) -> String {
 
 fn is_leap_year(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+#[cfg(test)]
+mod aud_036_tests {
+    //! AUD-036: checked 変換 helper のユニットテスト。file_size の u64→i64 境界は
+    //! `i64::MAX` 超のファイルを実際に作れないため、helper を直接検査する（§10.3）。
+    use super::*;
+    use crate::error::ErrorKind;
+
+    #[test]
+    fn file_size_accepts_i64_max() {
+        let size = i64::MAX as u64;
+        assert_eq!(checked_file_size_to_i64(size, 1).unwrap(), i64::MAX);
+    }
+
+    #[test]
+    fn file_size_rejects_i64_max_plus_one() {
+        let size = (i64::MAX as u64) + 1;
+        let error = checked_file_size_to_i64(size, 5).expect_err("i64::MAX+1 は範囲外");
+        assert_eq!(error.kind(), Some(ErrorKind::IntOverflow));
+        assert_eq!(error.message(), "ファイルサイズを Int で表現できません");
+        assert_eq!(error.line(), 5);
+    }
+
+    #[test]
+    fn file_size_rejects_u64_max() {
+        let error = checked_file_size_to_i64(u64::MAX, 1).expect_err("u64::MAX は範囲外");
+        assert_eq!(error.kind(), Some(ErrorKind::IntOverflow));
+    }
+
+    #[test]
+    fn file_size_accepts_zero() {
+        assert_eq!(checked_file_size_to_i64(0, 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn checked_float_accepts_i64_min() {
+        let v = checked_float_to_i64(i64::MIN as f64, RoundMode::TowardZero, "to_int", 1).unwrap();
+        assert_eq!(v, i64::MIN);
+    }
+
+    #[test]
+    fn checked_float_rejects_two_pow_63() {
+        // i64::MAX as f64 は 2^63 へ丸められるため上端として受理しない。
+        let error = checked_float_to_i64(i64::MAX as f64, RoundMode::TowardZero, "to_int", 1)
+            .expect_err("2^63 は範囲外");
+        assert_eq!(error.kind(), Some(ErrorKind::Conversion));
+        assert_eq!(
+            error.message(),
+            "to_int で Int に変換できません: i64 範囲外"
+        );
+    }
 }

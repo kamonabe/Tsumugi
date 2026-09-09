@@ -1,8 +1,8 @@
 # Tsumugi 言語仕様
 
-バージョン: 0.16
+バージョン: 0.17
 
-最終更新: 2026-09-08
+最終更新: 2026-09-09
 
 この番号は言語仕様のrevisionであり、Cargo package / REPLの実装バージョン `0.1.0` とは独立して管理する。
 
@@ -766,7 +766,8 @@ end
 - 未定義の変数・関数（名前を実際に評価した時点で発生）
 - 関数の引数不一致
 - リスト/辞書以外へのインデックス代入
-- `to_int` の変換失敗
+- `to_int` / `floor` / `ceil` / `round` の変換失敗（`NaN` / `±Infinity` / i64 範囲外）
+- `file_size` のサイズが i64 で表現できない（`int_overflow`）
 - ステップ上限超過
 - `print` の出力失敗（`io`）— 出力先が閉じられた場合など
 
@@ -804,6 +805,11 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 | loop外の`break` / `continue` | `control_flow` | `break はループの中でのみ使用できます` / `continue は…` |
 | ステップ上限 | `limit` | `ステップ上限に達しました (上限: {limit})` |
 | 整数演算overflow | `int_overflow` | `整数オーバーフロー: {operation}` |
+| Float→Int変換の`NaN` | `conversion` | `{builtin} で Int に変換できません: NaN` |
+| Float→Int変換の`±Infinity` | `conversion` | `{builtin} で Int に変換できません: 非有限値` |
+| Float→Int変換の範囲外 | `conversion` | `{builtin} で Int に変換できません: i64 範囲外` |
+| 文字列等からIntへ変換不能 | `conversion` | `to_int で Int に変換できません: {reason}` |
+| file sizeがi64範囲外 | `int_overflow` | `ファイルサイズを Int で表現できません` |
 
 `runtime` 種別は現行の言語コアが生成する経路を持たない（互換用に列挙のみ残す）。
 
@@ -830,7 +836,7 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 | `contains(collection, val)` | リストは要素、文字列は部分文字列、**辞書はキー**を探して含まれていれば true。型が合わない組み合わせ（文字列に非文字列など）はエラーにせず false を返す |
 | `split(str, sep)` | 文字列をセパレータで分割しリストで返す |
 | `join(list, sep)` | リストの各要素をセパレータで結合して文字列で返す |
-| `to_int(val)` | 値を整数に変換（Int/Float/Bool/文字列対応）。Floatは0方向へ切り捨て。文字列は整数リテラルとして解釈できる場合だけ成功し、`"3.5"` や前後に空白を含む `" 42"` は `conversion` エラー |
+| `to_int(val)` | 値を整数に変換（Int/Float/Bool/文字列対応）。Floatは0方向へ切り捨て、`NaN` / `±Infinity` / 丸め後に i64 範囲 `[-2^63, 2^63)` 外となる値は `conversion` エラー。文字列は整数リテラルとして解釈できる場合だけ成功し、`"3.5"` や前後に空白を含む `" 42"` は `conversion` エラー |
 | `to_str(val)` | 値を文字列に変換 |
 | `range(start, end)` | start から end の手前までの整数リストを生成 |
 | `read_file(path)` | ファイル全体を文字列で返す。失敗時は null |
@@ -849,7 +855,7 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 | `remove_dir(path)` | ディレクトリを中身ごと再帰削除。final symlinkはlink自体だけを削除し、targetをたどらない。成功で true |
 | `rename(from, to)` | ファイル/ディレクトリを移動・リネーム。from/toのfinal symlinkはtargetでなくdirectory entry自体として扱う。成功で true |
 | `list_dir(path)` | ディレクトリ内のエントリ名をリストで返す。失敗で null |
-| `file_size(path)` | ファイルサイズ（バイト）を整数で返す。失敗で null |
+| `file_size(path)` | ファイルサイズ（バイト）を整数で返す。失敗で null。サイズが i64 で表現できない（`i64::MAX` 超）場合は wrap・負値を返さず `int_overflow` エラー |
 | `trim(str)` | 前後の空白を除去 |
 | `starts_with(str, prefix)` | 接頭辞チェック |
 | `ends_with(str, suffix)` | 接尾辞チェック |
@@ -866,9 +872,9 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 | `is_dir(path)` | パスがディレクトリなら true |
 | `values(dict)` | 辞書の値一覧をリストで返す（キーのコードポイント順） |
 | `has_key(dict, key)` | 辞書にキーが存在すれば true（値が null でも true を返す）。`key` は文字列のみで、それ以外は `builtin_type` エラー |
-| `floor(num)` | 小数点以下を切り捨てて整数で返す |
-| `ceil(num)` | 小数点以下を切り上げて整数で返す |
-| `round(num)` | 四捨五入して整数で返す |
+| `floor(num)` | 負の無限大方向へ丸めて整数で返す。`NaN` / `±Infinity` / 丸め後に i64 範囲外となる値は `conversion` エラー |
+| `ceil(num)` | 正の無限大方向へ丸めて整数で返す。`NaN` / `±Infinity` / 丸め後に i64 範囲外となる値は `conversion` エラー |
+| `round(num)` | 最も近い整数へ丸めて返す（中間値は 0 から遠い側）。`NaN` / `±Infinity` / 丸め後に i64 範囲外となる値は `conversion` エラー |
 | `exit(code?)` | プロセスを終了する。引数省略時は終了コード 0。引数は整数のみ |
 | `map(list, fn)` | リストの各要素に関数を適用し、結果のリストを返す |
 | `filter(list, fn)` | リストの各要素に関数を適用し、真を返した要素のリストを返す |

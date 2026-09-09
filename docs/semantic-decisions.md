@@ -652,6 +652,21 @@ lineはLexerが生成するEOF tokenの行。未閉じblockのcanonical message�
 
 ## 10. lossy変換境界（AUD-036）
 
+> **実装状況（2026-09-09）:** 🟡 部分実装。**Float→Int 変換**（`to_int` / `floor` /
+> `ceil` / `round`）と **file_size** の u64→i64 変換を checked helper へ集約し、`NaN` /
+> `±Infinity` / i64 範囲外を lossy な `as` cast に頼らず `conversion` / `int_overflow`
+> エラーにした。`src/builtin_core.rs` の `checked_float_to_i64`（`RoundMode`）と
+> `checked_file_size_to_i64` を tree/VM 共有 handler として実装し、観測挙動が変わるため
+> `language-spec.md` へ反映し仕様revisionを0.17へ上げた。paired test は
+> `tests/canonical_error_inventory.rs`（tree/VM 一致）・`tests/checked_conversion_contract.rs`
+> （丸めモード・境界）・`builtin_core` の `aud_036_tests`（private file_size helper の
+> `i64::MAX+1` / `u64::MAX`）で固定した。
+>
+> **未実装（本節の残り）:** `exit` の構造化 `ExecutionOutcome::Exited { code, usage }` 化。
+> これは `BudgetUsage` と REV-023（`exit()` の process 終了廃止・Phase 3 budget 基盤）に
+> 依存するため、本節の他項目とは切り離し、REV-023 と同一マイルストーンで実装する。
+> それまで `exit` は従来どおり process を終了する（`language-spec.md` の記述は据え置き）。
+
 ### 10.1 採用判断
 
 #### Float→Int
