@@ -1871,6 +1871,128 @@ remove_tree(path):
 - symlink をリンク先まで辿って削除しない。
 - tree / VM の結果・error が一致する。
 
+### 17.7 bytecode 検証と `VerifiedChunk`（REV-006）
+
+> 設計ステータス: 次期仕様確定・未実装。§17.2（REV-004）・§17.3（REV-005）・REV-018 と同一マイルストーン（第18節ステップ7）で実装する。本節はそれらが「範囲検証は verifier が担う」と委譲している検証層の正本である。
+
+#### 17.7.1 採用判断
+
+VM が実行する bytecode を、**検証を通過した `VerifiedChunk` に限定する**。あわせて、任意の bytecode に対して停止性（step 予算での必ずの終了）が成り立つよう、**step 課金を「1 命令 dispatch ごとに 1」へ変更する**。この 2 層で REV-006 の 2 つの穴（`Jump(0)` 等による step 課金迂回、`PrepareCall` を省いた raw `Call` による call 課金迂回）を塞ぐ。
+
+- **層1（durable guarantee・bytecode 形状に非依存）**: VM のメインループは、fetch した全命令の dispatch 直前に無条件で `count_step` を呼ぶ。これにより、検証を通っていない chunk が防御的に VM へ届いた場合でも、任意の命令列は有限 step で `limit` error になる。`Jump(0)` の自己ループも 1 周ごとに 1 命令以上を dispatch するため必ず課金される。現行の Loop / PrepareCall / callback の 3 箇所だけの課金は廃止する（二重課金しない）。
+- **層2（gate・早期拒否と不変条件の確立）**: `Chunk` を `VerifiedChunk` へ昇格させる際に static verifier を通す。verifier はホストが構築・改変した bytecode の構造的健全性を compile/link 時に一度だけ検査し、VM 実行時の防御的分岐（AUD-023 の `require_*` ヘルパー）が「起こり得るが正常運用では到達しない」経路として残る前提を確立する。
+
+VM の公開入口は `VerifiedChunk` だけを受け取る。raw `Chunk` から VM を直接動かす現行の公開経路（`tsumugi::vm::Vm::new(chunk)` / `run_repl_chunk(chunk)` と `pub mod chunk/opcode/vm`）は封印する（REV-018 と共通作業）。
+
+停止性の正本は層1（per-instruction 課金）とする。verifier は「早期拒否・不変条件の明文化・defense-in-depth」であって、停止性を verifier だけに依存させない。verifier を通していない chunk が防御的に実行されても、ホストは panic せず有限 step で停止しなければならない。
+
+#### 17.7.2 却下案
+
+- **verifier だけで停止性を保証し、課金は現状（Loop/PrepareCall のみ）を維持する**: verifier に単一の見落としがあると無期限実行へ直結する。停止性を静的解析の完全性へ依存させるのは脆いため却下する。層1の無条件課金を正本にする。
+- **後方ジャンプの到達可能性を解析して「課金経路を必ず通る」ことを保証する**: 一般の bytecode で「必ず charged 命令を通る」ことの静的証明は制御フロー解析が重く、生成器の変更に脆い。per-instruction 課金なら形状に依存せず自明に停止するため却下する。
+- **`Jump` にだけ課金を追加する**: `Jump` 以外の後方遷移（不正な `Loop` operand 等）や、分岐で自己参照する構成を取りこぼす。命令種別ごとの課金は網羅が難しいため却下する。
+- **raw `Chunk` 経路を公開したまま実行時チェックだけ足す**: 未検証 bytecode が VM 内部不変条件へ到達し続け、verifier で確立したい「VM は検証済み前提」を崩す。公開入口を `VerifiedChunk` へ限定する。
+- **1 命令 = 1 step で既存 fixture の step 予算が変わることを避けるため、命令に重み付けする**: 重み表が opcode 追加ごとに保守対象になり、観測挙動（`limit` 到達点）の説明が複雑化する。等重み（1 命令 1 step）とし、必要なら `TSUMUGI_MAX_STEPS` の既定値だけを調整する。
+
+#### 17.7.3 データモデル / 状態遷移
+
+```text
+VerifiedChunk(inner: Chunk)          # 生成は verify() 経由のみ。inner は非公開。
+  - VM が参照する code / constants / lines / prototypes への読み取り専用アクセサを持つ
+  - Clone は検証状態を保つ（再検証不要）
+  - PartialEq は inner の等価で定義（test 用）
+
+verify(chunk: Chunk) -> Result<VerifiedChunk, ChunkVerifyError>
+  以下を、関数プロトタイプを含め chunk 木の全 code に対して検査する:
+
+  (V1) 行番号表整合:      lines.len() == code.len()
+  (V2) 定数参照:          LoadConst(i) の i < constants.len()
+  (V3) local slot:        Get/SetLocal(s) / LenLocal(s) / IndexLocal(s) /
+                          SetIndex(Local(s)) の s が、その chunk の宣言 local 数の上限内
+  (V4) upvalue index:     Get/SetUpvalue(i) / SetIndex(Upvalue(i)) の i が
+                          プロトタイプの capture 数（§17.3 の captures.len()）内
+  (V5) capture 記述子:    §17.3 の CaptureDesc の Local(slot)/Upvalue(index) が
+                          親プロトタイプの範囲内（REV-005 の範囲検証をここで実施）
+  (V6) jump target 範囲:  Jump / JumpIfFalse / JumpIfFalseKeep / JumpIfTrueKeep /
+                          Loop / SetupTry / JumpIfGlobalDefined の target が
+                          0 ..= code.len()（= 末尾＝暗黙 return 位置を許可）
+  (V7) builtin id:        CallBuiltin(id, _) の id が registry に存在
+                          （AUD-049 の BuiltinId は型で保証されるが、防御的に再確認）
+  (V8) stack operand:     PopN(n) / Print(n) / FStrConcat(n) / CallBuiltin(_, n) /
+                          Call(n) / ValidateCall(n) の n が u32→usize 変換可能
+                          （32-bit 迂回は REV-010 と整合。負の到達は型で排除）
+  (V9) try 構造:          SetupTry の target が catch 先頭として範囲内、
+                          TeardownTry が対応する SetupTry を持つ入れ子であること
+  検査は一度だけ。成功なら VerifiedChunk、失敗なら最初の違反を ChunkVerifyError で返す。
+
+ChunkVerifyError {
+    kind: BadLineTable | BadConstant | BadLocalSlot | BadUpvalue
+        | BadCapture | BadJumpTarget | UnknownBuiltin | BadOperand | BadTryStructure,
+    // 生値・オフセットは stable_detail へ含めず、種別と位置種別のみ保持する
+}
+```
+
+停止性（層1）の状態遷移:
+
+```text
+run_frames dispatch loop:
+  fetch instruction at ip
+  ip += 1
+  count_step(line)?        # ★ 全命令共通・無条件（REV-006）
+  dispatch(instruction)    # Loop / PrepareCall / callback では追加課金しない
+```
+
+`count_step` / `max_steps` / `TSUMUGI_MAX_STEPS` / `step_limit` error の定義は変更しない。変わるのは「どこで呼ぶか」だけ（3 箇所限定 → 全命令 1 回）。深度上限（`MAX_USER_CALL_DEPTH`）は現行どおり `PrepareCall` と `Call` の両方で検査し、call 課金は per-instruction 課金に吸収する（`Call` 命令自体が 1 step 課金されるため、`PrepareCall` を省いた raw `Call` でも課金を迂回できない）。
+
+`VerifiedChunk` は VM・関数プロトタイプ・REPL 差し替えの各所で `Chunk` を置き換える。VM 内部の `require_*` ヘルパー（AUD-023）は削除せず defense-in-depth として残す。verifier を通した chunk では発火しないことをテストで確認する。
+
+#### 17.7.4 tree / VM 変更箇所
+
+- 新規 `src/verifier.rs`（または `src/chunk.rs` 内 `verify`）: `verify(Chunk) -> Result<VerifiedChunk, ChunkVerifyError>` と `VerifiedChunk` を定義する。プロトタイプ木を再帰的に検査する。
+- `src/chunk.rs`: `VerifiedChunk` の読み取り専用アクセサを定義し、builder（`emit` / `patch_jump` 等）は §17.2 に従い `pub(crate)` へ縮小する。
+- `src/opcode.rs`: §17.3 の `MakeClosure(proto_index)` と `FunctionPrototype` を導入する（同一マイルストーン）。
+- `src/vm.rs`:
+  - メインループの `count_step` を全命令 dispatch 前の 1 回へ移す。`Loop` / `PrepareCall` / `call_fn_value` の個別 `count_step` を削除する。
+  - `Vm::new` / `run_repl_chunk` の受け取りを `VerifiedChunk` へ変更する。VM 内部が参照する code / constants / lines / prototypes を `VerifiedChunk` のアクセサ経由にする。
+  - `require_*` ヘルパーは残す（防御的経路）。
+- `src/compiler.rs`: `compile` / `compile_repl_line` の戻り値を `VerifiedChunk` にする（生成直後に `verify` を通す）か、compiler が生成する chunk は不変条件を満たすため verify を skip して `VerifiedChunk` を直接構築する `pub(crate)` 経路を用意する。どちらでも「VM へ渡る型は `VerifiedChunk`」を守る。
+- `src/lib.rs`: `chunk` / `opcode` / `vm` module の raw 公開を封印する（REV-018 と共通）。公開 facade は `Engine` 系のみ。raw builder / raw VM 経路は `unstable-bytecode` feature 下でだけ露出する。
+- `src/module.rs` / `src/engine.rs`: link 済みプログラムを compile→verify→VM の順に流す経路を `VerifiedChunk` で通す。
+
+#### 17.7.5 error
+
+- verifier 拒否（compile/link 段）: 第3.4節「VM/Compiler 不変条件違反」の `internal` / `内部エラー: {stable_detail}` を用いる。`{stable_detail}` は `ChunkVerifyError.kind` に対応する固定文字列（例: `bytecode 検証に失敗しました: jump target が範囲外です`）とし、オフセットや operand の生値・スタック内容を含めない。script からは到達しないため trace は付けない。
+- 防御的に未検証 chunk が VM 実行時の `require_*` へ到達した場合: 従来どおり `internal`（AUD-023 の各メッセージ）を維持し、host panic させない。
+- step 上限到達: 既存の `limit` / `ステップ上限に達しました (上限: {limit})` を変更しない。per-instruction 課金化により到達点（step 数）は変わるが、kind・message template・line 規則は不変。
+
+#### 17.7.6 移行
+
+- `TSUMUGI_MAX_STEPS` の既定値と、step 数に依存する fixture（`error_step_limit` 等）は、per-instruction 課金で到達点が変わるため再調整する。観測される kind・message は変えない。
+- ホストが `tsumugi::chunk::Chunk` を raw 構築して `tsumugi::vm::Vm` へ渡していた利用は、封印により `unstable-bytecode` feature が必要になる。安定利用は `Engine` facade へ移行する。
+- `tests/defensive_vm.rs` は「未検証 chunk を防御的経路（`unstable-bytecode` またはテスト内部 API）で VM へ渡しても host panic しない」方針を維持する。加えて REV-006 の 2 ケース（`Jump(0)` 自己ループ・`PrepareCall` なし raw `Call` ループ）を追加し、いずれも `limit` error で有限停止することを固定する。
+
+#### 17.7.7 テスト行列
+
+| 軸 | ケース |
+|---|---|
+| 停止性（層1） | `Jump(0)` 自己ループ / 後方 `Loop` 迂回 / `PrepareCall` なし raw `Call` ループ / 巨大 operand なし純命令ループ。いずれも `limit` で有限停止 |
+| verifier 拒否（層2） | V1〜V9 各違反を最低 1 ケース。最初の違反種別が `ChunkVerifyError` になる |
+| verifier 通過 | 正規 compiler 出力（if/while/for/関数/closure/try/f-string/builtin）が verify を通り、観測挙動が現行と一致 |
+| defense-in-depth | verify を通した chunk では `require_*` が発火しないこと（fault injection でのみ発火） |
+| backend | per-instruction 課金後の step 到達点を tree（該当する範囲）と VM で説明可能にし、VM の `limit` error が message/line 一致 |
+| 公開境界 | `unstable-bytecode` feature 無効時に raw `Chunk`→VM 経路がコンパイル不能／到達不能であること |
+
+全ケースで終了コード・stdout・stderr・kind・message・line を検査する。既存 golden の step 到達点変化は fixture 側で吸収し、backend 別期待値を新設しない。
+
+#### 17.7.8 受入基準
+
+- VM の公開入口が `VerifiedChunk` だけを受け取り、安定 API から raw `Chunk` を VM へ渡せない。
+- 全命令 dispatch ごとに 1 step 課金され、`Jump(0)` 自己ループ・`PrepareCall` なし raw `Call` ループが有限 step で `limit` error になる。
+- verifier が V1〜V9 の構造違反を compile/link 段で `internal` として拒否する。
+- verifier を通していない chunk が防御的に実行されても host が panic せず有限停止する（停止性は verifier に依存しない）。
+- 正規 compiler 出力の観測挙動（step 到達点を除く）が変わらず、tree / VM で kind・message・line が一致する。
+- §17.2（REV-004）builder 封印・§17.3（REV-005）capture 記述子と同一 build へ統合し、旧 API・旧フォールバックを併存させない。
+
 ## 18. 実装順
 
 次期revisionは以下の順で進める。各段階でfmt、Clippy、全test、paired golden、defensive testを通し、意味論変更と内部リファクタを同じcommitへ混在させない。
@@ -1881,7 +2003,7 @@ remove_tree(path):
 4. **Builtin/error基盤**: AUD-049単一registry、AUD-019共通error constructorと完全一致test。§17.1（REV-003）の `NumericOrder` 集約、および §17.4（REV-009）・§17.6（REV-021）で追加するhost error category（`directory_read` / `invalid_encoding` / `directory_not_empty`）のinventory登録もここで行う。
 5. **値表現**: AUD-047 List/Dict COW、続けてAUD-048 FunctionId。scaling/identity testを先に追加する。
 6. **binding/transaction**: AUD-016 VM fresh cell、AUD-024全language-state REPL journal。FunctionId counterをrollback対象外に固定する。
-7. **bytecode検証面**: §17.2（REV-004）の `patch_jump` fallible化とbuilder封印、§17.3（REV-005）の `MakeClosure` capture記述子化を、REV-006の `VerifiedChunk`/verifier と同一マイルストーンで実施する。opcodeと関数値表現の変更を伴うため境界挙動より前に置く。
+7. **bytecode検証面**: §17.7（REV-006）の `VerifiedChunk`/verifier と per-instruction step 課金を軸に、§17.2（REV-004）の `patch_jump` fallible化とbuilder封印、§17.3（REV-005）の `MakeClosure` capture記述子化、REV-018のraw module封印を同一マイルストーンで実施する。VM入口を `VerifiedChunk` へ限定し、停止性はper-instruction課金（verifier非依存）で担保する。opcodeと関数値表現の変更を伴うため境界挙動より前に置く。
 8. **境界挙動**: ~~AUD-034 `path_join`~~（✅ 完了、revision 0.16）、AUD-036 checked変換/Exited、AUD-018 CLI args/stdin、AUD-033 EOF診断。§17.1（REV-003）の混合数値比較の観測挙動変更もここでrevisionを上げる。
 9. **capability縦切り**: sandbox OnceLockをExecutionContext FilesystemCapabilityへ移し、tree/VM/importを同じpolicyへ接続する。§17.4（REV-009）の `list_dir` 部分失敗/非UTF-8、§17.6（REV-021）の `remove_dir`（空のみ）/`remove_tree`（`RecursiveDelete`）分割をこのcapability面で実装する。
 10. **検証基盤**: cargo-fuzzのfrontend/compiler/vm_chunk、続いてcapability完成後にevaluator/differential target。
@@ -1892,7 +2014,7 @@ remove_tree(path):
 ## 19. 文書全体の最終受入基準
 
 - AUD-016/017/018/019/024/033/034/036/047/048/049/050の採用判断、却下案、規範挙動、状態、変更箇所、error、移行、test、受入基準が実装PRから追跡できる。
-- §17のREV-003/004/005/009/012/021についても、同じ8観点（採用判断・却下案・データモデル・変更箇所・error・移行・test・受入基準）が実装PRから追跡できる。REV-012は既存の第5節（AUD-017）を正本とし、本書で新しい意味論を追加しない。
+- §17のREV-003/004/005/006/009/012/021についても、同じ8観点（採用判断・却下案・データモデル・変更箇所・error・移行・test・受入基準）が実装PRから追跡できる。REV-012は既存の第5節（AUD-017）を正本とし、本書で新しい意味論を追加しない。REV-006（§17.7）は停止性をper-instruction課金で担保し、verifierを唯一の停止性根拠にしない。
 - tree/VMで意図しないbackend別期待値が残らない。
 - 現行 `language-spec.md` は実装完了まで変更せず、現行挙動の正本として維持する。
 - クラスは「設計済み・低優先度」、HTTPは「設計済み・着手禁止」として扱われる。

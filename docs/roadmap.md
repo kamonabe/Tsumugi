@@ -18,7 +18,7 @@
 「設計sliceに沿う推奨実装順」の未完了部分を抜き出したもの。詳細は同節を参照。
 
 1. **境界挙動（意味論基盤の残り）:** ~~AUD-036 のchecked変換~~（✅ Float→Int/file_size完了、仕様revision 0.17）→ ~~AUD-018 のE8a（CLI script引数）~~（✅ 完了、仕様revision 0.18。capability profile/optionsはE8bで別追跡）→ AUD-033（未完結REPL入力のEOF診断）。あわせて §17 の REV-003（数値厳密比較）で観測挙動を変える revision を上げる。AUD-036 の構造化`Exited`は REV-023 と同基盤のためステップ3へ移す。
-2. **bytecode検証・API封印（基盤・境界挙動より前に置く）:** REV-006（`VerifiedChunk`/verifier）と同一マイルストーンで REV-004（`patch_jump` fallible化）・REV-005（`MakeClosure` capture記述子化）・REV-018（internal module封印）。
+2. **bytecode検証・API封印（基盤・境界挙動より前に置く）:** REV-006（`VerifiedChunk`/verifier + per-instruction step 課金。§17.7 で実装詳細確定）を軸に、同一マイルストーンで REV-004（`patch_jump` fallible化）・REV-005（`MakeClosure` capture記述子化）・REV-018（internal module封印）。停止性はper-instruction課金（verifier非依存）で担保し、VM入口を `VerifiedChunk` へ限定する。
 3. **包括budget（P0 基盤）:** REV-015（source/string/heap/I-O budget・deadline・cancel）に REV-001（共有DAGの指数時間/出力）の受入条件を含める。REV-023（`exit()`のprocess終了廃止）も同基盤。
 4. **Phase 1 embedding:** [組み込みAPI仕様](embedding-api.md) E1〜E6 → E8a。REV-007/008/011/013/014/020 はこの Phase 1〜2 で解消する。
 5. **Phase 2 capability:** E7 → E8b と Capability C1〜C10。REV-002/009/019/021/022 はこの capability 面で実装（sandbox の process-global を ExecutionContext へ移す）。
@@ -31,7 +31,7 @@
 |---|---|---|---|---|
 | P0 | REV-001 | 共有DAGの比較・表示が指数時間／出力 | ⬜ | REV表 P0 |
 | P0 | REV-002 | 非UTF-8 canonical import pathでsandbox認可がすり替わる | ⬜ | REV表 P0 |
-| P0 | REV-006 | 未検証bytecodeでstep/call課金を迂回し無期限実行 | ⬜ | REV表 P0 |
+| P0 | REV-006 | 未検証bytecodeでstep/call課金を迂回し無期限実行 | ⬜ | REV表 P0（§17.7 設計確定） |
 | P0 | REV-015 | source/string/heap/I-O/bulk workが未有限化 | ⬜ | REV表 P0 |
 | P0 | REV-023 | `exit()`がホストプロセスを終了する | ⬜ | REV表 P0 |
 | P1 | REV-003 | Int–Float比較が2^53超で誤り、`==`が非推移的 | ⬜ | REV表 P1（§17.1 設計確定） |
@@ -295,7 +295,7 @@ commit `092da35d0a01c6e3f403123df8416ec0819746d7` を対象に、production sour
 
 このレビューの環境では `rustc` / `cargo` が使えず、`cargo build` / `cargo test` / `cargo clippy` / fuzz / sanitizer は未実施である。「確認」とあるものは、明示しない限りコード経路を静的に追跡して成立を確認したものである。
 
-指摘のうち、レビュー時点で**設計が不足していた（設計欄が △ または ×）6件**（REV-003 / 004 / 005 / 009 / 012 / 021）は、次期実装仕様を [次期意味論・実装決定](semantic-decisions.md)第17節に追加済みである。残りの指摘は既存の各設計文書と該当節を正本とし、設計を新規追加せず実装バックログへ直結させる。REV-012 は既存の第5節（AUD-017）が正本であり、意味論変更ではなく status / doc drift の解消のみを扱う。
+指摘のうち、レビュー時点で**設計が不足していた（設計欄が △ または ×）6件**（REV-003 / 004 / 005 / 009 / 012 / 021）は、次期実装仕様を [次期意味論・実装決定](semantic-decisions.md)第17節に追加済みである。残りの指摘は既存の各設計文書と該当節を正本とし、設計を新規追加せず実装バックログへ直結させる。REV-012 は既存の第5節（AUD-017）が正本であり、意味論変更ではなく status / doc drift の解消のみを扱う。REV-006 は §17.2 / §17.3 が範囲検証を委譲する検証層であり、実装レベルの検査項目（V1〜V9）と 2 層モデル（per-instruction step 課金 + verifier）を §17.7 として後から確定した。
 
 > **状態の読み方:** 下表の最終列はコード・test・workflow・配布物の**実装状況**であり、設計状態ではない。設計正本で判断が確定していても、受入gateを満たす実装がなければ完了扱いにしない。REV は既存 AUD 番号を再割り当てせず、独立した追跡項目として扱う。
 
@@ -305,7 +305,7 @@ commit `092da35d0a01c6e3f403123df8416ec0819746d7` を対象に、production sour
 |---|---|---|---|---|
 | REV-001 | 共有DAGの構造比較・表示・join・sortが指数時間／指数出力になる。value graph traversalへnode/depth/fuel/bytes上限とvisited pair管理を導入し、表示をHumanDisplay/CanonicalRepr/TotalOrderKeyへ分離する | 通常script | 検討○・設計○（[実行予算・協調実行](execution-control.md)、REV-015受入条件へ追加） | ⬜ 未実装 |
 | REV-002 | 非UTF-8 canonical import pathが空文字へ変換され、sandbox認可対象とI/O対象が分離する。認可APIを`&Path`／認可済みhandleへ変更する | Unix + import | 設計○（次期path-handle方式、[capability-model](capability-model.md)） | ⬜ 未実装 |
-| REV-006 | 未検証bytecodeの`Jump(0)`等でstep課金を迂回し無期限実行できる。raw `Call`もcall課金を迂回する。`VerifiedChunk`とverifierで検証済みbytecodeだけをVMへ渡す | 公開raw bytecode | 設計○（verifier要件を報告書に記載） | ⬜ 未実装 |
+| REV-006 | 未検証bytecodeの`Jump(0)`等でstep課金を迂回し無期限実行できる。raw `Call`もcall課金を迂回する。`VerifiedChunk`とverifierで検証済みbytecodeだけをVMへ渡す。停止性はper-instruction step課金（全命令dispatchごとに1、verifier非依存）で担保し、verifierは早期拒否・不変条件確立・defense-in-depth | 公開raw bytecode | ✅ 確定済み（[次期意味論・実装決定](semantic-decisions.md)§17.7。実装レベルの検査項目V1〜V9・2層モデルを確定） | ⬜ 未実装 |
 | REV-015 | source・string・heap・I/O・bulk workが包括的に有限化されていない。reserve-before-allocate等でsource/string/heap/I-O budgetとdeadline/cancelを実装する。REV-001のDAG増幅も受入条件へ含める | 通常script | 検討◎・設計◎（[実行予算・協調実行](execution-control.md)、[capability-model](capability-model.md)） | ⬜ 未実装 |
 | REV-023 | script `exit()`がホストプロセスを終了する。process-globalなexitをやめ、構造化`Exited` outcomeを返す | embedding | 検討◎・設計◎（[実行予算・協調実行](execution-control.md)、AUD-036と同基盤） | ⬜ 未実装 |
 
