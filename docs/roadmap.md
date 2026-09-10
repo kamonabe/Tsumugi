@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-09-09
+最終更新: 2026-09-10
 
 ## 現在の作業状況（サマリ）
 
@@ -8,7 +8,7 @@
 
 ### 現在地
 
-- **フェーズ:** 意味論基盤（下記「設計sliceに沿う推奨実装順」のステップ2）を進行中。ステップ2の完了済み項目は AUD-050/017・049・019・047・048・016・024・034。Phase 1（embedding）以降は未着手。
+- **フェーズ:** 意味論基盤（下記「設計sliceに沿う推奨実装順」のステップ2）を進行中。ステップ2の完了済み項目は AUD-050/017・049・019・047・048・016・024・034。境界挙動ステップ1は AUD-036/018/033 完了、残りは REV-003 の revision 更新のみ。Phase 1（embedding）以降は未着手。
 - **仕様 revision:** language-spec 0.16（実装版 package は 0.1.0。番号体系は別管理）。
 - **完了の中心:** 2026-08-26 深層監査（AUD-001〜050）の大半は実装済み。残る open は下表のとおり。
 - **新規入力:** 2026-09-07 詳細レビュー（REV-001〜025）は全件が実装バックログ（設計は6件が §17 で確定、他は既存正本を参照）。
@@ -17,7 +17,7 @@
 
 「設計sliceに沿う推奨実装順」の未完了部分を抜き出したもの。詳細は同節を参照。
 
-1. **境界挙動（意味論基盤の残り）:** ~~AUD-036 のchecked変換~~（✅ Float→Int/file_size完了、仕様revision 0.17）→ ~~AUD-018 のE8a（CLI script引数）~~（✅ 完了、仕様revision 0.18。capability profile/optionsはE8bで別追跡）→ AUD-033（未完結REPL入力のEOF診断）。あわせて §17 の REV-003（数値厳密比較）で観測挙動を変える revision を上げる。AUD-036 の構造化`Exited`は REV-023 と同基盤のためステップ3へ移す。
+1. **境界挙動（意味論基盤の残り）:** ~~AUD-036 のchecked変換~~（✅ Float→Int/file_size完了、仕様revision 0.17）→ ~~AUD-018 のE8a（CLI script引数）~~（✅ 完了、仕様revision 0.18。capability profile/optionsはE8bで別追跡）→ ~~AUD-033（未完結REPL入力のEOF診断）~~（✅ 完了、tree/VM共有の `finish_repl_at_eof`）。あわせて §17 の REV-003（数値厳密比較）で観測挙動を変える revision を上げる。AUD-036 の構造化`Exited`は REV-023 と同基盤のためステップ3へ移す。ステップ1で残るのは REV-003 の revision 更新のみ。
 2. **bytecode検証・API封印（基盤・境界挙動より前に置く）:** REV-006（`VerifiedChunk`/verifier + per-instruction step 課金。§17.7 で実装詳細確定）を軸に、同一マイルストーンで REV-004（`patch_jump` fallible化）・REV-005（`MakeClosure` capture記述子化）・REV-018（internal module封印）。停止性はper-instruction課金（verifier非依存）で担保し、VM入口を `VerifiedChunk` へ限定する。
 3. **包括budget（P0 基盤）:** REV-015（source/string/heap/I-O budget・deadline・cancel）に REV-001（共有DAGの指数時間/出力）の受入条件を含める。REV-023（`exit()`のprocess終了廃止）も同基盤。
 4. **Phase 1 embedding:** [組み込みAPI仕様](embedding-api.md) E1〜E6 → E8a。REV-007/008/011/013/014/020 はこの Phase 1〜2 で解消する。
@@ -58,7 +58,6 @@
 | P2 | REV-025 | parse diagnostic件数に上限がない | ⬜ | REV表 P2 |
 | P2 | AUD-020 | sandbox TOCTOU/path-handle未実装 | 🟡 | AUD crosswalk |
 | P2 | AUD-022 | fuzz/stress/matrix未実装 | 🟡 | AUD crosswalk |
-| P2 | AUD-033 | 未完結REPL入力のEOF診断 | 🟡 | AUD P2表（§8 設計確定） |
 | P2 | AUD-036 | lossy数値・OS境界変換の検証（残: `exit`の構造化`Exited`） | 🟡 | AUD crosswalk（§10 設計確定・Float→Int/file_sizeは実装済み） |
 | P2 | AUD-045 | MSRV/release/install/OCI未実装 | 🟡 | AUD crosswalk |
 
@@ -141,7 +140,7 @@ Tsumugiは、学習用の言語処理系として得た知見を発展させ、�
 | AUD-023 | VMのunchecked index/`unwrap()`を構造化internal errorへ置換する | compiler/VM invariantが崩れるとhost panic。AUD-001/002でユーザー入力から到達可能だった。`Vm::new` / `run_repl_chunk`は任意の`Chunk`を受け取るため、library利用では範囲外のslot・定数・upvalue・行番号表の不足・operandのunderflowでindex panicへ到達した | ✅ 完了（frame/stack/upvalue/定数/命令参照を検査付きヘルパー経由にし、`unreachable!`も含め本番コードから`unwrap`を排除。公開APIだけで書いた`tests/defensive_vm.rs`で8ケースを固定し、修正前はindex panicで失敗することを確認） |
 | AUD-024 | import・REPLの状態commit方針を明文化する | 未捕捉error前の代入/list mutation/upvalue更新を保持するかrollbackするか未定義。外部I/Oはrollback不能 | ✅ 完了（tree/VMとも未捕捉errorで全language-state（binding・cell値・index代入・push/pop・import marker）を入力開始時点へrollback。正常完了とcatch済み完了はcommit。外部効果はrollbackしない。first-write undo logで実装し記録量は変更箇所数に比例。仕様revisionを0.15へ。deadline/budget/cancel由来のrollbackはPhase 3/4で別追跡） |
 | AUD-025 | VM REPL checkpointの複製コストを削減する | 入力ごとの`stack.clone()`が保持中List/Dictをdeep cloneし、時間・一時メモリがREPL状態量に比例する | ✅ 完了（stack全体cloneを初期長と変更済みslotのmutation logへ置換。通常入力は保持中List/Dictを複製せず、既存slotの書換・削除時だけrollback用の元値を記録して未捕捉エラー時に復元） |
-| AUD-033 | 未完結REPL入力のEOFを診断する | `if true`等の継続入力中にEOFを送ると、tree/VMとも構文エラーを出さずbufferを破棄して終了コード0になる | 🟡 設計確定・未実装（両engineで再現済み。[次期意味論・実装決定](semantic-decisions.md)第8節） |
+| AUD-033 | 未完結REPL入力のEOFを診断する | `if true`等の継続入力中にEOFを送ると、tree/VMとも構文エラーを出さずbufferを破棄して終了コード0になる | ✅ 完了（tree/VM共有の `finish_repl_at_eof` が非空bufferの継続入力EOFで実Parserのparse診断をstderrへ出し終了コード1。空bufferは0。未閉じブロックは canonical `入力が未完結です: end が必要です`。`tests/integration.rs` の `aud033_*` でtree/VM一致を固定。[次期意味論・実装決定](semantic-decisions.md)第8節） |
 | AUD-034 | `path_join`の引数型契約を厳格化する | `path_join("a", 123, "b")`が型エラーにならず`a/b`を返し、非文字列argumentを無言で欠落させる | ✅ 完了（全引数を左から右へStr検査し、最初の非Strで`builtin_type` / 「path_join の第 {position} 引数は Str である必要があります: {型名}」を返し結合を開始しない。tree/VMはAUD-049の共有registry/handlerを使うため差はなく、`tests/canonical_error_inventory.rs`にtree/VM一致の非Strケースを追加。正常系は`tests/path_join_contract.rs`でOS依存の期待値をRust `PathBuf`から構築して照合。観測挙動が変わるため仕様revisionを0.16へ） |
 | AUD-035 | CLI・標準I/Oのhost panic経路を構造化する | REPLのthread spawn・stdout flush・stdin readに`unwrap()`があり、broken pipe/I/O障害でpanicする。`print`も`println!`のため`tsumugi script.tsg \| head -1`でpanicした。Unixの非UTF-8 argvは`std::env::args()`でもpanicし得る | ✅ 完了（`ErrorKind::Io`を追加し`print`の出力失敗を構造化エラーへ。CLIのbanner・prompt・stdin・spawn・argv検証は診断＋終了コード1へ。パイプ切断と非UTF-8 argvの回帰テストを追加） |
 | AUD-036 | lossyな数値・OS境界変換を検証する | `exit`のi64→i32、`file_size`のu64→i64、NaN/Infを含む`to_int`/`floor`/`ceil`/`round`がwrap・飽和・0化し得る | 🟡 部分実装。Float→Int（`to_int`/`floor`/`ceil`/`round`）と`file_size`を共通checked helper（`checked_float_to_i64`/`checked_file_size_to_i64`）へ集約し、NaN/±Infinity/i64範囲外を`conversion`/`int_overflow`へ。tree/VM共有handlerで一致し、`canonical_error_inventory`・`checked_conversion_contract`・`builtin_core::aud_036_tests`で固定。仕様revision 0.17。残る`exit`の構造化`Exited`は`BudgetUsage`/REV-023依存のため同基盤で別実装 |

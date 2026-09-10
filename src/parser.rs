@@ -1101,6 +1101,15 @@ impl Parser {
         let spanned = self.advance_spanned();
         if spanned.token == expected {
             Ok(())
+        } else if spanned.token == Token::Eof && matches!(expected, Token::End | Token::Catch) {
+            // 未閉じブロックの EOF は、継続入力中の未完結を示す canonical 診断にする
+            // （AUD-033, semantic-decisions §8.3）。`try` が `catch` を待つ EOF も同じ未完結扱い。
+            // REPL で継続 buffer に EOF を受けたときもこの経路を通り、`is_incomplete` の判定では
+            // なく実 Parser の結果として表示される。
+            Err(TsumugiError::parse(
+                spanned.line,
+                "入力が未完結です: end が必要です".to_string(),
+            ))
         } else {
             Err(TsumugiError::parse(
                 spanned.line,
@@ -1243,6 +1252,22 @@ mod tests {
         assert_eq!(errors.len(), 2, "should report 2 errors: {:?}", errors);
         assert_eq!(errors[0].line(), 1);
         assert_eq!(errors[1].line(), 3);
+    }
+
+    #[test]
+    fn unclosed_block_eof_reports_incomplete_input() {
+        // 未閉じブロックが EOF に達したときの canonical 診断（AUD-033, §8.3）
+        for src in ["if true", "fn f()", "while x", "for x in xs", "try"] {
+            let result = parse(src);
+            let errors = result.unwrap_err();
+            assert!(!errors.is_empty(), "should error for {:?}", src);
+            assert_eq!(
+                errors[0].message(),
+                "入力が未完結です: end が必要です",
+                "canonical incomplete-input message for {:?}",
+                src
+            );
+        }
     }
 
     #[test]

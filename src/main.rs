@@ -220,9 +220,8 @@ fn run_repl() {
         let mut line = String::new();
         let bytes = read_stdin_line(&mut line);
         if bytes == 0 {
-            // Ctrl+D (EOF)
-            write_stdout("\n");
-            break;
+            // Ctrl+D (EOF)。継続入力 buffer が残っていれば診断して終了する（AUD-033）。
+            finish_repl_at_eof(&input);
         }
 
         input.push_str(&line);
@@ -293,6 +292,39 @@ fn is_incomplete(input: &str) -> bool {
     depth > 0
 }
 
+/// REPL で EOF（Ctrl+D）を受けたときの終了処理（AUD-033, semantic-decisions §8）。
+///
+/// tree / VM の両 REPL loop で共通に使う。継続入力 buffer が空でなければ、
+/// buffer を破棄して正常終了せず、実 Lexer/Parser へ渡した parse 診断を stderr へ出して
+/// 終了コード 1 で終了する。buffer が空の EOF だけを正常終了（0）とする。
+///
+/// `is_incomplete` の判定だけで message を合成せず、実 Parser の結果を表示する。
+fn finish_repl_at_eof(buffer: &str) -> ! {
+    // プロンプト行から改行して診断・シェルへ戻す。
+    write_stdout("\n");
+
+    if buffer.trim().is_empty() {
+        // 空 buffer（未完結の実体がない）は正常終了。
+        std::process::exit(0);
+    }
+
+    let tokens = Lexer::new(buffer).tokenize();
+    match Parser::new(tokens).parse() {
+        Ok(_) => {
+            // is_incomplete が継続と判定したが Parser は完結として受理した場合。
+            // buffer を黙って捨てないよう、診断を出して失敗扱いにする。
+            eprintln!("  エラー: 入力が未完結です");
+            std::process::exit(1);
+        }
+        Err(errors) => {
+            for e in &errors {
+                eprintln!("  エラー: {}", e);
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
 // =============================================
 // VM モード
 // =============================================
@@ -325,8 +357,8 @@ fn run_repl_vm() {
         let mut line = String::new();
         let bytes = read_stdin_line(&mut line);
         if bytes == 0 {
-            write_stdout("\n");
-            break;
+            // Ctrl+D (EOF)。継続入力 buffer が残っていれば診断して終了する（AUD-033）。
+            finish_repl_at_eof(&input);
         }
 
         input.push_str(&line);

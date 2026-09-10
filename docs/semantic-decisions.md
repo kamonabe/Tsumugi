@@ -567,6 +567,8 @@ UndoEntry =
 
 ## 8. 未完結REPL入力でのEOF（AUD-033）
 
+> 実装状況: ✅ 実装完了。`src/main.rs` の `finish_repl_at_eof` を tree / VM 両 REPL loop が共有し、継続入力 buffer が非空のまま EOF を受けたら実 Lexer/Parser の parse 診断を stderr へ出して終了コード 1 で終了する。空 buffer の EOF は 0。未閉じブロック（`if`/`fn`/`while`/`for`/`try` と複数行 lambda）は `src/parser.rs` の `expect` が canonical message `入力が未完結です: end が必要です` を返す。回帰は `tests/integration.rs` の `aud033_*`（tree/VM subprocess）と `src/parser.rs` の `unclosed_block_eof_reports_incomplete_input` で固定した。
+
 ### 8.1 採用判断
 
 継続入力bufferが空でない状態でEOFを受けた場合、bufferを破棄して正常終了してはならない。通常のLexer/ParserへEOFを渡し、parse診断をstderrへ出して終了コード1でREPLを終了する。tree/VM共通である。
@@ -2004,7 +2006,7 @@ run_frames dispatch loop:
 5. **値表現**: AUD-047 List/Dict COW、続けてAUD-048 FunctionId。scaling/identity testを先に追加する。
 6. **binding/transaction**: AUD-016 VM fresh cell、AUD-024全language-state REPL journal。FunctionId counterをrollback対象外に固定する。
 7. **bytecode検証面**: §17.7（REV-006）の `VerifiedChunk`/verifier と per-instruction step 課金を軸に、§17.2（REV-004）の `patch_jump` fallible化とbuilder封印、§17.3（REV-005）の `MakeClosure` capture記述子化、REV-018のraw module封印を同一マイルストーンで実施する。VM入口を `VerifiedChunk` へ限定し、停止性はper-instruction課金（verifier非依存）で担保する。opcodeと関数値表現の変更を伴うため境界挙動より前に置く。
-8. **境界挙動**: ~~AUD-034 `path_join`~~（✅ 完了、revision 0.16）、AUD-036 checked変換/Exited、AUD-018 CLI args/stdin、AUD-033 EOF診断。§17.1（REV-003）の混合数値比較の観測挙動変更もここでrevisionを上げる。
+8. **境界挙動**: ~~AUD-034 `path_join`~~（✅ 完了、revision 0.16）、AUD-036 checked変換/Exited、~~AUD-018 CLI args/stdin~~（✅ 完了、revision 0.18）、~~AUD-033 EOF診断~~（✅ 完了）。§17.1（REV-003）の混合数値比較の観測挙動変更もここでrevisionを上げる。
 9. **capability縦切り**: sandbox OnceLockをExecutionContext FilesystemCapabilityへ移し、tree/VM/importを同じpolicyへ接続する。§17.4（REV-009）の `list_dir` 部分失敗/非UTF-8、§17.6（REV-021）の `remove_dir`（空のみ）/`remove_tree`（`RecursiveDelete`）分割をこのcapability面で実装する。
 10. **検証基盤**: cargo-fuzzのfrontend/compiler/vm_chunk、続いてcapability完成後にevaluator/differential target。
 11. **次期仕様反映**: 全受入基準通過後にだけ `language-spec.md`、`LANG_GUIDE.md`、設計文書、revisionを更新する。
