@@ -2157,3 +2157,85 @@ fn dash_reads_source_from_stdin_with_args() {
     assert_eq!(outputs[0], "one\ntwo", "stdin script の args() が不正");
     assert_eq!(outputs[0], outputs[1], "tree/VM で args() が一致しません");
 }
+
+// =============================================================
+// AUD-033: 未完結REPL入力でのEOF診断（semantic-decisions §8）
+// =============================================================
+
+/// 継続入力 buffer を残したまま EOF（stdin 切断）を送る REPL の終了コードと
+/// stderr 診断を取得する。tree/VM 両方で呼ぶ。
+fn repl_eof_result(source: &str, use_vm: bool) -> (i32, String) {
+    let output = run_repl_process(source, use_vm, &[]);
+    let (_stdout, stderr) = output_text(&output);
+    let code = output.status.code().unwrap_or(-1);
+    (code, stderr)
+}
+
+#[test]
+fn aud033_incomplete_block_at_eof_reports_and_fails() {
+    // if/fn/while/for/try と複数行 lambda を未完結のまま EOF する。
+    // tree/VM とも parse 診断を stderr へ出し、終了コード 1 で終了する。
+    let cases = [
+        ("if", "if true\n"),
+        ("fn", "fn f()\n"),
+        ("while", "while x\n"),
+        ("for", "for x in [1, 2]\n"),
+        ("try", "try\n"),
+        ("multiline_lambda", "let g = fn(x)\n"),
+    ];
+
+    for (label, source) in cases {
+        let (tree_code, tree_err) = repl_eof_result(source, false);
+        let (vm_code, vm_err) = repl_eof_result(source, true);
+
+        assert_eq!(
+            tree_code, 1,
+            "tree [{label}] は終了コード 1 であるべき: {tree_err}"
+        );
+        assert_eq!(
+            vm_code, 1,
+            "VM [{label}] は終了コード 1 であるべき: {vm_err}"
+        );
+
+        assert!(
+            tree_err.contains("入力が未完結です"),
+            "tree [{label}] に未完結診断がない: {tree_err}"
+        );
+        // tree/VM で診断全文が一致する（§8.7 受入基準）。
+        assert_eq!(
+            tree_err, vm_err,
+            "[{label}] tree/VM の診断が一致しない\ntree: {tree_err}\nvm:   {vm_err}"
+        );
+    }
+}
+
+#[test]
+fn aud033_empty_buffer_at_eof_exits_zero() {
+    // 空 buffer での EOF は出力を壊さず正常終了（0）。
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let (code, stderr) = repl_eof_result("", use_vm);
+        assert_eq!(
+            code, 0,
+            "{mode}: 空 buffer の EOF は 0 であるべき: {stderr}"
+        );
+        assert!(
+            !stderr.contains("入力が未完結です"),
+            "{mode}: 空 buffer で未完結診断を出してはならない: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn aud033_comment_only_buffer_at_eof_exits_zero() {
+    // コメントのみの入力は完結扱い（継続 buffer にならない）。EOF で正常終了する。
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let (code, stderr) = repl_eof_result("# just a comment\n", use_vm);
+        assert_eq!(code, 0, "{mode}: コメントのみは 0 であるべき: {stderr}");
+        assert!(
+            !stderr.contains("入力が未完結です"),
+            "{mode}: コメントのみで未完結診断を出してはならない: {stderr}"
+        );
+    }
+}
