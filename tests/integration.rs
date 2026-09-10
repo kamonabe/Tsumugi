@@ -369,6 +369,7 @@ fixture_tests!(
         local_utils,
         logic,
         map_recursion_limit,
+        numeric_strict_comparison,
         numeric_utils,
         overflow_edge,
         runtime_global_import,

@@ -8,7 +8,7 @@ use crate::chunk::Chunk;
 use crate::error::TsumugiError;
 use crate::limits::MAX_USER_CALL_DEPTH;
 use crate::opcode::{MutationTarget, OpCode};
-use crate::value::{FunctionId, SharedValue, Value};
+use crate::value::{FunctionId, NumericOrder, SharedValue, Value};
 
 /// 演算・比較の型エラーを作る（AUD-014）
 ///
@@ -1769,12 +1769,10 @@ impl Vm {
     }
 
     fn compare_lt(&self, left: Value, right: Value, line: usize) -> Result<Value, TsumugiError> {
-        match (&left, &right) {
-            (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a < b)),
-            (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a < b)),
-            (Value::Int(a), Value::Float(b)) => Ok(Value::Bool((*a as f64) < *b)),
-            (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a < (*b as f64))),
-            _ => Err(TsumugiError::comparison_type(
+        // Int/Float は跨いで厳密比較する（REV-003）。tree と同じ NumericOrder を経由。
+        match NumericOrder::compare_relational(&left, &right) {
+            Some(ord) => Ok(Value::Bool(ord.is_lt())),
+            None => Err(TsumugiError::comparison_type(
                 line,
                 crate::ast::BinOpKind::Lt,
                 &left,
@@ -1784,12 +1782,9 @@ impl Vm {
     }
 
     fn compare_gt(&self, left: Value, right: Value, line: usize) -> Result<Value, TsumugiError> {
-        match (&left, &right) {
-            (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a > b)),
-            (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a > b)),
-            (Value::Int(a), Value::Float(b)) => Ok(Value::Bool((*a as f64) > *b)),
-            (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a > (*b as f64))),
-            _ => Err(TsumugiError::comparison_type(
+        match NumericOrder::compare_relational(&left, &right) {
+            Some(ord) => Ok(Value::Bool(ord.is_gt())),
+            None => Err(TsumugiError::comparison_type(
                 line,
                 crate::ast::BinOpKind::Gt,
                 &left,
@@ -1799,12 +1794,9 @@ impl Vm {
     }
 
     fn compare_lteq(&self, left: Value, right: Value, line: usize) -> Result<Value, TsumugiError> {
-        match (&left, &right) {
-            (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a <= b)),
-            (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a <= b)),
-            (Value::Int(a), Value::Float(b)) => Ok(Value::Bool((*a as f64) <= *b)),
-            (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a <= (*b as f64))),
-            _ => Err(TsumugiError::comparison_type(
+        match NumericOrder::compare_relational(&left, &right) {
+            Some(ord) => Ok(Value::Bool(ord.is_le())),
+            None => Err(TsumugiError::comparison_type(
                 line,
                 crate::ast::BinOpKind::LtEq,
                 &left,
@@ -1814,12 +1806,9 @@ impl Vm {
     }
 
     fn compare_gteq(&self, left: Value, right: Value, line: usize) -> Result<Value, TsumugiError> {
-        match (&left, &right) {
-            (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a >= b)),
-            (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a >= b)),
-            (Value::Int(a), Value::Float(b)) => Ok(Value::Bool((*a as f64) >= *b)),
-            (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(*a >= (*b as f64))),
-            _ => Err(TsumugiError::comparison_type(
+        match NumericOrder::compare_relational(&left, &right) {
+            Some(ord) => Ok(Value::Bool(ord.is_ge())),
+            None => Err(TsumugiError::comparison_type(
                 line,
                 crate::ast::BinOpKind::GtEq,
                 &left,

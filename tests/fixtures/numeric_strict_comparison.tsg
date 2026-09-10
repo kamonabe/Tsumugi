@@ -1,0 +1,60 @@
+# Int-Float の厳密比較（REV-003）
+# Int を f64 へ丸めず、数学的に厳密な順序で比較する。
+# 2^53 近傍で等価が対称・推移的になり、min/max は選択した operand を元の型で返す。
+
+# 2^53 = 9007199254740992
+let two53 = 9007199254740992
+let two53f = 9007199254740992.0
+
+# --- 2^53 近傍の等価 ---
+print(two53 == two53f)          # true（同値）
+print(two53 + 1 == two53f)      # false（旧実装では桁落ちで true だった）
+print(two53 - 1 == two53f)      # false
+
+# --- 2^53 近傍の大小 ---
+print(two53 + 1 > two53f)       # true
+print(two53 - 1 < two53f)       # true
+print(two53 + 1 <= two53f)      # false
+print(two53 - 1 >= two53f)      # false
+
+# --- 等価の推移性（旧実装では a==f かつ f==(a+1) だが a!=(a+1) で崩れていた） ---
+# 厳密比較では f == (two53+1) が false になるので非推移性は起きない
+print(two53 == two53f)          # true
+print(two53f == two53 + 1)      # false
+
+# --- 小数部を持つ Float との比較 ---
+print(1 < 1.5)                  # true
+print(2 > 1.5)                  # true
+print(1 == 1.5)                 # false
+print(-1 > -1.5)                # true
+
+# --- 無限大・NaN ---
+let inf = 1.0 / 0.0
+let nan = 0.0 / 0.0
+print(1 < inf)                  # true
+print(1 > 0.0 - inf)            # true
+print(1 < nan)                  # false（NaN は大小・等価とも false）
+print(1 == nan)                 # false
+
+# --- min / max は選択した operand を元の型で返す（REV-003） ---
+# mixed で Int が選ばれれば Int、Float が選ばれれば Float
+print(type(min(3, 2.5)))        # Float（2.5 が選択される）
+print(type(min(2, 2.5)))        # Int（2 が選択される）
+print(type(max(3, 2.5)))        # Int（3 が選択される）
+print(type(max(2.5, 4)))        # Int（4 が選択される）
+print(type(max(2.5, 1)))        # Float（2.5 が選択される）
+
+# 同値時は第1引数を返す
+print(type(min(2, 2.0)))        # Int（第1引数）
+print(type(min(2.0, 2)))        # Float（第1引数）
+print(type(max(2, 2.0)))        # Int（第1引数）
+
+# 値そのものも確認
+print(min(3, 2.5))              # 2.5
+print(max(3, 2.5))              # 3
+print(min(10, 20))              # 10
+print(max(1.5, 1.4))            # 1.5
+
+# NaN 入力は canonical NaN を返す（NaN == NaN は false）
+let m = min(1, nan)
+print(m == m)                   # false（NaN）

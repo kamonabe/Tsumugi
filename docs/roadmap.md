@@ -8,8 +8,8 @@
 
 ### 現在地
 
-- **フェーズ:** 意味論基盤（下記「設計sliceに沿う推奨実装順」のステップ2）を進行中。ステップ2の完了済み項目は AUD-050/017・049・019・047・048・016・024・034。境界挙動ステップ1は AUD-036/018/033 完了、残りは REV-003 の revision 更新のみ。Phase 1（embedding）以降は未着手。
-- **仕様 revision:** language-spec 0.16（実装版 package は 0.1.0。番号体系は別管理）。
+- **フェーズ:** 意味論基盤（下記「設計sliceに沿う推奨実装順」のステップ2）を進行中。ステップ2の完了済み項目は AUD-050/017・049・019・047・048・016・024・034。境界挙動ステップ1は AUD-036/018/033・REV-003 完了で完結（残りは AUD-036 の構造化`Exited`のみで、これは REV-023 と同基盤のためステップ3）。次はステップ2の bytecode検証・API封印（REV-006 ほか）。Phase 1（embedding）以降は未着手。
+- **仕様 revision:** language-spec 0.19（実装版 package は 0.1.0。番号体系は別管理）。
 - **完了の中心:** 2026-08-26 深層監査（AUD-001〜050）の大半は実装済み。残る open は下表のとおり。
 - **新規入力:** 2026-09-07 詳細レビュー（REV-001〜025）は全件が実装バックログ（設計は6件が §17 で確定、他は既存正本を参照）。
 
@@ -17,7 +17,7 @@
 
 「設計sliceに沿う推奨実装順」の未完了部分を抜き出したもの。詳細は同節を参照。
 
-1. **境界挙動（意味論基盤の残り）:** ~~AUD-036 のchecked変換~~（✅ Float→Int/file_size完了、仕様revision 0.17）→ ~~AUD-018 のE8a（CLI script引数）~~（✅ 完了、仕様revision 0.18。capability profile/optionsはE8bで別追跡）→ ~~AUD-033（未完結REPL入力のEOF診断）~~（✅ 完了、tree/VM共有の `finish_repl_at_eof`）。あわせて §17 の REV-003（数値厳密比較）で観測挙動を変える revision を上げる。AUD-036 の構造化`Exited`は REV-023 と同基盤のためステップ3へ移す。ステップ1で残るのは REV-003 の revision 更新のみ。
+1. **境界挙動（意味論基盤の残り）:** ~~AUD-036 のchecked変換~~（✅ Float→Int/file_size完了、仕様revision 0.17）→ ~~AUD-018 のE8a（CLI script引数）~~（✅ 完了、仕様revision 0.18。capability profile/optionsはE8bで別追跡）→ ~~AUD-033（未完結REPL入力のEOF診断）~~（✅ 完了、tree/VM共有の `finish_repl_at_eof`）→ ~~REV-003（数値厳密比較）~~（✅ 完了、共通 `NumericOrder`・仕様revision 0.19）。AUD-036 の構造化`Exited`は REV-023 と同基盤のためステップ3へ移す。ステップ1はこれで完結。
 2. **bytecode検証・API封印（基盤・境界挙動より前に置く）:** REV-006（`VerifiedChunk`/verifier + per-instruction step 課金。§17.7 で実装詳細確定）を軸に、同一マイルストーンで REV-004（`patch_jump` fallible化）・REV-005（`MakeClosure` capture記述子化）・REV-018（internal module封印）。停止性はper-instruction課金（verifier非依存）で担保し、VM入口を `VerifiedChunk` へ限定する。
 3. **包括budget（P0 基盤）:** REV-015（source/string/heap/I-O budget・deadline・cancel）に REV-001（共有DAGの指数時間/出力）の受入条件を含める。REV-023（`exit()`のprocess終了廃止）も同基盤。
 4. **Phase 1 embedding:** [組み込みAPI仕様](embedding-api.md) E1〜E6 → E8a。REV-007/008/011/013/014/020 はこの Phase 1〜2 で解消する。
@@ -34,7 +34,7 @@
 | P0 | REV-006 | 未検証bytecodeでstep/call課金を迂回し無期限実行 | ⬜ | REV表 P0（§17.7 設計確定） |
 | P0 | REV-015 | source/string/heap/I-O/bulk workが未有限化 | ⬜ | REV表 P0 |
 | P0 | REV-023 | `exit()`がホストプロセスを終了する | ⬜ | REV表 P0 |
-| P1 | REV-003 | Int–Float比較が2^53超で誤り、`==`が非推移的 | ⬜ | REV表 P1（§17.1 設計確定） |
+| ~~P1~~ | ~~REV-003~~ | ~~Int–Float比較が2^53超で誤り、`==`が非推移的~~ | ✅ | 完了（§17.1、仕様revision 0.19。下記REV表 P1参照） |
 | P1 | REV-004 | 公開`Chunk::patch_jump`がpanic | ⬜ | REV表 P1（§17.2 設計確定） |
 | P1 | REV-005 | 不正`MakeClosure` descriptorをNull captureで黙認 | ⬜ | REV表 P1（§17.3 設計確定） |
 | P1 | REV-007 | `ExecutionContext`がsession stateとrun meterを混在 | ⬜ | REV表 P1 |
@@ -312,7 +312,7 @@ commit `092da35d0a01c6e3f403123df8416ec0819746d7` を対象に、production sour
 
 | ID | 項目 | 到達範囲 | 設計状態 | 実装状況 |
 |---|---|---|---|---|
-| REV-003 | Int–Float比較が2^53超で誤り、`==`が非推移的になる。整数を丸めずFloatのbit表現から数学的に正確に比較する共通`NumericOrder`を導入し、`min`/`max`は選択したoperandを元の型で返す | 通常script | ✅ 確定済み（[次期意味論・実装決定](semantic-decisions.md)§17.1） | ⬜ 未実装 |
+| REV-003 | Int–Float比較が2^53超で誤り、`==`が非推移的になる。整数を丸めずFloatのbit表現から数学的に正確に比較する共通`NumericOrder`を導入し、`min`/`max`は選択したoperandを元の型で返す | 通常script | ✅ 確定済み（[次期意味論・実装決定](semantic-decisions.md)§17.1） | ✅ 完了。`src/value.rs`に共通`NumericOrder`（Int を`f64`へ丸めず`trunc`/`fract`分離+`i128` widenで厳密比較、`±Inf`/`NaN`対応）を新設し、`PartialEq`のInt×Float、tree(`eval.rs`)・VM(`vm.rs`)の関係演算子、`min`/`max`をこれへ集約。`contains`は`PartialEq`経由で自動追随。`min`/`max`は選択operandを元の型で返し同値時は第1引数・NaN入力はcanonical NaN。`sort`は現行仕様どおり文字列表現比較のまま（別課題）。value.rs unit 11件・golden fixture `numeric_strict_comparison`（tree/VM一致）を追加。仕様revision 0.19 |
 | REV-004 | 公開`Chunk::patch_jump`が範囲外／非jump offsetでpanicする。`patch_jump`をfallible化し、builderを`pub(crate)`／feature gateへ封印する | 公開low-level API | ✅ 確定済み（[次期意味論・実装決定](semantic-decisions.md)§17.2） | ⬜ 未実装 |
 | REV-005 | 不正`MakeClosure` descriptorをNull captureとして黙認する。capture記述子を明示化し、不整合は`internal` errorにする（REV-006と同一マイルストーン） | 公開raw bytecode | ✅ 確定済み（[次期意味論・実装決定](semantic-decisions.md)§17.3） | ⬜ 未実装 |
 | REV-007 | `ExecutionContext`がsession stateとrun meterを混在し、`execute`間でstepを累積する。meterをrequestごとに分離する | stable facade | 設計◎（[実行予算・協調実行](execution-control.md)、`ExecutionRequest`） | ⬜ 未実装 |

@@ -5,7 +5,7 @@ use crate::ast::*;
 use crate::env::Env;
 use crate::error::{TraceFrame, TsumugiError};
 use crate::limits::MAX_USER_CALL_DEPTH;
-use crate::value::{FnDef, FunctionId, Value};
+use crate::value::{FnDef, FunctionId, NumericOrder, Value};
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -656,23 +656,26 @@ impl Evaluator {
                 Ok(Value::Str(format!("{}{}", l, r)))
             }
 
-            // 大小比較は数値だけを対象にする。IntとFloatは跨いで比較できる（AUD-014）
-            (Value::Int(l), BinOpKind::Lt, Value::Int(r)) => Ok(Value::Bool(l < r)),
-            (Value::Int(l), BinOpKind::Gt, Value::Int(r)) => Ok(Value::Bool(l > r)),
-            (Value::Int(l), BinOpKind::LtEq, Value::Int(r)) => Ok(Value::Bool(l <= r)),
-            (Value::Int(l), BinOpKind::GtEq, Value::Int(r)) => Ok(Value::Bool(l >= r)),
-            (Value::Float(l), BinOpKind::Lt, Value::Float(r)) => Ok(Value::Bool(l < r)),
-            (Value::Float(l), BinOpKind::Gt, Value::Float(r)) => Ok(Value::Bool(l > r)),
-            (Value::Float(l), BinOpKind::LtEq, Value::Float(r)) => Ok(Value::Bool(l <= r)),
-            (Value::Float(l), BinOpKind::GtEq, Value::Float(r)) => Ok(Value::Bool(l >= r)),
-            (Value::Int(l), BinOpKind::Lt, Value::Float(r)) => Ok(Value::Bool((*l as f64) < *r)),
-            (Value::Int(l), BinOpKind::Gt, Value::Float(r)) => Ok(Value::Bool((*l as f64) > *r)),
-            (Value::Int(l), BinOpKind::LtEq, Value::Float(r)) => Ok(Value::Bool((*l as f64) <= *r)),
-            (Value::Int(l), BinOpKind::GtEq, Value::Float(r)) => Ok(Value::Bool((*l as f64) >= *r)),
-            (Value::Float(l), BinOpKind::Lt, Value::Int(r)) => Ok(Value::Bool(*l < (*r as f64))),
-            (Value::Float(l), BinOpKind::Gt, Value::Int(r)) => Ok(Value::Bool(*l > (*r as f64))),
-            (Value::Float(l), BinOpKind::LtEq, Value::Int(r)) => Ok(Value::Bool(*l <= (*r as f64))),
-            (Value::Float(l), BinOpKind::GtEq, Value::Int(r)) => Ok(Value::Bool(*l >= (*r as f64))),
+            // 大小比較は数値だけを対象にする。IntとFloatは跨いで厳密比較する
+            // （REV-003）。判定は NumericOrder へ集約し、VMと同じ意味論にする。
+            // NaN が絡む比較は UnorderedNaN として全演算子を false にする。
+            (
+                l @ (Value::Int(_) | Value::Float(_)),
+                BinOpKind::Lt | BinOpKind::Gt | BinOpKind::LtEq | BinOpKind::GtEq,
+                r @ (Value::Int(_) | Value::Float(_)),
+            ) => {
+                // 数値ペアなので compare_relational は必ず Some を返す。
+                let ord =
+                    NumericOrder::compare_relational(l, r).expect("Int/Float ペアは数値比較できる");
+                let result = match op {
+                    BinOpKind::Lt => ord.is_lt(),
+                    BinOpKind::Gt => ord.is_gt(),
+                    BinOpKind::LtEq => ord.is_le(),
+                    BinOpKind::GtEq => ord.is_ge(),
+                    _ => unreachable!(),
+                };
+                Ok(Value::Bool(result))
+            }
 
             // 等価比較は全ての型の組み合わせで結果を返す（AUD-014）
             // 判定は `Value` の等価規則へ集約し、VMと同じ意味論にする
