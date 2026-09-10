@@ -20,7 +20,7 @@
 //! 専用 opcode として実装するため source から到達できない。
 
 use crate::error::TsumugiError;
-use crate::value::Value;
+use crate::value::{NumericOrder, NumericOrdering, Value};
 
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -662,52 +662,67 @@ pub fn builtin_abs(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     }
 }
 
-pub fn builtin_min(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    check_arity("min", args, 2, line)?;
-    match (&args[0], &args[1]) {
-        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.min(b))),
-        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.min(*b))),
-        (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).min(*b))),
-        (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.min(*b as f64))),
-        (Value::Int(_) | Value::Float(_), other) => Err(TsumugiError::builtin_arg_type(
+/// min / max の共通実装（REV-003）。
+///
+/// NumericOrder で厳密比較し、選択した operand を**元の型のまま**返す
+/// （Int を渡せば Int が返る）。同値時は第 1 引数を返す。いずれかが NaN の
+/// ときは canonical NaN（`Float(f64::NAN)`）を返す。
+fn builtin_min_max(
+    name: &str,
+    args: &[Value],
+    line: usize,
+    want_min: bool,
+) -> Result<Value, TsumugiError> {
+    check_arity(name, args, 2, line)?;
+    // 型検査は第1・第2引数の順で行い、非数値を早期に拒否する。
+    if !matches!(args[0], Value::Int(_) | Value::Float(_)) {
+        return Err(TsumugiError::builtin_arg_type(
             line,
-            "min",
-            2,
-            "Int/Float",
-            other,
-        )),
-        (other, _) => Err(TsumugiError::builtin_arg_type(
-            line,
-            "min",
+            name,
             1,
             "Int/Float",
-            other,
-        )),
+            &args[0],
+        ));
+    }
+    if !matches!(args[1], Value::Int(_) | Value::Float(_)) {
+        return Err(TsumugiError::builtin_arg_type(
+            line,
+            name,
+            2,
+            "Int/Float",
+            &args[1],
+        ));
+    }
+
+    match NumericOrder::compare(&args[0], &args[1]) {
+        // NaN が絡む場合は canonical NaN を返す。
+        Some(NumericOrdering::UnorderedNaN) | None => Ok(Value::Float(f64::NAN)),
+        Some(NumericOrdering::Equal) => Ok(args[0].clone()),
+        Some(NumericOrdering::Less) => {
+            // args[0] < args[1]
+            Ok(if want_min {
+                args[0].clone()
+            } else {
+                args[1].clone()
+            })
+        }
+        Some(NumericOrdering::Greater) => {
+            // args[0] > args[1]
+            Ok(if want_min {
+                args[1].clone()
+            } else {
+                args[0].clone()
+            })
+        }
     }
 }
 
+pub fn builtin_min(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
+    builtin_min_max("min", args, line, true)
+}
+
 pub fn builtin_max(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    check_arity("max", args, 2, line)?;
-    match (&args[0], &args[1]) {
-        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.max(b))),
-        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.max(*b))),
-        (Value::Int(a), Value::Float(b)) => Ok(Value::Float((*a as f64).max(*b))),
-        (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a.max(*b as f64))),
-        (Value::Int(_) | Value::Float(_), other) => Err(TsumugiError::builtin_arg_type(
-            line,
-            "max",
-            2,
-            "Int/Float",
-            other,
-        )),
-        (other, _) => Err(TsumugiError::builtin_arg_type(
-            line,
-            "max",
-            1,
-            "Int/Float",
-            other,
-        )),
-    }
+    builtin_min_max("max", args, line, false)
 }
 
 pub fn builtin_floor(args: &[Value], line: usize) -> Result<Value, TsumugiError> {

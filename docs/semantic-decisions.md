@@ -1582,6 +1582,10 @@ compare_int_float(i: i64, f: f64) -> NumericOrdering:
 - 等価が対称・推移的、比較が反対称であることを property test が示す。
 - tree / VM の値・error・sort 順が全境界で一致する。
 
+#### 17.1.9 実装状況
+
+✅ 実装済み（仕様 revision 0.19）。`src/value.rs` に `NumericOrder` / `NumericOrdering` を新設し、`Int×Float` を `trunc` / `fract` 分離 + `i128` widen で丸めなし比較する（`±Infinity` は有限 Int と大小確定、`NaN` は `UnorderedNaN`、`i128` 範囲外の巨大 Float は magnitude で決着）。`PartialEq` の `Int×Float` / `Float×Int`、tree（`src/eval.rs`）と VM（`src/vm.rs`）の関係演算子、`min` / `max`（`src/builtin_core.rs`）がこの単一実装を経由する。`contains` は `PartialEq` 経由で自動的に追随する。`min` / `max` は選択した operand を元の型のまま返し、同値時は第 1 引数、NaN 入力は canonical NaN を返す。`sort` は現行仕様どおり文字列表現比較を維持し（別課題）、本節の sort 数値順化は対象外とした。`value.rs` の unit test 11 件と golden fixture `numeric_strict_comparison`（tree/VM 一致）で境界値・推移性・対称性・min/max 戻り型を固定する。
+
 ### 17.2 `Chunk::patch_jump` の fallible 化と builder 封印（REV-004）
 
 #### 17.2.1 採用判断
@@ -2006,7 +2010,7 @@ run_frames dispatch loop:
 5. **値表現**: AUD-047 List/Dict COW、続けてAUD-048 FunctionId。scaling/identity testを先に追加する。
 6. **binding/transaction**: AUD-016 VM fresh cell、AUD-024全language-state REPL journal。FunctionId counterをrollback対象外に固定する。
 7. **bytecode検証面**: §17.7（REV-006）の `VerifiedChunk`/verifier と per-instruction step 課金を軸に、§17.2（REV-004）の `patch_jump` fallible化とbuilder封印、§17.3（REV-005）の `MakeClosure` capture記述子化、REV-018のraw module封印を同一マイルストーンで実施する。VM入口を `VerifiedChunk` へ限定し、停止性はper-instruction課金（verifier非依存）で担保する。opcodeと関数値表現の変更を伴うため境界挙動より前に置く。
-8. **境界挙動**: ~~AUD-034 `path_join`~~（✅ 完了、revision 0.16）、AUD-036 checked変換/Exited、~~AUD-018 CLI args/stdin~~（✅ 完了、revision 0.18）、~~AUD-033 EOF診断~~（✅ 完了）。§17.1（REV-003）の混合数値比較の観測挙動変更もここでrevisionを上げる。
+8. **境界挙動**: ~~AUD-034 `path_join`~~（✅ 完了、revision 0.16）、AUD-036 checked変換/Exited、~~AUD-018 CLI args/stdin~~（✅ 完了、revision 0.18）、~~AUD-033 EOF診断~~（✅ 完了）、~~§17.1（REV-003）の混合数値比較~~（✅ 完了、revision 0.19）。
 9. **capability縦切り**: sandbox OnceLockをExecutionContext FilesystemCapabilityへ移し、tree/VM/importを同じpolicyへ接続する。§17.4（REV-009）の `list_dir` 部分失敗/非UTF-8、§17.6（REV-021）の `remove_dir`（空のみ）/`remove_tree`（`RecursiveDelete`）分割をこのcapability面で実装する。
 10. **検証基盤**: cargo-fuzzのfrontend/compiler/vm_chunk、続いてcapability完成後にevaluator/differential target。
 11. **次期仕様反映**: 全受入基準通過後にだけ `language-spec.md`、`LANG_GUIDE.md`、設計文書、revisionを更新する。
