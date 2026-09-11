@@ -8,7 +8,7 @@
 
 ### 現在地
 
-- **フェーズ:** 意味論基盤（下記「設計sliceに沿う推奨実装順」のステップ2）を進行中。ステップ2の完了済み項目は AUD-050/017・049・019・047・048・016・024・034。境界挙動ステップ1は AUD-036/018/033・REV-003 完了で完結（残りは AUD-036 の構造化`Exited`のみで、これは REV-023 と同基盤のためステップ3）。次はステップ2の bytecode検証・API封印（REV-006 ほか）。Phase 1（embedding）以降は未着手。
+- **フェーズ:** 意味論基盤（下記「設計sliceに沿う推奨実装順」のステップ2）を進行中。ステップ2の完了済み項目は AUD-050/017・049・019・047・048・016・024・034 と bytecode検証・API封印（REV-006/004/005/018）。境界挙動ステップ1は AUD-036/018/033・REV-003 完了で完結（残りは AUD-036 の構造化`Exited`のみで、これは REV-023 と同基盤のためステップ3）。次はステップ3の包括budget（REV-015/001/023）。Phase 1（embedding）以降は未着手。
 - **仕様 revision:** language-spec 0.19（実装版 package は 0.1.0。番号体系は別管理）。
 - **完了の中心:** 2026-08-26 深層監査（AUD-001〜050）の大半は実装済み。残る open は下表のとおり。
 - **新規入力:** 2026-09-07 詳細レビュー（REV-001〜025）は全件が実装バックログ（設計は6件が §17 で確定、他は既存正本を参照）。
@@ -18,7 +18,7 @@
 「設計sliceに沿う推奨実装順」の未完了部分を抜き出したもの。詳細は同節を参照。
 
 1. **境界挙動（意味論基盤の残り）:** ~~AUD-036 のchecked変換~~（✅ Float→Int/file_size完了、仕様revision 0.17）→ ~~AUD-018 のE8a（CLI script引数）~~（✅ 完了、仕様revision 0.18。capability profile/optionsはE8bで別追跡）→ ~~AUD-033（未完結REPL入力のEOF診断）~~（✅ 完了、tree/VM共有の `finish_repl_at_eof`）→ ~~REV-003（数値厳密比較）~~（✅ 完了、共通 `NumericOrder`・仕様revision 0.19）。AUD-036 の構造化`Exited`は REV-023 と同基盤のためステップ3へ移す。ステップ1はこれで完結。
-2. **bytecode検証・API封印（基盤・境界挙動より前に置く）:** REV-006（`VerifiedChunk`/verifier + per-instruction step 課金。§17.7 で実装詳細確定）を軸に、同一マイルストーンで REV-004（`patch_jump` fallible化）・REV-005（`MakeClosure` capture記述子化）・REV-018（internal module封印）。停止性はper-instruction課金（verifier非依存）で担保し、VM入口を `VerifiedChunk` へ限定する。
+2. ~~**bytecode検証・API封印（基盤・境界挙動より前に置く）:** REV-006（`VerifiedChunk`/verifier + per-instruction step 課金。§17.7 で実装詳細確定）を軸に、同一マイルストーンで REV-004（`patch_jump` fallible化）・REV-005（`MakeClosure` capture記述子化）・REV-018（internal module封印）。停止性はper-instruction課金（verifier非依存）で担保し、VM入口を `VerifiedChunk` へ限定する。~~（✅ 完了。`src/verifier.rs`の`VerifiedChunk`/`verify`（V1〜V9）、VMの全命令dispatch前per-instruction課金、`MakeClosure(proto_index)`+`FunctionPrototype`/`CaptureDesc`、`patch_jump`のfallible化、`unstable-bytecode` featureでのraw module封印。観測挙動はstep到達点以外不変）
 3. **包括budget（P0 基盤）:** REV-015（source/string/heap/I-O budget・deadline・cancel）に REV-001（共有DAGの指数時間/出力）の受入条件を含める。REV-023（`exit()`のprocess終了廃止）も同基盤。
 4. **Phase 1 embedding:** [組み込みAPI仕様](embedding-api.md) E1〜E6 → E8a。REV-007/008/011/013/014/020 はこの Phase 1〜2 で解消する。
 5. **Phase 2 capability:** E7 → E8b と Capability C1〜C10。REV-002/009/019/021/022 はこの capability 面で実装（sandbox の process-global を ExecutionContext へ移す）。
@@ -31,19 +31,19 @@
 |---|---|---|---|---|
 | P0 | REV-001 | 共有DAGの比較・表示が指数時間／出力 | ⬜ | REV表 P0 |
 | P0 | REV-002 | 非UTF-8 canonical import pathでsandbox認可がすり替わる | ⬜ | REV表 P0 |
-| P0 | REV-006 | 未検証bytecodeでstep/call課金を迂回し無期限実行 | ⬜ | REV表 P0（§17.7 設計確定） |
+| ~~P0~~ | ~~REV-006~~ | ~~未検証bytecodeでstep/call課金を迂回し無期限実行~~ | ✅ | 完了（§17.7、per-instruction課金+verifier+`VerifiedChunk`） |
 | P0 | REV-015 | source/string/heap/I-O/bulk workが未有限化 | ⬜ | REV表 P0 |
 | P0 | REV-023 | `exit()`がホストプロセスを終了する | ⬜ | REV表 P0 |
 | ~~P1~~ | ~~REV-003~~ | ~~Int–Float比較が2^53超で誤り、`==`が非推移的~~ | ✅ | 完了（§17.1、仕様revision 0.19。下記REV表 P1参照） |
-| P1 | REV-004 | 公開`Chunk::patch_jump`がpanic | ⬜ | REV表 P1（§17.2 設計確定） |
-| P1 | REV-005 | 不正`MakeClosure` descriptorをNull captureで黙認 | ⬜ | REV表 P1（§17.3 設計確定） |
+| ~~P1~~ | ~~REV-004~~ | ~~公開`Chunk::patch_jump`がpanic~~ | ✅ | 完了（§17.2、`patch_jump`をfallible化しbuilderエラーをcompiler internal errorへ） |
+| ~~P1~~ | ~~REV-005~~ | ~~不正`MakeClosure` descriptorをNull captureで黙認~~ | ✅ | 完了（§17.3、`MakeClosure(proto_index)`+明示`CaptureDesc`、Nullフォールバック廃止） |
 | P1 | REV-007 | `ExecutionContext`がsession stateとrun meterを混在 | ⬜ | REV表 P1 |
 | P1 | REV-008 | stable `Engine::execute`がtransactionでない | 🟡 | REV表 P1（REPLのみ実装） |
 | P1 | REV-011 | revision・engine差・実装statusが文書drift | ⬜ | REV表 P1 |
 | P1 | REV-012 | call評価順のstatus/doc drift（意味論正本はAUD-017） | 🟡 | REV表 P1（§17.5 設計確定） |
 | P1 | REV-013 | `args()`がhost process argvを読む | ⬜ | REV表 P1 |
 | P1 | REV-014 | sandbox/env/limits/stdio/clockがprocess-global | ⬜ | REV表 P1 |
-| P1 | REV-018 | internal module／raw bytecode公開が安全境界を弱める | ⬜ | REV表 P1 |
+| ~~P1~~ | ~~REV-018~~ | ~~internal module／raw bytecode公開が安全境界を弱める~~ | ✅ | 完了（`chunk`/`compiler`/`opcode`/`verifier`/`vm`を`unstable-bytecode` feature下でのみ公開、安定surfaceは`Engine`系） |
 | P1 | REV-020 | import先parse errorの原因を捨てる | ⬜ | REV表 P1 |
 | P1 | REV-021 | `remove_dir`の再帰削除とcapabilityの不整合 | ⬜ | REV表 P1（§17.6 設計確定） |
 | P1 | AUD-018 | CLIからscript引数を渡せない（capability profile/optionsはE8bで別追跡） | 🟡 | AUD crosswalk（E8a完了・E8b残） |
@@ -304,7 +304,7 @@ commit `092da35d0a01c6e3f403123df8416ec0819746d7` を対象に、production sour
 |---|---|---|---|---|
 | REV-001 | 共有DAGの構造比較・表示・join・sortが指数時間／指数出力になる。value graph traversalへnode/depth/fuel/bytes上限とvisited pair管理を導入し、表示をHumanDisplay/CanonicalRepr/TotalOrderKeyへ分離する | 通常script | 検討○・設計○（[実行予算・協調実行](execution-control.md)、REV-015受入条件へ追加） | ⬜ 未実装 |
 | REV-002 | 非UTF-8 canonical import pathが空文字へ変換され、sandbox認可対象とI/O対象が分離する。認可APIを`&Path`／認可済みhandleへ変更する | Unix + import | 設計○（次期path-handle方式、[capability-model](capability-model.md)） | ⬜ 未実装 |
-| REV-006 | 未検証bytecodeの`Jump(0)`等でstep課金を迂回し無期限実行できる。raw `Call`もcall課金を迂回する。`VerifiedChunk`とverifierで検証済みbytecodeだけをVMへ渡す。停止性はper-instruction step課金（全命令dispatchごとに1、verifier非依存）で担保し、verifierは早期拒否・不変条件確立・defense-in-depth | 公開raw bytecode | ✅ 確定済み（[次期意味論・実装決定](semantic-decisions.md)§17.7。実装レベルの検査項目V1〜V9・2層モデルを確定） | ⬜ 未実装 |
+| REV-006 | 未検証bytecodeの`Jump(0)`等でstep課金を迂回し無期限実行できる。raw `Call`もcall課金を迂回する。`VerifiedChunk`とverifierで検証済みbytecodeだけをVMへ渡す。停止性はper-instruction step課金（全命令dispatchごとに1、verifier非依存）で担保し、verifierは早期拒否・不変条件確立・defense-in-depth | 公開raw bytecode | ✅ 確定済み（[次期意味論・実装決定](semantic-decisions.md)§17.7。実装レベルの検査項目V1〜V9・2層モデルを確定） | ✅ 完了。`src/verifier.rs`に`VerifiedChunk`（生成は`verify`か信頼済み`from_trusted`のみ）と`verify`（V1〜V9をプロトタイプ木へ再帰適用、最初の違反を`ChunkVerifyError`で返し`internal`へ写像）を新設。VMの`run_frames`は全命令dispatch直前に無条件`count_step`（層1）へ変更し、`Loop`/`PrepareCall`/`call_fn_value`の個別課金を廃止（深度上限は`PrepareCall`と`Call`の両方で検査）。`Vm::new`/`run_repl_chunk`は`VerifiedChunk`だけを受け取り、compiler出力は`from_trusted`で昇格。停止性はper-instruction課金でverifier非依存。`tests/defensive_vm.rs`に`Jump(0)`/`Loop(0)`自己ループと`PrepareCall`なしraw `Call`再帰の有限停止を追加、verifier unit 13件でV1〜V9拒否と正規出力通過を固定。観測挙動はstep到達点以外不変（`error_step_limit`等のgoldenは不変で通過） |
 | REV-015 | source・string・heap・I/O・bulk workが包括的に有限化されていない。reserve-before-allocate等でsource/string/heap/I-O budgetとdeadline/cancelを実装する。REV-001のDAG増幅も受入条件へ含める | 通常script | 検討◎・設計◎（[実行予算・協調実行](execution-control.md)、[capability-model](capability-model.md)） | ⬜ 未実装 |
 | REV-023 | script `exit()`がホストプロセスを終了する。process-globalなexitをやめ、構造化`Exited` outcomeを返す | embedding | 検討◎・設計◎（[実行予算・協調実行](execution-control.md)、AUD-036と同基盤） | ⬜ 未実装 |
 
@@ -313,15 +313,15 @@ commit `092da35d0a01c6e3f403123df8416ec0819746d7` を対象に、production sour
 | ID | 項目 | 到達範囲 | 設計状態 | 実装状況 |
 |---|---|---|---|---|
 | REV-003 | Int–Float比較が2^53超で誤り、`==`が非推移的になる。整数を丸めずFloatのbit表現から数学的に正確に比較する共通`NumericOrder`を導入し、`min`/`max`は選択したoperandを元の型で返す | 通常script | ✅ 確定済み（[次期意味論・実装決定](semantic-decisions.md)§17.1） | ✅ 完了。`src/value.rs`に共通`NumericOrder`（Int を`f64`へ丸めず`trunc`/`fract`分離+`i128` widenで厳密比較、`±Inf`/`NaN`対応）を新設し、`PartialEq`のInt×Float、tree(`eval.rs`)・VM(`vm.rs`)の関係演算子、`min`/`max`をこれへ集約。`contains`は`PartialEq`経由で自動追随。`min`/`max`は選択operandを元の型で返し同値時は第1引数・NaN入力はcanonical NaN。`sort`は現行仕様どおり文字列表現比較のまま（別課題）。value.rs unit 11件・golden fixture `numeric_strict_comparison`（tree/VM一致）を追加。仕様revision 0.19 |
-| REV-004 | 公開`Chunk::patch_jump`が範囲外／非jump offsetでpanicする。`patch_jump`をfallible化し、builderを`pub(crate)`／feature gateへ封印する | 公開low-level API | ✅ 確定済み（[次期意味論・実装決定](semantic-decisions.md)§17.2） | ⬜ 未実装 |
-| REV-005 | 不正`MakeClosure` descriptorをNull captureとして黙認する。capture記述子を明示化し、不整合は`internal` errorにする（REV-006と同一マイルストーン） | 公開raw bytecode | ✅ 確定済み（[次期意味論・実装決定](semantic-decisions.md)§17.3） | ⬜ 未実装 |
+| REV-004 | 公開`Chunk::patch_jump`が範囲外／非jump offsetでpanicする。`patch_jump`をfallible化し、builderを`pub(crate)`／feature gateへ封印する | 公開low-level API | ✅ 確定済み（[次期意味論・実装決定](semantic-decisions.md)§17.2） | ✅ 完了。`patch_jump`を`Result<(), ChunkBuildError>`（`BadOffset`/`NotAJump`、エラー時は`code`を書き換えず部分破損を残さない）へ変更。compilerは`self.patch_jump(offset)?`で内部エラーへ写像し全9箇所を`?`伝播。raw builder（`chunk` module）はREV-018と共通で`unstable-bytecode` feature下へ封印 |
+| REV-005 | 不正`MakeClosure` descriptorをNull captureとして黙認する。capture記述子を明示化し、不整合は`internal` errorにする（REV-006と同一マイルストーン） | 公開raw bytecode | ✅ 確定済み（[次期意味論・実装決定](semantic-decisions.md)§17.3） | ✅ 完了。`MakeClosure`のoperandを「upvalue数」から「プロトタイプindex」へ変更し、`Chunk.prototypes: Vec<FunctionPrototype>`と明示`CaptureDesc`（`Local`/`Upvalue`）を導入。compilerは隣接`GetLocal`/`GetUpvalue`列の暗黙契約を廃止しプロトタイプへcapture記述子を格納、VMは記述子からcellを解決し`usize::MAX`/Null cellフォールバックを削除（不正記述子は`internal`。範囲はverifierのV5で拒否）。REV-006と同一build |
 | REV-007 | `ExecutionContext`がsession stateとrun meterを混在し、`execute`間でstepを累積する。meterをrequestごとに分離する | stable facade | 設計◎（[実行予算・協調実行](execution-control.md)、`ExecutionRequest`） | ⬜ 未実装 |
 | REV-008 | 通常`Engine::execute`がtransactionでなく、エラー前のstate mutationを保持する。全stable executionへtransactionを適用する（AUD-024はREPL限定で完了） | stable facade | 設計◎（[組み込みAPI](embedding-api.md)、[実行予算・協調実行](execution-control.md)、AUD-024） | 🟡 REPLのみ実装。全execution transactionは未実装 |
 | REV-011 | language revision・engine差・実装statusが複数文書でdriftしている。機械可読な単一正本（project-metadata）から生成し、CIでstale literalを検査する | 文書・release | 設計◎（報告書に受入条件、§17との連携） | ⬜ 未実装 |
 | REV-012 | call評価順が現行仕様・実装（callee評価前検査）と次期仕様・code comment（callee先行）で矛盾し、完了表示も不整合。意味論の正本は第5節（AUD-017）で、statusとdoc driftのみ解消する | call semantics | ✅ 確定済み（[次期意味論・実装決定](semantic-decisions.md)§17.5、第5節が正本） | 🟡 depth-counting実装済み。callee-precedence切替は未実装 |
 | REV-013 | `args()`がhost process argvを読み、tree/VMで解析規則も異なる。runtime coreから`std::env::args_os()`を除去し、`ExecutionRequest.arguments`のみを公開する | embedding | 設計◎（[組み込みAPI](embedding-api.md)、AUD-018） | ✅ 完了（AUD-018 E8aと一体）。`src/builtin.rs`（tree）・`src/vm.rs`（VM）の`args()`から`std::env::args_os()`を除去し、`Evaluator` / `Vm`のscript_args snapshotを返すよう統一。tree/VMで解析規則差（skip 2 vs skip 1+`--vm` filter）も解消。CLIのみが`std::env::args_os()`をargv取得に使い、runtime coreからは参照しない |
 | REV-014 | sandbox/env/limits/stdio/clockがprocess-globalまたはfirst-use global。`EngineConfig`／`ExecutionRequest`へ移し、library coreが`std::env`等を直接参照しないようにする | embedding | 設計◎（[capability-model](capability-model.md)、[組み込みAPI](embedding-api.md)、AUD-014と関連） | ⬜ 未実装 |
-| REV-018 | internal module／raw bytecodeの公開が安全境界とstable surfaceを弱める。stable rootをEngine等へ限定し、internalsを`pub(crate)`にする（REV-004〜006の根因） | 公開API | 設計◎（[組み込みAPI](embedding-api.md)、§17.2と共通の封印作業） | ⬜ 未実装 |
+| REV-018 | internal module／raw bytecodeの公開が安全境界とstable surfaceを弱める。stable rootをEngine等へ限定し、internalsを`pub(crate)`にする（REV-004〜006の根因） | 公開API | 設計◎（[組み込みAPI](embedding-api.md)、§17.2と共通の封印作業） | ✅ 完了。`chunk`/`compiler`/`opcode`/`verifier`/`vm`を`unstable-bytecode` feature（`default`で有効）でのみ`pub`にし、feature無効時は`pub(crate)`。安定利用者は`default-features = false`でraw bytecode surfaceを封印できる。安定embedding surfaceは`Engine`系のみ。`Vm::new`はREV-006により`VerifiedChunk`だけを受け取るため、feature有効でもraw `Chunk`を直接VMへ渡せない |
 | REV-020 | import先parse errorの原因を捨て、wrapper messageだけを返す。原因診断を保持する | import diagnostics | 設計○（[組み込みAPI](embedding-api.md) error契約） | ⬜ 未実装 |
 | REV-021 | 現行`remove_dir`は再帰削除だが次期capabilityは`EmptyDirectory`へ割当て。`remove_dir`を空のみへ変更し、再帰削除を`remove_tree`（`RecursiveDelete`）へ分離する | filesystem capability | ✅ 確定済み（[次期意味論・実装決定](semantic-decisions.md)§17.6） | ⬜ 未実装 |
 
@@ -406,6 +406,7 @@ REV 由来項目の実装順は、[次期意味論・実装決定](semantic-deci
 - [x] バイトコード VM: Phase 5（クロージャ — upvalue / MakeClosure / Lambda）
 - [x] バイトコード VM: Phase 6（組み込み関数 — 53個対応）
 - [x] バイトコード VM: Phase 7（互換性修正 — min/max Int×Float混合、remove ファイル/ディレクトリ判定、write_file/append_file 型変換）
+- [x] bytecode検証・API封印（REV-006/004/005/018）— `VerifiedChunk`/verifier（V1〜V9）、per-instruction step課金、`MakeClosure(proto_index)`+明示`CaptureDesc`、`patch_jump`のfallible化、`unstable-bytecode` featureでのraw module封印。VM入口を検証済みchunkへ限定
 - [x] スタックトレース（関数呼び出し経路のエラー表示、ツリーウォーク版/VM版両対応）
 - [x] ステップ予算（ループ反復 + 関数呼び出しのカウント制限、無限ループ/無限再帰を防止）
 - [x] ファイルI/Oサンドボックス（環境変数 `TSUMUGI_SANDBOX` でアクセス許可パスを制限）
