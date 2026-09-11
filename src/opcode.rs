@@ -11,6 +11,20 @@ pub enum MutationTarget {
     Global(String),
 }
 
+/// closure が capture する変数セルの明示記述子（REV-005）。
+///
+/// 現行の「`MakeClosure` 直前の隣接 opcode 列から逆算する」暗黙契約を廃止し、
+/// 関数プロトタイプが capture を明示的に持つ。`Local(slot)` は親フレームの
+/// local cell を、`Upvalue(index)` は親フレームの upvalue cell を共有する。
+/// 範囲は REV-006 の verifier が検査し、VM 実行時は defense-in-depth で再検査する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureDesc {
+    /// 親フレームの local slot を capture する。
+    Local(usize),
+    /// 親フレームの upvalue index を capture する。
+    Upvalue(usize),
+}
+
 /// VM が実行する命令
 #[derive(Debug, Clone, PartialEq)]
 pub enum OpCode {
@@ -107,8 +121,10 @@ pub enum OpCode {
     /// upvalue（クロージャがキャプチャした変数）を更新する
     SetUpvalue(usize),
 
-    /// クロージャを作る: スタックの [VmFn, upval0, upval1, ...] → クロージャ値
-    /// operand: upvalue の数
+    /// クロージャを作る（REV-005）。
+    /// operand: `Chunk.prototypes` 内のプロトタイプ index。
+    /// capture は隣接 opcode 列ではなくプロトタイプの `captures` 記述子から解釈する。
+    /// スタックには何も積まれている必要がなく、結果としてクロージャ値を 1 つ push する。
     MakeClosure(usize),
 
     // --- 組み込み関数呼び出し ---

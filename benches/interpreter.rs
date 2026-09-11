@@ -15,11 +15,11 @@
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 
 use tsumugi::ast::Program;
-use tsumugi::chunk::Chunk;
 use tsumugi::compiler::Compiler;
 use tsumugi::eval::Evaluator;
 use tsumugi::lexer::Lexer;
 use tsumugi::parser::Parser;
+use tsumugi::verifier::VerifiedChunk;
 use tsumugi::vm::Vm;
 
 // ---------------------------------------------------------------------------
@@ -31,7 +31,7 @@ fn parse(source: &str) -> Program {
     Parser::new(tokens).parse().expect("ベンチのパースに失敗")
 }
 
-fn compile(program: &Program) -> Chunk {
+fn compile(program: &Program) -> VerifiedChunk {
     Compiler::new()
         .compile(program)
         .expect("ベンチのコンパイルに失敗")
@@ -42,7 +42,7 @@ fn execute_tree_walk(program: &Program) {
     evaluator.run(program).expect("ベンチのtree実行に失敗");
 }
 
-fn execute_vm(chunk: Chunk) {
+fn execute_vm(chunk: VerifiedChunk) {
     let mut vm = Vm::new(chunk);
     vm.run().expect("ベンチのVM実行に失敗");
 }

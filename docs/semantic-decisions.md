@@ -1588,6 +1588,8 @@ compare_int_float(i: i64, f: f64) -> NumericOrdering:
 
 ### 17.2 `Chunk::patch_jump` の fallible 化と builder 封印（REV-004）
 
+> 設計ステータス: ✅ 実装済み。`patch_jump` を `Result<(), ChunkBuildError>`（`BadOffset`/`NotAJump`）へ変更し、エラー時は `code` を書き換えず部分破損を残さない。compiler は内部エラーへ写像して `?` 伝播する。raw builder（`chunk` module）は REV-018 と共通で `unstable-bytecode` feature 下へ封印した。
+
 #### 17.2.1 採用判断
 
 `Chunk` の可変 builder API（`emit` / `emit_jump` / `patch_jump` / `add_constant` 等）を公開 panic 面から外す。二段構えとする。
@@ -1632,6 +1634,8 @@ builder エラーが VM 実行時まで漏れた場合（防御的経路）は�
 - builder 縮小後、通常 compile 経路の観測挙動が変わらない。
 
 ### 17.3 `MakeClosure` capture 記述子の明示化（REV-005）
+
+> 設計ステータス: ✅ 実装済み。`MakeClosure` の operand を「upvalue 数」から `Chunk.prototypes` の「プロトタイプ index」へ変更し、`FunctionPrototype`（`chunk` / `captures`）と明示 `CaptureDesc`（`Local`/`Upvalue`）を導入。compiler は隣接 `GetLocal`/`GetUpvalue` 列の暗黙契約を廃止し、VM は記述子から cell を解決する（`usize::MAX`/Null cell フォールバックを削除。不正記述子は `internal`、範囲は verifier の V5 で拒否）。REV-006 と同一 build で実施した。
 
 #### 17.3.1 採用判断
 
@@ -1879,7 +1883,7 @@ remove_tree(path):
 
 ### 17.7 bytecode 検証と `VerifiedChunk`（REV-006）
 
-> 設計ステータス: 次期仕様確定・未実装。§17.2（REV-004）・§17.3（REV-005）・REV-018 と同一マイルストーン（第18節ステップ7）で実装する。本節はそれらが「範囲検証は verifier が担う」と委譲している検証層の正本である。
+> 設計ステータス: ✅ 実装済み。§17.2（REV-004）・§17.3（REV-005）・REV-018 と同一マイルストーンで実装した。`src/verifier.rs` に `VerifiedChunk`（生成は `verify` か信頼済み `from_trusted` のみ）と `verify`（V1〜V9 をプロトタイプ木へ再帰適用し、最初の違反を `ChunkVerifyError` として返す。`From<ChunkVerifyError> for TsumugiError` と `verify_or_internal_error` で `internal` へ写像）を新設。VM の `run_frames` は全命令 dispatch 直前で無条件に `count_step` する層1課金へ変更し、`Loop`/`PrepareCall`/`call_fn_value` の個別課金を廃止（深度上限は `PrepareCall` と `Call` の両方で検査）。`Vm::new` / `run_repl_chunk` は `VerifiedChunk` だけを受け取り、compiler 出力は `from_trusted` で昇格する。停止性は per-instruction 課金で verifier 非依存。本節はそれらが「範囲検証は verifier が担う」と委譲している検証層の正本である。
 
 #### 17.7.1 採用判断
 
@@ -2009,7 +2013,7 @@ run_frames dispatch loop:
 4. **Builtin/error基盤**: AUD-049単一registry、AUD-019共通error constructorと完全一致test。§17.1（REV-003）の `NumericOrder` 集約、および §17.4（REV-009）・§17.6（REV-021）で追加するhost error category（`directory_read` / `invalid_encoding` / `directory_not_empty`）のinventory登録もここで行う。
 5. **値表現**: AUD-047 List/Dict COW、続けてAUD-048 FunctionId。scaling/identity testを先に追加する。
 6. **binding/transaction**: AUD-016 VM fresh cell、AUD-024全language-state REPL journal。FunctionId counterをrollback対象外に固定する。
-7. **bytecode検証面**: §17.7（REV-006）の `VerifiedChunk`/verifier と per-instruction step 課金を軸に、§17.2（REV-004）の `patch_jump` fallible化とbuilder封印、§17.3（REV-005）の `MakeClosure` capture記述子化、REV-018のraw module封印を同一マイルストーンで実施する。VM入口を `VerifiedChunk` へ限定し、停止性はper-instruction課金（verifier非依存）で担保する。opcodeと関数値表現の変更を伴うため境界挙動より前に置く。
+7. ✅ **bytecode検証面（実装済み）**: §17.7（REV-006）の `VerifiedChunk`/verifier と per-instruction step 課金を軸に、§17.2（REV-004）の `patch_jump` fallible化とbuilder封印、§17.3（REV-005）の `MakeClosure` capture記述子化、REV-018のraw module封印を同一マイルストーンで実装した。VM入口を `VerifiedChunk` へ限定し、停止性はper-instruction課金（verifier非依存）で担保する。観測挙動はstep到達点以外不変。
 8. **境界挙動**: ~~AUD-034 `path_join`~~（✅ 完了、revision 0.16）、AUD-036 checked変換/Exited、~~AUD-018 CLI args/stdin~~（✅ 完了、revision 0.18）、~~AUD-033 EOF診断~~（✅ 完了）、~~§17.1（REV-003）の混合数値比較~~（✅ 完了、revision 0.19）。
 9. **capability縦切り**: sandbox OnceLockをExecutionContext FilesystemCapabilityへ移し、tree/VM/importを同じpolicyへ接続する。§17.4（REV-009）の `list_dir` 部分失敗/非UTF-8、§17.6（REV-021）の `remove_dir`（空のみ）/`remove_tree`（`RecursiveDelete`）分割をこのcapability面で実装する。
 10. **検証基盤**: cargo-fuzzのfrontend/compiler/vm_chunk、続いてcapability完成後にevaluator/differential target。

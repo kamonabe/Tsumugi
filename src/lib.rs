@@ -12,8 +12,6 @@
 pub mod ast;
 pub mod builtin_core;
 pub mod builtin_registry;
-pub mod chunk;
-pub mod compiler;
 pub mod engine;
 pub mod env;
 pub mod error;
@@ -21,11 +19,36 @@ pub mod eval;
 pub mod lexer;
 pub(crate) mod limits;
 pub mod module;
-pub mod opcode;
 pub mod parser;
 pub mod sandbox;
 pub mod token;
 pub mod value;
+
+// raw bytecode モジュール群（REV-018）。安定 surface は `Engine` 系のみとし、
+// これらは `unstable-bytecode` feature でのみ公開する。feature 無効時は crate 内部限定。
+#[cfg(feature = "unstable-bytecode")]
+pub mod chunk;
+#[cfg(not(feature = "unstable-bytecode"))]
+pub(crate) mod chunk;
+
+#[cfg(feature = "unstable-bytecode")]
+pub mod compiler;
+#[cfg(not(feature = "unstable-bytecode"))]
+pub(crate) mod compiler;
+
+#[cfg(feature = "unstable-bytecode")]
+pub mod opcode;
+#[cfg(not(feature = "unstable-bytecode"))]
+pub(crate) mod opcode;
+
+#[cfg(feature = "unstable-bytecode")]
+pub mod verifier;
+#[cfg(not(feature = "unstable-bytecode"))]
+pub(crate) mod verifier;
+
+#[cfg(feature = "unstable-bytecode")]
 pub mod vm;
+#[cfg(not(feature = "unstable-bytecode"))]
+pub(crate) mod vm;
 
 pub use engine::{CompiledScript, Engine, ExecutionContext, ExecutionOutcome};

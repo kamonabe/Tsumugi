@@ -7,8 +7,9 @@ use std::rc::Rc;
 use crate::chunk::Chunk;
 use crate::error::TsumugiError;
 use crate::limits::MAX_USER_CALL_DEPTH;
-use crate::opcode::{MutationTarget, OpCode};
+use crate::opcode::{CaptureDesc, MutationTarget, OpCode};
 use crate::value::{FunctionId, NumericOrder, SharedValue, Value};
+use crate::verifier::VerifiedChunk;
 
 /// 演算・比較の型エラーを作る（AUD-014）
 ///
@@ -124,9 +125,9 @@ pub struct Vm {
 }
 
 impl Vm {
-    pub fn new(chunk: Chunk) -> Self {
+    pub fn new(chunk: VerifiedChunk) -> Self {
         let frame = CallFrame {
-            chunk: Rc::new(chunk),
+            chunk: Rc::new(chunk.into_inner()),
             ip: 0,
             base: 0,
             upvalues: Vec::new(),
@@ -165,6 +166,14 @@ impl Vm {
         self.script_args = args;
     }
 
+    /// step 上限を明示的に設定する。
+    ///
+    /// 既定は `TSUMUGI_MAX_STEPS`（未設定なら [`DEFAULT_MAX_STEPS`]）。process-global な
+    /// env に依存せず停止性を検証したいテストや、ホストが実行単位で予算を与える場合に使う。
+    pub fn set_max_steps(&mut self, max_steps: u64) {
+        self.max_steps = max_steps;
+    }
+
     /// 関数値へ新しい FunctionId を発番する（AUD-048）。
     ///
     /// MakeClosure 実行のたびに呼ぶ。u64 を使い切った場合は internal error を返す
@@ -196,7 +205,8 @@ impl Vm {
 
     /// REPL 用: 既存のスタック（ローカル変数）を保持したまま新しいチャンクを実行する。
     /// 前回のフレームを差し替えて実行し、終了後もスタック上の値を保持する。
-    pub fn run_repl_chunk(&mut self, chunk: Chunk) -> Result<(), TsumugiError> {
+    pub fn run_repl_chunk(&mut self, chunk: VerifiedChunk) -> Result<(), TsumugiError> {
+        let chunk = chunk.into_inner();
         // 未捕捉エラー時に、入力途中の一時値・callee frame・try handlerを
         // 次の入力へ持ち越さないための構造状態checkpoint。
         // stackはList/Dictを深く複製せず、既存slotの書換・削除時だけjournalへ退避する。
@@ -296,53 +306,61 @@ impl Vm {
                 .ok_or_else(|| internal_error(0, "命令に対応する行番号がありません"))?;
             self.frame_mut(line)?.ip += 1;
 
-            let result = match &instruction {
-                OpCode::ReturnValue => {
-                    let return_value = self.pop(line)?;
-                    let frame = self.take_frame(line)?;
-                    self.truncate_stack(frame.base);
-                    // return 時にこのフレーム内の try ハンドラを除去する
-                    let current_depth = self.frames.len();
-                    self.try_handlers.retain(|h| h.frame_depth <= current_depth);
-                    if current_depth <= stop_depth {
-                        return Ok(return_value);
+            // per-instruction step 課金（REV-006 層1）。
+            // fetch した全命令の dispatch 直前に無条件で 1 step 課金する。これにより、
+            // 検証を通っていない chunk が防御的に届いても、任意の命令列は有限 step で
+            // `limit` error になる（`Jump(0)` 自己ループも 1 周ごとに課金される）。
+            // step 上限到達エラーは、既存挙動どおり try/catch handler 経路を通す。
+            let result = match self.count_step(line) {
+                Err(step_error) => Err(step_error),
+                Ok(()) => match &instruction {
+                    OpCode::ReturnValue => {
+                        let return_value = self.pop(line)?;
+                        let frame = self.take_frame(line)?;
+                        self.truncate_stack(frame.base);
+                        // return 時にこのフレーム内の try ハンドラを除去する
+                        let current_depth = self.frames.len();
+                        self.try_handlers.retain(|h| h.frame_depth <= current_depth);
+                        if current_depth <= stop_depth {
+                            return Ok(return_value);
+                        }
+                        self.stack.push(return_value);
+                        Ok(())
                     }
-                    self.stack.push(return_value);
-                    Ok(())
-                }
-                OpCode::Return => {
-                    if self.frames.len() <= stop_depth + 1 {
-                        return Ok(Value::Null);
+                    OpCode::Return => {
+                        if self.frames.len() <= stop_depth + 1 {
+                            return Ok(Value::Null);
+                        }
+                        // ネストされたフレーム内の Return（通常は起きないがガード）
+                        let f = self.take_frame(line)?;
+                        self.truncate_stack(f.base);
+                        // return 時にこのフレーム内の try ハンドラを除去する
+                        self.try_handlers
+                            .retain(|h| h.frame_depth <= self.frames.len());
+                        self.stack.push(Value::Null);
+                        Ok(())
                     }
-                    // ネストされたフレーム内の Return（通常は起きないがガード）
-                    let f = self.take_frame(line)?;
-                    self.truncate_stack(f.base);
-                    // return 時にこのフレーム内の try ハンドラを除去する
-                    self.try_handlers
-                        .retain(|h| h.frame_depth <= self.frames.len());
-                    self.stack.push(Value::Null);
-                    Ok(())
-                }
-                OpCode::SetupTry(catch_ip) => {
-                    let catch_ip = *catch_ip;
-                    let locals_count = self
-                        .frames
-                        .last()
-                        .map(|frame| self.stack.len().saturating_sub(frame.base))
-                        .unwrap_or(0);
-                    self.try_handlers.push(TryHandler {
-                        catch_ip,
-                        stack_depth: self.stack.len(),
-                        frame_depth: self.frames.len(),
-                        locals_count,
-                    });
-                    Ok(())
-                }
-                OpCode::TeardownTry => {
-                    self.try_handlers.pop();
-                    Ok(())
-                }
-                _ => self.dispatch(instruction, line),
+                    OpCode::SetupTry(catch_ip) => {
+                        let catch_ip = *catch_ip;
+                        let locals_count = self
+                            .frames
+                            .last()
+                            .map(|frame| self.stack.len().saturating_sub(frame.base))
+                            .unwrap_or(0);
+                        self.try_handlers.push(TryHandler {
+                            catch_ip,
+                            stack_depth: self.stack.len(),
+                            frame_depth: self.frames.len(),
+                            locals_count,
+                        });
+                        Ok(())
+                    }
+                    OpCode::TeardownTry => {
+                        self.try_handlers.pop();
+                        Ok(())
+                    }
+                    _ => self.dispatch(instruction, line),
+                },
             };
 
             if let Err(e) = result {
@@ -962,7 +980,7 @@ impl Vm {
                 }
             }
             OpCode::Loop(target) => {
-                self.count_step(line)?;
+                // step 課金はメインループの per-instruction 課金へ一本化した（REV-006）。
                 self.set_ip(target, line)?;
             }
             OpCode::GetUpvalue(index) => {
@@ -979,89 +997,43 @@ impl Vm {
                 self.checkpoint_cell(&cell);
                 *cell.borrow_mut() = value;
             }
-            OpCode::MakeClosure(upvalue_count) => {
-                // upvalue_count 個の値がスタックに積まれている
-                // コンパイラは MakeClosure(N) の直前に N 個の GetLocal/GetUpvalue を emit する
-                // GetLocal → 親のローカル変数セルを共有
-                // GetUpvalue → 親の upvalue セルを共有（多段キャプチャ）
-                // 不正なoperandで巨大な確保やindex計算のunderflowを起こさない
-                self.require_stack_len(upvalue_count, line)?;
+            OpCode::MakeClosure(proto_index) => {
+                // capture は隣接 opcode 列ではなくプロトタイプの明示記述子から解釈する（REV-005）。
+                // operand はプロトタイプ index。範囲は verifier 済みだが、防御的に再検査する。
                 let frame = self.frame(line)?;
-                let sources_start = frame
-                    .ip
-                    .checked_sub(1)
-                    .and_then(|make_closure_ip| make_closure_ip.checked_sub(upvalue_count))
+                let prototype = frame
+                    .chunk
+                    .prototypes
+                    .get(proto_index)
+                    .cloned()
                     .ok_or_else(|| {
-                        internal_error(line, "MakeClosure の直前にupvalue命令がありません")
+                        internal_error(line, "MakeClosure のプロトタイプ index が範囲外です")
                     })?;
 
-                let mut upvalue_sources = Vec::with_capacity(upvalue_count);
-                for i in 0..upvalue_count {
-                    let instr_ip = sources_start + i;
-                    match frame.chunk.code.get(instr_ip) {
-                        Some(OpCode::GetLocal(slot)) => {
-                            upvalue_sources.push((true, *slot)); // is_local, slot
-                        }
-                        Some(OpCode::GetUpvalue(index)) => {
-                            upvalue_sources.push((false, *index)); // is_upvalue, index
-                        }
-                        _ => {
-                            upvalue_sources.push((true, usize::MAX)); // フォールバック
-                        }
-                    }
+                // 各 capture 記述子をセルへ解決する。Null フォールバックは持たない。
+                let mut upvalue_cells = Vec::with_capacity(prototype.captures.len());
+                for cap in &prototype.captures {
+                    let cell = match cap {
+                        CaptureDesc::Local(slot) => self.ensure_local_cell(*slot, line)?,
+                        CaptureDesc::Upvalue(index) => self.upvalue_cell(*index, line)?,
+                    };
+                    upvalue_cells.push(cell);
                 }
 
-                // スタックから積まれた値を pop
-                for _ in 0..upvalue_count {
-                    self.pop(line)?;
-                }
-
-                // 各 upvalue についてセルを取得/作成
-                let mut upvalue_cells = Vec::with_capacity(upvalue_count);
-                for (is_local, slot) in upvalue_sources {
-                    if is_local {
-                        if slot == usize::MAX {
-                            upvalue_cells.push(Rc::new(RefCell::new(Value::Null)));
-                        } else {
-                            let cell = self.ensure_local_cell(slot, line)?;
-                            upvalue_cells.push(cell);
-                        }
-                    } else {
-                        // 親の upvalue セルを直接共有（多段キャプチャ）
-                        let cell = self.upvalue_cell(slot, line)?;
-                        upvalue_cells.push(cell);
-                    }
-                }
-
-                let fn_value = self.pop(line)?;
-                if let Value::VmFn {
-                    name,
-                    arity,
-                    params,
-                    chunk,
-                    ..
-                } = fn_value
-                {
-                    // 定数の id は placeholder。ここで新しい FunctionId を発番して
-                    // 関数式の評価ごとに一意な同一性を与える（AUD-048）。
-                    let id = self.allocate_function_id(line)?;
-                    self.stack.push(Value::VmFn {
-                        id,
-                        name,
-                        arity,
-                        params,
-                        chunk,
-                        upvalues: upvalue_cells,
-                    });
-                } else {
-                    return Err(internal_error(
-                        line,
-                        "内部エラー: MakeClosure の対象が VmFn ではありません",
-                    ));
-                }
+                // 関数式の評価ごとに一意な FunctionId を発番する（AUD-048）。
+                let id = self.allocate_function_id(line)?;
+                self.stack.push(Value::VmFn {
+                    id,
+                    name: prototype.name.clone(),
+                    arity: prototype.arity,
+                    params: prototype.params.clone(),
+                    chunk: prototype.chunk.clone(),
+                    upvalues: upvalue_cells,
+                });
             }
             OpCode::PrepareCall => {
-                self.count_step(line)?;
+                // step 課金は per-instruction 課金へ一本化した（REV-006）。深度上限は
+                // PrepareCall と Call の両方で検査する（raw Call でも迂回させない）。
                 if self.active_user_frame_count() >= MAX_USER_CALL_DEPTH {
                     return Err(TsumugiError::call_depth_limit(line, MAX_USER_CALL_DEPTH));
                 }
@@ -1620,8 +1592,8 @@ impl Vm {
         args: Vec<Value>,
         line: usize,
     ) -> Result<Value, TsumugiError> {
-        self.count_step(line)?;
-        // 再帰制限チェック（OpCode::Call と同じガードを適用）
+        // step 課金は per-instruction 課金へ一本化した（REV-006）。callback 本体の
+        // 各命令は run_frames で課金される。深度上限のみここで検査する。
         if self.active_user_frame_count() >= MAX_USER_CALL_DEPTH {
             return Err(TsumugiError::call_depth_limit(line, MAX_USER_CALL_DEPTH));
         }
@@ -1846,7 +1818,7 @@ mod tests {
         main.emit(OpCode::Call(0), 1);
         main.emit(OpCode::Return, 1);
 
-        let error = Vm::new(main)
+        let error = Vm::new(VerifiedChunk::from_trusted(main))
             .run()
             .expect_err("PrepareCallなしの再帰Callが成功しました");
         assert_eq!(error.error_type(), "overflow");
@@ -1859,7 +1831,7 @@ mod tests {
         chunk.emit(OpCode::Call(0), 1);
         chunk.emit(OpCode::Return, 1);
 
-        let error = Vm::new(chunk)
+        let error = Vm::new(VerifiedChunk::from_trusted(chunk))
             .run()
             .expect_err("calleeのないCallが成功しました");
         assert!(error.message().contains("Call のスタック要素が不足"));
@@ -1871,7 +1843,7 @@ mod tests {
         chunk.emit(OpCode::Call(usize::MAX), 1);
         chunk.emit(OpCode::Return, 1);
 
-        let error = Vm::new(chunk)
+        let error = Vm::new(VerifiedChunk::from_trusted(chunk))
             .run()
             .expect_err("overflowする引数数のCallが成功しました");
         assert!(error.message().contains("Call の引数数が不正"));
@@ -1887,7 +1859,7 @@ mod tests {
         chunk.emit(OpCode::GetLocal(999), 1);
         chunk.emit(OpCode::Return, 1);
 
-        let error = Vm::new(chunk)
+        let error = Vm::new(VerifiedChunk::from_trusted(chunk))
             .run()
             .expect_err("範囲外のlocal読み取りが成功しました");
         assert_eq!(error.error_type(), "internal");
@@ -1901,7 +1873,7 @@ mod tests {
     #[test]
     fn function_id_is_monotonic_and_starts_at_zero() {
         // AUD-048: allocate_function_id は 0 から単調増加する
-        let mut vm = Vm::new(Chunk::new());
+        let mut vm = Vm::new(VerifiedChunk::from_trusted(Chunk::new()));
         assert_eq!(vm.allocate_function_id(1).unwrap(), FunctionId(0));
         assert_eq!(vm.allocate_function_id(1).unwrap(), FunctionId(1));
         assert_eq!(vm.allocate_function_id(1).unwrap(), FunctionId(2));
@@ -1910,7 +1882,7 @@ mod tests {
     #[test]
     fn function_id_overflow_reports_internal_error() {
         // AUD-048: u64 を使い切ったら internal error を返す
-        let mut vm = Vm::new(Chunk::new());
+        let mut vm = Vm::new(VerifiedChunk::from_trusted(Chunk::new()));
         vm.next_function_id = u64::MAX - 1;
         assert_eq!(
             vm.allocate_function_id(7).unwrap(),
