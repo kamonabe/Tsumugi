@@ -5,10 +5,10 @@ use std::rc::Rc;
 use crate::ast::{
     BinOpKind, Expr, FStrExprPart, Program, Stmt, UnaryOpKind, validate_program_depth,
 };
-use crate::chunk::Chunk;
+use crate::chunk::{Chunk, ChunkBuildError, FunctionPrototype};
 use crate::error::TsumugiError;
-use crate::opcode::{MutationTarget, OpCode};
-use crate::value::{FunctionId, Value};
+use crate::opcode::{CaptureDesc, MutationTarget, OpCode};
+use crate::value::Value;
 
 /// ローカル変数の情報
 #[derive(Debug, Clone)]
@@ -92,6 +92,50 @@ impl Compiler {
             enclosing_locals: Some(enclosing_locals),
             enclosing_upvalues: Some(enclosing_upvalues),
         }
+    }
+
+    /// `Chunk::patch_jump` を呼び、builder エラーを compiler 内部エラーへ写像する（REV-004）。
+    ///
+    /// 正規の compile 経路では発生しない（jump 命令の offset は自分で発行したもの）。
+    /// 発生した場合は compiler の不変条件違反であり、script からは到達しない。
+    fn patch_jump(&mut self, offset: usize) -> Result<(), TsumugiError> {
+        self.chunk.patch_jump(offset).map_err(|err| {
+            let detail = match err {
+                ChunkBuildError::BadOffset => "jump offset が範囲外です",
+                ChunkBuildError::NotAJump => "jump 命令ではない offset を patch しました",
+            };
+            TsumugiError::internal(0, detail)
+        })
+    }
+
+    /// compiler の `Upvalue` 列を明示 capture 記述子へ変換し、プロトタイプ表へ登録する（REV-005）。
+    ///
+    /// 戻り値は `MakeClosure` が参照する `Chunk.prototypes` 内の index。
+    fn add_prototype(
+        &mut self,
+        name: String,
+        arity: usize,
+        params: Vec<String>,
+        fn_chunk: Chunk,
+        upvalues: &[Upvalue],
+    ) -> usize {
+        let captures = upvalues
+            .iter()
+            .map(|uv| {
+                if uv.is_local {
+                    CaptureDesc::Local(uv.slot)
+                } else {
+                    CaptureDesc::Upvalue(uv.slot)
+                }
+            })
+            .collect();
+        self.chunk.add_prototype(FunctionPrototype {
+            name,
+            arity,
+            params,
+            chunk: Rc::new(fn_chunk),
+            captures,
+        })
     }
 
     /// プログラム全体をコンパイルして Chunk を返す
@@ -293,7 +337,7 @@ impl Compiler {
         self.end_scope(line);
 
         // catch 後への合流点
-        self.chunk.patch_jump(jump_over_catch);
+        self.patch_jump(jump_over_catch)?;
 
         Ok(())
     }
@@ -321,7 +365,7 @@ impl Compiler {
         // then の末尾で else の後ろへジャンプ（else がある場合のみ）
         if !else_body.is_empty() {
             let jump_over_else = self.chunk.emit_jump(OpCode::Jump(0), line);
-            self.chunk.patch_jump(jump_to_else);
+            self.patch_jump(jump_to_else)?;
 
             // else ブロック（elif は Parser が再帰的に If ノードに変換済み）
             self.begin_scope();
@@ -330,9 +374,9 @@ impl Compiler {
             }
             self.end_scope(line);
 
-            self.chunk.patch_jump(jump_over_else);
+            self.patch_jump(jump_over_else)?;
         } else {
-            self.chunk.patch_jump(jump_to_else);
+            self.patch_jump(jump_to_else)?;
         }
 
         Ok(())
@@ -372,12 +416,12 @@ impl Compiler {
         self.chunk.emit(OpCode::Loop(loop_start), line);
 
         // ループ脱出先をパッチ
-        self.chunk.patch_jump(exit_jump);
+        self.patch_jump(exit_jump)?;
 
         // break のパッチ
         let loop_state = self.loops.pop().unwrap();
         for break_offset in loop_state.breaks {
-            self.chunk.patch_jump(break_offset);
+            self.patch_jump(break_offset)?;
         }
 
         Ok(())
@@ -461,12 +505,12 @@ impl Compiler {
         self.chunk.emit(OpCode::Loop(loop_start), line);
 
         // 脱出先パッチ
-        self.chunk.patch_jump(exit_jump);
+        self.patch_jump(exit_jump)?;
 
         // break / continue パッチ
         let loop_state = self.loops.pop().unwrap();
         for break_offset in loop_state.breaks {
-            self.chunk.patch_jump(break_offset);
+            self.patch_jump(break_offset)?;
         }
         // continue のジャンプ先をインクリメント位置にパッチ
         for cont_offset in loop_state.continues {
@@ -572,7 +616,7 @@ impl Compiler {
                         // 左辺が真 → 左辺を捨てて右辺を評価
                         self.chunk.emit(OpCode::Pop, line);
                         self.compile_expr(right, line)?;
-                        self.chunk.patch_jump(jump);
+                        self.patch_jump(jump)?;
                     }
                     // or: 短絡評価（左辺が真なら左辺の値を返す）
                     BinOpKind::Or => {
@@ -582,7 +626,7 @@ impl Compiler {
                         // 左辺が偽 → 左辺を捨てて右辺を評価
                         self.chunk.emit(OpCode::Pop, line);
                         self.compile_expr(right, line)?;
-                        self.chunk.patch_jump(jump);
+                        self.patch_jump(jump)?;
                     }
                     _ => {
                         self.compile_expr(left, line)?;
@@ -638,9 +682,9 @@ impl Compiler {
                             self.compile_builtin_call(name, args, line)?;
                             let end_jump = self.chunk.emit_jump(OpCode::Jump(0), line);
 
-                            self.chunk.patch_jump(user_jump);
+                            self.patch_jump(user_jump)?;
                             self.compile_user_call(callee, args, line)?;
-                            self.chunk.patch_jump(end_jump);
+                            self.patch_jump(end_jump)?;
                             return Ok(());
                         }
                     }
@@ -920,30 +964,20 @@ impl Compiler {
         // 子の is_local=false upvalue を解決（親が中間キャプチャを行う）
         self.resolve_child_upvalues(&mut upvalues);
 
-        // VmFn プロトタイプを定数テーブルに追加してロードする。
-        // 定数の id は placeholder（FunctionId(0)）で、実行時に MakeClosure が
-        // 新しい FunctionId を発番して差し替える（AUD-048）。
-        let fn_value = Value::VmFn {
-            id: FunctionId(0),
-            name: name.to_string(),
-            arity: params.len(),
-            params: params.to_vec(),
-            chunk: Rc::new(fn_chunk),
-            upvalues: Vec::new(),
-        };
-        self.chunk.emit_constant(fn_value, line);
+        // capture を明示記述子として確定し、プロトタイプ表へ登録する（REV-005）。
+        // 隣接 opcode 列（GetLocal/GetUpvalue）からの逆算は廃止する。
+        let proto_index = self.add_prototype(
+            name.to_string(),
+            params.len(),
+            params.to_vec(),
+            fn_chunk,
+            &upvalues,
+        );
 
-        // upvalue の有無に関わらず必ず MakeClosure を通す（AUD-048）。
-        // capture 0 件でも実行時に一意な FunctionId を持つ新インスタンスを生成し、
-        // 同じ fn 式を複数回評価した値が別物になるようにする。
-        for uv in &upvalues {
-            if uv.is_local {
-                self.chunk.emit(OpCode::GetLocal(uv.slot), line);
-            } else {
-                self.chunk.emit(OpCode::GetUpvalue(uv.slot), line);
-            }
-        }
-        self.chunk.emit(OpCode::MakeClosure(upvalues.len()), line);
+        // capture 0 件でも必ず MakeClosure を通す（AUD-048）。実行時に一意な
+        // FunctionId を持つ新インスタンスを生成し、同じ fn 式を複数回評価した値が
+        // 別物になるようにする。
+        self.chunk.emit(OpCode::MakeClosure(proto_index), line);
 
         // 関数名を現在のscopeへ登録する。script top-levelならruntime globalにも公開する。
         self.declare_local(name.to_string(), line);
@@ -982,26 +1016,17 @@ impl Compiler {
         // 子の is_local=false upvalue を解決（親が中間キャプチャを行う）
         self.resolve_child_upvalues(&mut upvalues);
 
-        // VmFn プロトタイプ（id は placeholder。実行時に MakeClosure が発番する。AUD-048）
-        let fn_value = Value::VmFn {
-            id: FunctionId(0),
-            name: "<lambda>".to_string(),
-            arity: params.len(),
-            params: params.to_vec(),
-            chunk: Rc::new(fn_chunk),
-            upvalues: Vec::new(),
-        };
-        self.chunk.emit_constant(fn_value, line);
+        // capture を明示記述子として確定し、プロトタイプ表へ登録する（REV-005）。
+        let proto_index = self.add_prototype(
+            "<lambda>".to_string(),
+            params.len(),
+            params.to_vec(),
+            fn_chunk,
+            &upvalues,
+        );
 
         // capture 0 件でも必ず MakeClosure を通し、評価ごとに一意な FunctionId を得る（AUD-048）
-        for uv in &upvalues {
-            if uv.is_local {
-                self.chunk.emit(OpCode::GetLocal(uv.slot), line);
-            } else {
-                self.chunk.emit(OpCode::GetUpvalue(uv.slot), line);
-            }
-        }
-        self.chunk.emit(OpCode::MakeClosure(upvalues.len()), line);
+        self.chunk.emit(OpCode::MakeClosure(proto_index), line);
 
         Ok(())
     }

@@ -7,7 +7,7 @@ use std::rc::Rc;
 use crate::chunk::Chunk;
 use crate::error::TsumugiError;
 use crate::limits::MAX_USER_CALL_DEPTH;
-use crate::opcode::{MutationTarget, OpCode};
+use crate::opcode::{CaptureDesc, MutationTarget, OpCode};
 use crate::value::{FunctionId, NumericOrder, SharedValue, Value};
 
 /// 演算・比較の型エラーを作る（AUD-014）
@@ -979,86 +979,39 @@ impl Vm {
                 self.checkpoint_cell(&cell);
                 *cell.borrow_mut() = value;
             }
-            OpCode::MakeClosure(upvalue_count) => {
-                // upvalue_count 個の値がスタックに積まれている
-                // コンパイラは MakeClosure(N) の直前に N 個の GetLocal/GetUpvalue を emit する
-                // GetLocal → 親のローカル変数セルを共有
-                // GetUpvalue → 親の upvalue セルを共有（多段キャプチャ）
-                // 不正なoperandで巨大な確保やindex計算のunderflowを起こさない
-                self.require_stack_len(upvalue_count, line)?;
+            OpCode::MakeClosure(proto_index) => {
+                // capture は隣接 opcode 列ではなくプロトタイプの明示記述子から解釈する（REV-005）。
+                // operand はプロトタイプ index。範囲は verifier 済みだが、防御的に再検査する。
                 let frame = self.frame(line)?;
-                let sources_start = frame
-                    .ip
-                    .checked_sub(1)
-                    .and_then(|make_closure_ip| make_closure_ip.checked_sub(upvalue_count))
+                let prototype = frame
+                    .chunk
+                    .prototypes
+                    .get(proto_index)
+                    .cloned()
                     .ok_or_else(|| {
-                        internal_error(line, "MakeClosure の直前にupvalue命令がありません")
+                        internal_error(line, "MakeClosure のプロトタイプ index が範囲外です")
                     })?;
 
-                let mut upvalue_sources = Vec::with_capacity(upvalue_count);
-                for i in 0..upvalue_count {
-                    let instr_ip = sources_start + i;
-                    match frame.chunk.code.get(instr_ip) {
-                        Some(OpCode::GetLocal(slot)) => {
-                            upvalue_sources.push((true, *slot)); // is_local, slot
-                        }
-                        Some(OpCode::GetUpvalue(index)) => {
-                            upvalue_sources.push((false, *index)); // is_upvalue, index
-                        }
-                        _ => {
-                            upvalue_sources.push((true, usize::MAX)); // フォールバック
-                        }
-                    }
+                // 各 capture 記述子をセルへ解決する。Null フォールバックは持たない。
+                let mut upvalue_cells = Vec::with_capacity(prototype.captures.len());
+                for cap in &prototype.captures {
+                    let cell = match cap {
+                        CaptureDesc::Local(slot) => self.ensure_local_cell(*slot, line)?,
+                        CaptureDesc::Upvalue(index) => self.upvalue_cell(*index, line)?,
+                    };
+                    upvalue_cells.push(cell);
                 }
 
-                // スタックから積まれた値を pop
-                for _ in 0..upvalue_count {
-                    self.pop(line)?;
-                }
-
-                // 各 upvalue についてセルを取得/作成
-                let mut upvalue_cells = Vec::with_capacity(upvalue_count);
-                for (is_local, slot) in upvalue_sources {
-                    if is_local {
-                        if slot == usize::MAX {
-                            upvalue_cells.push(Rc::new(RefCell::new(Value::Null)));
-                        } else {
-                            let cell = self.ensure_local_cell(slot, line)?;
-                            upvalue_cells.push(cell);
-                        }
-                    } else {
-                        // 親の upvalue セルを直接共有（多段キャプチャ）
-                        let cell = self.upvalue_cell(slot, line)?;
-                        upvalue_cells.push(cell);
-                    }
-                }
-
-                let fn_value = self.pop(line)?;
-                if let Value::VmFn {
-                    name,
-                    arity,
-                    params,
-                    chunk,
-                    ..
-                } = fn_value
-                {
-                    // 定数の id は placeholder。ここで新しい FunctionId を発番して
-                    // 関数式の評価ごとに一意な同一性を与える（AUD-048）。
-                    let id = self.allocate_function_id(line)?;
-                    self.stack.push(Value::VmFn {
-                        id,
-                        name,
-                        arity,
-                        params,
-                        chunk,
-                        upvalues: upvalue_cells,
-                    });
-                } else {
-                    return Err(internal_error(
-                        line,
-                        "内部エラー: MakeClosure の対象が VmFn ではありません",
-                    ));
-                }
+                // 関数式の評価ごとに一意な FunctionId を発番する（AUD-048）。
+                let id = self.allocate_function_id(line)?;
+                self.stack.push(Value::VmFn {
+                    id,
+                    name: prototype.name.clone(),
+                    arity: prototype.arity,
+                    params: prototype.params.clone(),
+                    chunk: prototype.chunk.clone(),
+                    upvalues: upvalue_cells,
+                });
             }
             OpCode::PrepareCall => {
                 self.count_step(line)?;

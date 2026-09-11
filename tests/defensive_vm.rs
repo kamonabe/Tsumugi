@@ -6,11 +6,9 @@
 //!
 //! ライブラリの公開APIだけを使うため、VM側の実装を差し戻してもこのテストは残る。
 
-use std::rc::Rc;
-
 use tsumugi::chunk::Chunk;
 use tsumugi::opcode::OpCode;
-use tsumugi::value::{FunctionId, Value};
+use tsumugi::value::Value;
 use tsumugi::vm::Vm;
 
 /// 不正なChunkを実行し、`internal` エラーのメッセージを返す
@@ -107,33 +105,20 @@ fn stack_hungry_operands_return_internal_errors() {
     }
 }
 
-/// 関数の先頭にMakeClosureがあると、直前の命令を数える計算がunderflowし得る。
+/// `MakeClosure` のプロトタイプ index が範囲外でも panic せず内部エラーになる（REV-005）。
 ///
-/// 呼び出し先frameでは `ip` が0から始まる一方、stackには呼び出し元の値が
-/// 残っているため、要素数の検査だけでは防げない経路になる。
+/// capture を隣接 opcode 列から逆算する旧方式を廃止し、プロトタイプ表の index を
+/// operand とする。空のプロトタイプ表に対する index はここで防御的に拒否する。
 #[test]
-fn make_closure_at_function_start_returns_internal_error() {
-    let mut body = Chunk::new();
-    body.name = "malformed_closure".to_string();
-    body.emit(OpCode::MakeClosure(1), 1);
-    body.emit(OpCode::Return, 1);
+fn make_closure_with_out_of_range_prototype_returns_internal_error() {
+    let mut chunk = Chunk::new();
+    // prototypes が空の状態で index 0 を参照する。
+    chunk.emit(OpCode::MakeClosure(0), 1);
+    chunk.emit(OpCode::Return, 1);
 
-    let function = Value::VmFn {
-        id: FunctionId(0),
-        name: "malformed_closure".to_string(),
-        arity: 0,
-        params: Vec::new(),
-        chunk: Rc::new(body),
-        upvalues: Vec::new(),
-    };
-    let mut main = Chunk::new();
-    main.emit_constant(function, 1);
-    main.emit(OpCode::Call(0), 1);
-    main.emit(OpCode::Return, 1);
-
-    let message = run_expecting_internal_error("関数先頭のMakeClosure", main);
+    let message = run_expecting_internal_error("範囲外プロトタイプのMakeClosure", chunk);
     assert!(
-        message.contains("MakeClosure の直前にupvalue命令がありません"),
+        message.contains("MakeClosure のプロトタイプ index が範囲外です"),
         "想定外のメッセージ: {message}"
     );
 }
