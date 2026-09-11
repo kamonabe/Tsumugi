@@ -296,53 +296,61 @@ impl Vm {
                 .ok_or_else(|| internal_error(0, "命令に対応する行番号がありません"))?;
             self.frame_mut(line)?.ip += 1;
 
-            let result = match &instruction {
-                OpCode::ReturnValue => {
-                    let return_value = self.pop(line)?;
-                    let frame = self.take_frame(line)?;
-                    self.truncate_stack(frame.base);
-                    // return 時にこのフレーム内の try ハンドラを除去する
-                    let current_depth = self.frames.len();
-                    self.try_handlers.retain(|h| h.frame_depth <= current_depth);
-                    if current_depth <= stop_depth {
-                        return Ok(return_value);
+            // per-instruction step 課金（REV-006 層1）。
+            // fetch した全命令の dispatch 直前に無条件で 1 step 課金する。これにより、
+            // 検証を通っていない chunk が防御的に届いても、任意の命令列は有限 step で
+            // `limit` error になる（`Jump(0)` 自己ループも 1 周ごとに課金される）。
+            // step 上限到達エラーは、既存挙動どおり try/catch handler 経路を通す。
+            let result = match self.count_step(line) {
+                Err(step_error) => Err(step_error),
+                Ok(()) => match &instruction {
+                    OpCode::ReturnValue => {
+                        let return_value = self.pop(line)?;
+                        let frame = self.take_frame(line)?;
+                        self.truncate_stack(frame.base);
+                        // return 時にこのフレーム内の try ハンドラを除去する
+                        let current_depth = self.frames.len();
+                        self.try_handlers.retain(|h| h.frame_depth <= current_depth);
+                        if current_depth <= stop_depth {
+                            return Ok(return_value);
+                        }
+                        self.stack.push(return_value);
+                        Ok(())
                     }
-                    self.stack.push(return_value);
-                    Ok(())
-                }
-                OpCode::Return => {
-                    if self.frames.len() <= stop_depth + 1 {
-                        return Ok(Value::Null);
+                    OpCode::Return => {
+                        if self.frames.len() <= stop_depth + 1 {
+                            return Ok(Value::Null);
+                        }
+                        // ネストされたフレーム内の Return（通常は起きないがガード）
+                        let f = self.take_frame(line)?;
+                        self.truncate_stack(f.base);
+                        // return 時にこのフレーム内の try ハンドラを除去する
+                        self.try_handlers
+                            .retain(|h| h.frame_depth <= self.frames.len());
+                        self.stack.push(Value::Null);
+                        Ok(())
                     }
-                    // ネストされたフレーム内の Return（通常は起きないがガード）
-                    let f = self.take_frame(line)?;
-                    self.truncate_stack(f.base);
-                    // return 時にこのフレーム内の try ハンドラを除去する
-                    self.try_handlers
-                        .retain(|h| h.frame_depth <= self.frames.len());
-                    self.stack.push(Value::Null);
-                    Ok(())
-                }
-                OpCode::SetupTry(catch_ip) => {
-                    let catch_ip = *catch_ip;
-                    let locals_count = self
-                        .frames
-                        .last()
-                        .map(|frame| self.stack.len().saturating_sub(frame.base))
-                        .unwrap_or(0);
-                    self.try_handlers.push(TryHandler {
-                        catch_ip,
-                        stack_depth: self.stack.len(),
-                        frame_depth: self.frames.len(),
-                        locals_count,
-                    });
-                    Ok(())
-                }
-                OpCode::TeardownTry => {
-                    self.try_handlers.pop();
-                    Ok(())
-                }
-                _ => self.dispatch(instruction, line),
+                    OpCode::SetupTry(catch_ip) => {
+                        let catch_ip = *catch_ip;
+                        let locals_count = self
+                            .frames
+                            .last()
+                            .map(|frame| self.stack.len().saturating_sub(frame.base))
+                            .unwrap_or(0);
+                        self.try_handlers.push(TryHandler {
+                            catch_ip,
+                            stack_depth: self.stack.len(),
+                            frame_depth: self.frames.len(),
+                            locals_count,
+                        });
+                        Ok(())
+                    }
+                    OpCode::TeardownTry => {
+                        self.try_handlers.pop();
+                        Ok(())
+                    }
+                    _ => self.dispatch(instruction, line),
+                },
             };
 
             if let Err(e) = result {
@@ -962,7 +970,7 @@ impl Vm {
                 }
             }
             OpCode::Loop(target) => {
-                self.count_step(line)?;
+                // step 課金はメインループの per-instruction 課金へ一本化した（REV-006）。
                 self.set_ip(target, line)?;
             }
             OpCode::GetUpvalue(index) => {
@@ -1014,7 +1022,8 @@ impl Vm {
                 });
             }
             OpCode::PrepareCall => {
-                self.count_step(line)?;
+                // step 課金は per-instruction 課金へ一本化した（REV-006）。深度上限は
+                // PrepareCall と Call の両方で検査する（raw Call でも迂回させない）。
                 if self.active_user_frame_count() >= MAX_USER_CALL_DEPTH {
                     return Err(TsumugiError::call_depth_limit(line, MAX_USER_CALL_DEPTH));
                 }
@@ -1573,8 +1582,8 @@ impl Vm {
         args: Vec<Value>,
         line: usize,
     ) -> Result<Value, TsumugiError> {
-        self.count_step(line)?;
-        // 再帰制限チェック（OpCode::Call と同じガードを適用）
+        // step 課金は per-instruction 課金へ一本化した（REV-006）。callback 本体の
+        // 各命令は run_frames で課金される。深度上限のみここで検査する。
         if self.active_user_frame_count() >= MAX_USER_CALL_DEPTH {
             return Err(TsumugiError::call_depth_limit(line, MAX_USER_CALL_DEPTH));
         }
