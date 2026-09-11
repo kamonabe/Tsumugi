@@ -19,7 +19,7 @@ Tsumugiは、プログラミング言語処理系への理解を深めるため�
 
 現在は**教育・実験用途のalpha版**であり、言語仕様・組み込みAPI・CLIの後方互換性は保証していない。crate root には、デフォルトのツリーウォークを利用する最小の埋め込み facade（`Engine`、`CompiledScript`、`ExecutionContext`、`ExecutionOutcome`）がある。これはCLIも利用する入口だが、stable Engine APIからのVM利用、host I/Oの注入、deny-by-default capability、包括的な実行予算、監査 event は未実装である。`--vm`は処理系比較のための実験的backendで、未捕捉エラー後のREPL状態にデフォルト実行系との既知の差が残る。現在利用できる観測仕様は[言語仕様](docs/language-spec.md)、現行アーキテクチャは[設計ドキュメント](docs/design.md)を正本とする。Phase 0〜7の次期実装契約は後述の7設計正本で確定済みだが、設計確定は実装完了を意味しない。実装差の一覧と進捗は[ロードマップ](docs/roadmap.md)を参照すること。
 
-組み込みのステップ上限やfilesystem制限はdefense-in-depthであり、非信頼コードを隔離するsecurity sandboxではない。CLIは`tsumugi [--vm] [SCRIPT [ARGS...]]`の形でスクリプト引数を受け取り、`args()`から参照できる（`SCRIPT`が`-`なら標準入力からソースを読む。AUD-018 E8a）。`--help` / `--version`とcapability profile/options（`--profile` / `--allow-*` / `--fs-*`）は未対応で、Phase 2で追加する。Cargo package / REPLの`0.1.0`と[言語仕様](docs/language-spec.md)の`0.18`は、それぞれ実装版と仕様revisionを表す独立した番号として管理している。
+組み込みのステップ上限やfilesystem制限はdefense-in-depthであり、非信頼コードを隔離するsecurity sandboxではない。CLIは`tsumugi [--vm] [SCRIPT [ARGS...]]`の形でスクリプト引数を受け取り、`args()`から参照できる（`SCRIPT`が`-`なら標準入力からソースを読む。AUD-018 E8a）。`--help` / `--version`とcapability profile/options（`--profile` / `--allow-*` / `--fs-*`）は未対応で、Phase 2で追加する。Cargo package / REPLの`0.1.0`と[言語仕様](docs/language-spec.md)の`0.19`は、それぞれ実装版と仕様revisionを表す独立した番号として管理している。
 
 ## 組み込み API（tree-walk）
 
@@ -272,12 +272,14 @@ src/
 ├── opcode.rs     # バイトコード命令セット
 ├── chunk.rs      # 命令列 + 定数テーブル
 ├── compiler.rs   # コンパイラ（AST → Chunk、builtin判定はregistryから導出）
+├── verifier.rs   # bytecode検証（VerifiedChunk、V1〜V9の検査でVM入口を検証済みchunkへ限定）
 ├── vm.rs         # スタックマシン VM + コンテキスト依存の組み込み関数
 │
 │  --- 実行時ガードレール（両実行系で共有） ---
 ├── builtin_core.rs     # 組み込み関数の共通実装（47個）
 ├── builtin_registry.rs # builtin名・arity・context/pure分類の単一正本（BuiltinSpec）
-├── limits.rs           # 構造的上限（MAX_AST_DEPTH / MAX_IMPORT_DEPTH）
+├── budget.rs           # 実行予算（BudgetLedger、reserve/commitによるstep等の一元管理）
+├── limits.rs           # 構造的上限（MAX_AST_DEPTH / MAX_IMPORT_DEPTH / MAX_USER_CALL_DEPTH）
 └── sandbox.rs          # ファイルI/Oと環境変数のallow-list検査
 
 tests/
