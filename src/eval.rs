@@ -2,6 +2,7 @@
 mod builtin;
 
 use crate::ast::*;
+use crate::budget::{BudgetConfig, BudgetLedger, ControlStop, ExecutionPhase};
 use crate::env::Env;
 use crate::error::{TraceFrame, TsumugiError};
 use crate::limits::MAX_USER_CALL_DEPTH;
@@ -18,26 +19,14 @@ enum EvalResult {
     Continue,
 }
 
-/// デフォルトのステップ上限（100万）
-const DEFAULT_MAX_STEPS: u64 = 1_000_000;
-
-/// 環境変数からステップ上限を読み取る
-fn resolve_max_steps() -> u64 {
-    std::env::var("TSUMUGI_MAX_STEPS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_MAX_STEPS)
-}
-
 /// AST を評価して実行する
 pub struct Evaluator {
     pub(crate) env: Env,
     /// 関数呼び出しのスタック（スタックトレース用）
     call_stack: Vec<TraceFrame>,
-    /// 実行ステップカウンタ（ループ反復 + 関数呼び出し）
-    steps: u64,
-    /// ステップ上限
-    max_steps: u64,
+    /// 実行予算の課金台帳（REV-015 Slice 1）。
+    /// step（fuel）と collection 要素数の検査をここへ一本化する。
+    budget: BudgetLedger,
     /// import の解決状態（実行前にリンクする。AUD-030）
     loader: crate::module::ModuleLoader,
     /// 関数値へ発番する次の FunctionId（AUD-048）。単調増加し、
@@ -50,11 +39,15 @@ pub struct Evaluator {
 
 impl Evaluator {
     pub fn new() -> Self {
+        Self::with_budget(BudgetConfig::from_legacy_env())
+    }
+
+    /// 明示 `BudgetConfig` で評価器を作る（埋め込み host 向け）。
+    pub fn with_budget(config: BudgetConfig) -> Self {
         Self {
             env: Env::new(),
             call_stack: Vec::new(),
-            steps: 0,
-            max_steps: resolve_max_steps(),
+            budget: BudgetLedger::with_config(config),
             loader: crate::module::ModuleLoader::new(),
             next_function_id: 0,
             script_args: Vec::new(),
@@ -89,24 +82,54 @@ impl Evaluator {
         self.loader.set_base_dir(path);
     }
 
-    /// ステップカウンタを進め、上限チェックする
+    /// ステップ（fuel）を 1 課金し、上限チェックする（REV-015 Slice 1）。
+    ///
+    /// 既存挙動どおり、上限到達時は `step_limit` エラーを call trace 付きで返す。
     fn count_step(&mut self, line: usize) -> Result<(), TsumugiError> {
-        self.steps += 1;
-        if self.steps > self.max_steps {
-            let mut err = TsumugiError::step_limit(line, self.max_steps);
-            if !self.call_stack.is_empty() {
-                let mut trace = self.call_stack.clone();
-                trace.reverse();
-                err = err.with_trace(trace);
+        self.budget
+            .charge_fuel(1, ExecutionPhase::Run)
+            .map_err(|stop| self.control_stop_to_error(stop, line))
+    }
+
+    /// collection 要素数の per-item 検査（REV-015 Slice 1）。
+    ///
+    /// 既存の `check_collection_size_public` を置き換える入口。上限超過時は
+    /// 既存挙動どおり `collection_limit` エラーを返す。
+    fn check_collection(&mut self, size: usize, line: usize) -> Result<(), TsumugiError> {
+        self.budget
+            .check_collection_elements(size as u64, ExecutionPhase::Run)
+            .map_err(|stop| self.control_stop_to_error(stop, line))
+    }
+
+    /// budget の [`ControlStop`] を既存の [`TsumugiError`] へ写像する（Slice 1 互換）。
+    ///
+    /// Slice 1 で発生し得るのは fuel（= step）と collection 超過のみ。cancel /
+    /// deadline は ledger の charge 経路にまだ配線しておらず（Slice 4）、
+    /// 到達した場合も安全側で step 上限として扱う。
+    fn control_stop_to_error(&self, stop: ControlStop, line: usize) -> TsumugiError {
+        use crate::budget::BudgetResource;
+        let err = match stop {
+            ControlStop::BudgetExceeded(e) => match e.resource {
+                BudgetResource::CollectionElements => {
+                    TsumugiError::collection_limit(line, e.requested as usize, e.limit as usize)
+                }
+                _ => TsumugiError::step_limit(line, e.limit),
+            },
+            ControlStop::Cancelled | ControlStop::DeadlineExceeded { .. } => {
+                TsumugiError::step_limit(line, self.budget.usage().committed.fuel)
             }
-            return Err(err);
+        };
+        if !self.call_stack.is_empty() {
+            let mut trace = self.call_stack.clone();
+            trace.reverse();
+            return err.with_trace(trace);
         }
-        Ok(())
+        err
     }
 
     /// REPLの新しい入力を開始する前にステップ予算をリセットする。
     pub fn reset_step_budget(&mut self) {
-        self.steps = 0;
+        self.budget.reset_fuel();
     }
 
     /// プログラム全体を実行
@@ -209,7 +232,14 @@ impl Evaluator {
                 self.env.journal_cell(&cell);
                 // 更新はcellへのin-place代入。index/valueの評価中に同じbindingが
                 // 変更されていても、その最新状態に対して書き込む。
-                crate::builtin_core::assign_index(&mut cell.borrow_mut(), &idx, val, *line)?;
+                let max_collection = self.budget.max_collection_elements();
+                crate::builtin_core::assign_index(
+                    &mut cell.borrow_mut(),
+                    &idx,
+                    val,
+                    max_collection,
+                    *line,
+                )?;
 
                 Ok(EvalResult::Val)
             }
@@ -268,18 +298,18 @@ impl Evaluator {
                 let collection = self.eval_expr(iter, *line)?;
                 let items: Vec<Value> = match &collection {
                     Value::List(list) => {
-                        crate::builtin_core::check_collection_size_public(list.len(), *line)?;
+                        self.check_collection(list.len(), *line)?;
                         // 開始時点の要素を snapshot する。ループ本体で元 binding を
                         // 変更しても make_mut が detach するため反復列は不変（AUD-047）。
                         (**list).clone()
                     }
                     Value::Dict(map) => {
-                        crate::builtin_core::check_collection_size_public(map.len(), *line)?;
+                        self.check_collection(map.len(), *line)?;
                         map.keys().map(|k| Value::Str(k.clone())).collect()
                     }
                     Value::Str(s) => {
                         let size = s.chars().count();
-                        crate::builtin_core::check_collection_size_public(size, *line)?;
+                        self.check_collection(size, *line)?;
                         s.chars().map(|c| Value::Str(c.to_string())).collect()
                     }
                     _ => {
@@ -410,10 +440,7 @@ impl Evaluator {
                 let mut values = Vec::new();
                 for item in items {
                     let value = self.eval_expr(item, line)?;
-                    crate::builtin_core::check_collection_size_public(
-                        values.len().saturating_add(1),
-                        line,
-                    )?;
+                    self.check_collection(values.len().saturating_add(1), line)?;
                     values.push(value);
                 }
                 Ok(Value::List(Rc::new(values)))
@@ -430,10 +457,7 @@ impl Evaluator {
                     };
                     let val = self.eval_expr(val_expr, line)?;
                     if !map.contains_key(&key) {
-                        crate::builtin_core::check_collection_size_public(
-                            map.len().saturating_add(1),
-                            line,
-                        )?;
+                        self.check_collection(map.len().saturating_add(1), line)?;
                     }
                     map.insert(key, val);
                 }

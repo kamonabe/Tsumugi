@@ -154,7 +154,8 @@ impl Evaluator {
                 for arg in args {
                     evaluated.push(self.eval_expr(arg, line)?);
                 }
-                crate::builtin_core::dispatch(name, &evaluated, line)
+                let max_collection = self.budget.max_collection_elements();
+                crate::builtin_core::dispatch(name, &evaluated, max_collection, line)
             }
 
             _ => Ok(None),
@@ -211,7 +212,7 @@ impl Evaluator {
                     .iter()
                     .map(|arg| Value::Str(arg.clone()))
                     .collect();
-                crate::builtin_core::check_collection_size_public(argv.len(), line)?;
+                self.check_collection(argv.len(), line)?;
                 Ok(Some(Value::List(Rc::new(argv))))
             }
             "exit" => {
@@ -263,7 +264,12 @@ impl Evaluator {
                 // 第1引数を先にsnapshotし、第2引数の評価後に同じbindingへ書き戻す。
                 let target_value = cell.borrow().clone();
                 let value = self.eval_expr(&args[1], line)?;
-                let updated = crate::builtin_core::builtin_push(&[target_value, value], line)?;
+                let max_collection = self.budget.max_collection_elements();
+                let updated = crate::builtin_core::builtin_push(
+                    &[target_value, value],
+                    max_collection,
+                    line,
+                )?;
                 // 書き戻し前に元値を記録する（AUD-024）。
                 self.env.journal_cell(&cell);
                 *cell.borrow_mut() = updated;
@@ -300,10 +306,7 @@ impl Evaluator {
                 let mut result = Vec::new();
                 for item in list.iter().cloned() {
                     let val = self.call_fn_value("map", &func, vec![item], line)?;
-                    crate::builtin_core::check_collection_size_public(
-                        result.len().saturating_add(1),
-                        line,
-                    )?;
+                    self.check_collection(result.len().saturating_add(1), line)?;
                     result.push(val);
                 }
                 Ok(Some(Value::List(Rc::new(result))))
@@ -323,10 +326,7 @@ impl Evaluator {
                 for item in list.iter().cloned() {
                     let val = self.call_fn_value("filter", &func, vec![item.clone()], line)?;
                     if val.is_truthy() {
-                        crate::builtin_core::check_collection_size_public(
-                            result.len().saturating_add(1),
-                            line,
-                        )?;
+                        self.check_collection(result.len().saturating_add(1), line)?;
                         result.push(item);
                     }
                 }

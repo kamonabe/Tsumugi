@@ -1536,6 +1536,44 @@ fn collection_limit_is_consistent_in_both_engines() {
 }
 
 #[test]
+fn step_limit_env_still_gates_both_engines_via_budget_ledger() {
+    // REV-015 Slice 1: step 課金を BudgetLedger の fuel へ移しても、legacy 環境変数
+    // TSUMUGI_MAX_STEPS が両 engine で従来どおり上限として機能する。
+    let source = "let i = 0\nwhile i < 1000000\n    i = i + 1\nend\nprint(i)\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_STEPS", "50")]);
+        let (_stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("ステップ上限に達しました"),
+            "{mode}で step 上限が適用されていない: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn shared_builtin_range_gates_via_ledger_collection_limit_in_both_engines() {
+    // REV-015 Slice 1: 共有 builtin（range）の collection 検査も、engine の
+    // BudgetLedger が保持する上限（legacy env 由来）を単一の正本として使う。
+    let source = "print(range(0, 5))\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_COLLECTION_SIZE", "3")]);
+        let (_stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("コレクション要素数が上限を超えました"),
+            "{mode}で range の collection 上限が適用されていない: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn index_assign_recovers_and_writes_across_inputs_in_both_engines() {
     // 未定義targetはcompile errorではなくcatch可能なruntime errorとして扱い、
     // 入力をまたいでも同じbindingへ書き込めること。
