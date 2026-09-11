@@ -556,7 +556,8 @@ Parserはプログラム直下とblock内の文を区別し、block内のimport�
 | `src/opcode.rs` | OpCode enum — VM が実行する命令の種類 |
 | `src/chunk.rs` | Chunk — 命令列（`Vec<OpCode>`）+ 定数テーブル（`Vec<Value>`）+ 行番号 |
 | `src/compiler.rs` | Compiler — AST を走査して Chunk を生成する |
-| `src/vm.rs` | Vm — Chunk をスタックマシンとして実行する |
+| `src/verifier.rs` | VerifiedChunk — Chunk を V1〜V9 で検証し、VM 入口を検証済み chunk に限定する（REV-006） |
+| `src/vm.rs` | Vm — VerifiedChunk をスタックマシンとして実行する |
 | `src/builtin_core.rs` | 組み込み関数の共通ロジック — VM/ツリーウォーク両方から呼ばれる |
 | `src/builtin_registry.rs` | 単一 BuiltinSpec registry — language-visible builtin 名・arity・context/pure 分類の正本（AUD-049） |
 
