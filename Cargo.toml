@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[features]
+# raw bytecode（chunk / opcode / vm / compiler / verifier）を公開する不安定 feature（REV-018）。
+# 安定した埋め込み surface は `Engine` 系のみ。raw bytecode を直接構築・実行する利用は
+# この feature を明示的に有効化する必要がある。同一 package の CLI・ベンチ・内部テストが
+# これらを使うため default で有効にし、安定利用者は `default-features = false` で封印できる。
+default = ["unstable-bytecode"]
+unstable-bytecode = []
+
 [dependencies]
 
 [dev-dependencies]

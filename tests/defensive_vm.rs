@@ -9,11 +9,21 @@
 use tsumugi::chunk::Chunk;
 use tsumugi::opcode::OpCode;
 use tsumugi::value::Value;
+use tsumugi::verifier::VerifiedChunk;
 use tsumugi::vm::Vm;
+
+/// 未検証の raw chunk を防御的経路で VM へ渡すためのヘルパー（REV-006）。
+///
+/// `VerifiedChunk::from_trusted` は検証をバイパスするため、compiler が生成しない
+/// 不正命令列も VM へ届けられる。これらが host panic せず internal error / limit で
+/// 有限停止することを検査するのがこのテストの目的である。
+fn unverified(chunk: Chunk) -> VerifiedChunk {
+    VerifiedChunk::from_trusted(chunk)
+}
 
 /// 不正なChunkを実行し、`internal` エラーのメッセージを返す
 fn run_expecting_internal_error(label: &str, chunk: Chunk) -> String {
-    let error = match Vm::new(chunk).run() {
+    let error = match Vm::new(unverified(chunk)).run() {
         Ok(()) => panic!("{label}: 不正な命令列が成功しました"),
         Err(error) => error,
     };
@@ -144,7 +154,7 @@ fn try_opcode_reaching_dispatch_does_not_panic() {
 
     // SetupTry自体はrun_framesが処理する。ハンドラ登録後の不正命令でも
     // catch経路へ入り、host panicにはならない（結果の成否は問わない）。
-    let _ = Vm::new(chunk).run();
+    let _ = Vm::new(unverified(chunk)).run();
 }
 
 #[test]
@@ -158,7 +168,7 @@ fn repl_rolls_back_malformed_chunk_and_recovers() {
     malformed.emit(OpCode::Return, 1);
 
     let error = vm
-        .run_repl_chunk(malformed)
+        .run_repl_chunk(unverified(malformed))
         .expect_err("不正なREPL chunkが成功しました");
     assert_eq!(error.error_type(), "internal");
     assert!(
@@ -172,13 +182,13 @@ fn repl_rolls_back_malformed_chunk_and_recovers() {
     stack_probe.emit(OpCode::Pop, 2);
     stack_probe.emit(OpCode::Return, 2);
     let error = vm
-        .run_repl_chunk(stack_probe)
+        .run_repl_chunk(unverified(stack_probe))
         .expect_err("失敗した入力のstack値が次の入力へ漏洩しています");
     assert_eq!(error.error_type(), "internal");
 
     // 防御エラーが続いても、後続の正常な入力を受け付けられる。
     let mut valid = Chunk::new();
     valid.emit(OpCode::Return, 3);
-    vm.run_repl_chunk(valid)
+    vm.run_repl_chunk(unverified(valid))
         .expect("不正な入力の後にREPL VMが回復しませんでした");
 }

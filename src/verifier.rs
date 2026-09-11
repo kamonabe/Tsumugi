@@ -28,13 +28,22 @@ impl VerifiedChunk {
         &self.inner
     }
 
-    /// compiler が生成した chunk のように、不変条件を満たすことが分かっている場合に
-    /// 検証を skip して `VerifiedChunk` を直接構築する crate 内部経路。
+    /// 検証済み `Chunk` を取り出す（VM が root frame を構築する際に使う）。
+    pub fn into_inner(self) -> Chunk {
+        self.inner
+    }
+
+    /// 検証を skip して `VerifiedChunk` を直接構築する（検証をバイパスする）。
     ///
     /// 正規 compiler 出力（`compile` / `compile_repl_line` の戻り値）は構造的に健全なので、
     /// verify の再走を避けるためこの経路を使う。それ以外（ホスト構築 bytecode）は
-    /// 必ず [`verify`] を通す。
-    pub(crate) fn from_trusted(chunk: Chunk) -> Self {
+    /// 通常 [`verify`] を通す。
+    ///
+    /// この関数は検証を行わないため、防御的テストや raw bytecode 実験のための
+    /// unstable な経路である（`verifier` module 自体が `unstable-bytecode` feature 下でのみ
+    /// 公開される）。未検証の chunk を渡しても VM は host panic せず、per-instruction step
+    /// 課金と `require_*` 防御により有限停止する（REV-006 層1）。
+    pub fn from_trusted(chunk: Chunk) -> Self {
         VerifiedChunk { inner: chunk }
     }
 }
@@ -76,10 +85,18 @@ impl ChunkVerifyError {
                 "bytecode 検証に失敗しました: 行番号表が命令列と一致しません"
             }
             ChunkVerifyError::BadConstant => "bytecode 検証に失敗しました: 定数参照が範囲外です",
-            ChunkVerifyError::BadLocalSlot => "bytecode 検証に失敗しました: local slot が範囲外です",
-            ChunkVerifyError::BadUpvalue => "bytecode 検証に失敗しました: upvalue index が範囲外です",
-            ChunkVerifyError::BadCapture => "bytecode 検証に失敗しました: capture 記述子が範囲外です",
-            ChunkVerifyError::BadJumpTarget => "bytecode 検証に失敗しました: jump target が範囲外です",
+            ChunkVerifyError::BadLocalSlot => {
+                "bytecode 検証に失敗しました: local slot が範囲外です"
+            }
+            ChunkVerifyError::BadUpvalue => {
+                "bytecode 検証に失敗しました: upvalue index が範囲外です"
+            }
+            ChunkVerifyError::BadCapture => {
+                "bytecode 検証に失敗しました: capture 記述子が範囲外です"
+            }
+            ChunkVerifyError::BadJumpTarget => {
+                "bytecode 検証に失敗しました: jump target が範囲外です"
+            }
             ChunkVerifyError::UnknownBuiltin => {
                 "bytecode 検証に失敗しました: 未登録の builtin id です"
             }
@@ -246,11 +263,14 @@ mod tests {
     use crate::value::Value;
     use std::rc::Rc;
 
-    /// source を compile して Chunk を得る。
+    /// source を compile して raw Chunk を得る（compiler は VerifiedChunk を返すため中身を取り出す）。
     fn compile(source: &str) -> Chunk {
         let tokens = Lexer::new(source).tokenize();
         let program = Parser::new(tokens).parse().expect("parse に失敗");
-        Compiler::new().compile(&program).expect("compile に失敗")
+        Compiler::new()
+            .compile(&program)
+            .expect("compile に失敗")
+            .into_inner()
     }
 
     /// V1〜V9 を通る正規 compiler 出力（if/while/for/関数/closure/try/f-string/builtin）。
@@ -282,7 +302,10 @@ mod tests {
             end
         "#;
         let chunk = compile(source);
-        assert!(verify(chunk).is_ok(), "正規 compiler 出力は verify を通るべき");
+        assert!(
+            verify(chunk).is_ok(),
+            "正規 compiler 出力は verify を通るべき"
+        );
     }
 
     #[test]

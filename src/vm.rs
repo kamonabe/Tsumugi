@@ -9,6 +9,7 @@ use crate::error::TsumugiError;
 use crate::limits::MAX_USER_CALL_DEPTH;
 use crate::opcode::{CaptureDesc, MutationTarget, OpCode};
 use crate::value::{FunctionId, NumericOrder, SharedValue, Value};
+use crate::verifier::VerifiedChunk;
 
 /// 演算・比較の型エラーを作る（AUD-014）
 ///
@@ -124,9 +125,9 @@ pub struct Vm {
 }
 
 impl Vm {
-    pub fn new(chunk: Chunk) -> Self {
+    pub fn new(chunk: VerifiedChunk) -> Self {
         let frame = CallFrame {
-            chunk: Rc::new(chunk),
+            chunk: Rc::new(chunk.into_inner()),
             ip: 0,
             base: 0,
             upvalues: Vec::new(),
@@ -196,7 +197,8 @@ impl Vm {
 
     /// REPL 用: 既存のスタック（ローカル変数）を保持したまま新しいチャンクを実行する。
     /// 前回のフレームを差し替えて実行し、終了後もスタック上の値を保持する。
-    pub fn run_repl_chunk(&mut self, chunk: Chunk) -> Result<(), TsumugiError> {
+    pub fn run_repl_chunk(&mut self, chunk: VerifiedChunk) -> Result<(), TsumugiError> {
+        let chunk = chunk.into_inner();
         // 未捕捉エラー時に、入力途中の一時値・callee frame・try handlerを
         // 次の入力へ持ち越さないための構造状態checkpoint。
         // stackはList/Dictを深く複製せず、既存slotの書換・削除時だけjournalへ退避する。
@@ -1808,7 +1810,7 @@ mod tests {
         main.emit(OpCode::Call(0), 1);
         main.emit(OpCode::Return, 1);
 
-        let error = Vm::new(main)
+        let error = Vm::new(VerifiedChunk::from_trusted(main))
             .run()
             .expect_err("PrepareCallなしの再帰Callが成功しました");
         assert_eq!(error.error_type(), "overflow");
@@ -1821,7 +1823,7 @@ mod tests {
         chunk.emit(OpCode::Call(0), 1);
         chunk.emit(OpCode::Return, 1);
 
-        let error = Vm::new(chunk)
+        let error = Vm::new(VerifiedChunk::from_trusted(chunk))
             .run()
             .expect_err("calleeのないCallが成功しました");
         assert!(error.message().contains("Call のスタック要素が不足"));
@@ -1833,7 +1835,7 @@ mod tests {
         chunk.emit(OpCode::Call(usize::MAX), 1);
         chunk.emit(OpCode::Return, 1);
 
-        let error = Vm::new(chunk)
+        let error = Vm::new(VerifiedChunk::from_trusted(chunk))
             .run()
             .expect_err("overflowする引数数のCallが成功しました");
         assert!(error.message().contains("Call の引数数が不正"));
@@ -1849,7 +1851,7 @@ mod tests {
         chunk.emit(OpCode::GetLocal(999), 1);
         chunk.emit(OpCode::Return, 1);
 
-        let error = Vm::new(chunk)
+        let error = Vm::new(VerifiedChunk::from_trusted(chunk))
             .run()
             .expect_err("範囲外のlocal読み取りが成功しました");
         assert_eq!(error.error_type(), "internal");
@@ -1863,7 +1865,7 @@ mod tests {
     #[test]
     fn function_id_is_monotonic_and_starts_at_zero() {
         // AUD-048: allocate_function_id は 0 から単調増加する
-        let mut vm = Vm::new(Chunk::new());
+        let mut vm = Vm::new(VerifiedChunk::from_trusted(Chunk::new()));
         assert_eq!(vm.allocate_function_id(1).unwrap(), FunctionId(0));
         assert_eq!(vm.allocate_function_id(1).unwrap(), FunctionId(1));
         assert_eq!(vm.allocate_function_id(1).unwrap(), FunctionId(2));
@@ -1872,7 +1874,7 @@ mod tests {
     #[test]
     fn function_id_overflow_reports_internal_error() {
         // AUD-048: u64 を使い切ったら internal error を返す
-        let mut vm = Vm::new(Chunk::new());
+        let mut vm = Vm::new(VerifiedChunk::from_trusted(Chunk::new()));
         vm.next_function_id = u64::MAX - 1;
         assert_eq!(
             vm.allocate_function_id(7).unwrap(),

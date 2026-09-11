@@ -9,6 +9,7 @@ use crate::chunk::{Chunk, ChunkBuildError, FunctionPrototype};
 use crate::error::TsumugiError;
 use crate::opcode::{CaptureDesc, MutationTarget, OpCode};
 use crate::value::Value;
+use crate::verifier::VerifiedChunk;
 
 /// ローカル変数の情報
 #[derive(Debug, Clone)]
@@ -142,27 +143,30 @@ impl Compiler {
         })
     }
 
-    /// プログラム全体をコンパイルして Chunk を返す
-    pub fn compile(mut self, program: &Program) -> Result<Chunk, TsumugiError> {
+    /// プログラム全体をコンパイルして検証済みチャンクを返す（REV-006）。
+    ///
+    /// compiler 出力は構造的に不変条件を満たすため、`verify` を再走せず
+    /// `VerifiedChunk::from_trusted` で直接昇格する。VM へ渡る型は常に `VerifiedChunk`。
+    pub fn compile(mut self, program: &Program) -> Result<VerifiedChunk, TsumugiError> {
         validate_program_depth(program)?;
         for stmt in program {
             self.compile_stmt(stmt)?;
         }
         self.chunk.emit(OpCode::Return, 0);
         self.chunk.max_locals = self.max_locals;
-        Ok(self.chunk)
+        Ok(VerifiedChunk::from_trusted(self.chunk))
     }
 
     /// REPL 用インクリメンタルコンパイル: 既存のローカル変数を保持したまま
-    /// 新しいステートメントだけをコンパイルして Chunk を返す。
+    /// 新しいステートメントだけをコンパイルして検証済みチャンクを返す（REV-006）。
     /// self は消費されず次の入力に再利用される。
-    pub fn compile_repl_line(&mut self, program: &Program) -> Result<Chunk, TsumugiError> {
+    pub fn compile_repl_line(&mut self, program: &Program) -> Result<VerifiedChunk, TsumugiError> {
         validate_program_depth(program)?;
         // コンパイル途中で失敗しても、永続する locals / scope / loop / import 状態を
         // 次の入力へ持ち越さない。VM 側は失敗チャンクを実行しないため、Compiler も
         // 入力開始時点へ戻す必要がある。
         let checkpoint = self.clone();
-        let result = (|| -> Result<Chunk, TsumugiError> {
+        let result = (|| -> Result<VerifiedChunk, TsumugiError> {
             // 新しいチャンクを作成（前のチャンクは捨てる）
             let prev_chunk = std::mem::replace(&mut self.chunk, Chunk::new());
             // チャンク名を引き継ぐ
@@ -174,8 +178,12 @@ impl Compiler {
             self.chunk.emit(OpCode::Return, 0);
             self.chunk.max_locals = self.max_locals;
 
-            // 今回のチャンクを取り出して返す（次回用に空チャンクをセット）
-            Ok(std::mem::replace(&mut self.chunk, Chunk::new()))
+            // 今回のチャンクを取り出して返す（次回用に空チャンクをセット）。
+            // compiler 出力は不変条件を満たすため verify を再走せず昇格する。
+            Ok(VerifiedChunk::from_trusted(std::mem::replace(
+                &mut self.chunk,
+                Chunk::new(),
+            )))
         })();
 
         if result.is_err() {
