@@ -492,6 +492,11 @@ pub fn id_of(name: &str) -> Option<BuiltinId> {
     lookup_public(name).map(|spec| spec.id)
 }
 
+/// BuiltinId が registry に登録済みか（REV-006 の V7 検証で防御的に確認する）。
+pub fn is_registered(id: BuiltinId) -> bool {
+    PUBLIC_BUILTINS.iter().any(|spec| spec.id == id)
+}
+
 /// BuiltinId から名前を引く（VM の handler dispatch に使う）。
 pub fn name_of(id: BuiltinId) -> &'static str {
     // id ごとに一意な entry が存在することは contract test で保証する。

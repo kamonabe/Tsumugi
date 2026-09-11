@@ -52,6 +52,12 @@ pub struct Chunk {
 
     /// 関数プロトタイプ表（REV-005）。`MakeClosure(proto_index)` が参照する。
     pub prototypes: Vec<FunctionPrototype>,
+
+    /// この chunk がコンパイル時に宣言した local slot 数の上限（REV-006 の V3 検証用）。
+    ///
+    /// compiler の local テーブルが到達した最大長。local slot を operand に持つ命令の
+    /// slot はすべてこの値未満でなければならない。
+    pub max_locals: usize,
 }
 
 impl Chunk {
@@ -62,6 +68,7 @@ impl Chunk {
             constants: Vec::new(),
             lines: Vec::new(),
             prototypes: Vec::new(),
+            max_locals: 0,
         }
     }
 

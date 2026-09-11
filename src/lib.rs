@@ -26,6 +26,7 @@ pub mod parser;
 pub mod sandbox;
 pub mod token;
 pub mod value;
+pub mod verifier;
 pub mod vm;
 
 pub use engine::{CompiledScript, Engine, ExecutionContext, ExecutionOutcome};

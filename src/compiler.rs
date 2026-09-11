@@ -66,6 +66,8 @@ pub struct Compiler {
     enclosing_locals: Option<Vec<Local>>,
     /// 親コンパイラの upvalue リスト（多段キャプチャ用）
     enclosing_upvalues: Option<Vec<Upvalue>>,
+    /// この chunk で local テーブルが到達した最大長（REV-006 の V3 検証用の宣言 local 数）。
+    max_locals: usize,
 }
 
 impl Compiler {
@@ -78,6 +80,7 @@ impl Compiler {
             upvalues: Vec::new(),
             enclosing_locals: None,
             enclosing_upvalues: None,
+            max_locals: 0,
         }
     }
 
@@ -91,6 +94,7 @@ impl Compiler {
             upvalues: Vec::new(),
             enclosing_locals: Some(enclosing_locals),
             enclosing_upvalues: Some(enclosing_upvalues),
+            max_locals: 0,
         }
     }
 
@@ -145,6 +149,7 @@ impl Compiler {
             self.compile_stmt(stmt)?;
         }
         self.chunk.emit(OpCode::Return, 0);
+        self.chunk.max_locals = self.max_locals;
         Ok(self.chunk)
     }
 
@@ -167,6 +172,7 @@ impl Compiler {
                 self.compile_stmt(stmt)?;
             }
             self.chunk.emit(OpCode::Return, 0);
+            self.chunk.max_locals = self.max_locals;
 
             // 今回のチャンクを取り出して返す（次回用に空チャンクをセット）
             Ok(std::mem::replace(&mut self.chunk, Chunk::new()))
@@ -958,7 +964,8 @@ impl Compiler {
         fn_compiler.chunk.emit_constant(Value::Null, line);
         fn_compiler.chunk.emit(OpCode::ReturnValue, line);
 
-        let fn_chunk = fn_compiler.chunk;
+        let mut fn_chunk = fn_compiler.chunk;
+        fn_chunk.max_locals = fn_compiler.max_locals;
         let mut upvalues = fn_compiler.upvalues;
 
         // 子の is_local=false upvalue を解決（親が中間キャプチャを行う）
@@ -1010,7 +1017,8 @@ impl Compiler {
         fn_compiler.chunk.emit_constant(Value::Null, line);
         fn_compiler.chunk.emit(OpCode::ReturnValue, line);
 
-        let fn_chunk = fn_compiler.chunk;
+        let mut fn_chunk = fn_compiler.chunk;
+        fn_chunk.max_locals = fn_compiler.max_locals;
         let mut upvalues = fn_compiler.upvalues;
 
         // 子の is_local=false upvalue を解決（親が中間キャプチャを行う）
@@ -1043,6 +1051,7 @@ impl Compiler {
     }
 
     fn add_local(&mut self, name: String) {
+        self.max_locals = self.max_locals.max(self.locals.len() + 1);
         self.locals.push(Local {
             name,
             depth: self.scope_depth,
