@@ -23,39 +23,23 @@ use crate::error::TsumugiError;
 use crate::value::{NumericOrder, NumericOrdering, Value};
 
 use std::rc::Rc;
-use std::sync::OnceLock;
 
 // =============================================================================
-// コレクションサイズ上限（メモリ DoS 対策）
+// コレクションサイズ上限（メモリ DoS 対策 / REV-015 Slice 1）
 // =============================================================================
+//
+// 上限値の正本は各 engine が保持する [`crate::budget::BudgetLedger`] の
+// `max_collection_elements` である。共有 builtin handler（両 engine から dispatch
+// される）は engine の ledger へ直接触れないため、上限値を引数で受け取る。
+// これにより、旧実装の process-global な `OnceLock` を廃止し、上限を execution
+// 単位の config へ一本化する（execution-control.md §13）。
 
-/// デフォルトのコレクション要素数上限（100万）
-const DEFAULT_MAX_COLLECTION_SIZE: usize = 1_000_000;
-
-/// 環境変数からコレクションサイズ上限を読み取る（プロセス起動時に一度だけ解決）
-static MAX_COLLECTION_SIZE: OnceLock<usize> = OnceLock::new();
-
-fn max_collection_size() -> usize {
-    *MAX_COLLECTION_SIZE.get_or_init(|| {
-        std::env::var("TSUMUGI_MAX_COLLECTION_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_MAX_COLLECTION_SIZE)
-    })
-}
-
-/// コレクションサイズが上限を超えていないかチェックする
-fn check_collection_size(size: usize, line: usize) -> Result<(), TsumugiError> {
-    let limit = max_collection_size();
-    if size > limit {
-        return Err(TsumugiError::collection_limit(line, size, limit));
+/// コレクションサイズが上限を超えていないかチェックする（上限は呼び出し側が渡す）。
+fn check_collection_size(size: usize, limit: u64, line: usize) -> Result<(), TsumugiError> {
+    if size as u64 > limit {
+        return Err(TsumugiError::collection_limit(line, size, limit as usize));
     }
     Ok(())
-}
-
-/// コレクションサイズチェック（外部モジュールから利用可能）
-pub fn check_collection_size_public(size: usize, line: usize) -> Result<(), TsumugiError> {
-    check_collection_size(size, line)
 }
 
 // =============================================================================
@@ -168,6 +152,7 @@ pub fn assign_index(
     target: &mut Value,
     index: &Value,
     value: Value,
+    max_collection: u64,
     line: usize,
 ) -> Result<(), TsumugiError> {
     match target {
@@ -196,7 +181,7 @@ pub fn assign_index(
                 }
             };
             if !map.contains_key(&key) {
-                check_collection_size(map.len().saturating_add(1), line)?;
+                check_collection_size(map.len().saturating_add(1), max_collection, line)?;
             }
             Rc::make_mut(map).insert(key, value);
             Ok(())
@@ -205,11 +190,15 @@ pub fn assign_index(
     }
 }
 
-pub fn builtin_push(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
+pub fn builtin_push(
+    args: &[Value],
+    max_collection: u64,
+    line: usize,
+) -> Result<Value, TsumugiError> {
     check_arity("push", args, 2, line)?;
     let mut list = args[0].clone();
     if let Value::List(ref mut v) = list {
-        check_collection_size(v.len().saturating_add(1), line)?;
+        check_collection_size(v.len().saturating_add(1), max_collection, line)?;
         Rc::make_mut(v).push(args[1].clone());
         Ok(list)
     } else {
@@ -248,10 +237,14 @@ pub fn builtin_pop_update(args: &[Value], line: usize) -> Result<Value, TsumugiE
     }
 }
 
-pub fn builtin_keys(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
+pub fn builtin_keys(
+    args: &[Value],
+    max_collection: u64,
+    line: usize,
+) -> Result<Value, TsumugiError> {
     check_arity("keys", args, 1, line)?;
     if let Value::Dict(map) = &args[0] {
-        check_collection_size(map.len(), line)?;
+        check_collection_size(map.len(), max_collection, line)?;
         let keys: Vec<Value> = map.keys().map(|k| Value::Str(k.clone())).collect();
         Ok(Value::List(Rc::new(keys)))
     } else {
@@ -261,10 +254,14 @@ pub fn builtin_keys(args: &[Value], line: usize) -> Result<Value, TsumugiError> 
     }
 }
 
-pub fn builtin_values(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
+pub fn builtin_values(
+    args: &[Value],
+    max_collection: u64,
+    line: usize,
+) -> Result<Value, TsumugiError> {
     check_arity("values", args, 1, line)?;
     if let Value::Dict(map) = &args[0] {
-        check_collection_size(map.len(), line)?;
+        check_collection_size(map.len(), max_collection, line)?;
         let vals: Vec<Value> = map.values().cloned().collect();
         Ok(Value::List(Rc::new(vals)))
     } else {
@@ -406,7 +403,11 @@ pub fn builtin_reverse(args: &[Value], line: usize) -> Result<Value, TsumugiErro
     }
 }
 
-pub fn builtin_range(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
+pub fn builtin_range(
+    args: &[Value],
+    max_collection: u64,
+    line: usize,
+) -> Result<Value, TsumugiError> {
     check_arity("range", args, 2, line)?;
     let start = match &args[0] {
         Value::Int(n) => *n,
@@ -433,7 +434,7 @@ pub fn builtin_range(args: &[Value], line: usize) -> Result<Value, TsumugiError>
     } else {
         0
     };
-    check_collection_size(size, line)?;
+    check_collection_size(size, max_collection, line)?;
     let list: Vec<Value> = (start..end).map(Value::Int).collect();
     Ok(Value::List(Rc::new(list)))
 }
@@ -442,13 +443,17 @@ pub fn builtin_range(args: &[Value], line: usize) -> Result<Value, TsumugiError>
 // 文字列操作系
 // =============================================================================
 
-pub fn builtin_split(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
+pub fn builtin_split(
+    args: &[Value],
+    max_collection: u64,
+    line: usize,
+) -> Result<Value, TsumugiError> {
     check_arity("split", args, 2, line)?;
     let s = require_str(&args[0], "split", 1, line)?;
     let sep = require_str(&args[1], "split", 2, line)?;
     let mut parts = Vec::new();
     for part in s.split(sep.as_str()) {
-        check_collection_size(parts.len().saturating_add(1), line)?;
+        check_collection_size(parts.len().saturating_add(1), max_collection, line)?;
         parts.push(Value::Str(part.to_string()));
     }
     Ok(Value::List(Rc::new(parts)))
@@ -858,7 +863,11 @@ pub fn builtin_read_file(args: &[Value], line: usize) -> Result<Value, TsumugiEr
     }
 }
 
-pub fn builtin_read_lines(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
+pub fn builtin_read_lines(
+    args: &[Value],
+    max_collection: u64,
+    line: usize,
+) -> Result<Value, TsumugiError> {
     check_arity("read_lines", args, 1, line)?;
     if let Value::Str(path) = &args[0] {
         let safe_path = crate::sandbox::check_path(path, line)?;
@@ -866,7 +875,7 @@ pub fn builtin_read_lines(args: &[Value], line: usize) -> Result<Value, TsumugiE
             Ok(content) => {
                 let mut lines = Vec::new();
                 for content_line in content.lines() {
-                    check_collection_size(lines.len().saturating_add(1), line)?;
+                    check_collection_size(lines.len().saturating_add(1), max_collection, line)?;
                     lines.push(Value::Str(content_line.to_string()));
                 }
                 Ok(Value::List(Rc::new(lines)))
@@ -1118,7 +1127,11 @@ pub fn builtin_rename(args: &[Value], line: usize) -> Result<Value, TsumugiError
     Ok(Value::Bool(std::fs::rename(&safe_from, &safe_to).is_ok()))
 }
 
-pub fn builtin_list_dir(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
+pub fn builtin_list_dir(
+    args: &[Value],
+    max_collection: u64,
+    line: usize,
+) -> Result<Value, TsumugiError> {
     check_arity("list_dir", args, 1, line)?;
     if let Value::Str(path) = &args[0] {
         let safe_path = crate::sandbox::check_path(path, line)?;
@@ -1126,7 +1139,7 @@ pub fn builtin_list_dir(args: &[Value], line: usize) -> Result<Value, TsumugiErr
             Ok(entries) => {
                 let mut names = Vec::new();
                 for entry in entries.flatten() {
-                    check_collection_size(names.len().saturating_add(1), line)?;
+                    check_collection_size(names.len().saturating_add(1), max_collection, line)?;
                     names.push(Value::Str(entry.file_name().to_string_lossy().to_string()));
                 }
                 names.sort_by_key(|v| v.to_string());
@@ -1193,21 +1206,26 @@ pub fn builtin_is_dir(args: &[Value], line: usize) -> Result<Value, TsumugiError
 /// map/filter/each/print/input/exit/args は実行コンテキスト依存のため含まない。
 /// 内部命令 `__pop_update` は public 名として持たず、[`builtin_pop_update`] を
 /// VM の [`crate::opcode::OpCode::PopUpdate`] と tree の pop 実装が直接呼ぶ（AUD-049）。
-pub fn dispatch(name: &str, args: &[Value], line: usize) -> Result<Option<Value>, TsumugiError> {
+pub fn dispatch(
+    name: &str,
+    args: &[Value],
+    max_collection: u64,
+    line: usize,
+) -> Result<Option<Value>, TsumugiError> {
     let result = match name {
         "len" => builtin_len(args, line)?,
-        "push" => builtin_push(args, line)?,
+        "push" => builtin_push(args, max_collection, line)?,
         "pop" => builtin_pop(args, line)?,
-        "keys" => builtin_keys(args, line)?,
-        "values" => builtin_values(args, line)?,
+        "keys" => builtin_keys(args, max_collection, line)?,
+        "values" => builtin_values(args, max_collection, line)?,
         "has_key" => builtin_has_key(args, line)?,
         "type" => builtin_type(args, line)?,
         "slice" => builtin_slice(args, line)?,
         "contains" => builtin_contains(args, line)?,
         "sort" => builtin_sort(args, line)?,
         "reverse" => builtin_reverse(args, line)?,
-        "range" => builtin_range(args, line)?,
-        "split" => builtin_split(args, line)?,
+        "range" => builtin_range(args, max_collection, line)?,
+        "split" => builtin_split(args, max_collection, line)?,
         "join" => builtin_join(args, line)?,
         "trim" => builtin_trim(args, line)?,
         "upper" => builtin_upper(args, line)?,
@@ -1227,7 +1245,7 @@ pub fn dispatch(name: &str, args: &[Value], line: usize) -> Result<Option<Value>
         "now" => builtin_now(args, line)?,
         "format_time" => builtin_format_time(args, line)?,
         "read_file" => builtin_read_file(args, line)?,
-        "read_lines" => builtin_read_lines(args, line)?,
+        "read_lines" => builtin_read_lines(args, max_collection, line)?,
         "write_file" => builtin_write_file(args, line)?,
         "append_file" => builtin_append_file(args, line)?,
         "env" => builtin_env(args, line)?,
@@ -1237,7 +1255,7 @@ pub fn dispatch(name: &str, args: &[Value], line: usize) -> Result<Option<Value>
         "remove" => builtin_remove(args, line)?,
         "remove_dir" => builtin_remove_dir(args, line)?,
         "rename" => builtin_rename(args, line)?,
-        "list_dir" => builtin_list_dir(args, line)?,
+        "list_dir" => builtin_list_dir(args, max_collection, line)?,
         "file_size" => builtin_file_size(args, line)?,
         "is_file" => builtin_is_file(args, line)?,
         "is_dir" => builtin_is_dir(args, line)?,

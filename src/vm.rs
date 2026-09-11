@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::budget::{BudgetConfig, BudgetLedger, ControlStop, ExecutionPhase};
 use crate::chunk::Chunk;
 use crate::error::TsumugiError;
 use crate::limits::MAX_USER_CALL_DEPTH;
@@ -35,17 +36,6 @@ struct CallFrame {
     /// ローカル変数のうちキャプチャされたもののセル
     /// locals_cells[slot] が Some のとき、その変数はヒープ上のセルで管理される
     locals_cells: Vec<Option<SharedValue>>,
-}
-
-/// デフォルトのステップ上限（100万）
-const DEFAULT_MAX_STEPS: u64 = 1_000_000;
-
-/// 環境変数からステップ上限を読み取る
-fn vm_resolve_max_steps() -> u64 {
-    std::env::var("TSUMUGI_MAX_STEPS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_MAX_STEPS)
 }
 
 /// 例外ハンドラ: try/catch のスタック状態を保持
@@ -106,11 +96,9 @@ pub struct Vm {
     /// 値自体はstack/locals_cellsをsource of truthとし、bindingを複製しない。
     globals: HashMap<String, usize>,
 
-    /// 実行ステップカウンタ（ループ反復 + 関数呼び出し）
-    steps: u64,
-
-    /// ステップ上限
-    max_steps: u64,
+    /// 実行予算の課金台帳（REV-015 Slice 1）。
+    /// per-instruction の fuel 課金と collection 要素数検査をここへ一本化する。
+    budget: BudgetLedger,
 
     /// 例外ハンドラスタック（try/catch）
     try_handlers: Vec<TryHandler>,
@@ -138,8 +126,7 @@ impl Vm {
             stack: Vec::with_capacity(256),
             repl_stack_checkpoint: None,
             globals: HashMap::new(),
-            steps: 0,
-            max_steps: vm_resolve_max_steps(),
+            budget: BudgetLedger::with_config(BudgetConfig::from_legacy_env()),
             try_handlers: Vec::new(),
             next_function_id: 0,
             script_args: Vec::new(),
@@ -153,8 +140,7 @@ impl Vm {
             stack: Vec::with_capacity(256),
             repl_stack_checkpoint: None,
             globals: HashMap::new(),
-            steps: 0,
-            max_steps: vm_resolve_max_steps(),
+            budget: BudgetLedger::with_config(BudgetConfig::from_legacy_env()),
             try_handlers: Vec::new(),
             next_function_id: 0,
             script_args: Vec::new(),
@@ -166,12 +152,12 @@ impl Vm {
         self.script_args = args;
     }
 
-    /// step 上限を明示的に設定する。
+    /// step（fuel）上限を明示的に設定する。
     ///
-    /// 既定は `TSUMUGI_MAX_STEPS`（未設定なら [`DEFAULT_MAX_STEPS`]）。process-global な
-    /// env に依存せず停止性を検証したいテストや、ホストが実行単位で予算を与える場合に使う。
+    /// 既定は legacy 環境変数（`TSUMUGI_MAX_STEPS`）由来。process-global な env に
+    /// 依存せず停止性を検証したいテストや、ホストが実行単位で予算を与える場合に使う。
     pub fn set_max_steps(&mut self, max_steps: u64) {
-        self.max_steps = max_steps;
+        self.budget.set_total_fuel(max_steps);
     }
 
     /// 関数値へ新しい FunctionId を発番する（AUD-048）。
@@ -213,7 +199,7 @@ impl Vm {
         let frames_checkpoint = self.frames.clone();
         let globals_checkpoint = self.globals.clone();
         let handlers_checkpoint = self.try_handlers.clone();
-        let steps_checkpoint = self.steps;
+        let steps_checkpoint = self.budget.committed_fuel();
         debug_assert!(self.repl_stack_checkpoint.is_none());
         self.repl_stack_checkpoint = Some(ReplStackCheckpoint {
             stack_len: self.stack.len(),
@@ -242,8 +228,8 @@ impl Vm {
             self.frames.truncate(1);
             self.frames[0] = frame;
         }
-        // ステップカウンタはリセット（各入力で予算を全額使えるように）
-        self.steps = 0;
+        // fuel 予算はリセット（各入力で予算を全額使えるように）
+        self.budget.reset_fuel();
 
         match self.run_frames(0) {
             Ok(_) => {
@@ -258,7 +244,7 @@ impl Vm {
                 }
                 self.globals = globals_checkpoint;
                 self.try_handlers = handlers_checkpoint;
-                self.steps = steps_checkpoint;
+                self.budget.restore_fuel(steps_checkpoint);
                 Err(error)
             }
         }
@@ -399,13 +385,42 @@ impl Vm {
         Ok(Value::Null)
     }
 
-    /// ステップカウンタを進め、上限チェックする
+    /// ステップ（fuel）を 1 課金し、上限チェックする（REV-015 Slice 1）。
     fn count_step(&mut self, line: usize) -> Result<(), TsumugiError> {
-        self.steps += 1;
-        if self.steps > self.max_steps {
-            return Err(TsumugiError::step_limit(line, self.max_steps));
+        self.budget
+            .charge_fuel(1, ExecutionPhase::Run)
+            .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))
+    }
+
+    /// collection 要素数の per-item 検査（REV-015 Slice 1）。
+    fn check_collection(&mut self, size: usize, line: usize) -> Result<(), TsumugiError> {
+        self.budget
+            .check_collection_elements(size as u64, ExecutionPhase::Run)
+            .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))
+    }
+
+    /// budget の [`ControlStop`] を既存の [`TsumugiError`] へ写像する（Slice 1 互換）。
+    ///
+    /// Slice 1 で発生し得るのは fuel（= step）と collection 超過のみ。cancel /
+    /// deadline は ledger の charge 経路にまだ配線しておらず（Slice 4）、
+    /// 到達した場合も安全側で step 上限として扱う。
+    fn control_stop_to_error(
+        budget: &BudgetLedger,
+        stop: ControlStop,
+        line: usize,
+    ) -> TsumugiError {
+        use crate::budget::BudgetResource;
+        match stop {
+            ControlStop::BudgetExceeded(e) => match e.resource {
+                BudgetResource::CollectionElements => {
+                    TsumugiError::collection_limit(line, e.requested as usize, e.limit as usize)
+                }
+                _ => TsumugiError::step_limit(line, e.limit),
+            },
+            ControlStop::Cancelled | ControlStop::DeadlineExceeded { .. } => {
+                TsumugiError::step_limit(line, budget.usage().committed.fuel)
+            }
         }
-        Ok(())
     }
 
     // --- 内部不変条件の検査（AUD-023） ---
@@ -1156,15 +1171,20 @@ impl Vm {
                 let value = self.pop(line)?;
                 let stack_index = self.stack.len().saturating_sub(1);
                 self.checkpoint_stack_slot(stack_index);
-                let list = self
-                    .stack
-                    .last_mut()
-                    .ok_or_else(|| internal_error(line, "内部エラー: スタックが空です"))?;
-                if let Value::List(v) = list {
-                    crate::builtin_core::check_collection_size_public(
-                        v.len().saturating_add(1),
-                        line,
-                    )?;
+                // 候補サイズを先に確定してから collection 検査する（self への
+                // mutable borrow を stack 要素 borrow と両立させるため）。
+                let candidate = match self.stack.last() {
+                    Some(Value::List(v)) => v.len().saturating_add(1),
+                    Some(_) => {
+                        return Err(internal_error(
+                            line,
+                            "内部エラー: ListPush の対象がリストではありません",
+                        ));
+                    }
+                    None => return Err(internal_error(line, "内部エラー: スタックが空です")),
+                };
+                self.check_collection(candidate, line)?;
+                if let Some(Value::List(v)) = self.stack.last_mut() {
                     Rc::make_mut(v).push(value);
                 } else {
                     return Err(internal_error(
@@ -1178,22 +1198,32 @@ impl Vm {
                 let key = self.pop(line)?;
                 let stack_index = self.stack.len().saturating_sub(1);
                 self.checkpoint_stack_slot(stack_index);
-                let dict = self
-                    .stack
-                    .last_mut()
-                    .ok_or_else(|| internal_error(line, "内部エラー: スタックが空です"))?;
-                if let Value::Dict(map) = dict {
-                    if let Value::Str(k) = key {
-                        if !map.contains_key(&k) {
-                            crate::builtin_core::check_collection_size_public(
-                                map.len().saturating_add(1),
-                                line,
-                            )?;
+                let k = match key {
+                    Value::Str(k) => k,
+                    other => return Err(TsumugiError::dict_key_type(line, &other)),
+                };
+                // 新規 key のときだけ候補サイズを確定して collection 検査する。
+                let candidate = match self.stack.last() {
+                    Some(Value::Dict(map)) => {
+                        if map.contains_key(&k) {
+                            None
+                        } else {
+                            Some(map.len().saturating_add(1))
                         }
-                        Rc::make_mut(map).insert(k, value);
-                    } else {
-                        return Err(TsumugiError::dict_key_type(line, &key));
                     }
+                    Some(_) => {
+                        return Err(internal_error(
+                            line,
+                            "内部エラー: DictInsert の対象が辞書ではありません",
+                        ));
+                    }
+                    None => return Err(internal_error(line, "内部エラー: スタックが空です")),
+                };
+                if let Some(candidate) = candidate {
+                    self.check_collection(candidate, line)?;
+                }
+                if let Some(Value::Dict(map)) = self.stack.last_mut() {
+                    Rc::make_mut(map).insert(k, value);
                 } else {
                     return Err(internal_error(
                         line,
@@ -1210,19 +1240,22 @@ impl Vm {
                 let value = self.pop(line)?;
                 let list = match value {
                     Value::List(ref values) => {
-                        crate::builtin_core::check_collection_size_public(values.len(), line)?;
+                        let size = values.len();
+                        self.check_collection(size, line)?;
                         value
                     }
                     Value::Dict(ref map) => {
-                        crate::builtin_core::check_collection_size_public(map.len(), line)?;
-                        Value::List(Rc::new(map.keys().map(|k| Value::Str(k.clone())).collect()))
+                        let size = map.len();
+                        let keys: Vec<Value> = map.keys().map(|k| Value::Str(k.clone())).collect();
+                        self.check_collection(size, line)?;
+                        Value::List(Rc::new(keys))
                     }
                     Value::Str(ref s) => {
                         let size = s.chars().count();
-                        crate::builtin_core::check_collection_size_public(size, line)?;
-                        Value::List(Rc::new(
-                            s.chars().map(|c| Value::Str(c.to_string())).collect(),
-                        ))
+                        let chars: Vec<Value> =
+                            s.chars().map(|c| Value::Str(c.to_string())).collect();
+                        self.check_collection(size, line)?;
+                        Value::List(Rc::new(chars))
                     }
                     _ => {
                         return Err(TsumugiError::not_iterable(line, &value));
@@ -1441,10 +1474,17 @@ impl Vm {
         value: Value,
         line: usize,
     ) -> Result<(), TsumugiError> {
+        let max_collection = self.budget.max_collection_elements();
         match self.resolve_binding_storage(target, line)? {
             BindingStorage::Cell(cell) => {
                 self.checkpoint_cell(&cell);
-                crate::builtin_core::assign_index(&mut cell.borrow_mut(), index, value, line)
+                crate::builtin_core::assign_index(
+                    &mut cell.borrow_mut(),
+                    index,
+                    value,
+                    max_collection,
+                    line,
+                )
             }
             BindingStorage::Stack(stack_index) => {
                 self.checkpoint_stack_slot(stack_index);
@@ -1452,7 +1492,7 @@ impl Vm {
                     .stack
                     .get_mut(stack_index)
                     .ok_or_else(|| internal_error(line, "インデックス代入の対象slotが不正です"))?;
-                crate::builtin_core::assign_index(slot, index, value, line)
+                crate::builtin_core::assign_index(slot, index, value, max_collection, line)
             }
         }
     }
@@ -1466,7 +1506,8 @@ impl Vm {
         line: usize,
     ) -> Result<Value, TsumugiError> {
         // まず共通モジュールで処理を試みる
-        if let Some(result) = crate::builtin_core::dispatch(name, &args, line)? {
+        let max_collection = self.budget.max_collection_elements();
+        if let Some(result) = crate::builtin_core::dispatch(name, &args, max_collection, line)? {
             return Ok(result);
         }
 
@@ -1516,7 +1557,7 @@ impl Vm {
                     .iter()
                     .map(|arg| Value::Str(arg.clone()))
                     .collect();
-                crate::builtin_core::check_collection_size_public(argv.len(), line)?;
+                self.check_collection(argv.len(), line)?;
                 Ok(Value::List(Rc::new(argv)))
             }
             "map" => {
@@ -1527,10 +1568,7 @@ impl Vm {
                     for item in list.iter() {
                         let value =
                             self.call_fn_value("map", func.clone(), vec![item.clone()], line)?;
-                        crate::builtin_core::check_collection_size_public(
-                            result.len().saturating_add(1),
-                            line,
-                        )?;
+                        self.check_collection(result.len().saturating_add(1), line)?;
                         result.push(value);
                     }
                     Ok(Value::List(Rc::new(result)))
@@ -1549,10 +1587,7 @@ impl Vm {
                         let cond =
                             self.call_fn_value("filter", func.clone(), vec![item.clone()], line)?;
                         if cond.is_truthy() {
-                            crate::builtin_core::check_collection_size_public(
-                                result.len().saturating_add(1),
-                                line,
-                            )?;
+                            self.check_collection(result.len().saturating_add(1), line)?;
                             result.push(item.clone());
                         }
                     }

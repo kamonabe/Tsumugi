@@ -1,12 +1,12 @@
 # Tsumugi 実行予算・協調実行仕様
 
-最終更新: 2026-08-31
+最終更新: 2026-09-11
 
-設計ステータス: **実装仕様確定・未実装**
+設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 以降は未着手）
 
 ## 1. 位置づけ
 
-本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用するが、本文書の型と状態機械はまだ実装されていない。
+本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 以降（heap/string/source/I-O accounting、continuation、cancel/pause、scheduler、VM parity）は未実装である。
 
 本文書は次の既存仕様と一体で実装する。
 
@@ -674,10 +674,37 @@ run-turn queueはEngine全体でFIFO round-robinとし、continuation自体で�
 
 ### Slice 1: budget型とlegacy adapter
 
+実装状況: ✅ 実装済み（`src/budget.rs`）。詳細は末尾の注記を参照。
+
 - `BudgetConfig`、`BudgetUsage`、`BudgetExceeded`、checked arithmetic、固定優先順位を実装
 - CLIだけに旧環境変数adapterを置き、libraryは明示configを要求
 - fake monotonic clockを導入
 - まだ同期実行だが、既存step/collection検査を共有BudgetLedger経由へ移す
+
+> **Slice 1 実装注記（2026-09-11）**
+>
+> `src/budget.rs` に第3節の公開型（`BudgetConfig` / `BudgetCounters` / `BudgetPeaks` /
+> `BudgetUsage` / `BudgetExceeded` / `BudgetUnit` / `BudgetResource` / `ExecutionPhase`）、
+> `ControlStop`、`MonotonicClock` / `MonotonicInstant` / `FakeClock`、`CancellationToken`、
+> `BudgetLedger` を実装した。`reserve_all` / `commit` / `refund` は第7節の checked
+> arithmetic と第7.2節の固定優先順位（`BudgetResource::priority`）に従う。overflow は
+> `requested = u64::MAX` の `BudgetExceeded` へ写像し wrap しない。`BudgetConfig::standard`
+> は第3.1節の既定値を、`from_legacy_env` / `for_legacy` は `TSUMUGI_MAX_STEPS` /
+> `TSUMUGI_MAX_COLLECTION_SIZE` を fuel / collection 上限へ写す legacy 入口を提供する。
+>
+> tree evaluator（`src/eval.rs`）と VM（`src/vm.rs`）の step 検査を `charge_fuel(1, Run)`
+> へ、collection 検査を `check_collection_elements` / 共有 handler へ渡す
+> `max_collection_elements` へ一本化した。`builtin_core` の process-global な `OnceLock`
+> collection 上限は廃止し、上限値は各 execution の ledger config を単一の正本とする。
+> `ControlStop` は Slice 1 では既存の `step_limit` / `collection_limit` エラーへ写像し、
+> 観測挙動を変えない（既存 golden・回帰テストは不変で通過）。
+>
+> Slice 1 の範囲外（後続 slice）: fuel 全 charge point の展開・heap/string/source/I-O
+> accounting は Slice 2。ledger charge 経路での deadline / cancel checkpoint は Slice 4
+> （現状 `check_deadline` は no-op、cancel は `charge` 前確認のみ）。共有 builtin の
+> per-item collection peak 反映（`note_collection_elements`）は未接続。library の
+> 明示 config 要求は `Evaluator::with_budget` を用意済みだが、公開 `Engine` API への
+> `ExecutionRequest` 配線は Slice 3。
 
 ### Slice 2: source・string・heap・I/O accounting
 
