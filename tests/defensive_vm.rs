@@ -157,6 +157,93 @@ fn try_opcode_reaching_dispatch_does_not_panic() {
     let _ = Vm::new(unverified(chunk)).run();
 }
 
+/// REV-006 層1: `Jump(0)` 自己ループが per-instruction 課金で有限 step 停止する。
+///
+/// 旧モデルでは Jump に課金がなく、`Jump(0)` の自己ループは step 予算を迂回して
+/// 無期限実行できた。per-instruction 課金では 1 周ごとに 1 命令以上 dispatch するため
+/// 必ず課金され、`limit` error で停止する。
+#[test]
+fn jump_self_loop_halts_with_limit() {
+    let mut chunk = Chunk::new();
+    chunk.emit(OpCode::Jump(0), 1); // index 0 へ無条件ジャンプ（自己ループ）
+    let mut vm = Vm::new(unverified(chunk));
+    vm.set_max_steps(1000);
+    let error = vm
+        .run()
+        .expect_err("Jump(0) 自己ループが停止しませんでした");
+    assert_eq!(
+        error.error_type(),
+        "limit",
+        "想定外の種別: {}",
+        error.message()
+    );
+    assert!(
+        error.message().contains("ステップ上限に達しました"),
+        "想定外のメッセージ: {}",
+        error.message()
+    );
+}
+
+/// REV-006 層1: 後方 `Loop(0)` 迂回ループが per-instruction 課金で有限 step 停止する。
+#[test]
+fn backward_loop_halts_with_limit() {
+    let mut chunk = Chunk::new();
+    chunk.emit(OpCode::Loop(0), 1); // index 0 へ後方ジャンプ（自己ループ）
+    let mut vm = Vm::new(unverified(chunk));
+    vm.set_max_steps(1000);
+    let error = vm
+        .run()
+        .expect_err("Loop(0) 迂回ループが停止しませんでした");
+    assert_eq!(
+        error.error_type(),
+        "limit",
+        "想定外の種別: {}",
+        error.message()
+    );
+}
+
+/// REV-006 層1: `PrepareCall` を省いた raw `Call` の再帰ループが有限停止する。
+///
+/// per-instruction 課金では `Call` 命令自体が 1 step 課金されるため、`PrepareCall` を
+/// 迂回しても課金を回避できない。深度上限（先に到達）または step 上限のいずれかで
+/// 必ず有限停止し、host panic しない。
+#[test]
+fn prepare_call_less_recursion_halts() {
+    let mut recursive = Chunk::new();
+    recursive.name = "raw_recursive".to_string();
+    recursive.emit(OpCode::GetLocal(0), 1); // 自身（slot 0）を積む
+    recursive.emit(OpCode::Call(0), 1); // PrepareCall なしで自己呼び出し
+    recursive.emit(OpCode::ReturnValue, 1);
+    recursive.max_locals = 1;
+
+    let mut body = Chunk::new();
+    let proto = tsumugi::chunk::FunctionPrototype {
+        name: "raw_recursive".to_string(),
+        arity: 0,
+        params: Vec::new(),
+        chunk: std::rc::Rc::new(recursive),
+        captures: Vec::new(),
+    };
+    body.add_prototype(proto);
+    body.emit(OpCode::MakeClosure(0), 1);
+    body.emit(OpCode::Call(0), 1);
+    body.emit(OpCode::Return, 1);
+    body.max_locals = 0;
+
+    let mut vm = Vm::new(unverified(body));
+    vm.set_max_steps(100_000);
+    let error = vm
+        .run()
+        .expect_err("raw Call の再帰ループが停止しませんでした");
+    // 深度上限（overflow）または step 上限（limit）のいずれかで有限停止する。
+    assert!(
+        matches!(error.error_type(), "overflow" | "limit"),
+        "想定外の種別: {} / {}",
+        error.error_type(),
+        error.message()
+    );
+}
+
 #[test]
 fn repl_rolls_back_malformed_chunk_and_recovers() {
     let mut vm = Vm::new_repl();

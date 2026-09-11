@@ -106,6 +106,24 @@ impl ChunkVerifyError {
     }
 }
 
+impl From<ChunkVerifyError> for crate::error::TsumugiError {
+    /// verifier 拒否を「VM/Compiler 不変条件違反」の internal error へ写像する（REV-006）。
+    ///
+    /// 第3.4節に従い `internal(line, detail)` を用い、`detail` は種別ごとの固定文字列
+    /// （生値・operand・スタック内容を含めない）。script からは到達しないため trace は付けない。
+    fn from(err: ChunkVerifyError) -> Self {
+        crate::error::TsumugiError::internal(0, err.stable_detail())
+    }
+}
+
+/// `Chunk` を検証し、失敗時は internal `TsumugiError` を返す（REV-006）。
+///
+/// ホストが raw bytecode を構築して VM へ渡す経路（`unstable-bytecode`）で、
+/// verifier 拒否を安定した internal error として受け取るための便宜関数。
+pub fn verify_or_internal_error(chunk: Chunk) -> Result<VerifiedChunk, crate::error::TsumugiError> {
+    verify(chunk).map_err(Into::into)
+}
+
 /// `Chunk` を検証して `VerifiedChunk` へ昇格させる（REV-006）。
 ///
 /// 関数プロトタイプを含め chunk 木の全 code に対して V1〜V9 を検査する。検査は一度だけ行い、
@@ -425,6 +443,30 @@ mod tests {
         chunk.emit(OpCode::MakeClosure(0), 1);
         chunk.emit(OpCode::Return, 1);
         assert!(verify(chunk).is_ok());
+    }
+
+    #[test]
+    fn verify_or_internal_error_maps_rejection_to_internal() {
+        // 不正な jump target を verify_or_internal_error に通すと internal error になる。
+        let mut chunk = Chunk::new();
+        chunk.emit(OpCode::Jump(999), 1);
+        chunk.emit(OpCode::Return, 1);
+        let error =
+            super::verify_or_internal_error(chunk).expect_err("不正 chunk が検証を通過しました");
+        assert_eq!(error.error_type(), "internal");
+        assert!(
+            error
+                .message()
+                .contains("bytecode 検証に失敗しました: jump target が範囲外です"),
+            "想定外のメッセージ: {}",
+            error.message()
+        );
+        // 生値（999）を含めない。
+        assert!(
+            !error.message().contains("999"),
+            "エラーメッセージに operand の生値が含まれています: {}",
+            error.message()
+        );
     }
 
     #[test]

@@ -166,6 +166,14 @@ impl Vm {
         self.script_args = args;
     }
 
+    /// step 上限を明示的に設定する。
+    ///
+    /// 既定は `TSUMUGI_MAX_STEPS`（未設定なら [`DEFAULT_MAX_STEPS`]）。process-global な
+    /// env に依存せず停止性を検証したいテストや、ホストが実行単位で予算を与える場合に使う。
+    pub fn set_max_steps(&mut self, max_steps: u64) {
+        self.max_steps = max_steps;
+    }
+
     /// 関数値へ新しい FunctionId を発番する（AUD-048）。
     ///
     /// MakeClosure 実行のたびに呼ぶ。u64 を使い切った場合は internal error を返す
