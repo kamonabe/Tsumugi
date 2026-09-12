@@ -101,24 +101,16 @@ impl Evaluator {
             .map_err(|stop| self.control_stop_to_error(stop, line))
     }
 
-    /// budget の [`ControlStop`] を既存の [`TsumugiError`] へ写像する（Slice 1 互換）。
+    /// budget の [`ControlStop`] を既存の [`TsumugiError`] へ写像する（Slice 1/2 互換）。
+    /// resource → error kind/message の対応は tree/VM 共有の
+    /// [`crate::budget::control_stop_to_error`] に集約し、trace だけ tree 側で付ける。
     ///
-    /// Slice 1 で発生し得るのは fuel（= step）と collection 超過のみ。cancel /
+    /// Slice 1/2 で発生し得るのは fuel（= step）・collection・string 超過。cancel /
     /// deadline は ledger の charge 経路にまだ配線しておらず（Slice 4）、
     /// 到達した場合も安全側で step 上限として扱う。
     fn control_stop_to_error(&self, stop: ControlStop, line: usize) -> TsumugiError {
-        use crate::budget::BudgetResource;
-        let err = match stop {
-            ControlStop::BudgetExceeded(e) => match e.resource {
-                BudgetResource::CollectionElements => {
-                    TsumugiError::collection_limit(line, e.requested as usize, e.limit as usize)
-                }
-                _ => TsumugiError::step_limit(line, e.limit),
-            },
-            ControlStop::Cancelled | ControlStop::DeadlineExceeded { .. } => {
-                TsumugiError::step_limit(line, self.budget.usage().committed.fuel)
-            }
-        };
+        let err =
+            crate::budget::control_stop_to_error(stop, self.budget.usage().committed.fuel, line);
         if !self.call_stack.is_empty() {
             let mut trace = self.call_stack.clone();
             trace.reverse();

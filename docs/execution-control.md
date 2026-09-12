@@ -2,11 +2,11 @@
 
 最終更新: 2026-09-11
 
-設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 以降は未着手）
+設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は string accounting サブスライスのみ実装済みで、heap/source/I-O accounting は未着手）
 
 ## 1. 位置づけ
 
-本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 以降（heap/string/source/I-O accounting、continuation、cancel/pause、scheduler、VM parity）は未実装である。
+本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleStringBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線）も実装済みである。Slice 2 の残り（heap/source/I-O accounting、string リテラル/連結/f-string 経路、context baseline 走査）と Slice 3 以降（continuation、cancel/pause、scheduler、VM parity）は未実装である。
 
 本文書は次の既存仕様と一体で実装する。
 
@@ -708,10 +708,21 @@ run-turn queueはEngine全体でFIFO round-robinとし、continuation自体で�
 
 ### Slice 2: source・string・heap・I/O accounting
 
-- `AllocationId`とper-execution ledgerを導入
-- Value、String、List、Dict、function、AST/chunk、import、journalを論理heapへ接続
-- source/import/input/output/host count+bytesとreserve/commit/refundを実装
-- baseline context graphの反復走査を実装
+- string accounting（✅ 実装済み）: per-item `SingleStringBytes` と cumulative
+  `StringAllocations`/`StringBytes` を `BudgetLedger::charge_string` /
+  `charge_result_strings` で課金する。§7.2 の固定優先順位（`SingleStringBytes` <
+  `StringAllocations` < `StringBytes`）に従い、cancel を charge 前に確認する。共有
+  builtin handler（`builtin_core::dispatch`）が新規生成する String body（scalar /
+  List / Dict key を含む）へ、tree（`builtin.rs`）と VM（`vm.rs`）の dispatch 呼び
+  出し側から共通で配線する。`control_stop_to_error` を `budget` へ集約し両 engine の
+  error 写像を一本化。legacy env `TSUMUGI_MAX_SINGLE_STRING_BYTES` /
+  `TSUMUGI_MAX_STRING_ALLOCATIONS` / `TSUMUGI_MAX_STRING_BYTES` を追加。既定上限では
+  観測挙動を変えない。string リテラル・`+` 連結・f-string 経路の課金は tree/VM で
+  dispatch を経由しないため本サブスライスの範囲外（後続）。
+- `AllocationId`とper-execution ledgerを導入（未実装）
+- Value、String、List、Dict、function、AST/chunk、import、journalを論理heapへ接続（未実装）
+- source/import/input/output/host count+bytesとreserve/commit/refundを実装（未実装）
+- baseline context graphの反復走査を実装（未実装）
 
 ### Slice 3: explicit continuation
 
