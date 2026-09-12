@@ -155,7 +155,14 @@ impl Evaluator {
                     evaluated.push(self.eval_expr(arg, line)?);
                 }
                 let max_collection = self.budget.max_collection_elements();
-                crate::builtin_core::dispatch(name, &evaluated, max_collection, line)
+                let result = crate::builtin_core::dispatch(name, &evaluated, max_collection, line)?;
+                if let Some(value) = &result {
+                    // builtin が新規生成した String body を課金する（REV-015 Slice 2）。
+                    self.budget
+                        .charge_result_strings(value, crate::budget::ExecutionPhase::Run)
+                        .map_err(|stop| self.control_stop_to_error(stop, line))?;
+                }
+                Ok(result)
             }
 
             _ => Ok(None),

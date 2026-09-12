@@ -1574,6 +1574,71 @@ fn shared_builtin_range_gates_via_ledger_collection_limit_in_both_engines() {
 }
 
 #[test]
+fn single_string_limit_gates_shared_builtin_in_both_engines() {
+    // REV-015 Slice 2: builtin が新規生成する String body の byte 長が
+    // max_single_string_bytes を超えると、両 engine で string 上限エラーになる。
+    // to_str が 6 byte の "123456" を生成し、上限 5 で拒否する。
+    let source = "print(to_str(123456))\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_SINGLE_STRING_BYTES", "5")]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("文字列の長さが上限を超えました"),
+            "{mode}で single string 上限が適用されていない: {stderr}"
+        );
+        // 拒否された文字列は出力されない。
+        assert!(
+            !stdout.contains("123456"),
+            "{mode}で拒否された文字列が出力された: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn string_bytes_cumulative_limit_gates_shared_builtin_in_both_engines() {
+    // REV-015 Slice 2: 複数の String 生成の累積 byte 数が max_string_bytes を
+    // 超えると、両 engine で string 上限エラーになる。
+    // upper が "AAAAA"(5)+"BBBBB"(5) を生成し、累積 10 > 上限 8 で拒否する。
+    let source = "print(upper(\"aaaaa\"))\nprint(upper(\"bbbbb\"))\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_STRING_BYTES", "8")]);
+        let (_stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("文字列の総バイト数が上限を超えました"),
+            "{mode}で cumulative string bytes 上限が適用されていない: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn string_allocations_limit_gates_shared_builtin_in_both_engines() {
+    // REV-015 Slice 2: 新規 String body の生成個数が max_string_allocations を
+    // 超えると、両 engine で string 上限エラーになる。split は要素ごとに新規 String
+    // body を作るため、3 要素で上限 2 を超える。
+    let source = "print(split(\"a,b,c\", \",\"))\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_STRING_ALLOCATIONS", "2")]);
+        let (_stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("文字列の生成数が上限を超えました"),
+            "{mode}で string allocations 上限が適用されていない: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn index_assign_recovers_and_writes_across_inputs_in_both_engines() {
     // 未定義targetはcompile errorではなくcatch可能なruntime errorとして扱い、
     // 入力をまたいでも同じbindingへ書き込めること。

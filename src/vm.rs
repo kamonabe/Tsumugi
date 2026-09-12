@@ -399,9 +399,10 @@ impl Vm {
             .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))
     }
 
-    /// budget の [`ControlStop`] を既存の [`TsumugiError`] へ写像する（Slice 1 互換）。
+    /// budget の [`ControlStop`] を既存の [`TsumugiError`] へ写像する（Slice 1/2 互換）。
+    /// 実体は tree/VM 共有の [`crate::budget::control_stop_to_error`]。
     ///
-    /// Slice 1 で発生し得るのは fuel（= step）と collection 超過のみ。cancel /
+    /// Slice 1/2 で発生し得るのは fuel（= step）・collection・string 超過。cancel /
     /// deadline は ledger の charge 経路にまだ配線しておらず（Slice 4）、
     /// 到達した場合も安全側で step 上限として扱う。
     fn control_stop_to_error(
@@ -409,18 +410,7 @@ impl Vm {
         stop: ControlStop,
         line: usize,
     ) -> TsumugiError {
-        use crate::budget::BudgetResource;
-        match stop {
-            ControlStop::BudgetExceeded(e) => match e.resource {
-                BudgetResource::CollectionElements => {
-                    TsumugiError::collection_limit(line, e.requested as usize, e.limit as usize)
-                }
-                _ => TsumugiError::step_limit(line, e.limit),
-            },
-            ControlStop::Cancelled | ControlStop::DeadlineExceeded { .. } => {
-                TsumugiError::step_limit(line, budget.usage().committed.fuel)
-            }
-        }
+        crate::budget::control_stop_to_error(stop, budget.usage().committed.fuel, line)
     }
 
     // --- 内部不変条件の検査（AUD-023） ---
@@ -1508,6 +1498,10 @@ impl Vm {
         // まず共通モジュールで処理を試みる
         let max_collection = self.budget.max_collection_elements();
         if let Some(result) = crate::builtin_core::dispatch(name, &args, max_collection, line)? {
+            // builtin が新規生成した String body を課金する（REV-015 Slice 2）。
+            self.budget
+                .charge_result_strings(&result, ExecutionPhase::Run)
+                .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
             return Ok(result);
         }
 

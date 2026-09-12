@@ -1,17 +1,23 @@
 //! 実行予算（REV-015 / Phase 3）の公開型と課金台帳。
 //!
 //! 設計正本は [`docs/execution-control.md`](../docs/execution-control.md) 第3〜7節である。
-//! 本モジュールは Slice 1（budget型と legacy adapter）を実装する。すなわち:
+//! 本モジュールは Slice 1（budget型と legacy adapter）と、Slice 2 のうち string
+//! accounting サブスライスを実装する。すなわち:
 //!
 //! - `BudgetConfig` / `BudgetUsage` / `BudgetExceeded` などの公開型（§3）
 //! - `BudgetConfig::standard` の既定値（§3.1）
 //! - checked arithmetic による reserve / commit / refund（§7）と、複数超過時の
 //!   固定優先順位（§7.2）
 //! - 既存の step / collection 検査を一本化する [`BudgetLedger`]
+//! - string accounting（§5.3）: per-item `SingleStringBytes` と cumulative
+//!   `StringAllocations` / `StringBytes` を [`BudgetLedger::charge_string`] /
+//!   [`BudgetLedger::charge_result_strings`] で課金する。現行の共有 builtin handler
+//!   が新規生成する String body に配線済み。
 //!
 //! Slice 1 の時点では実行系は同期のままで、`ExecutionHandle` / `poll` / scheduler
-//! （Slice 3 以降）は実装しない。fuel の全 charge point 展開と heap/string/source/I-O
-//! accounting は Slice 2 以降で本モジュールへ積み増す。
+//! （Slice 3 以降）は実装しない。fuel の全 charge point 展開と heap/source/I-O
+//! accounting、および string リテラル・連結・f-string 経路の課金は Slice 2 の
+//! 残りサブスライスとして本モジュールへ積み増す。
 //!
 //! # 不変条件（§2）
 //!
@@ -264,7 +270,27 @@ impl BudgetConfig {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(1_000_000);
-        Self::for_legacy(total_fuel, max_collection_elements)
+        let mut config = Self::for_legacy(total_fuel, max_collection_elements);
+        // string accounting（REV-015 Slice 2）の legacy 上限入口。未設定は §3.1 の既定値。
+        if let Some(v) = std::env::var("TSUMUGI_MAX_SINGLE_STRING_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            config.max_single_string_bytes = v;
+        }
+        if let Some(v) = std::env::var("TSUMUGI_MAX_STRING_ALLOCATIONS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            config.max_string_allocations = v;
+        }
+        if let Some(v) = std::env::var("TSUMUGI_MAX_STRING_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            config.max_string_bytes = v;
+        }
+        config
     }
 
     /// config の妥当性を検証する（§3）。execution 作成前に呼ぶ。
@@ -862,6 +888,113 @@ impl BudgetLedger {
         Ok(())
     }
 
+    /// 新規 String body 1 個の生成を課金する（§5.3 / §7、REV-015 Slice 2）。
+    ///
+    /// `byte_len` は UTF-8 payload の byte 長（String header は含めない）。1 個の新規
+    /// String body を作る前に、次を 1 個の atomic reservation として扱う。
+    ///
+    /// 1. per-item `SingleStringBytes`（§5.1 per-item）: `byte_len > max_single_string_bytes`
+    ///    なら `used = reserved = 0`、`requested = byte_len` の [`BudgetExceeded`] を返す。
+    /// 2. cumulative `StringAllocations`（+1）と `StringBytes`（+`byte_len`）を
+    ///    [`Self::reserve_all`] で予約し、成功時に確定 commit する（§5.3）。
+    ///
+    /// per-item と cumulative の複数超過は §7.2 の固定優先順位（`SingleStringBytes` <
+    /// `StringAllocations` < `StringBytes`）で先頭 1 件を primary にする。cancel /
+    /// deadline は [`Self::reserve_all`] が charge 前に確認する。成功時は
+    /// `peaks.single_string_bytes` を `max` 更新する。substring が既存 body を共有する
+    /// 実装なら新規 allocation として数えないが、現行の `Value::Str(String)` は常に
+    /// 新規 copy なので生成のたびに課金する（§5.3）。
+    pub fn charge_string(
+        &mut self,
+        byte_len: u64,
+        phase: ExecutionPhase,
+    ) -> Result<(), ControlStop> {
+        // per-item を先に検査する（§7.2 で SingleStringBytes が cumulative より優先）。
+        let single_limit = self.config.max_single_string_bytes;
+        if byte_len > single_limit {
+            self.check_cancel()?;
+            return Err(ControlStop::BudgetExceeded(BudgetExceeded {
+                resource: BudgetResource::SingleStringBytes,
+                limit: single_limit,
+                used: 0,
+                reserved: 0,
+                requested: byte_len,
+                unit: BudgetUnit::Bytes,
+                phase,
+            }));
+        }
+        // cumulative を 1 個の atomic reservation として予約する。
+        let requests = [
+            CumulativeRequest {
+                resource: BudgetResource::StringAllocations,
+                amount: 1,
+            },
+            CumulativeRequest {
+                resource: BudgetResource::StringBytes,
+                amount: byte_len,
+            },
+        ];
+        self.reserve_all(&requests, phase)?;
+        // amount 確定のため reserved と同額を commit する。
+        self.commit(BudgetResource::StringAllocations, 1, 1);
+        self.commit(BudgetResource::StringBytes, byte_len, byte_len);
+        // per-item peak を更新する（§5.1 per-item）。
+        if byte_len > self.peaks.single_string_bytes {
+            self.peaks.single_string_bytes = byte_len;
+        }
+        Ok(())
+    }
+
+    /// 単一文字列 payload の上限（config 値）。共有 builtin handler へ渡す。
+    pub fn max_single_string_bytes(&self) -> u64 {
+        self.config.max_single_string_bytes
+    }
+
+    /// dispatch 結果の `Value` から到達する新規 String body をすべて課金する
+    /// （REV-015 Slice 2、string accounting）。
+    ///
+    /// 現行の `Value::Str(String)` は共有 backing を持たず、builtin が返す String は
+    /// 必ず新規 copy なので、結果内の各 String body を [`Self::charge_string`] で
+    /// 課金する。List / Dict の backing byte は heap accounting（別サブスライス）の
+    /// 対象で、ここでは走査して内部の String body だけを課金する。Dict の key も
+    /// String body なので課金する。再帰は使わず worklist で走査し、深い構造でも
+    /// host stack を消費しない。
+    ///
+    /// per-item / cumulative のいずれかを超えた時点で `ControlStop` を返し、以降の
+    /// 課金は行わない（部分的に committed が進むが、超過は catch 不能 terminal なので
+    /// engine 側が実行を止める）。
+    pub fn charge_result_strings(
+        &mut self,
+        value: &crate::value::Value,
+        phase: ExecutionPhase,
+    ) -> Result<(), ControlStop> {
+        use crate::value::Value;
+        let mut worklist: Vec<&Value> = vec![value];
+        while let Some(v) = worklist.pop() {
+            match v {
+                Value::Str(s) => {
+                    self.charge_string(s.len() as u64, phase)?;
+                }
+                Value::List(items) => {
+                    for item in items.iter() {
+                        worklist.push(item);
+                    }
+                }
+                Value::Dict(map) => {
+                    for (key, item) in map.iter() {
+                        // Dict key も新規 String body として課金する（§5.1）。
+                        self.charge_string(key.len() as u64, phase)?;
+                        worklist.push(item);
+                    }
+                }
+                // Int / Float / Bool / Null / Fn / VmFn / Error は String body を
+                // 新規生成しない（Error の message は既存 body の写像で別サブスライス）。
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// fuel の committed / reserved を 0 に戻す（REPL 入力ごとの予算リセット）。
     ///
     /// 各 REPL 入力で fuel 予算を全額使えるようにするための Slice 1 互換操作。
@@ -911,6 +1044,41 @@ impl BudgetLedger {
             .total_fuel
             .saturating_sub(self.committed.fuel)
             .saturating_sub(self.reserved.fuel)
+    }
+}
+
+/// budget の [`ControlStop`] を既存の [`TsumugiError`] へ写像する（Slice 1/2 互換）。
+///
+/// tree evaluator と VM の両方から呼び、resource → error kind/message の対応を
+/// 1 箇所へ集約して parity を保証する。trace は各 engine が呼び出し側で付ける。
+///
+/// Slice 1/2 で発生し得るのは fuel（= step）・collection・string 超過。cancel /
+/// deadline は ledger の charge 経路にまだ配線しておらず（Slice 4）、到達した場合も
+/// 安全側で step 上限として扱う。`committed_fuel` は cancel/deadline fallback の
+/// 上限表示に使う。
+pub fn control_stop_to_error(
+    stop: ControlStop,
+    committed_fuel: u64,
+    line: usize,
+) -> crate::error::TsumugiError {
+    use crate::error::TsumugiError;
+    match stop {
+        ControlStop::BudgetExceeded(e) => match e.resource {
+            BudgetResource::CollectionElements => {
+                TsumugiError::collection_limit(line, e.requested as usize, e.limit as usize)
+            }
+            BudgetResource::SingleStringBytes => {
+                TsumugiError::single_string_limit(line, e.requested, e.limit)
+            }
+            BudgetResource::StringAllocations => {
+                TsumugiError::string_allocation_limit(line, e.limit)
+            }
+            BudgetResource::StringBytes => TsumugiError::string_bytes_limit(line, e.limit),
+            _ => TsumugiError::step_limit(line, e.limit),
+        },
+        ControlStop::Cancelled | ControlStop::DeadlineExceeded { .. } => {
+            TsumugiError::step_limit(line, committed_fuel)
+        }
     }
 }
 
@@ -1051,6 +1219,153 @@ mod tests {
         }
         // 超過検査は peak を更新しない。
         assert_eq!(l.usage().peaks.collection_elements, 2);
+    }
+
+    // -------------------------------------------------------------------------
+    // string accounting（§5.3, §15.1）: single/allocations/bytes
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn string_at_single_limit_succeeds_and_plus_one_exceeds() {
+        // single 上限 4 byte、cumulative は十分。
+        let mut config = BudgetConfig::for_legacy(1_000_000, 0);
+        config.max_single_string_bytes = 4;
+        config.max_string_allocations = 1_000;
+        config.max_string_bytes = 1_000;
+        let mut l = ledger(config);
+        // ちょうど 4 byte は成功し、peak と cumulative が積まれる。
+        assert!(l.charge_string(4, ExecutionPhase::Run).is_ok());
+        assert_eq!(l.usage().peaks.single_string_bytes, 4);
+        assert_eq!(l.usage().committed.string_allocations, 1);
+        assert_eq!(l.usage().committed.string_bytes, 4);
+        // 5 byte は SingleStringBytes 超過。used/reserved は 0、requested は byte 長。
+        let err = l.charge_string(5, ExecutionPhase::Run).unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::SingleStringBytes);
+                assert_eq!(e.limit, 4);
+                assert_eq!(e.used, 0);
+                assert_eq!(e.reserved, 0);
+                assert_eq!(e.requested, 5);
+                assert_eq!(e.unit, BudgetUnit::Bytes);
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+        // 超過検査は cumulative も peak も更新しない。
+        assert_eq!(l.usage().committed.string_allocations, 1);
+        assert_eq!(l.usage().committed.string_bytes, 4);
+        assert_eq!(l.usage().peaks.single_string_bytes, 4);
+    }
+
+    #[test]
+    fn string_bytes_accumulate_across_allocations() {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 0);
+        config.max_single_string_bytes = 100;
+        config.max_string_allocations = 1_000;
+        config.max_string_bytes = 10;
+        let mut l = ledger(config);
+        // 4 + 4 = 8 byte までは成功。allocations は 2。
+        assert!(l.charge_string(4, ExecutionPhase::Run).is_ok());
+        assert!(l.charge_string(4, ExecutionPhase::Run).is_ok());
+        assert_eq!(l.usage().committed.string_allocations, 2);
+        assert_eq!(l.usage().committed.string_bytes, 8);
+        // さらに 4 byte で累積 12 > 10。StringBytes 超過。
+        let err = l.charge_string(4, ExecutionPhase::Run).unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::StringBytes);
+                assert_eq!(e.limit, 10);
+                assert_eq!(e.used, 8);
+                assert_eq!(e.requested, 4);
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+        // 失敗は何も commit しない。
+        assert_eq!(l.usage().committed.string_allocations, 2);
+        assert_eq!(l.usage().committed.string_bytes, 8);
+    }
+
+    #[test]
+    fn string_allocations_count_limit_is_enforced() {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 0);
+        config.max_single_string_bytes = 100;
+        config.max_string_allocations = 2;
+        config.max_string_bytes = 1_000;
+        let mut l = ledger(config);
+        // 空文字列（0 byte）でも allocation は 1 個として数える。
+        assert!(l.charge_string(0, ExecutionPhase::Run).is_ok());
+        assert!(l.charge_string(1, ExecutionPhase::Run).is_ok());
+        assert_eq!(l.usage().committed.string_allocations, 2);
+        // 3 個目は StringAllocations 超過。
+        let err = l.charge_string(1, ExecutionPhase::Run).unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::StringAllocations);
+                assert_eq!(e.limit, 2);
+                assert_eq!(e.used, 2);
+                assert_eq!(e.requested, 1);
+                assert_eq!(e.unit, BudgetUnit::Count);
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_single_string_limit_forbids_nonempty_but_allows_empty() {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 0);
+        config.max_single_string_bytes = 0;
+        config.max_string_allocations = 1_000;
+        config.max_string_bytes = 1_000;
+        let mut l = ledger(config);
+        // 0 byte は single 上限 0 ちょうどで成功。
+        assert!(l.charge_string(0, ExecutionPhase::Run).is_ok());
+        // 1 byte は SingleStringBytes 超過。
+        let err = l.charge_string(1, ExecutionPhase::Run).unwrap_err();
+        assert!(matches!(
+            err,
+            ControlStop::BudgetExceeded(BudgetExceeded {
+                resource: BudgetResource::SingleStringBytes,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn string_single_and_cumulative_both_exceed_prefers_single() {
+        // single も cumulative も 0 上限 → §7.2 で SingleStringBytes が優先。
+        let config = BudgetConfig::for_legacy(1_000_000, 0);
+        let mut config = config;
+        config.max_single_string_bytes = 0;
+        config.max_string_allocations = 0;
+        config.max_string_bytes = 0;
+        let mut l = ledger(config);
+        let err = l.charge_string(1, ExecutionPhase::Run).unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::SingleStringBytes)
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_cancel_is_checked_before_charge() {
+        let token = CancellationToken::new();
+        let mut config = BudgetConfig::for_legacy(1_000_000, 0);
+        config.max_single_string_bytes = 100;
+        config.max_string_allocations = 100;
+        config.max_string_bytes = 100;
+        let mut l = BudgetLedger::new(config, token.clone());
+        token.cancel();
+        assert_eq!(
+            l.charge_string(1, ExecutionPhase::Run),
+            Err(ControlStop::Cancelled)
+        );
+        // per-item 超過より cancel が先。
+        assert_eq!(
+            l.charge_string(u64::MAX, ExecutionPhase::Run),
+            Err(ControlStop::Cancelled)
+        );
     }
 
     // -------------------------------------------------------------------------

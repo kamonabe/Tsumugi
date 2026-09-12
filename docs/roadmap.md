@@ -8,7 +8,7 @@
 
 ### 現在地
 
-- **フェーズ:** 意味論基盤（下記「設計sliceに沿う推奨実装順」のステップ2）を進行中。ステップ2の完了済み項目は AUD-050/017・049・019・047・048・016・024・034 と bytecode検証・API封印（REV-006/004/005/018）。境界挙動ステップ1は AUD-036/018/033・REV-003 完了で完結（残りは AUD-036 の構造化`Exited`のみで、これは REV-023 と同基盤のためステップ3）。次はステップ3の包括budget（REV-015/001/023）。Phase 1（embedding）以降は未着手。
+- **フェーズ:** 意味論基盤（下記「設計sliceに沿う推奨実装順」のステップ2）を進行中。ステップ2の完了済み項目は AUD-050/017・049・019・047・048・016・024・034 と bytecode検証・API封印（REV-006/004/005/018）。境界挙動ステップ1は AUD-036/018/033・REV-003 完了で完結（残りは AUD-036 の構造化`Exited`のみで、これは REV-023 と同基盤のためステップ3）。ステップ3の包括budget（REV-015/001/023）を進行中で、Slice 1 と Slice 2 の string accounting サブスライスまで実装済み。次は Slice 2 の残り（heap/source/I-O accounting）。Phase 1（embedding）以降は未着手。
 - **仕様 revision:** language-spec 0.19（実装版 package は 0.1.0。番号体系は別管理）。
 - **完了の中心:** 2026-08-26 深層監査（AUD-001〜050）の大半は実装済み。残る open は下表のとおり。
 - **新規入力:** 2026-09-07 詳細レビュー（REV-001〜025）は全件が実装バックログ（設計は6件が §17 で確定、他は既存正本を参照）。
@@ -19,7 +19,7 @@
 
 1. **境界挙動（意味論基盤の残り）:** ~~AUD-036 のchecked変換~~（✅ Float→Int/file_size完了、仕様revision 0.17）→ ~~AUD-018 のE8a（CLI script引数）~~（✅ 完了、仕様revision 0.18。capability profile/optionsはE8bで別追跡）→ ~~AUD-033（未完結REPL入力のEOF診断）~~（✅ 完了、tree/VM共有の `finish_repl_at_eof`）→ ~~REV-003（数値厳密比較）~~（✅ 完了、共通 `NumericOrder`・仕様revision 0.19）。AUD-036 の構造化`Exited`は REV-023 と同基盤のためステップ3へ移す。ステップ1はこれで完結。
 2. ~~**bytecode検証・API封印（基盤・境界挙動より前に置く）:** REV-006（`VerifiedChunk`/verifier + per-instruction step 課金。§17.7 で実装詳細確定）を軸に、同一マイルストーンで REV-004（`patch_jump` fallible化）・REV-005（`MakeClosure` capture記述子化）・REV-018（internal module封印）。停止性はper-instruction課金（verifier非依存）で担保し、VM入口を `VerifiedChunk` へ限定する。~~（✅ 完了。`src/verifier.rs`の`VerifiedChunk`/`verify`（V1〜V9）、VMの全命令dispatch前per-instruction課金、`MakeClosure(proto_index)`+`FunctionPrototype`/`CaptureDesc`、`patch_jump`のfallible化、`unstable-bytecode` featureでのraw module封印。観測挙動はstep到達点以外不変）
-3. **包括budget（P0 基盤）:** REV-015（source/string/heap/I-O budget・deadline・cancel）に REV-001（共有DAGの指数時間/出力）の受入条件を含める。REV-023（`exit()`のprocess終了廃止）も同基盤。**進行中**: [実行制御仕様](execution-control.md) 第14節 Slice 1（budget型・checked reserve/commit・固定優先順位・fake clock・共有 `BudgetLedger`）を `src/budget.rs` に実装済み。既存 step/collection 検査を ledger 経由へ一本化し、`builtin_core` の process-global `OnceLock` 上限を廃止。観測挙動は不変。残りは Slice 2（heap/string/source/I-O accounting）以降。
+3. **包括budget（P0 基盤）:** REV-015（source/string/heap/I-O budget・deadline・cancel）に REV-001（共有DAGの指数時間/出力）の受入条件を含める。REV-023（`exit()`のprocess終了廃止）も同基盤。**進行中**: [実行制御仕様](execution-control.md) 第14節 Slice 1（budget型・checked reserve/commit・固定優先順位・fake clock・共有 `BudgetLedger`）を `src/budget.rs` に実装済み。既存 step/collection 検査を ledger 経由へ一本化し、`builtin_core` の process-global `OnceLock` 上限を廃止。続けて Slice 2 の **string accounting サブスライス**（per-item `SingleStringBytes`・cumulative `StringAllocations`/`StringBytes` を `charge_string`/`charge_result_strings` で課金し、共有 builtin handler が新規生成する String body に tree/VM 共通で配線。`control_stop_to_error` を共有化して両 engine の error 写像を一本化。legacy env `TSUMUGI_MAX_SINGLE_STRING_BYTES`/`_STRING_ALLOCATIONS`/`_STRING_BYTES` を追加）を実装済み。既定上限では観測挙動は不変。残りは Slice 2 の heap/source/I-O accounting と、string リテラル/連結/f-string 経路の課金、context baseline 走査。
 4. **Phase 1 embedding:** [組み込みAPI仕様](embedding-api.md) E1〜E6 → E8a。REV-007/008/011/013/014/020 はこの Phase 1〜2 で解消する。
 5. **Phase 2 capability:** E7 → E8b と Capability C1〜C10。REV-002/009/019/021/022 はこの capability 面で実装（sandbox の process-global を ExecutionContext へ移す）。
 
@@ -32,7 +32,7 @@
 | P0 | REV-001 | 共有DAGの比較・表示が指数時間／出力 | ⬜ | REV表 P0 |
 | P0 | REV-002 | 非UTF-8 canonical import pathでsandbox認可がすり替わる | ⬜ | REV表 P0 |
 | ~~P0~~ | ~~REV-006~~ | ~~未検証bytecodeでstep/call課金を迂回し無期限実行~~ | ✅ | 完了（§17.7、per-instruction課金+verifier+`VerifiedChunk`） |
-| P0 | REV-015 | source/string/heap/I-O/bulk workが未有限化 | 🟡 | Slice 1（budget型・`BudgetLedger`・legacy adapter）実装済み。heap/string/source/I-O accounting は Slice 2 以降。REV表 P0 |
+| P0 | REV-015 | source/string/heap/I-O/bulk workが未有限化 | 🟡 | Slice 1（budget型・`BudgetLedger`・legacy adapter）と Slice 2 の string accounting サブスライス（per-item `SingleStringBytes`・cumulative `StringAllocations`/`StringBytes`、共有 builtin 経由）実装済み。heap/source/I-O accounting と string リテラル/連結/f-string 経路は Slice 2 の残り。REV表 P0 |
 | P0 | REV-023 | `exit()`がホストプロセスを終了する | ⬜ | REV表 P0 |
 | ~~P1~~ | ~~REV-003~~ | ~~Int–Float比較が2^53超で誤り、`==`が非推移的~~ | ✅ | 完了（§17.1、仕様revision 0.19。下記REV表 P1参照） |
 | ~~P1~~ | ~~REV-004~~ | ~~公開`Chunk::patch_jump`がpanic~~ | ✅ | 完了（§17.2、`patch_jump`をfallible化しbuilderエラーをcompiler internal errorへ） |

@@ -81,6 +81,8 @@ pub enum ErrorKind {
     ControlFlow,
     /// コレクションサイズ上限超過
     CollectionLimit,
+    /// 文字列予算上限超過（single/allocations/bytes、REV-015 Slice 2）
+    StringLimit,
     /// 型変換失敗（to_int / to_float）
     Conversion,
     /// 組み込み関数への不正な型の引数
@@ -111,6 +113,7 @@ impl ErrorKind {
             Self::IntOverflow => "int_overflow",
             Self::ControlFlow => "control_flow",
             Self::CollectionLimit => "collection_limit",
+            Self::StringLimit => "string_limit",
             Self::Conversion => "conversion",
             Self::BuiltinType => "builtin_type",
             Self::Iteration => "iteration",
@@ -535,6 +538,39 @@ impl TsumugiError {
             line,
             ErrorKind::StepLimit,
             format!("ステップ上限に達しました (上限: {})", limit),
+        )
+    }
+
+    /// 単一文字列の byte 長上限超過（REV-015 Slice 2、per-item SingleStringBytes）
+    pub fn single_string_limit(line: usize, requested: u64, limit: u64) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::StringLimit,
+            format!(
+                "文字列の長さが上限を超えました: {} バイト (上限: {} バイト)",
+                requested, limit
+            ),
+        )
+    }
+
+    /// 文字列の総生成数上限超過（REV-015 Slice 2、cumulative StringAllocations）
+    pub fn string_allocation_limit(line: usize, limit: u64) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::StringLimit,
+            format!("文字列の生成数が上限を超えました (上限: {})", limit),
+        )
+    }
+
+    /// 文字列の総 byte 数上限超過（REV-015 Slice 2、cumulative StringBytes）
+    pub fn string_bytes_limit(line: usize, limit: u64) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::StringLimit,
+            format!(
+                "文字列の総バイト数が上限を超えました (上限: {} バイト)",
+                limit
+            ),
         )
     }
 
