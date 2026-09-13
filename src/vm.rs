@@ -183,6 +183,32 @@ impl Vm {
         self.frames.len().saturating_sub(1)
     }
 
+    /// root source と import source を予算へ課金する（REV-015 Slice 2、§5.3）。
+    ///
+    /// `Link` フェーズの課金であり、`run` の前に呼ぶ。tree evaluator の
+    /// `Evaluator::charge_link` と同じ規則で、root を 1 本の source として `charge_source`
+    /// し、初めて解決した各 import module を `charge_source`（`source_bytes`）と
+    /// `charge_import`（`import_bytes`）の両方へ課金する。超過は catch 不能 terminal
+    /// として既存 error へ写像する。両 engine で観測挙動を一致させる。
+    pub fn charge_link(
+        &mut self,
+        root_source_bytes: u64,
+        loaded: &[crate::module::LoadedModule],
+    ) -> Result<(), TsumugiError> {
+        self.budget
+            .charge_source(root_source_bytes, ExecutionPhase::Link)
+            .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, 0))?;
+        for module in loaded {
+            self.budget
+                .charge_source(module.byte_len, ExecutionPhase::Link)
+                .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, module.line))?;
+            self.budget
+                .charge_import(module.byte_len, ExecutionPhase::Link)
+                .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, module.line))?;
+        }
+        Ok(())
+    }
+
     /// チャンクを実行する
     pub fn run(&mut self) -> Result<(), TsumugiError> {
         self.run_frames(0)?;

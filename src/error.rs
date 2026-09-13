@@ -83,6 +83,8 @@ pub enum ErrorKind {
     CollectionLimit,
     /// 文字列予算上限超過（single/allocations/bytes、REV-015 Slice 2）
     StringLimit,
+    /// source/import 予算上限超過（single/count/bytes、REV-015 Slice 2）
+    SourceLimit,
     /// 型変換失敗（to_int / to_float）
     Conversion,
     /// 組み込み関数への不正な型の引数
@@ -114,6 +116,7 @@ impl ErrorKind {
             Self::ControlFlow => "control_flow",
             Self::CollectionLimit => "collection_limit",
             Self::StringLimit => "string_limit",
+            Self::SourceLimit => "source_limit",
             Self::Conversion => "conversion",
             Self::BuiltinType => "builtin_type",
             Self::Iteration => "iteration",
@@ -569,6 +572,60 @@ impl TsumugiError {
             ErrorKind::StringLimit,
             format!(
                 "文字列の総バイト数が上限を超えました (上限: {} バイト)",
+                limit
+            ),
+        )
+    }
+
+    /// 単一 source の byte 長上限超過（REV-015 Slice 2、per-item SingleSourceBytes）
+    pub fn single_source_limit(line: usize, requested: u64, limit: u64) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::SourceLimit,
+            format!(
+                "ソースの長さが上限を超えました: {} バイト (上限: {} バイト)",
+                requested, limit
+            ),
+        )
+    }
+
+    /// source の総本数上限超過（REV-015 Slice 2、cumulative SourceCount）
+    pub fn source_count_limit(line: usize, limit: u64) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::SourceLimit,
+            format!("ソースの本数が上限を超えました (上限: {})", limit),
+        )
+    }
+
+    /// source の総 byte 数上限超過（REV-015 Slice 2、cumulative SourceBytes）
+    pub fn source_bytes_limit(line: usize, limit: u64) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::SourceLimit,
+            format!(
+                "ソースの総バイト数が上限を超えました (上限: {} バイト)",
+                limit
+            ),
+        )
+    }
+
+    /// import の総本数上限超過（REV-015 Slice 2、cumulative ImportCount）
+    pub fn import_count_limit(line: usize, limit: u64) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::SourceLimit,
+            format!("import の本数が上限を超えました (上限: {})", limit),
+        )
+    }
+
+    /// import の総 byte 数上限超過（REV-015 Slice 2、cumulative ImportBytes）
+    pub fn import_bytes_limit(line: usize, limit: u64) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::SourceLimit,
+            format!(
+                "import の総バイト数が上限を超えました (上限: {} バイト)",
                 limit
             ),
         )

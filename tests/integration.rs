@@ -719,6 +719,89 @@ fn import_outside_sandbox_is_blocked_in_both_engines() {
 }
 
 #[test]
+fn import_count_limit_gates_file_execution_in_both_engines() {
+    // REV-015 Slice 2: import module は import_count へ課金する。上限 0 では
+    // root は実行できるが、初めての import 解決で source 上限エラーになり
+    // 1 文も実行しない。tree/VM で観測挙動を一致させる。
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree-walk" };
+        let label = format!("import-count-{}", if use_vm { "vm" } else { "tree" });
+        let dir = TestDir::new(&label);
+
+        let lib = dir.path.join("lib.tsg");
+        std::fs::write(&lib, "let helper = 42\n").expect("lib の作成に失敗");
+        let script = dir.path.join("main.tsg");
+        std::fs::write(&script, "import \"lib.tsg\"\nprint(\"AFTER\")\n")
+            .expect("main の作成に失敗");
+
+        let context = format!("import count limit [{mode}]");
+        let output = run_script_process(
+            &script,
+            use_vm,
+            &[
+                ("TSUMUGI_SANDBOX", dir.as_str()),
+                ("TSUMUGI_MAX_IMPORT_COUNT", "0"),
+            ],
+            &context,
+        );
+        let (stdout, stderr) = output_text(&output);
+
+        assert!(
+            !output.status.success(),
+            "{context}: 終了コード0で終了しました\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stderr.contains("import の本数が上限を超えました"),
+            "{context}: import count 上限が適用されていません\n--- stderr ---\n{stderr}"
+        );
+        // 1 文も実行しないため後続の print は出ない。
+        assert_eq!(
+            stdout, "",
+            "{context}: 上限超過後に実行されました\n--- stdout ---\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn import_source_bytes_charged_allows_execution_within_limit_in_both_engines() {
+    // REV-015 Slice 2: import source は source_bytes と import_bytes の両方へ
+    // 課金する。上限内なら root + import が実行される。tree/VM で一致する。
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree-walk" };
+        let label = format!("import-bytes-ok-{}", if use_vm { "vm" } else { "tree" });
+        let dir = TestDir::new(&label);
+
+        let lib = dir.path.join("lib.tsg");
+        std::fs::write(&lib, "let helper = 7\n").expect("lib の作成に失敗");
+        let script = dir.path.join("main.tsg");
+        std::fs::write(&script, "import \"lib.tsg\"\nprint(helper)\n").expect("main の作成に失敗");
+
+        let context = format!("import bytes within limit [{mode}]");
+        let output = run_script_process(
+            &script,
+            use_vm,
+            &[
+                ("TSUMUGI_SANDBOX", dir.as_str()),
+                // root + import の合計 byte 数を十分に上回る上限。
+                ("TSUMUGI_MAX_SOURCE_BYTES", "1024"),
+                ("TSUMUGI_MAX_IMPORT_BYTES", "1024"),
+            ],
+            &context,
+        );
+        let (stdout, stderr) = output_text(&output);
+
+        assert!(
+            output.status.success(),
+            "{context}: 上限内なのに失敗しました\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("7"),
+            "{context}: import した値が使えていません\n--- stdout ---\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn env_allow_list() {
     let dir = fixtures_dir();
     let script = dir.join("env_allow.tsg");
@@ -1634,6 +1717,51 @@ fn string_allocations_limit_gates_shared_builtin_in_both_engines() {
         assert!(
             stderr.contains("文字列の生成数が上限を超えました"),
             "{mode}で string allocations 上限が適用されていない: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn single_source_limit_gates_root_source_in_both_engines() {
+    // REV-015 Slice 2: root source の生 byte 長が max_single_source_bytes を
+    // 超えると、両 engine で source 上限エラーになり 1 文も実行しない。
+    // 入力は 10 byte 超で、上限 5 で拒否する。
+    let source = "print(1234567890)\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_SINGLE_SOURCE_BYTES", "5")]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("ソースの長さが上限を超えました"),
+            "{mode}で single source 上限が適用されていない: {stderr}"
+        );
+        // 拒否された source は 1 文も実行されない。
+        assert!(
+            !stdout.contains("1234567890"),
+            "{mode}で拒否された source が実行された: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn source_bytes_cumulative_limit_gates_across_inputs_in_both_engines() {
+    // REV-015 Slice 2: REPL の各入力を 1 本の source として累積課金し、
+    // 生 byte 数の合計が max_source_bytes を超えると source 上限エラーになる。
+    // 各入力が数 byte で、2 本目以降の累積で上限 10 を超える。
+    let source = "print(1)\nprint(2)\nprint(3)\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_SOURCE_BYTES", "10")]);
+        let (_stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("ソースの総バイト数が上限を超えました"),
+            "{mode}で cumulative source bytes 上限が適用されていない: {stderr}"
         );
     }
 }

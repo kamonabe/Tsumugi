@@ -33,7 +33,11 @@ impl Engine {
         let mut parser = Parser::new(tokens);
         let program = parser.parse()?;
 
-        Ok(CompiledScript { program })
+        Ok(CompiledScript {
+            program,
+            // root source の生 UTF-8 byte 長（REV-015 Slice 2、source accounting）。
+            source_bytes: source.len() as u64,
+        })
     }
 
     /// スクリプトを実行コンテキスト内で同期的に実行する。
@@ -46,7 +50,9 @@ impl Engine {
         script: &CompiledScript,
         context: &mut ExecutionContext,
     ) -> Result<ExecutionOutcome, TsumugiError> {
-        context.evaluator.run(&script.program)?;
+        context
+            .evaluator
+            .run(&script.program, script.source_bytes)?;
         Ok(ExecutionOutcome::Completed)
     }
 
@@ -60,7 +66,9 @@ impl Engine {
         script: &CompiledScript,
         context: &mut ExecutionContext,
     ) -> Result<ExecutionOutcome, TsumugiError> {
-        context.evaluator.run_repl_submission(&script.program)?;
+        context
+            .evaluator
+            .run_repl_submission(&script.program, script.source_bytes)?;
         Ok(ExecutionOutcome::Completed)
     }
 }
@@ -68,6 +76,8 @@ impl Engine {
 /// パース済みで、実行可能な Tsumugi スクリプト。
 pub struct CompiledScript {
     program: Program,
+    /// root source の生 UTF-8 byte 長（REV-015 Slice 2 の source accounting）。
+    source_bytes: u64,
 }
 
 /// 実行間で維持する Tsumugi の状態。

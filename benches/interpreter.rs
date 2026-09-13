@@ -39,7 +39,8 @@ fn compile(program: &Program) -> VerifiedChunk {
 
 fn execute_tree_walk(program: &Program) {
     let mut evaluator = Evaluator::new();
-    evaluator.run(program).expect("ベンチのtree実行に失敗");
+    // execute フェーズだけを測るため source accounting（REV-015 Slice 2）は 0 とする。
+    evaluator.run(program, 0).expect("ベンチのtree実行に失敗");
 }
 
 fn execute_vm(chunk: VerifiedChunk) {

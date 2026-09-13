@@ -290,6 +290,37 @@ impl BudgetConfig {
         {
             config.max_string_bytes = v;
         }
+        // source accounting（REV-015 Slice 2）の legacy 上限入口。未設定は §3.1 の既定値。
+        if let Some(v) = std::env::var("TSUMUGI_MAX_SINGLE_SOURCE_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            config.max_single_source_bytes = v;
+        }
+        if let Some(v) = std::env::var("TSUMUGI_MAX_SOURCE_COUNT")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            config.max_source_count = v;
+        }
+        if let Some(v) = std::env::var("TSUMUGI_MAX_SOURCE_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            config.max_source_bytes = v;
+        }
+        if let Some(v) = std::env::var("TSUMUGI_MAX_IMPORT_COUNT")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            config.max_import_count = v;
+        }
+        if let Some(v) = std::env::var("TSUMUGI_MAX_IMPORT_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            config.max_import_bytes = v;
+        }
         config
     }
 
@@ -950,6 +981,95 @@ impl BudgetLedger {
         self.config.max_single_string_bytes
     }
 
+    /// 読み込んだ source 1 本を課金する（§5.3 / §7、REV-015 Slice 2）。
+    ///
+    /// `byte_len` は BOM・改行を正規化しない生 UTF-8 byte 長で、hash 対象と同じ byte
+    /// 列を数える。root（実行対象スクリプト）も import module も 1 本の source として
+    /// `SourceCount += 1` / `SourceBytes += byte_len` を課金し、per-item
+    /// `SingleSourceBytes` を検査する。import module の byte は別途
+    /// [`Self::charge_import`] で `ImportCount` / `ImportBytes` にも課金する（§5.3）。
+    ///
+    /// 1 本の source を受理する前に次を 1 個の atomic reservation として扱う。
+    ///
+    /// 1. per-item `SingleSourceBytes`（§5.1 per-item）: `byte_len > max_single_source_bytes`
+    ///    なら `used = reserved = 0`、`requested = byte_len` の [`BudgetExceeded`] を返す。
+    /// 2. cumulative `SourceCount`（+1）と `SourceBytes`（+`byte_len`）を
+    ///    [`Self::reserve_all`] で予約し、成功時に確定 commit する（§5.3）。
+    ///
+    /// per-item と cumulative の複数超過は §7.2 の固定優先順位（`SingleSourceBytes` <
+    /// `SourceCount` < `SourceBytes`）で先頭 1 件を primary にする。cancel / deadline は
+    /// [`Self::reserve_all`] が charge 前に確認する。成功時は `peaks.single_source_bytes`
+    /// を `max` 更新する。同一 normalized module ID の cache hit は呼び出し側が除外し、
+    /// ここでは受理した 1 本だけを数える（§5.3）。
+    pub fn charge_source(
+        &mut self,
+        byte_len: u64,
+        phase: ExecutionPhase,
+    ) -> Result<(), ControlStop> {
+        // per-item を先に検査する（§7.2 で SingleSourceBytes が cumulative より優先）。
+        let single_limit = self.config.max_single_source_bytes;
+        if byte_len > single_limit {
+            self.check_cancel()?;
+            return Err(ControlStop::BudgetExceeded(BudgetExceeded {
+                resource: BudgetResource::SingleSourceBytes,
+                limit: single_limit,
+                used: 0,
+                reserved: 0,
+                requested: byte_len,
+                unit: BudgetUnit::Bytes,
+                phase,
+            }));
+        }
+        // cumulative を 1 個の atomic reservation として予約する。
+        let requests = [
+            CumulativeRequest {
+                resource: BudgetResource::SourceCount,
+                amount: 1,
+            },
+            CumulativeRequest {
+                resource: BudgetResource::SourceBytes,
+                amount: byte_len,
+            },
+        ];
+        self.reserve_all(&requests, phase)?;
+        self.commit(BudgetResource::SourceCount, 1, 1);
+        self.commit(BudgetResource::SourceBytes, byte_len, byte_len);
+        if byte_len > self.peaks.single_source_bytes {
+            self.peaks.single_source_bytes = byte_len;
+        }
+        Ok(())
+    }
+
+    /// 初めて解決した import module 1 本を課金する（§5.3 / §7、REV-015 Slice 2）。
+    ///
+    /// `import_count` は root を含まず、初めて解決した normalized module ID ごとに
+    /// 1 増やす。`import_bytes` は import source の生 byte 長である。したがって import
+    /// source は [`Self::charge_source`]（`source_bytes`）と本メソッド（`import_bytes`）
+    /// の両方へ意図的に課金する（§5.3）。`ImportCount`（+1）と `ImportBytes`
+    /// （+`byte_len`）を 1 個の atomic reservation として予約し、成功時に確定 commit
+    /// する。複数超過は §7.2 の固定優先順位（`ImportCount` < `ImportBytes`）で先頭 1 件
+    /// を primary にする。cancel / deadline は charge 前に確認する。
+    pub fn charge_import(
+        &mut self,
+        byte_len: u64,
+        phase: ExecutionPhase,
+    ) -> Result<(), ControlStop> {
+        let requests = [
+            CumulativeRequest {
+                resource: BudgetResource::ImportCount,
+                amount: 1,
+            },
+            CumulativeRequest {
+                resource: BudgetResource::ImportBytes,
+                amount: byte_len,
+            },
+        ];
+        self.reserve_all(&requests, phase)?;
+        self.commit(BudgetResource::ImportCount, 1, 1);
+        self.commit(BudgetResource::ImportBytes, byte_len, byte_len);
+        Ok(())
+    }
+
     /// dispatch 結果の `Value` から到達する新規 String body をすべて課金する
     /// （REV-015 Slice 2、string accounting）。
     ///
@@ -1074,6 +1194,13 @@ pub fn control_stop_to_error(
                 TsumugiError::string_allocation_limit(line, e.limit)
             }
             BudgetResource::StringBytes => TsumugiError::string_bytes_limit(line, e.limit),
+            BudgetResource::SingleSourceBytes => {
+                TsumugiError::single_source_limit(line, e.requested, e.limit)
+            }
+            BudgetResource::SourceCount => TsumugiError::source_count_limit(line, e.limit),
+            BudgetResource::SourceBytes => TsumugiError::source_bytes_limit(line, e.limit),
+            BudgetResource::ImportCount => TsumugiError::import_count_limit(line, e.limit),
+            BudgetResource::ImportBytes => TsumugiError::import_bytes_limit(line, e.limit),
             _ => TsumugiError::step_limit(line, e.limit),
         },
         ControlStop::Cancelled | ControlStop::DeadlineExceeded { .. } => {
@@ -1366,6 +1493,157 @@ mod tests {
             l.charge_string(u64::MAX, ExecutionPhase::Run),
             Err(ControlStop::Cancelled)
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // source accounting（§5.3, §15.1）
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn source_at_single_limit_succeeds_and_plus_one_exceeds() {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 0);
+        config.max_single_source_bytes = 4;
+        config.max_source_count = 1_000;
+        config.max_source_bytes = 1_000;
+        let mut l = ledger(config);
+        // ちょうど 4 byte は成功し、peak と cumulative が積まれる。
+        assert!(l.charge_source(4, ExecutionPhase::Run).is_ok());
+        assert_eq!(l.usage().peaks.single_source_bytes, 4);
+        assert_eq!(l.usage().committed.source_count, 1);
+        assert_eq!(l.usage().committed.source_bytes, 4);
+        // 5 byte は SingleSourceBytes 超過。used/reserved は 0、requested は byte 長。
+        let err = l.charge_source(5, ExecutionPhase::Run).unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::SingleSourceBytes);
+                assert_eq!(e.requested, 5);
+                assert_eq!(e.used, 0);
+                assert_eq!(e.reserved, 0);
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_bytes_accumulate_across_sources() {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 0);
+        config.max_single_source_bytes = 100;
+        config.max_source_count = 1_000;
+        config.max_source_bytes = 10;
+        let mut l = ledger(config);
+        assert!(l.charge_source(4, ExecutionPhase::Run).is_ok());
+        assert!(l.charge_source(4, ExecutionPhase::Run).is_ok());
+        assert_eq!(l.usage().committed.source_count, 2);
+        assert_eq!(l.usage().committed.source_bytes, 8);
+        // さらに 4 byte で累積 12 > 10。SourceBytes 超過。
+        let err = l.charge_source(4, ExecutionPhase::Run).unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::SourceBytes);
+                assert_eq!(e.limit, 10);
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_count_limit_is_enforced() {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 0);
+        config.max_single_source_bytes = 100;
+        config.max_source_count = 2;
+        config.max_source_bytes = 1_000;
+        let mut l = ledger(config);
+        // 空 source（0 byte）でも 1 本として数える。
+        assert!(l.charge_source(0, ExecutionPhase::Run).is_ok());
+        assert!(l.charge_source(1, ExecutionPhase::Run).is_ok());
+        assert_eq!(l.usage().committed.source_count, 2);
+        // 3 本目は SourceCount 超過。
+        let err = l.charge_source(1, ExecutionPhase::Run).unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::SourceCount);
+                assert_eq!(e.limit, 2);
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_single_and_cumulative_both_exceed_prefers_single() {
+        // single も cumulative も 0 上限 → §7.2 で SingleSourceBytes が優先。
+        let mut config = BudgetConfig::for_legacy(1_000_000, 0);
+        config.max_single_source_bytes = 0;
+        config.max_source_count = 0;
+        config.max_source_bytes = 0;
+        let mut l = ledger(config);
+        let err = l.charge_source(1, ExecutionPhase::Run).unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::SingleSourceBytes)
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_cancel_is_checked_before_charge() {
+        let token = CancellationToken::new();
+        let mut config = BudgetConfig::for_legacy(1_000_000, 0);
+        config.max_single_source_bytes = 100;
+        config.max_source_count = 100;
+        config.max_source_bytes = 100;
+        let mut l = BudgetLedger::new(config, token.clone());
+        token.cancel();
+        assert_eq!(
+            l.charge_source(1, ExecutionPhase::Run),
+            Err(ControlStop::Cancelled)
+        );
+        // per-item 超過より cancel が先。
+        assert_eq!(
+            l.charge_source(u64::MAX, ExecutionPhase::Run),
+            Err(ControlStop::Cancelled)
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // import accounting（§5.3, §15.1）
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn import_count_and_bytes_accumulate() {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 0);
+        config.max_import_count = 2;
+        config.max_import_bytes = 10;
+        let mut l = ledger(config);
+        assert!(l.charge_import(4, ExecutionPhase::Run).is_ok());
+        assert!(l.charge_import(4, ExecutionPhase::Run).is_ok());
+        assert_eq!(l.usage().committed.import_count, 2);
+        assert_eq!(l.usage().committed.import_bytes, 8);
+        // 3 本目は ImportCount 超過（count が bytes より優先）。
+        let err = l.charge_import(1, ExecutionPhase::Run).unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::ImportCount);
+                assert_eq!(e.limit, 2);
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_bytes_limit_is_enforced() {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 0);
+        config.max_import_count = 1_000;
+        config.max_import_bytes = 5;
+        let mut l = ledger(config);
+        let err = l.charge_import(6, ExecutionPhase::Run).unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::ImportBytes);
+                assert_eq!(e.limit, 5);
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
     }
 
     // -------------------------------------------------------------------------

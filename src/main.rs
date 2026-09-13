@@ -379,8 +379,16 @@ fn run_repl_vm() {
                 let loader_checkpoint = loader.clone();
                 // import は実行前に解決する（AUD-030）
                 match loader.link(&program) {
-                    Ok((linked, _)) => {
+                    Ok((linked, loaded)) => {
                         let linked_program = linked.as_ref().unwrap_or(&program);
+                        // source/import 予算を Link フェーズで課金する（REV-015 Slice 2）。
+                        // 超過なら compile も実行もせず、loader を巻き戻す。
+                        if let Err(e) = vm.charge_link(input.len() as u64, &loaded) {
+                            loader = loader_checkpoint;
+                            eprintln!("  エラー: {}", e);
+                            input.clear();
+                            continue;
+                        }
                         match compiler.compile_repl_line(linked_program) {
                             Ok(chunk) => {
                                 if let Err(e) = vm.run_repl_chunk(chunk) {
@@ -430,13 +438,16 @@ fn execute_vm_with_path(
     // import は実行前に解決する（AUD-030）
     let mut loader = ModuleLoader::new();
     loader.set_base_dir(std::path::Path::new(path));
-    let (linked, _) = loader.link(&program).map_err(|e| vec![e])?;
-    let program = linked.as_ref().unwrap_or(&program);
+    let (linked, loaded) = loader.link(&program).map_err(|e| vec![e])?;
+    let linked_program = linked.as_ref().unwrap_or(&program);
 
     let compiler = Compiler::new();
-    let chunk = compiler.compile(program).map_err(|e| vec![e])?;
+    let chunk = compiler.compile(linked_program).map_err(|e| vec![e])?;
     let mut vm = Vm::new(chunk);
     vm.set_script_args(script_args);
+    // source/import 予算を Link フェーズで課金する（REV-015 Slice 2）。
+    vm.charge_link(source.len() as u64, &loaded)
+        .map_err(|e| vec![e])?;
     vm.run().map_err(|e| vec![e])
 }
 
