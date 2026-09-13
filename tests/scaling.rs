@@ -129,7 +129,9 @@ fn retained_bytes(source: &str, use_vm: bool) -> usize {
         drop(vm);
     } else {
         let mut evaluator = Evaluator::new();
-        evaluator.run(&program).expect("ツリーウォーク実行に失敗");
+        evaluator
+            .run(&program, source.len() as u64)
+            .expect("ツリーウォーク実行に失敗");
         drop(evaluator);
     }
     LIVE.load(Ordering::Relaxed).saturating_sub(before).max(0) as usize
@@ -149,7 +151,9 @@ fn execute_bytes(source: &str, use_vm: bool) -> usize {
     } else {
         allocated_bytes(|| {
             let mut evaluator = Evaluator::new();
-            evaluator.run(&program).expect("ツリーウォーク実行に失敗");
+            evaluator
+                .run(&program, source.len() as u64)
+                .expect("ツリーウォーク実行に失敗");
         })
     }
 }

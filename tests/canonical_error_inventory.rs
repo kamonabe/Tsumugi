@@ -18,7 +18,7 @@ fn run_tree(source: &str) -> TsumugiError {
         .unwrap_or_else(|errors| panic!("パースに失敗: {errors:?}"));
     let mut evaluator = tsumugi::eval::Evaluator::new();
     evaluator
-        .run(&program)
+        .run(&program, source.len() as u64)
         .expect_err("tree: エラーになるはずのソースが成功した")
 }
 

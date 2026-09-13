@@ -2,11 +2,11 @@
 
 最終更新: 2026-09-11
 
-設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は string accounting サブスライスのみ実装済みで、heap/source/I-O accounting は未着手）
+設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は string / source / import accounting サブスライスを実装済みで、heap/I-O accounting は未着手）
 
 ## 1. 位置づけ
 
-本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleStringBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線）も実装済みである。Slice 2 の残り（heap/source/I-O accounting、string リテラル/連結/f-string 経路、context baseline 走査）と Slice 3 以降（continuation、cancel/pause、scheduler、VM parity）は未実装である。
+本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleStringBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線）と source / import accounting サブスライス（per-item `SingleSourceBytes`・cumulative `SourceCount`/`SourceBytes`・`ImportCount`/`ImportBytes` を Link フェーズで root と import へ tree/VM 共通で課金）も実装済みである。Slice 2 の残り（heap/I-O accounting、string リテラル/連結/f-string 経路、context baseline 走査）と Slice 3 以降（continuation、cancel/pause、scheduler、VM parity）は未実装である。
 
 本文書は次の既存仕様と一体で実装する。
 
@@ -719,9 +719,23 @@ run-turn queueはEngine全体でFIFO round-robinとし、continuation自体で�
   `TSUMUGI_MAX_STRING_ALLOCATIONS` / `TSUMUGI_MAX_STRING_BYTES` を追加。既定上限では
   観測挙動を変えない。string リテラル・`+` 連結・f-string 経路の課金は tree/VM で
   dispatch を経由しないため本サブスライスの範囲外（後続）。
+- source / import accounting（✅ 実装済み）: per-item `SingleSourceBytes` と cumulative
+  `SourceCount`/`SourceBytes`、`ImportCount`/`ImportBytes` を
+  `BudgetLedger::charge_source` / `charge_import` で課金する。§5.3 のとおり root を
+  `source_count` の 1 本目として数え、初めて解決した各 import module を `charge_source`
+  （`source_bytes`）と `charge_import`（`import_bytes`）の両方へ課金する。§7.2 の固定
+  優先順位（`SingleSourceBytes` < `SourceCount` < `SourceBytes`、`ImportCount` <
+  `ImportBytes`）に従い、cancel を charge 前に確認する。課金は `Link` フェーズで最初の
+  文を実行する前に行い、超過なら 1 文も実行しない。`ModuleLoader::link` が初めて解決した
+  import の生 byte 長（`LoadedModule`）を返し、tree（`Evaluator::charge_link`）と
+  VM（`Vm::charge_link`）が共通規則で課金する。root source byte 長は `CompiledScript`
+  （tree）と CLI 入口（VM）から渡す。cache hit（解決済み module ID）は数えない。
+  legacy env `TSUMUGI_MAX_SINGLE_SOURCE_BYTES` / `TSUMUGI_MAX_SOURCE_COUNT` /
+  `TSUMUGI_MAX_SOURCE_BYTES` / `TSUMUGI_MAX_IMPORT_COUNT` / `TSUMUGI_MAX_IMPORT_BYTES`
+  を追加。既定上限では観測挙動を変えない。
+- input/output/host count+bytesとreserve/commit/refundを実装（未実装）
 - `AllocationId`とper-execution ledgerを導入（未実装）
 - Value、String、List、Dict、function、AST/chunk、import、journalを論理heapへ接続（未実装）
-- source/import/input/output/host count+bytesとreserve/commit/refundを実装（未実装）
 - baseline context graphの反復走査を実装（未実装）
 
 ### Slice 3: explicit continuation

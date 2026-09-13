@@ -124,12 +124,43 @@ impl Evaluator {
         self.budget.reset_fuel();
     }
 
+    /// root source と import source を予算へ課金する（REV-015 Slice 2、§5.3）。
+    ///
+    /// `Link` フェーズの課金であり、最初の文を実行する前に行う。root（実行対象
+    /// スクリプト）を 1 本の source として `charge_source` し、初めて解決した各 import
+    /// module を `charge_source`（`source_bytes`）と `charge_import`（`import_bytes`）
+    /// の両方へ課金する。超過は catch 不能 terminal として既存 error へ写像する。
+    fn charge_link(
+        &mut self,
+        root_source_bytes: u64,
+        loaded: &[crate::module::LoadedModule],
+    ) -> Result<(), TsumugiError> {
+        self.budget
+            .charge_source(root_source_bytes, ExecutionPhase::Link)
+            .map_err(|stop| self.control_stop_to_error(stop, 0))?;
+        for module in loaded {
+            self.budget
+                .charge_source(module.byte_len, ExecutionPhase::Link)
+                .map_err(|stop| self.control_stop_to_error(stop, module.line))?;
+            self.budget
+                .charge_import(module.byte_len, ExecutionPhase::Link)
+                .map_err(|stop| self.control_stop_to_error(stop, module.line))?;
+        }
+        Ok(())
+    }
+
     /// プログラム全体を実行
     ///
     /// import は実行前にリンクして解決する（AUD-030）。読み込み・パース・サンドボックス・
     /// 深度の失敗は、最初の文を実行する前に報告される。
-    pub fn run(&mut self, program: &Program) -> Result<(), TsumugiError> {
+    pub fn run(&mut self, program: &Program, root_source_bytes: u64) -> Result<(), TsumugiError> {
         let (linked, newly_loaded) = self.loader.link(program)?;
+        // source/import 予算を Link フェーズで課金する（REV-015 Slice 2）。
+        // 超過なら 1 文も実行せず、解決済みマーカーを巻き戻す。
+        if let Err(e) = self.charge_link(root_source_bytes, &newly_loaded) {
+            self.loader.forget(&newly_loaded);
+            return Err(e);
+        }
         let target = linked.as_ref().unwrap_or(program);
         let result = self.exec_program(target);
         if result.is_err() {
@@ -148,7 +179,11 @@ impl Evaluator {
     ///
     /// link 失敗（読み込み・parse・sandbox・深度）は最初の文を実行する前に報告され、
     /// この場合 language-state は変化していないため journal は空のまま破棄される。
-    pub fn run_repl_submission(&mut self, program: &Program) -> Result<(), TsumugiError> {
+    pub fn run_repl_submission(
+        &mut self,
+        program: &Program,
+        root_source_bytes: u64,
+    ) -> Result<(), TsumugiError> {
         self.env.begin_submission();
         let (linked, newly_loaded) = match self.loader.link(program) {
             Ok(linked) => linked,
@@ -158,6 +193,13 @@ impl Evaluator {
                 return Err(e);
             }
         };
+        // source/import 予算を Link フェーズで課金する（REV-015 Slice 2）。
+        // 超過なら 1 文も実行せず、language-state も import marker も巻き戻す。
+        if let Err(e) = self.charge_link(root_source_bytes, &newly_loaded) {
+            self.env.rollback_submission();
+            self.loader.forget(&newly_loaded);
+            return Err(e);
+        }
         let target = linked.as_ref().unwrap_or(program);
         let result = self.exec_program(target);
         if result.is_err() {
@@ -854,7 +896,7 @@ mod tests {
             .parse()
             .map_err(|errors| errors.into_iter().next().unwrap())?;
         let mut eval = Evaluator::new();
-        eval.run(&program)
+        eval.run(&program, input.len() as u64)
     }
 
     #[test]

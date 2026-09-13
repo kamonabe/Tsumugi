@@ -18,6 +18,20 @@ fn import_error(line: usize, message: impl Into<String>) -> TsumugiError {
     TsumugiError::runtime_with_kind(line, ErrorKind::Import, message)
 }
 
+/// リンク中に初めて解決した import モジュール 1 本の記録。
+///
+/// 実行が完了しなかった入力を巻き戻す（[`ModuleLoader::forget`]）ためのパスに加えて、
+/// source/import 予算（REV-015 Slice 2）の課金に使う生 byte 長と、診断行番号を持つ。
+#[derive(Debug, Clone)]
+pub struct LoadedModule {
+    /// 正規化した import 先パス（`forget` で未解決へ戻す対象）。
+    pub path: PathBuf,
+    /// import source の生 UTF-8 byte 長（`source_bytes` / `import_bytes` の課金量）。
+    pub byte_len: u64,
+    /// import 文の行番号（予算超過エラーの行表示に使う）。
+    pub line: usize,
+}
+
 /// import の解決状態を保持するローダー
 ///
 /// 解決済みモジュールの集合はセッション内で保持する。REPLでは入力をまたいで同じ
@@ -53,9 +67,9 @@ impl ModuleLoader {
     ///
     /// リンクは成功したが実行が完了しなかったモジュールを、未解決へ戻すために使う。
     /// これで同じパスを再度 import できる（AUD-006）。
-    pub fn forget(&mut self, paths: &[PathBuf]) {
-        for path in paths {
-            self.loaded.remove(path);
+    pub fn forget(&mut self, modules: &[LoadedModule]) {
+        for module in modules {
+            self.loaded.remove(&module.path);
         }
     }
 
@@ -66,7 +80,7 @@ impl ModuleLoader {
     pub fn link(
         &mut self,
         program: &Program,
-    ) -> Result<(Option<Program>, Vec<PathBuf>), TsumugiError> {
+    ) -> Result<(Option<Program>, Vec<LoadedModule>), TsumugiError> {
         if !program
             .iter()
             .any(|stmt| matches!(stmt, Stmt::Import { .. }))
@@ -94,7 +108,7 @@ impl ModuleLoader {
         base_dir: &Path,
         depth: usize,
         out: &mut Vec<Stmt>,
-        newly_loaded: &mut Vec<PathBuf>,
+        newly_loaded: &mut Vec<LoadedModule>,
     ) -> Result<(), TsumugiError> {
         for stmt in program {
             let Stmt::Import { path, line } = stmt else {
@@ -107,7 +121,12 @@ impl ModuleLoader {
                 continue;
             };
             self.loaded.insert(canonical.clone());
-            newly_loaded.push(canonical.clone());
+            // source/import 予算（REV-015 Slice 2）の課金は生 byte 長で行う。
+            newly_loaded.push(LoadedModule {
+                path: canonical.clone(),
+                byte_len: source.len() as u64,
+                line: *line,
+            });
 
             let module = parse_module(&source, path, *line)?;
             let module_dir = canonical
