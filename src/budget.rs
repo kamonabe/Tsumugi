@@ -26,7 +26,8 @@
 //! - budget 超過は script の `try` / `catch` から捕捉できない。本モジュールは
 //!   [`ControlStop`] を返すだけで、engine 側が catch 不能な terminal として扱う。
 
-use std::rc::Rc;
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -769,6 +770,24 @@ impl AllocationLedger {
 }
 
 // =============================================================================
+// 共有 heap 台帳ハンドル（per-drop release 用、REV-015 案A PR-a）
+// =============================================================================
+
+/// [`AllocationLedger`] への強参照ハンドル。
+///
+/// `BudgetLedger` が 1 本保持し、`Tracked` collection には [`HeapLedgerWeak`] を配る。
+/// per-drop release は tracked collection の `Drop` から `Weak::upgrade` して
+/// `release` を呼ぶため、台帳を単一 owner の field から `Rc<RefCell<>>` の共有へ移す。
+pub type HeapLedger = Rc<RefCell<AllocationLedger>>;
+
+/// [`AllocationLedger`] への弱参照。tracked collection が保持する。
+///
+/// `Weak` にすることで (1) tracked value が engine（＝台帳）より長生きしても台帳を
+/// 生かし続けず、(2) 台帳 → value → 台帳 の循環を作らない。engine drop 後の遅延
+/// release は `upgrade` が `None` を返し no-op になる（その時点で live 集計は不要）。
+pub type HeapLedgerWeak = Weak<RefCell<AllocationLedger>>;
+
+// =============================================================================
 // 課金台帳（BudgetLedger）
 // =============================================================================
 
@@ -791,14 +810,19 @@ pub struct BudgetLedger {
     peaks: BudgetPeaks,
     cancellation: CancellationToken,
     /// live heap accounting（§5.2、REV-015 Slice 2）。
-    heap: AllocationLedger,
+    ///
+    /// per-drop release（案A）のため `Rc<RefCell<>>` 共有ハンドルにする。tracked
+    /// collection へ [`HeapLedgerWeak`] を配り、その `Drop` から release させる。
+    heap: HeapLedger,
 }
 
 impl BudgetLedger {
     /// config と cancellation token から台帳を作る。
     pub fn new(config: BudgetConfig, cancellation: CancellationToken) -> Self {
         Self {
-            heap: AllocationLedger::new(config.max_live_heap_bytes),
+            heap: Rc::new(RefCell::new(AllocationLedger::new(
+                config.max_live_heap_bytes,
+            ))),
             config,
             committed: BudgetCounters::default(),
             reserved: BudgetCounters::default(),
@@ -817,11 +841,11 @@ impl BudgetLedger {
         BudgetUsage {
             committed: self.committed,
             reserved: self.reserved,
-            live_heap_bytes: self.heap.live_bytes(),
+            live_heap_bytes: self.heap.borrow().live_bytes(),
             // reserved_heap は per-drop release 導入（後続 PR）まで常に 0。本 PR の
             // heap 課金は生成時に live へ直接 commit する方式で reserve を保持しない。
             reserved_heap_bytes: 0,
-            peak_heap_bytes: self.heap.peak_bytes(),
+            peak_heap_bytes: self.heap.borrow().peak_bytes(),
             peaks: self.peaks,
         }
     }
@@ -1342,6 +1366,65 @@ impl BudgetLedger {
         Ok(())
     }
 
+    /// 生成・変更された `Value` を走査し、untracked な collection backing を tracked へ
+    /// 変換しつつ heap 課金する（REV-015 案A、per-drop release）。
+    ///
+    /// `builtin_core` は heap 台帳を持たないため collection を untracked
+    /// （`Tracked::constant`、`AllocationId(0)`）で生成する。engine 側は builtin dispatch
+    /// や push/pop/index 代入の直後にこの pass を通し、untracked backing を（子要素を
+    /// 先に処理してから）tracked backing へ包み直して §5.1 の body サイズを課金する。
+    /// 既に tracked（`id != 0`）な backing は再課金せず据え置く（共有・再利用の二重課金
+    /// 防止、§5.2）。String body の課金も併せて行い、[`Self::charge_result_strings`] の
+    /// 役割を包含する。
+    ///
+    /// 値を所有権ごと受け取り、tracked 化した値を返す。上限超過・overflow は
+    /// `ControlStop`（catch 不能 terminal）。深い構造でも再帰は最小限（child を処理して
+    /// から親を包む後順走査）に留める。
+    pub fn track_result(
+        &mut self,
+        value: crate::value::Value,
+        phase: ExecutionPhase,
+    ) -> Result<crate::value::Value, ControlStop> {
+        use crate::value::Value;
+        match value {
+            Value::Str(s) => {
+                // 新規 String body を課金する（string accounting）。
+                self.charge_string(s.len() as u64, phase)?;
+                Ok(Value::Str(s))
+            }
+            Value::List(list) => {
+                if list.alloc_id().0 != 0 {
+                    // 既に tracked。子は生成時に処理済みなので据え置く。
+                    return Ok(Value::List(list));
+                }
+                // untracked。子を先に track し、その後 backing を tracked で包む。
+                // untracked backing の Drop は no-op なので clone で中身を取り出してよい。
+                let data: Vec<Value> = list.clone_data();
+                drop(list);
+                let mut tracked_items = Vec::with_capacity(data.len());
+                for item in data {
+                    tracked_items.push(self.track_result(item, phase)?);
+                }
+                Value::new_list(tracked_items, self, phase)
+            }
+            Value::Dict(dict) => {
+                if dict.alloc_id().0 != 0 {
+                    return Ok(Value::Dict(dict));
+                }
+                let data: std::collections::BTreeMap<String, Value> = dict.clone_data();
+                drop(dict);
+                let mut tracked_map = std::collections::BTreeMap::new();
+                for (k, item) in data {
+                    tracked_map.insert(k, self.track_result(item, phase)?);
+                }
+                Value::new_dict(tracked_map, self, phase)
+            }
+            // scalar / Fn / VmFn / Error は collection backing を持たない。
+            // Fn/VmFn/Error の内部 String は既存 body の写像で本 PR の対象外。
+            other => Ok(other),
+        }
+    }
+
     /// fuel の committed / reserved を 0 に戻す（REPL 入力ごとの予算リセット）。
     ///
     /// 各 REPL 入力で fuel 予算を全額使えるようにするための Slice 1 互換操作。
@@ -1372,11 +1455,25 @@ impl BudgetLedger {
     // heap accounting（§5.2、REV-015 Slice 2）
     // -------------------------------------------------------------------------
 
+    /// tracked collection へ配る heap 台帳への弱参照（案A PR-a）。
+    ///
+    /// `Tracked` collection はこの [`HeapLedgerWeak`] を保持し、`Drop` で `upgrade`
+    /// して `release` を呼ぶ。engine（＝台帳の強参照 owner）が drop 済みなら upgrade は
+    /// `None` になり release は no-op（その時点で live 集計は不要）。
+    pub fn heap_handle(&self) -> HeapLedgerWeak {
+        Rc::downgrade(&self.heap)
+    }
+
+    /// heap 台帳を borrow して 1 回課金する内部ヘルパ（baseline 走査などで使う）。
+    fn heap_charge_raw(&self, bytes: u64, phase: ExecutionPhase) -> Result<(), ControlStop> {
+        self.heap.borrow_mut().charge(bytes, phase)
+    }
+
     /// 新しい [`AllocationId`] を 1 個発番する（§5.2）。
     ///
     /// overflow は [`ControlStop::InternalFailure`]（`AllocationIdExhausted`）。
     pub fn allocate_heap_id(&mut self) -> Result<AllocationId, ControlStop> {
-        self.heap.allocate_id()
+        self.heap.borrow_mut().allocate_id()
     }
 
     /// 新規 heap object 1 個の論理サイズ `bytes` を live heap へ課金する（§5.2）。
@@ -1386,31 +1483,31 @@ impl BudgetLedger {
     pub fn charge_heap(&mut self, bytes: u64, phase: ExecutionPhase) -> Result<(), ControlStop> {
         self.check_cancel()?;
         self.check_deadline()?;
-        self.heap.charge(bytes, phase)
+        self.heap.borrow_mut().charge(bytes, phase)
     }
 
     /// object の最後の execution 内参照が消えたときに live heap を戻す（§5.2 / §7-6）。
     ///
     /// cumulative counter は減らさない。二重 release でも 0 未満へ回らない。
     pub fn release_heap(&mut self, bytes: u64) {
-        self.heap.release(bytes);
+        self.heap.borrow_mut().release(bytes);
     }
 
     /// 現在の live heap byte 数（REPL rollback の snapshot 用）。
     pub fn live_heap_bytes(&self) -> u64 {
-        self.heap.live_bytes()
+        self.heap.borrow().live_bytes()
     }
 
     /// live heap byte 数を指定値へ復元する（REPL 未捕捉エラー時の rollback 用）。
     /// peak は据え置く。
     pub fn restore_live_heap_bytes(&mut self, live_heap_bytes: u64) {
-        self.heap.restore_live_bytes(live_heap_bytes);
+        self.heap.borrow_mut().restore_live_bytes(live_heap_bytes);
     }
 
     /// live heap 上限を再設定する。
     pub fn set_max_live_heap_bytes(&mut self, limit: u64) {
         self.config.max_live_heap_bytes = limit;
-        self.heap.set_limit(limit);
+        self.heap.borrow_mut().set_limit(limit);
     }
 
     /// `ExecutionContext` に既存の変数・closure・collection を、新 execution の
@@ -1453,19 +1550,17 @@ impl BudgetLedger {
 
         while let Some(v) = worklist.pop() {
             // この Value slot 自体を課金する（§5.1 Value slot = 32）。
-            self.heap.charge(heap_size::VALUE_SLOT, phase)?;
+            self.heap_charge_raw(heap_size::VALUE_SLOT, phase)?;
             match v {
                 Value::Str(s) => {
-                    self.heap
-                        .charge(heap_size::string_body(s.len() as u64), phase)?;
+                    self.heap_charge_raw(heap_size::string_body(s.len() as u64), phase)?;
                 }
                 Value::List(items) => {
                     let ptr = Rc::as_ptr(&items) as usize;
                     if !visited.insert(ptr) {
                         continue;
                     }
-                    self.heap
-                        .charge(heap_size::list_body(items.len() as u64), phase)?;
+                    self.heap_charge_raw(heap_size::list_body(items.len() as u64), phase)?;
                     for item in items.iter() {
                         worklist.push(item.clone());
                     }
@@ -1479,7 +1574,7 @@ impl BudgetLedger {
                         .keys()
                         .map(|k| k.len() as u64)
                         .fold(0u64, u64::saturating_add);
-                    self.heap.charge(
+                    self.heap_charge_raw(
                         heap_size::dict_body(map.len() as u64, key_bytes_total),
                         phase,
                     )?;
@@ -1493,13 +1588,12 @@ impl BudgetLedger {
                         continue;
                     }
                     // tree function instance（64 + 16 × captured cell 数、§5.1）。
-                    self.heap
-                        .charge(heap_size::tree_function(captured.len() as u64), phase)?;
+                    self.heap_charge_raw(heap_size::tree_function(captured.len() as u64), phase)?;
                     // captured cell 1 個ずつ（§5.1 captured cell = 32）と、その中身を辿る。
                     for cell in captured.values() {
                         let cell_ptr = Rc::as_ptr(cell) as usize;
                         if visited.insert(cell_ptr) {
-                            self.heap.charge(heap_size::CAPTURED_CELL, phase)?;
+                            self.heap_charge_raw(heap_size::CAPTURED_CELL, phase)?;
                             worklist.push(cell.borrow().clone());
                         }
                     }
@@ -1507,20 +1601,18 @@ impl BudgetLedger {
                 Value::VmFn { upvalues, .. } => {
                     // VM function instance（48 + 16 × upvalue 数、§5.1）。VmFn 自体は Rc
                     // 共有されないため body ごとに課金する。
-                    self.heap
-                        .charge(heap_size::vm_function(upvalues.len() as u64), phase)?;
+                    self.heap_charge_raw(heap_size::vm_function(upvalues.len() as u64), phase)?;
                     for cell in upvalues.iter() {
                         let cell_ptr = Rc::as_ptr(cell) as usize;
                         if visited.insert(cell_ptr) {
-                            self.heap.charge(heap_size::CAPTURED_CELL, phase)?;
+                            self.heap_charge_raw(heap_size::CAPTURED_CELL, phase)?;
                             worklist.push(cell.borrow().clone());
                         }
                     }
                 }
                 Value::Error { message, .. } => {
                     // Error の message を live な String body として 1 個数える（§5.1）。
-                    self.heap
-                        .charge(heap_size::string_body(message.len() as u64), phase)?;
+                    self.heap_charge_raw(heap_size::string_body(message.len() as u64), phase)?;
                 }
                 // Int / Float / Bool / Null は Value slot だけで、追加 payload なし。
                 _ => {}
@@ -2402,7 +2494,7 @@ mod tests {
 
     // ---- context baseline 走査（§5.2 / §15.2） ----
 
-    use crate::value::{FunctionId, Value};
+    use crate::value::{FunctionId, Tracked, Value};
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::rc::Rc as StdRc;
@@ -2437,7 +2529,7 @@ mod tests {
     #[test]
     fn baseline_charges_list_and_elements() {
         let mut l = heap_ledger(10_000);
-        let list = Value::List(StdRc::new(vec![Value::Int(1), Value::Int(2)]));
+        let list = Value::List(Tracked::constant(vec![Value::Int(1), Value::Int(2)]));
         l.charge_context_baseline([list], ExecutionPhase::Link)
             .unwrap();
         // list Value slot 32 + list body(24 + 32*2) + 各要素 Value slot 32*2。
@@ -2451,7 +2543,7 @@ mod tests {
         let mut map = BTreeMap::new();
         map.insert("ab".to_string(), Value::Int(1));
         map.insert("cde".to_string(), Value::Int(2));
-        let dict = Value::Dict(StdRc::new(map));
+        let dict = Value::Dict(Tracked::constant(map));
         l.charge_context_baseline([dict], ExecutionPhase::Link)
             .unwrap();
         // dict Value slot 32 + dict body(24 + 64*2 + key bytes(2+3)) + 各値 Value slot 32*2。
@@ -2464,7 +2556,7 @@ mod tests {
     fn baseline_shared_rc_charged_once() {
         // 同じ List backing を 2 つの root から指しても 1 回だけ課金する（§5.2 visited）。
         let mut l_shared = heap_ledger(100_000);
-        let shared = StdRc::new(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        let shared = Tracked::constant(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
         let a = Value::List(StdRc::clone(&shared));
         let b = Value::List(StdRc::clone(&shared));
         l_shared
@@ -2473,12 +2565,12 @@ mod tests {
 
         // 別 backing の等価な 2 List だと body と要素が 2 回課金される。
         let mut l_distinct = heap_ledger(100_000);
-        let c = Value::List(StdRc::new(vec![
+        let c = Value::List(Tracked::constant(vec![
             Value::Int(1),
             Value::Int(2),
             Value::Int(3),
         ]));
-        let d = Value::List(StdRc::new(vec![
+        let d = Value::List(Tracked::constant(vec![
             Value::Int(1),
             Value::Int(2),
             Value::Int(3),
@@ -2535,5 +2627,58 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // ---- track_result: untracked collection の tracked 化と課金（REV-015 案A）----
+
+    #[test]
+    fn track_result_charges_untracked_collection_once_and_releases_on_drop() {
+        let mut l = heap_ledger(1_000_000);
+        // untracked（Tracked::constant）な List を dispatch 境界で tracked 化する。
+        let untracked = Value::List(Tracked::constant(vec![Value::Int(1), Value::Int(2)]));
+        assert_eq!(l.usage().live_heap_bytes, 0);
+        let tracked = l.track_result(untracked, ExecutionPhase::Run).unwrap();
+        // list body(2) が 1 回だけ課金される。
+        assert_eq!(l.usage().live_heap_bytes, heap_size::list_body(2));
+        drop(tracked);
+        // per-drop release で 0 へ戻る。
+        assert_eq!(l.usage().live_heap_bytes, 0);
+    }
+
+    #[test]
+    fn track_result_leaves_already_tracked_collection_uncharged_again() {
+        let mut l = heap_ledger(1_000_000);
+        // 既に tracked な List（new_list 経由）。
+        let tracked = Value::new_list(vec![Value::Int(1)], &mut l, ExecutionPhase::Run).unwrap();
+        let before = l.usage().live_heap_bytes;
+        assert_eq!(before, heap_size::list_body(1));
+        // track_result は tracked（id != 0）を再課金しない。
+        let again = l.track_result(tracked, ExecutionPhase::Run).unwrap();
+        assert_eq!(l.usage().live_heap_bytes, before);
+        drop(again);
+        assert_eq!(l.usage().live_heap_bytes, 0);
+    }
+
+    #[test]
+    fn track_result_charges_nested_untracked_collections() {
+        let mut l = heap_ledger(1_000_000);
+        // untracked な外側 List に untracked な内側 List を格納。
+        let inner = Value::List(Tracked::constant(vec![Value::Int(1)]));
+        let outer = Value::List(Tracked::constant(vec![inner]));
+        let tracked = l.track_result(outer, ExecutionPhase::Run).unwrap();
+        // 外側 body(1) + 内側 body(1) の両方が課金される。
+        assert_eq!(l.usage().live_heap_bytes, heap_size::list_body(1) * 2);
+        drop(tracked);
+        assert_eq!(l.usage().live_heap_bytes, 0);
+    }
+
+    #[test]
+    fn track_result_charges_strings_like_before() {
+        let mut l = heap_ledger(1_000_000);
+        // track_result は string accounting も包含する（charge_result_strings 相当）。
+        let v = Value::Str("hello".to_string());
+        l.track_result(v, ExecutionPhase::Run).unwrap();
+        assert_eq!(l.usage().committed.string_allocations, 1);
+        assert_eq!(l.usage().committed.string_bytes, 5);
     }
 }

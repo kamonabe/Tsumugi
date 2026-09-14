@@ -5,11 +5,11 @@
 //! 残りは builtin_core モジュールに委譲する。
 
 use crate::ast::Expr;
+use crate::budget::ExecutionPhase;
 use crate::error::TsumugiError;
 use crate::value::Value;
 
 use std::io::{self, BufRead};
-use std::rc::Rc;
 
 use super::Evaluator;
 
@@ -156,13 +156,18 @@ impl Evaluator {
                 }
                 let max_collection = self.budget.max_collection_elements();
                 let result = crate::builtin_core::dispatch(name, &evaluated, max_collection, line)?;
-                if let Some(value) = &result {
-                    // builtin が新規生成した String body を課金する（REV-015 Slice 2）。
-                    self.budget
-                        .charge_result_strings(value, crate::budget::ExecutionPhase::Run)
-                        .map_err(|stop| self.control_stop_to_error(stop, line))?;
+                match result {
+                    Some(value) => {
+                        // builtin が生成した untracked collection を tracked 化しつつ heap
+                        // 課金し、新規 String body も課金する（REV-015 案A / Slice 2）。
+                        let tracked = self
+                            .budget
+                            .track_result(value, ExecutionPhase::Run)
+                            .map_err(|stop| self.control_stop_to_error(stop, line))?;
+                        Ok(Some(tracked))
+                    }
+                    None => Ok(None),
                 }
-                Ok(result)
             }
 
             _ => Ok(None),
@@ -220,7 +225,9 @@ impl Evaluator {
                     .map(|arg| Value::Str(arg.clone()))
                     .collect();
                 self.check_collection(argv.len(), line)?;
-                Ok(Some(Value::List(Rc::new(argv))))
+                let listed = Value::new_list(argv, &mut self.budget, ExecutionPhase::Run)
+                    .map_err(|stop| self.control_stop_to_error(stop, line))?;
+                Ok(Some(listed))
             }
             "exit" => {
                 if args.len() > 1 {
@@ -268,18 +275,22 @@ impl Evaluator {
                     .get_cell(var_name)
                     .ok_or_else(|| TsumugiError::undefined_name(line, var_name))?;
 
-                // 第1引数を先にsnapshotし、第2引数の評価後に同じbindingへ書き戻す。
-                let target_value = cell.borrow().clone();
+                // 第2引数を評価してから、同じbindingへin-placeで push する。
                 let value = self.eval_expr(&args[1], line)?;
-                let max_collection = self.budget.max_collection_elements();
-                let updated = crate::builtin_core::builtin_push(
-                    &[target_value, value],
-                    max_collection,
-                    line,
-                )?;
+                // 型・上限を検査する（値は借用せず長さだけ見る）。
+                {
+                    let target = cell.borrow();
+                    let Value::List(v) = &*target else {
+                        return Err(TsumugiError::builtin_arg_type(
+                            line, "push", 1, "List", &target,
+                        ));
+                    };
+                    self.check_collection(v.len().saturating_add(1), line)?;
+                }
                 // 書き戻し前に元値を記録する（AUD-024）。
                 self.env.journal_cell(&cell);
-                *cell.borrow_mut() = updated;
+                // tracked backing へ delta 課金付きで push する（REV-015 案A）。
+                self.budget_list_push(&cell, value, line)?;
                 Ok(Some(Value::Null))
             }
             "pop" => {
@@ -290,14 +301,24 @@ impl Evaluator {
                     .env
                     .get_cell(var_name)
                     .ok_or_else(|| TsumugiError::undefined_name(line, var_name))?;
-                let target_value = cell.borrow().clone();
-                let value =
-                    crate::builtin_core::builtin_pop(std::slice::from_ref(&target_value), line)?;
-                let updated = crate::builtin_core::builtin_pop_update(&[target_value], line)?;
+                // 末尾要素を取り出す（型検査と空チェックを含む）。
+                let popped = {
+                    let target = cell.borrow();
+                    let Value::List(v) = &*target else {
+                        return Err(TsumugiError::builtin_arg_type(
+                            line, "pop", 1, "List", &target,
+                        ));
+                    };
+                    match v.last() {
+                        Some(last) => last.clone(),
+                        None => return Err(TsumugiError::pop_empty_list(line)),
+                    }
+                };
                 // 書き戻し前に元値を記録する（AUD-024）。
                 self.env.journal_cell(&cell);
-                *cell.borrow_mut() = updated;
-                Ok(Some(value))
+                // tracked backing から delta release 付きで末尾を除く（REV-015 案A）。
+                self.budget_list_pop(&cell, line)?;
+                Ok(Some(popped))
             }
             "map" => {
                 let list_value = self.eval_expr(&args[0], line)?;
@@ -316,7 +337,9 @@ impl Evaluator {
                     self.check_collection(result.len().saturating_add(1), line)?;
                     result.push(val);
                 }
-                Ok(Some(Value::List(Rc::new(result))))
+                let listed = Value::new_list(result, &mut self.budget, ExecutionPhase::Run)
+                    .map_err(|stop| self.control_stop_to_error(stop, line))?;
+                Ok(Some(listed))
             }
             "filter" => {
                 let list_value = self.eval_expr(&args[0], line)?;
@@ -337,7 +360,9 @@ impl Evaluator {
                         result.push(item);
                     }
                 }
-                Ok(Some(Value::List(Rc::new(result))))
+                let listed = Value::new_list(result, &mut self.budget, ExecutionPhase::Run)
+                    .map_err(|stop| self.control_stop_to_error(stop, line))?;
+                Ok(Some(listed))
             }
             "each" => {
                 let list_value = self.eval_expr(&args[0], line)?;

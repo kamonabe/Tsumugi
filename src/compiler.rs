@@ -707,8 +707,10 @@ impl Compiler {
                 self.compile_user_call(callee, args, line)?;
             }
             Expr::List(elements) => {
-                self.chunk
-                    .emit_constant(Value::List(Rc::new(Vec::new())), line);
+                self.chunk.emit_constant(
+                    Value::List(crate::value::Tracked::constant(Vec::new())),
+                    line,
+                );
                 for elem in elements {
                     self.compile_expr(elem, line)?;
                     self.chunk.emit(OpCode::ListPush, line);
@@ -716,7 +718,9 @@ impl Compiler {
             }
             Expr::Dict(pairs) => {
                 self.chunk.emit_constant(
-                    Value::Dict(Rc::new(std::collections::BTreeMap::new())),
+                    Value::Dict(crate::value::Tracked::constant(
+                        std::collections::BTreeMap::new(),
+                    )),
                     line,
                 );
                 for (key, val) in pairs {
@@ -795,6 +799,15 @@ impl Compiler {
 
         // push/pop は第一引数のリストを破壊的に変更する
         // → 実行後に元の変数スロットを更新する
+        //
+        // REV-015 案A（heap accounting）の注記: この lowering は `CallBuiltin` が
+        // 新しい List を返し（builtin_core は full-clone で untracked backing を作る）、
+        // dispatch 境界の `track_result` が list_body(N±1) を丸ごと課金する。tree engine の
+        // in-place delta 課金（`list_push_tracked`）と異なり、VM では push のたびに新旧
+        // backing が一瞬同時に live になり peak_heap がスパイクする。既定上限では観測挙動は
+        // 変わらないが、configured 上限では tree と VM で live/peak が食い違う。charge trace
+        // の tree/VM 完全一致は第14節 Slice 6（VM charge parity、VM が experimental の間）で
+        // 解消する。本 PR ではこの差異を既知の VM experimental 差として許容する。
         if (name == "push" || name == "pop")
             && !args.is_empty()
             && let Expr::Ident(var_name) = &args[0]

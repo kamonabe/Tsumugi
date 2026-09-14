@@ -2,11 +2,11 @@
 
 最終更新: 2026-09-11
 
-設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は string / source / import accounting と heap accounting 基盤（`AllocationLedger`・§5.1 論理サイズ・§5.2 context baseline 走査）を実装済みで、heap の per-drop release（実行中の per-allocation 課金と最後の参照 drop での release）と I-O accounting は未着手）
+設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は string / source / import accounting、heap accounting 基盤（`AllocationLedger`・§5.1 論理サイズ）、および collection（`List`/`Dict`）の per-drop release（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、tree/VM 両対応）を実装済み。残りは cell / 関数 instance / String / AST / chunk / journal の per-drop 追跡と I-O accounting。VM の push/pop は full-clone 経路のため configured 上限で tree と live/peak が食い違い得るが、charge trace の tree/VM 完全一致は第14節 Slice 6（VM が experimental の間）で解消する）
 
 ## 1. 位置づけ
 
-本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleSourceBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線）と source / import accounting サブスライス（per-item `SingleSourceBytes`・cumulative `SourceCount`/`SourceBytes`・`ImportCount`/`ImportBytes` を Link フェーズで root と import へ tree/VM 共通で課金）、および heap accounting 基盤サブスライス（`AllocationId`・`AllocationLedger`・§5.1 論理サイズ関数・`HeapBytes` reserve/超過写像・§5.2 context baseline 走査を Link フェーズで tree/VM 共通に課金）も実装済みである。Slice 2 の残り（heap の per-drop release と実行中の per-allocation 課金、I-O accounting、string リテラル/連結/f-string 経路）と Slice 3 以降（continuation、cancel/pause、scheduler、VM parity）は未実装である。
+本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleSourceBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線）と source / import accounting サブスライス（per-item `SingleSourceBytes`・cumulative `SourceCount`/`SourceBytes`・`ImportCount`/`ImportBytes` を Link フェーズで root と import へ tree/VM 共通で課金）、heap accounting 基盤サブスライス（`AllocationId`・`AllocationLedger`・§5.1 論理サイズ関数・`HeapBytes` reserve/超過写像）、および collection（`List`/`Dict`）の per-drop release サブスライス（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、COW は delta 課金、tree/VM 両対応）も実装済みである。Slice 2 の残り（cell / 関数 instance / String / AST / chunk / journal の per-drop 追跡、I-O accounting、string リテラル/連結/f-string 経路、非 collection の baseline 再導入）と Slice 3 以降（continuation、cancel/pause、scheduler、VM charge parity）は未実装である。
 
 本文書は次の既存仕様と一体で実装する。
 
@@ -742,21 +742,35 @@ run-turn queueはEngine全体でFIFO round-robinとし、continuation自体で�
   live heap を checked add / saturating sub で管理する。上限超過・overflow は §7.2 の
   固定優先順位（`HeapBytes` は Fuel の次）で `BudgetExceeded(HeapBytes)`、`AllocationId`
   の発行 overflow は 0 へ wrap せず `ControlStop::InternalFailure(AllocationIdExhausted)`
-  にする。`usage()` が `live_heap_bytes` / `peak_heap_bytes` を反映する。§5.2 の context
-  baseline 走査を `charge_context_baseline` に実装し、`Link` フェーズで最初の文を実行する
-  前に、既存 context（tree は全 scope の変数 cell、VM は value stack と top-level cell）
-  から到達する heap graph を反復 worklist + `Rc` pointer visited set で走査して live heap
-  へ課金する。baseline が上限を超えれば 1 文も実行せず `BudgetExceeded(HeapBytes)`。tree
-  （`Evaluator::charge_link`）と VM（`Vm::charge_link`）が共通規則で課金し、走査前に live
-  heap を 0 へ戻して REPL 入力間の二重計上を避ける。legacy env
-  `TSUMUGI_MAX_LIVE_HEAP_BYTES` を追加。既定上限では観測挙動を変えない。
-- heap の per-drop release（未実装、後続 PR）: 実行中の per-allocation 課金と、object への
-  最後の execution 内参照が drop した時点での live heap release は、`Value`（`List`/`Dict`/
-  cell）へ `AllocationId` を持たせる忠実版として後続 PR で実装する。本 PR の基盤（ledger・
-  論理サイズ・baseline）を土台に、`charge_heap`/`release_heap`/`allocate_heap_id` を各
-  allocation/drop site へ配線する。それまで live heap は baseline 確定後 submission 内で
-  一定に保つ。
-- Value、String、List、Dict、function、AST/chunk、import、journalを実行中の論理heapへ接続（未実装、上記 per-drop release と同 PR）
+  にする。`usage()` が `live_heap_bytes` / `peak_heap_bytes` を反映する。legacy env
+  `TSUMUGI_MAX_LIVE_HEAP_BYTES` を追加。§5.2 の context baseline 走査
+  （`charge_context_baseline`、反復 worklist + `Rc` pointer visited set）は純関数として
+  実装・単体テスト済みだが、collection の per-drop release 導入（下記）に伴い engine の
+  `charge_link` からは呼ばない（tracked collection を二重計上するため）。非 collection の
+  pre-existing context 状態（String / 関数 instance / cell）を baseline 課金する配線は、
+  それらを per-drop 化する後続 PR で再導入する。
+- collection（`List`/`Dict`）の per-drop release（✅ 実装済み、REV-015 案A PR-a）:
+  `Value::List`/`Dict` の backing を `Rc<Tracked<T>>` にした。`Tracked<T>` は
+  `AllocationId`・論理サイズ・heap 台帳への `Weak` を持ち、生成（`Value::new_list` /
+  `new_dict`、`Tracked::new`）で §5.1 の body サイズを課金し、この backing を指す最後の
+  `Rc` が drop した瞬間に `Drop` で release する（§5.2）。`Rc::clone`（共有）は無課金。
+  COW mutation（index 代入・push/pop）は `detach`＋`retrack` で、単独所有なら in-place・
+  共有なら新 `AllocationId` を発番して複製し、要素数変化ぶんの delta だけ課金/release する。
+  compile 時の空リテラル定数は untracked（`Tracked::constant`）で、最初の mutation か
+  dispatch 境界の `track_result` で tracked へ昇格する。builtin_core が返す collection は
+  untracked で作られ、engine（tree=`builtin.rs`, VM=`vm.rs`）の dispatch 境界 `track_result`
+  が tracked へ変換して課金する。tree/VM 両対応。未捕捉エラーの AUD-024 rollback では、
+  巻き戻しで drop される tracked collection が `Drop` で自動 release される。既定上限では
+  観測挙動を変えない。
+  - 既知の tree/VM 差（第14節 Slice 6 で解消）: VM の `push`/`pop` は `CallBuiltin` +
+    書き戻しで backing を full-clone してから `track_result` で丸ごと課金するため、tree の
+    in-place delta 課金と異なり push のたびに peak_heap がスパイクする。VM の空リテラル
+    `x=[]` は untracked 定数のまま変数へ渡り、最初の mutation まで body 24 byte を課金
+    しない。いずれも既定上限では観測に影響しないが、configured 上限では tree と live/peak
+    が食い違い得る。VM が experimental の間の既知差として許容する。
+- 未実装（後続 PR）: cell（`SharedValue`）・tree/VM 関数 instance・String body・AST/chunk・
+  import record・rollback journal の per-drop 追跡。これらは per-drop 化に加えて、上で
+  外した baseline 課金（非 collection の pre-existing 状態）の再導入も担う。
 
 ### Slice 3: explicit continuation
 
