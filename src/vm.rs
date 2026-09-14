@@ -183,40 +183,6 @@ impl Vm {
         self.frames.len().saturating_sub(1)
     }
 
-    /// heap baseline 走査の root を集める（REV-015 Slice 2、§5.2 context baseline）。
-    ///
-    /// VM の execution 跨ぎ state は value stack と top-level frame の `locals_cells`
-    /// （top-level 変数の cell 化済み値）である。両者が保持する `Value` を root として
-    /// 返す。
-    ///
-    /// top-level 変数が closure capture 等で cell 化されると、`ensure_local_cell` は
-    /// stack slot の値を新しい cell へ clone するが stack slot は stale なまま残す
-    /// （cell が source of truth）。top-level frame は `base == 0` なので slot `i` は
-    /// stack index `i` に対応する。cell がある slot の stale な stack 値を root へ含める
-    /// と 1 変数を二重計上し、全変数を 1 回だけ数える tree engine（`Env::baseline_roots`）
-    /// と baseline 量が食い違う。よって cell 化済み slot の stack 値は除外し、cell 側だけ
-    /// を root にする。List / Dict / 関数値は `Rc` 共有なので clone は handle 複製 O(1)、
-    /// 走査側が pointer 同一性で backing を dedup する。
-    fn baseline_roots(&self) -> Vec<Value> {
-        let top_cells = self
-            .frames
-            .first()
-            .map(|frame| frame.locals_cells.as_slice())
-            .unwrap_or(&[]);
-        let mut roots: Vec<Value> = Vec::new();
-        for (i, v) in self.stack.iter().enumerate() {
-            // slot i が cell 化済みなら stack 値は stale。cell 側で数える。
-            let cell_ified = matches!(top_cells.get(i), Some(Some(_)));
-            if !cell_ified {
-                roots.push(v.clone());
-            }
-        }
-        for cell in top_cells.iter().flatten() {
-            roots.push(cell.borrow().clone());
-        }
-        roots
-    }
-
     /// root source と import source を予算へ課金する（REV-015 Slice 2、§5.3）。
     ///
     /// `Link` フェーズの課金であり、`run` の前に呼ぶ。tree evaluator の
@@ -229,16 +195,11 @@ impl Vm {
         root_source_bytes: u64,
         loaded: &[crate::module::LoadedModule],
     ) -> Result<(), TsumugiError> {
-        // context baseline live heap を課金する（REV-015 Slice 2、§5.2）。tree engine の
-        // `Evaluator::charge_link` と同じく、走査前に live heap を 0 へ戻して現在の
-        // context（stack slot と top-level cell）から到達する live 量を積み直す。
-        // baseline が上限を超えるなら 1 文も実行しない。per-allocation 課金・per-drop
-        // release は本 PR の範囲外（後続 PR）。
-        self.budget.restore_live_heap_bytes(0);
-        let baseline_roots = self.baseline_roots();
-        self.budget
-            .charge_context_baseline(baseline_roots, ExecutionPhase::Link)
-            .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, 0))?;
+        // live heap は tracked collection の生成/drop で逐次維持する（REV-015 案A）。
+        // per-drop release 導入後は charge_link で baseline を 0 へ戻して再走査すると
+        // 既に tracked な collection を二重計上するため、baseline 再課金は行わない
+        // （tree engine の `Evaluator::charge_link` と対称）。非 collection の pre-existing
+        // 状態の baseline は後続 PR で再導入する。
         self.budget
             .charge_source(root_source_bytes, ExecutionPhase::Link)
             .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, 0))?;
@@ -1244,14 +1205,14 @@ impl Vm {
                     None => return Err(internal_error(line, "内部エラー: スタックが空です")),
                 };
                 self.check_collection(candidate, line)?;
-                if let Some(Value::List(v)) = self.stack.last_mut() {
-                    Rc::make_mut(v).push(value);
-                } else {
-                    return Err(internal_error(
-                        line,
-                        "内部エラー: ListPush の対象がリストではありません",
-                    ));
-                }
+                // stack 上のリテラル backing へ tracked push する（delta 課金、REV-015 案A）。
+                // budget と stack の同時可変借用を避けるため、slot を一旦取り出して戻す。
+                let idx = self.stack.len().saturating_sub(1);
+                let mut collection = std::mem::replace(&mut self.stack[idx], Value::Null);
+                let result =
+                    collection.list_push_tracked(value, &mut self.budget, ExecutionPhase::Run);
+                self.stack[idx] = collection;
+                result.map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
             }
             OpCode::DictInsert => {
                 let value = self.pop(line)?;
@@ -1282,14 +1243,17 @@ impl Vm {
                 if let Some(candidate) = candidate {
                     self.check_collection(candidate, line)?;
                 }
-                if let Some(Value::Dict(map)) = self.stack.last_mut() {
-                    Rc::make_mut(map).insert(k, value);
-                } else {
-                    return Err(internal_error(
-                        line,
-                        "内部エラー: DictInsert の対象が辞書ではありません",
-                    ));
-                }
+                // stack 上のリテラル backing へ tracked insert する（delta 課金）。
+                let idx = self.stack.len().saturating_sub(1);
+                let mut collection = std::mem::replace(&mut self.stack[idx], Value::Null);
+                let result = collection.index_set_tracked(
+                    crate::value::IndexTarget::DictKey(k),
+                    value,
+                    &mut self.budget,
+                    ExecutionPhase::Run,
+                );
+                self.stack[idx] = collection;
+                result.map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
             }
             OpCode::SetIndex(target) => {
                 let value = self.pop(line)?;
@@ -1308,14 +1272,16 @@ impl Vm {
                         let size = map.len();
                         let keys: Vec<Value> = map.keys().map(|k| Value::Str(k.clone())).collect();
                         self.check_collection(size, line)?;
-                        Value::List(Rc::new(keys))
+                        Value::new_list(keys, &mut self.budget, ExecutionPhase::Run)
+                            .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?
                     }
                     Value::Str(ref s) => {
                         let size = s.chars().count();
                         let chars: Vec<Value> =
                             s.chars().map(|c| Value::Str(c.to_string())).collect();
                         self.check_collection(size, line)?;
-                        Value::List(Rc::new(chars))
+                        Value::new_list(chars, &mut self.budget, ExecutionPhase::Run)
+                            .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?
                     }
                     _ => {
                         return Err(TsumugiError::not_iterable(line, &value));
@@ -1344,11 +1310,15 @@ impl Vm {
             }
             OpCode::PopUpdate => {
                 // pop の書き戻し専用の内部命令。スタックトップの List から末尾を
-                // 取り除いた List へ置き換える（source から到達不能）。
+                // 取り除く（source から到達不能）。tracked backing 上で delta release
+                // しながら in-place で更新する（REV-015 案A）。
                 self.require_stack_len(1, line)?;
-                let list = self.pop(line)?;
-                let updated = crate::builtin_core::builtin_pop_update(&[list], line)?;
-                self.stack.push(updated);
+                let idx = self.stack.len().saturating_sub(1);
+                self.checkpoint_stack_slot(idx);
+                let mut collection = std::mem::replace(&mut self.stack[idx], Value::Null);
+                let result = collection.list_pop_tracked(&mut self.budget, ExecutionPhase::Run);
+                self.stack[idx] = collection;
+                result.map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
             }
             OpCode::FStrConcat(count) => {
                 // スタックから count 個の値を取り出して文字列に連結
@@ -1538,21 +1508,34 @@ impl Vm {
         match self.resolve_binding_storage(target, line)? {
             BindingStorage::Cell(cell) => {
                 self.checkpoint_cell(&cell);
+                // cell は self とは別の Rc なので、cell の借用と &mut self.budget は両立する。
                 crate::builtin_core::assign_index(
                     &mut cell.borrow_mut(),
                     index,
                     value,
                     max_collection,
+                    &mut self.budget,
                     line,
                 )
             }
             BindingStorage::Stack(stack_index) => {
                 self.checkpoint_stack_slot(stack_index);
-                let slot = self
-                    .stack
-                    .get_mut(stack_index)
-                    .ok_or_else(|| internal_error(line, "インデックス代入の対象slotが不正です"))?;
-                crate::builtin_core::assign_index(slot, index, value, max_collection, line)
+                if stack_index >= self.stack.len() {
+                    return Err(internal_error(line, "インデックス代入の対象slotが不正です"));
+                }
+                // self.stack と self.budget を同時可変借用できないため、slot を一旦
+                // 取り出して assign_index へ渡し、書き戻す。
+                let mut slot = std::mem::replace(&mut self.stack[stack_index], Value::Null);
+                let result = crate::builtin_core::assign_index(
+                    &mut slot,
+                    index,
+                    value,
+                    max_collection,
+                    &mut self.budget,
+                    line,
+                );
+                self.stack[stack_index] = slot;
+                result
             }
         }
     }
@@ -1568,11 +1551,13 @@ impl Vm {
         // まず共通モジュールで処理を試みる
         let max_collection = self.budget.max_collection_elements();
         if let Some(result) = crate::builtin_core::dispatch(name, &args, max_collection, line)? {
-            // builtin が新規生成した String body を課金する（REV-015 Slice 2）。
-            self.budget
-                .charge_result_strings(&result, ExecutionPhase::Run)
+            // builtin が生成した untracked collection を tracked 化しつつ heap 課金し、
+            // 新規 String body も課金する（REV-015 案A / Slice 2）。
+            let tracked = self
+                .budget
+                .track_result(result, ExecutionPhase::Run)
                 .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
-            return Ok(result);
+            return Ok(tracked);
         }
 
         // コンテキスト依存のビルトイン（VM固有の実装が必要なもの）
@@ -1622,7 +1607,8 @@ impl Vm {
                     .map(|arg| Value::Str(arg.clone()))
                     .collect();
                 self.check_collection(argv.len(), line)?;
-                Ok(Value::List(Rc::new(argv)))
+                Value::new_list(argv, &mut self.budget, ExecutionPhase::Run)
+                    .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))
             }
             "map" => {
                 crate::builtin_core::check_arity(name, &args, 2, line)?;
@@ -1635,7 +1621,8 @@ impl Vm {
                         self.check_collection(result.len().saturating_add(1), line)?;
                         result.push(value);
                     }
-                    Ok(Value::List(Rc::new(result)))
+                    Value::new_list(result, &mut self.budget, ExecutionPhase::Run)
+                        .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))
                 } else {
                     Err(TsumugiError::builtin_arg_type(
                         line, "map", 1, "List", &args[0],
@@ -1655,7 +1642,8 @@ impl Vm {
                             result.push(item.clone());
                         }
                     }
-                    Ok(Value::List(Rc::new(result)))
+                    Value::new_list(result, &mut self.budget, ExecutionPhase::Run)
+                        .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))
                 } else {
                     Err(TsumugiError::builtin_arg_type(
                         line, "filter", 1, "List", &args[0],

@@ -466,7 +466,6 @@ fn cow_read_allocation_stays_linear_in_both_engines() {
 /// baseline は n に対して線形に増える（O(n)）。
 #[test]
 fn context_baseline_heap_is_linear_in_element_count() {
-    use std::rc::Rc;
     use tsumugi::budget::{BudgetConfig, BudgetLedger, ExecutionPhase};
     use tsumugi::value::Value;
 
@@ -474,7 +473,9 @@ fn context_baseline_heap_is_linear_in_element_count() {
         let mut config = BudgetConfig::for_legacy(1_000_000, 1_000_000);
         config.max_live_heap_bytes = u64::MAX;
         let mut ledger = BudgetLedger::with_config(config);
-        let list = Value::List(Rc::new((0..n as i64).map(Value::Int).collect::<Vec<_>>()));
+        let list = Value::List(tsumugi::value::Tracked::constant(
+            (0..n as i64).map(Value::Int).collect::<Vec<_>>(),
+        ));
         ledger
             .charge_context_baseline([list], ExecutionPhase::Link)
             .expect("baseline 課金に失敗");
@@ -508,7 +509,8 @@ fn context_baseline_dedups_shared_backing() {
         BudgetLedger::with_config(config)
     }
 
-    let shared_backing = Rc::new((0..200i64).map(Value::Int).collect::<Vec<_>>());
+    let shared_backing =
+        tsumugi::value::Tracked::constant((0..200i64).map(Value::Int).collect::<Vec<_>>());
     let mut shared = ledger();
     shared
         .charge_context_baseline(
@@ -524,8 +526,12 @@ fn context_baseline_dedups_shared_backing() {
     distinct
         .charge_context_baseline(
             [
-                Value::List(Rc::new((0..200i64).map(Value::Int).collect::<Vec<_>>())),
-                Value::List(Rc::new((0..200i64).map(Value::Int).collect::<Vec<_>>())),
+                Value::List(tsumugi::value::Tracked::constant(
+                    (0..200i64).map(Value::Int).collect::<Vec<_>>(),
+                )),
+                Value::List(tsumugi::value::Tracked::constant(
+                    (0..200i64).map(Value::Int).collect::<Vec<_>>(),
+                )),
             ],
             ExecutionPhase::Link,
         )
@@ -536,5 +542,110 @@ fn context_baseline_dedups_shared_backing() {
         "共有 backing が dedup されていません: shared={} distinct={}",
         shared.usage().live_heap_bytes,
         distinct.usage().live_heap_bytes
+    );
+}
+
+/// REV-015 案A / §15.2: per-drop release で live heap が回復する。
+/// 同じ論理サイズの List を N 回作っては drop すると、live heap は N に依存せず
+/// 1 個ぶんに収まる（O(1)）。全体を保持し続ければ O(N) になるのと対比する。
+#[test]
+fn live_heap_is_bounded_across_allocate_and_free() {
+    use tsumugi::budget::{BudgetConfig, BudgetLedger, ExecutionPhase};
+    use tsumugi::value::Value;
+
+    fn ledger() -> BudgetLedger {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+        config.max_live_heap_bytes = u64::MAX;
+        BudgetLedger::with_config(config)
+    }
+
+    // 作っては即 drop（変数への再代入相当）を N 回。live heap は常に高々 1 個ぶん。
+    fn peak_holding_one(n: usize) -> u64 {
+        let mut budget = ledger();
+        let mut held: Option<Value> = None;
+        for _ in 0..n {
+            let list = Value::new_list(
+                (0..50i64).map(Value::Int).collect::<Vec<_>>(),
+                &mut budget,
+                ExecutionPhase::Run,
+            )
+            .unwrap();
+            // 直前の held を上書き → drop → release。
+            held = Some(list);
+        }
+        drop(held);
+        budget.live_heap_bytes()
+    }
+
+    // 全部保持すると live は N に比例する（対照）。
+    fn holding_all(n: usize) -> u64 {
+        let mut budget = ledger();
+        let mut all = Vec::new();
+        for _ in 0..n {
+            all.push(
+                Value::new_list(
+                    (0..50i64).map(Value::Int).collect::<Vec<_>>(),
+                    &mut budget,
+                    ExecutionPhase::Run,
+                )
+                .unwrap(),
+            );
+        }
+        let live = budget.live_heap_bytes();
+        drop(all);
+        live
+    }
+
+    // 作っては捨てると、最後に held を drop したので live は 0。N=10 と N=1000 で不変。
+    assert_eq!(peak_holding_one(10), 0);
+    assert_eq!(peak_holding_one(1000), 0);
+
+    // 全保持は N に比例（10 個ぶん vs 1000 個ぶん）。release と対照的に線形増加する。
+    let ten = holding_all(10);
+    let thousand = holding_all(1000);
+    assert!(ten > 0);
+    let ratio = thousand as f64 / ten as f64;
+    assert!(
+        (95.0..=105.0).contains(&ratio),
+        "全保持 live heap が N に線形でない: N=10 で {ten}, N=1000 で {thousand}（比 {ratio:.1}）"
+    );
+}
+
+/// REV-015 案A: push は delta 課金であり、N 回 push した後の live heap は
+/// 最終要素数ぶん（O(N)）に収まる。中間 backing を全体再課金・保持すると O(N^2) に
+/// なるが、delta 課金＋in-place 更新ならそうならない（live は最終サイズのみ）。
+#[test]
+fn push_delta_charging_live_heap_is_linear_not_quadratic() {
+    use tsumugi::budget::{BudgetConfig, BudgetLedger, ExecutionPhase};
+    use tsumugi::value::Value;
+
+    fn final_live_after_pushes(n: usize) -> u64 {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+        config.max_live_heap_bytes = u64::MAX;
+        let mut budget = BudgetLedger::with_config(config);
+        let mut list = Value::new_list(vec![], &mut budget, ExecutionPhase::Run).unwrap();
+        for i in 0..n as i64 {
+            list.list_push_tracked(Value::Int(i), &mut budget, ExecutionPhase::Run)
+                .unwrap();
+        }
+        let live = budget.live_heap_bytes();
+        drop(list);
+        // drop 後は 0 に戻る（delta で積んだぶんが 1 個の backing の release で戻る）。
+        assert_eq!(
+            budget.live_heap_bytes(),
+            0,
+            "push 後の drop で live が 0 に戻らない"
+        );
+        live
+    }
+
+    // 一意所有の in-place push は最終サイズ（list_body(n)）だけが live。
+    let small = final_live_after_pushes(100);
+    let large = final_live_after_pushes(1000);
+    // list_body(n) = 24 + 32n。1000/100 の比は約 10（固定 header ぶんだけ超える）。
+    let ratio = large as f64 / small as f64;
+    assert!(
+        (9.0..=11.0).contains(&ratio),
+        "push 後 live heap が要素数に線形でない: n=100 で {small}, n=1000 で {large}（比 {ratio:.2}）"
     );
 }

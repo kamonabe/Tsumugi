@@ -261,22 +261,6 @@ impl Env {
         self.scopes.truncate(frame.scope_len);
         self.frame_base = frame.previous_base;
     }
-
-    /// 全スコープの変数 cell が保持する値を、heap baseline 走査の root として集める
-    /// （REV-015 Slice 2、§5.2 context baseline）。
-    ///
-    /// 各 cell の中身を clone するが、List / Dict / 関数値 / cell は `Rc` 共有なので
-    /// handle 複製の O(1) であり、走査側が pointer 同一性で dedup する。`Link` フェーズで
-    /// 1 回だけ呼ぶ想定。
-    pub fn baseline_roots(&self) -> Vec<Value> {
-        let mut roots = Vec::new();
-        for scope in &self.scopes {
-            for cell in scope.values() {
-                roots.push(cell.borrow().clone());
-            }
-        }
-        roots
-    }
 }
 
 #[cfg(test)]

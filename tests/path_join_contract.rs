@@ -142,7 +142,10 @@ fn various_non_str_types_report_their_type_name() {
         (Value::Float(1.0), "Float"),
         (Value::Bool(false), "Bool"),
         (Value::Null, "Null"),
-        (Value::List(std::rc::Rc::new(vec![])), "List"),
+        (
+            Value::List(tsumugi::value::Tracked::constant(vec![])),
+            "List",
+        ),
     ];
     for (value, type_name) in cases {
         let args = vec![Value::Str("a".to_string()), value];

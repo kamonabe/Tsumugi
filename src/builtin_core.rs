@@ -20,9 +20,12 @@
 //! 専用 opcode として実装するため source から到達できない。
 
 use crate::error::TsumugiError;
-use crate::value::{NumericOrder, NumericOrdering, Value};
+use crate::value::{IndexTarget, NumericOrder, NumericOrdering, Tracked, Value};
 
-use std::rc::Rc;
+// collection を返す純粋 builtin は untracked backing（`Tracked::constant`）で生成し、
+// 呼び出し側（eval/vm）の `track_result` が dispatch 境界で課金・tracked 化する。
+// in-place mutation（index 代入・push/pop）は ledger を受け取り、tracked mutation
+// primitive で delta 課金する（REV-015 案A、§5.2）。
 
 // =============================================================================
 // コレクションサイズ上限（メモリ DoS 対策 / REV-015 Slice 1）
@@ -153,9 +156,13 @@ pub fn assign_index(
     index: &Value,
     value: Value,
     max_collection: u64,
+    budget: &mut crate::budget::BudgetLedger,
     line: usize,
 ) -> Result<(), TsumugiError> {
-    match target {
+    // ターゲット種別ごとに index/key と上限を検査し、正規化した IndexTarget を作る。
+    // 実際の書き込みと heap の delta 課金は tracked mutation primitive に集約する
+    // （REV-015 案A、§5.2）。両エンジンが同じ経路を通り parity を保つ。
+    let normalized = match target {
         Value::List(list) => {
             let i = match index {
                 Value::Int(n) => *n,
@@ -168,10 +175,7 @@ pub fn assign_index(
             if actual_idx < 0 || actual_idx >= len {
                 return Err(TsumugiError::list_index_out_of_range(line, i, list.len()));
             }
-            // 検査後に detach（copy-on-write）。共有中の backing は複製され、
-            // 別 binding から見た元の値は変化しない（AUD-047）。
-            Rc::make_mut(list)[actual_idx as usize] = value;
-            Ok(())
+            IndexTarget::ListIndex(actual_idx as usize)
         }
         Value::Dict(map) => {
             let key = match index {
@@ -183,11 +187,18 @@ pub fn assign_index(
             if !map.contains_key(&key) {
                 check_collection_size(map.len().saturating_add(1), max_collection, line)?;
             }
-            Rc::make_mut(map).insert(key, value);
-            Ok(())
+            IndexTarget::DictKey(key)
         }
-        other => Err(TsumugiError::index_assign_unsupported(line, other)),
-    }
+        other => return Err(TsumugiError::index_assign_unsupported(line, other)),
+    };
+    target
+        .index_set_tracked(
+            normalized,
+            value,
+            budget,
+            crate::budget::ExecutionPhase::Run,
+        )
+        .map_err(|stop| crate::budget::control_stop_to_error(stop, budget.live_heap_bytes(), line))
 }
 
 pub fn builtin_push(
@@ -196,11 +207,13 @@ pub fn builtin_push(
     line: usize,
 ) -> Result<Value, TsumugiError> {
     check_arity("push", args, 2, line)?;
-    let mut list = args[0].clone();
-    if let Value::List(ref mut v) = list {
+    if let Value::List(v) = &args[0] {
         check_collection_size(v.len().saturating_add(1), max_collection, line)?;
-        Rc::make_mut(v).push(args[1].clone());
-        Ok(list)
+        // COW: backing を複製して 1 要素追加し、untracked で包む。heap 課金は
+        // 呼び出し側の `track_result` で行う（REV-015 案A）。
+        let mut data: Vec<Value> = (**v).clone();
+        data.push(args[1].clone());
+        Ok(Value::List(Tracked::constant(data)))
     } else {
         Err(TsumugiError::builtin_arg_type(
             line, "push", 1, "List", &args[0],
@@ -210,12 +223,11 @@ pub fn builtin_push(
 
 pub fn builtin_pop(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("pop", args, 1, line)?;
-    let mut list = args[0].clone();
-    if let Value::List(ref mut v) = list {
-        if v.is_empty() {
-            Err(TsumugiError::pop_empty_list(line))
-        } else {
-            Ok(Rc::make_mut(v).pop().unwrap())
+    if let Value::List(v) = &args[0] {
+        // pop は末尾要素（値）を返す。list 本体の書き戻しは __pop_update が行う。
+        match v.last() {
+            Some(last) => Ok(last.clone()),
+            None => Err(TsumugiError::pop_empty_list(line)),
         }
     } else {
         Err(TsumugiError::builtin_arg_type(
@@ -226,12 +238,15 @@ pub fn builtin_pop(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
 
 pub fn builtin_pop_update(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("__pop_update", args, 1, line)?;
-    let mut list = args[0].clone();
-    if let Value::List(ref mut v) = list {
-        if !v.is_empty() {
-            Rc::make_mut(v).pop();
+    if let Value::List(v) = &args[0] {
+        if v.is_empty() {
+            return Ok(args[0].clone());
         }
-        Ok(list)
+        // COW: backing を複製して末尾を除き、untracked で包む。heap 課金は
+        // 呼び出し側の `track_result` で行う（REV-015 案A）。
+        let mut data: Vec<Value> = (**v).clone();
+        data.pop();
+        Ok(Value::List(Tracked::constant(data)))
     } else {
         Ok(args[0].clone())
     }
@@ -246,7 +261,7 @@ pub fn builtin_keys(
     if let Value::Dict(map) = &args[0] {
         check_collection_size(map.len(), max_collection, line)?;
         let keys: Vec<Value> = map.keys().map(|k| Value::Str(k.clone())).collect();
-        Ok(Value::List(Rc::new(keys)))
+        Ok(Value::List(Tracked::constant(keys)))
     } else {
         Err(TsumugiError::builtin_arg_type(
             line, "keys", 1, "Dict", &args[0],
@@ -263,7 +278,7 @@ pub fn builtin_values(
     if let Value::Dict(map) = &args[0] {
         check_collection_size(map.len(), max_collection, line)?;
         let vals: Vec<Value> = map.values().cloned().collect();
-        Ok(Value::List(Rc::new(vals)))
+        Ok(Value::List(Tracked::constant(vals)))
     } else {
         Err(TsumugiError::builtin_arg_type(
             line, "values", 1, "Dict", &args[0],
@@ -327,9 +342,9 @@ pub fn builtin_slice(args: &[Value], line: usize) -> Result<Value, TsumugiError>
             let e = end.min(v.len());
             // start > end の場合は空リストを返す（パニックしない）
             if s > e {
-                return Ok(Value::List(Rc::new(Vec::new())));
+                return Ok(Value::List(Tracked::constant(Vec::new())));
             }
-            Ok(Value::List(Rc::new(v[s..e].to_vec())))
+            Ok(Value::List(Tracked::constant(v[s..e].to_vec())))
         }
         Value::Str(s) => {
             let chars: Vec<char> = s.chars().collect();
@@ -380,7 +395,7 @@ pub fn builtin_sort(args: &[Value], line: usize) -> Result<Value, TsumugiError> 
     if let Value::List(list) = &args[0] {
         let mut sorted = (**list).clone();
         sorted.sort_by_key(|a| a.to_string());
-        Ok(Value::List(Rc::new(sorted)))
+        Ok(Value::List(Tracked::constant(sorted)))
     } else {
         Err(TsumugiError::builtin_arg_type(
             line, "sort", 1, "List", &args[0],
@@ -394,7 +409,7 @@ pub fn builtin_reverse(args: &[Value], line: usize) -> Result<Value, TsumugiErro
         Value::List(list) => {
             let mut rev = (**list).clone();
             rev.reverse();
-            Ok(Value::List(Rc::new(rev)))
+            Ok(Value::List(Tracked::constant(rev)))
         }
         Value::Str(s) => Ok(Value::Str(s.chars().rev().collect())),
         other => Err(TsumugiError::builtin_arg_type(
@@ -436,7 +451,7 @@ pub fn builtin_range(
     };
     check_collection_size(size, max_collection, line)?;
     let list: Vec<Value> = (start..end).map(Value::Int).collect();
-    Ok(Value::List(Rc::new(list)))
+    Ok(Value::List(Tracked::constant(list)))
 }
 
 // =============================================================================
@@ -456,7 +471,7 @@ pub fn builtin_split(
         check_collection_size(parts.len().saturating_add(1), max_collection, line)?;
         parts.push(Value::Str(part.to_string()));
     }
-    Ok(Value::List(Rc::new(parts)))
+    Ok(Value::List(Tracked::constant(parts)))
 }
 
 pub fn builtin_join(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
@@ -878,7 +893,7 @@ pub fn builtin_read_lines(
                     check_collection_size(lines.len().saturating_add(1), max_collection, line)?;
                     lines.push(Value::Str(content_line.to_string()));
                 }
-                Ok(Value::List(Rc::new(lines)))
+                Ok(Value::List(Tracked::constant(lines)))
             }
             Err(_) => Ok(Value::Null),
         }
@@ -1143,7 +1158,7 @@ pub fn builtin_list_dir(
                     names.push(Value::Str(entry.file_name().to_string_lossy().to_string()));
                 }
                 names.sort_by_key(|v| v.to_string());
-                Ok(Value::List(Rc::new(names)))
+                Ok(Value::List(Tracked::constant(names)))
             }
             Err(_) => Ok(Value::Null),
         }

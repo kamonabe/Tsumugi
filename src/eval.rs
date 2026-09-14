@@ -101,6 +101,32 @@ impl Evaluator {
             .map_err(|stop| self.control_stop_to_error(stop, line))
     }
 
+    /// cell が保持する `Value::List` へ tracked backing 上で 1 要素 push する
+    /// （delta 課金、REV-015 案A）。型・上限は呼び出し側で検査済み。
+    fn budget_list_push(
+        &mut self,
+        cell: &crate::value::SharedValue,
+        value: Value,
+        line: usize,
+    ) -> Result<(), TsumugiError> {
+        let mut target = cell.borrow_mut();
+        target
+            .list_push_tracked(value, &mut self.budget, ExecutionPhase::Run)
+            .map_err(|stop| crate::budget::control_stop_to_error(stop, 0, line))
+    }
+
+    /// cell が保持する `Value::List` の末尾を tracked backing 上で除く（delta release）。
+    fn budget_list_pop(
+        &mut self,
+        cell: &crate::value::SharedValue,
+        line: usize,
+    ) -> Result<(), TsumugiError> {
+        let mut target = cell.borrow_mut();
+        target
+            .list_pop_tracked(&mut self.budget, ExecutionPhase::Run)
+            .map_err(|stop| crate::budget::control_stop_to_error(stop, 0, line))
+    }
+
     /// budget の [`ControlStop`] を既存の [`TsumugiError`] へ写像する（Slice 1/2 互換）。
     /// resource → error kind/message の対応は tree/VM 共有の
     /// [`crate::budget::control_stop_to_error`] に集約し、trace だけ tree 側で付ける。
@@ -135,19 +161,13 @@ impl Evaluator {
         root_source_bytes: u64,
         loaded: &[crate::module::LoadedModule],
     ) -> Result<(), TsumugiError> {
-        // context baseline live heap を課金する（REV-015 Slice 2、§5.2）。
-        // `ExecutionContext` に残る既存の変数・closure・collection を、最初の文を
-        // 実行する前に live heap へ数える。baseline が上限を超えるなら 1 文も実行しない。
-        //
-        // baseline は「現在の context から到達する live 量」を表すため、走査前に live
-        // heap を 0 へ戻してから積み直す。REPL の複数入力で同じ cell を重複計上しない。
-        // 本 PR は実行中の per-allocation 課金・per-drop release を含まないため、live
-        // heap は baseline 確定後 submission 内で一定に保たれる（正確な追跡は後続 PR）。
-        self.budget.restore_live_heap_bytes(0);
-        let baseline_roots = self.env.baseline_roots();
-        self.budget
-            .charge_context_baseline(baseline_roots, ExecutionPhase::Link)
-            .map_err(|stop| self.control_stop_to_error(stop, 0))?;
+        // live heap は tracked collection の生成/drop で逐次維持する（REV-015 案A）。
+        // per-drop release 導入後は、REPL 入力境界で live heap を 0 へ戻して baseline を
+        // 再走査すると、既に tracked（自己 release する）collection を二重計上してしまう。
+        // よって collection を per-drop 追跡する本 PR では charge_link での baseline 再課金を
+        // 行わない。埋め込み host が注入する非 collection の pre-existing 状態（String /
+        // 関数 instance / cell）の baseline 課金は、それらを per-drop 化する後続 PR で
+        // 再導入する。`charge_context_baseline` 自体は単体テスト・後続 PR 用に残す。
         self.budget
             .charge_source(root_source_bytes, ExecutionPhase::Link)
             .map_err(|stop| self.control_stop_to_error(stop, 0))?;
@@ -285,6 +305,7 @@ impl Evaluator {
                     &idx,
                     val,
                     max_collection,
+                    &mut self.budget,
                     *line,
                 )?;
 
@@ -490,7 +511,9 @@ impl Evaluator {
                     self.check_collection(values.len().saturating_add(1), line)?;
                     values.push(value);
                 }
-                Ok(Value::List(Rc::new(values)))
+                // heap 課金付きで tracked backing を作る（REV-015 案A、§5.2）。
+                Value::new_list(values, &mut self.budget, ExecutionPhase::Run)
+                    .map_err(|stop| self.control_stop_to_error(stop, line))
             }
 
             Expr::Dict(pairs) => {
@@ -508,7 +531,8 @@ impl Evaluator {
                     }
                     map.insert(key, val);
                 }
-                Ok(Value::Dict(Rc::new(map)))
+                Value::new_dict(map, &mut self.budget, ExecutionPhase::Run)
+                    .map_err(|stop| self.control_stop_to_error(stop, line))
             }
 
             Expr::Ident(name) => self

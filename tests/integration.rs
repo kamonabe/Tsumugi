@@ -2490,13 +2490,14 @@ fn repl_context_baseline_heap_limit_rejects_next_input_before_executing() {
     // フェーズで baseline live heap を走査し、上限を超えるため 1 文も実行せずに拒否される。
     // 拒否された入力の副作用（print）は出ない。tree/VM で観測挙動を一致させる。
     //
-    // 上限 500 byte: 空 baseline（最初の入力）は 0 で通過し、100 要素の List を持つ
-    // 2 本目の baseline（>6000 byte）は超過する。
-    let source = concat!(
-        "let big = range(0, 100)\n",
-        "print(\"first-ok\")\n",
-        "print(len(big))\n",
-    );
+    // per-allocation 課金（REV-015 案A）導入後は、100 要素 List（list_body = 24 + 32*100
+    // = 3224 byte）を作る `range(0, 100)` の allocation 自体が上限 500 を超えて catch 不能
+    // terminal になる。各行は独立した REPL 入力なので:
+    //   入力1 `let big = range(0, 100)` … heap 超過で失敗、`big` は rollback される
+    //   入力2 `print(len(big))`         … `big` 未定義エラー（len(=数値) は出力されない）
+    // heap 上限診断が観測され、`big` の長さ（100）は決して出力されない。REPL は入力単位で
+    // 継続し正常終了する。tree/VM で観測挙動を一致させる。
+    let source = concat!("let big = range(0, 100)\n", "print(len(big))\n");
 
     for use_vm in [false, true] {
         let mode = if use_vm { "VM" } else { "tree" };
@@ -2507,11 +2508,10 @@ fn repl_context_baseline_heap_limit_rejects_next_input_before_executing() {
         // REPL 自体は後続入力を続行して正常終了する（catch 不能 terminal は入力単位）。
         assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
 
-        // 最初の入力（束縛のみ、print なし）は成功する。
-        // 2 本目の `print("first-ok")` は自身の baseline 走査で拒否され、出力されない。
+        // heap 超過で `big` は束縛されず、その長さ（100）は決して出力されない。
         assert!(
-            !visible.contains(&"first-ok"),
-            "{mode}: baseline 超過の入力を実行してしまった: stdout={stdout}"
+            !visible.contains(&"100"),
+            "{mode}: heap 超過した collection の長さを出力してしまった: stdout={stdout}"
         );
         // heap 上限診断が観測される。
         assert!(
@@ -2523,9 +2523,9 @@ fn repl_context_baseline_heap_limit_rejects_next_input_before_executing() {
 
 #[test]
 fn file_run_default_heap_limit_does_not_change_observable_output() {
-    // 既定の heap 上限では、collection を作る通常スクリプトの観測挙動は変わらない
-    // （baseline は fresh context で 0、本 PR は実行中の per-allocation 課金を含まない）。
-    // tree/VM 両方で同じ出力になることを確認する。
+    // 既定の heap 上限（64 MiB）では、collection を作る通常スクリプトの観測挙動は
+    // 変わらない。per-allocation 課金（REV-015 案A）を入れても、既定上限に対して小さな
+    // collection は課金・release されるだけで観測挙動に影響しない。tree/VM で同一出力。
     let script =
         "let xs = range(0, 50)\nprint(len(xs))\nlet d = {\"a\": 1, \"b\": 2}\nprint(len(d))\n";
     let dir = TestDir::new("heap-default");
@@ -2549,24 +2549,118 @@ fn file_run_default_heap_limit_does_not_change_observable_output() {
 }
 
 #[test]
-fn vm_context_baseline_does_not_double_count_cellified_top_level_var() {
-    // REV-015 Slice 2（§5.2）: VM は top-level 変数が closure に捕捉されると
-    // `ensure_local_cell` で値を cell へ clone するが stack slot は stale なまま残す。
-    // baseline 走査が stack と cell の両方を数えると 1 変数を二重計上する。`baseline_roots`
-    // が cell 化済み slot の stale stack 値を除外することを、観測可能な受理境界で固定する。
+fn heap_release_recovers_across_reassignment_in_both_engines() {
+    // REV-015 案A / §15.2: 大量 allocate/free で live heap が回復する（per-drop release）。
+    // ループの各反復で 100 要素 List（3224 byte）を変数へ再代入する。旧値は上書きで
+    // drop され live heap から release される。反復ごとに解放されるなら、総確保量
+    // （1000 * 3224 ≒ 3.2 MB）とは無関係に、iterable + 数個ぶんの上限で完走できる。
     //
-    // 注: tree と VM の関数 instance 論理サイズは §5.1 で意図的に異なる（tree 64+16n /
-    // VM 48+16n）ため、ここでは tree/VM の byte 一致ではなく「VM が二重計上しない」
-    // ことだけを検証する。二重計上すると n の Value slot 32 が余計に乗り、同じ上限で
-    // 拒否されて "5" が出なくなる。210 byte はその境界の上側に置く。
-    let source = concat!("let n = 5\n", "let get = fn() n end\n", "print(get())\n");
-
-    let output = run_repl_process(source, true, &[("TSUMUGI_MAX_LIVE_HEAP_BYTES", "210")]);
-    let (stdout, stderr) = output_text(&output);
-    let visible = repl_visible_lines(&stdout, true);
-    assert!(output.status.success(), "VM REPLが異常終了: {stderr}");
-    assert!(
-        visible.contains(&"5"),
-        "VM が捕捉変数を二重計上して baseline を超えた疑い: stdout={stdout} stderr={stderr}"
+    // for の iterable range(0, 1000) は 32024 byte なので、上限はそれ + 数個ぶんの
+    // 60000 byte に置く。release されなければ 3.2 MB で確実に超過する。tree/VM 一致。
+    let script = concat!(
+        "let x = []\n",
+        "for i in range(0, 1000)\n",
+        "  x = range(0, 100)\n",
+        "end\n",
+        "print(\"done\")\n",
     );
+    let dir = TestDir::new("heap-release-reassign");
+    let path = std::path::Path::new(dir.as_str()).join("reassign.tsg");
+    std::fs::write(&path, script).expect("スクリプトの書き込みに失敗");
+
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let mut cmd = Command::new(tsumugi_bin());
+        if use_vm {
+            cmd.arg("--vm");
+        }
+        cmd.arg(path.to_str().unwrap())
+            .env("TSUMUGI_MAX_LIVE_HEAP_BYTES", "60000");
+        let output = cmd.output().expect("tsumugi バイナリの実行に失敗");
+        let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+        let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
+        assert!(
+            output.status.success(),
+            "{mode}: reassign ループが heap 上限で失敗した（release が効いていない疑い）: {stderr}"
+        );
+        assert_eq!(normalize(&stdout), "done", "{mode}の出力が不正: {stdout}");
+    }
+}
+
+#[test]
+fn heap_accumulation_trips_limit_in_both_engines() {
+    // 対になる負のテスト: 1 つの List へ push し続けて解放しない場合は、live heap が
+    // 単調増加して上限を超える。release が「なんでも通す」わけではないことを固定する。
+    // iterable range(0, 1000)=32024 + 累積 push。上限 50000 は途中で必ず超える。
+    let script = concat!(
+        "let x = []\n",
+        "for i in range(0, 1000)\n",
+        "  push(x, i)\n",
+        "end\n",
+        "print(\"done\")\n",
+    );
+    let dir = TestDir::new("heap-accumulate");
+    let path = std::path::Path::new(dir.as_str()).join("accum.tsg");
+    std::fs::write(&path, script).expect("スクリプトの書き込みに失敗");
+
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let mut cmd = Command::new(tsumugi_bin());
+        if use_vm {
+            cmd.arg("--vm");
+        }
+        cmd.arg(path.to_str().unwrap())
+            .env("TSUMUGI_MAX_LIVE_HEAP_BYTES", "50000");
+        let output = cmd.output().expect("tsumugi バイナリの実行に失敗");
+        let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+        let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
+        // 累積で上限を超えるため "done" は出ず、heap 診断が出る。
+        assert!(
+            !normalize(&stdout).contains("done"),
+            "{mode}: 累積 push が上限を超えず完走してしまった: {stdout}"
+        );
+        assert!(
+            stderr.contains("ヒープ"),
+            "{mode}: 累積 push で heap 診断が出ない: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn heap_released_after_repl_rollback_in_both_engines() {
+    // §10 / §15.2: 未捕捉エラーで rollback された入力が確保した collection は release
+    // される（per-drop release + AUD-024 rollback）。
+    //
+    // 入力1: 100 要素 List（3224）を束縛 → commit（live=3224）
+    // 入力2（1 つの継続入力＝1 submission）: `if true` ブロック内で別の 100 要素 List を
+    //   束縛してから未捕捉エラー。ブロック全体が 1 submission なので、未捕捉エラーで
+    //   束縛が rollback され、確保した List が drop → release される。
+    // 入力3: さらに 100 要素 List を束縛。入力2 が release されていれば 3224*2 で収まる。
+    //
+    // 上限 7000（≒ 2 * 3224 + 余白）。入力2 が release されないと、入力3 時点で
+    // 3224(入力1) + 3224(入力2 の残骸) + 3224(入力3) = 9672 > 7000 で入力3 が失敗する。
+    let source = concat!(
+        "let a = range(0, 100)\n",
+        "if true\n  let b = range(0, 100)\n  let oops = (1 / 0)\nend\n",
+        "let c = range(0, 100)\n",
+        "print(len(c))\n",
+    );
+
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_LIVE_HEAP_BYTES", "7000")]);
+        let (stdout, stderr) = output_text(&output);
+        let visible = repl_visible_lines(&stdout, use_vm);
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        // 入力2 のエラー（ゼロ除算）は観測される。
+        assert!(
+            stderr.contains("ゼロ除算"),
+            "{mode}: 入力2 のゼロ除算が観測されない: {stderr}"
+        );
+        // 入力2 が rollback で release されていれば、入力3 の c は成功して長さ 100 を出す。
+        assert!(
+            visible.contains(&"100"),
+            "{mode}: rollback 後に heap が release されず入力3 が失敗した疑い: stdout={stdout} stderr={stderr}"
+        );
+    }
 }

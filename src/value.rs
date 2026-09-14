@@ -1,13 +1,153 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::rc::Rc;
 
 use crate::ast::Stmt;
+use crate::budget::{AllocationId, ControlStop, ExecutionPhase, HeapLedgerWeak, heap_size};
 use crate::chunk::Chunk;
 
 /// 共有可能な変数セル（参照キャプチャ用）
 pub type SharedValue = Rc<RefCell<Value>>;
+
+/// heap 課金付きの collection backing（REV-015 案A、per-drop release）。
+///
+/// `T`（`Vec<Value>` または `BTreeMap<String, Value>`）と、その論理サイズ・
+/// [`AllocationId`]・heap 台帳への弱参照を束ねる。`Drop` で台帳へ `release` を通知し、
+/// この backing を指す最後の `Rc` が落ちた瞬間に live heap を戻す（§5.2）。
+///
+/// # 課金と共有
+///
+/// 生成（[`Tracked::new`]）だけが台帳へ `charge` する fallible な入口である。`Rc` の
+/// clone（＝共有）は無課金で、`Drop` は最後の 1 本が落ちたときだけ発火するため、
+/// 「共有は課金しない・最後の参照で release」という §5.2 の規則を `Rc` の refcount が
+/// そのまま担保する。台帳が engine より先に drop された場合、`Weak::upgrade` が `None`
+/// を返し release は no-op になる（その時点で live 集計は不要）。
+///
+/// # `Deref`
+///
+/// 読み取りは `Deref<Target = T>` 経由で透過的に行えるため、既存の `items.len()` /
+/// `map.iter()` 等はそのまま動く。書き込みは呼び出し側が台帳を持つ fallible 経路で
+/// 新しい `Tracked` を作る（COW detach）。`Tracked` は不変とみなし、内部可変はしない。
+pub struct Tracked<T> {
+    data: T,
+    id: AllocationId,
+    bytes: u64,
+    ledger: HeapLedgerWeak,
+}
+
+impl<T> Tracked<T> {
+    /// backing を台帳へ課金してから包む（§5.2）。`logical_bytes` は §5.1 の論理サイズ。
+    ///
+    /// `charge` が上限超過・overflow なら `ControlStop` を返し、`Tracked` は作られない
+    /// （＝ live heap は増えない）。`AllocationId` は成功時に 1 個発番する。
+    pub fn new(
+        data: T,
+        logical_bytes: u64,
+        budget: &mut crate::budget::BudgetLedger,
+        phase: ExecutionPhase,
+    ) -> Result<Rc<Self>, ControlStop> {
+        // charge を先に行い、成功した場合だけ id を発番して包む。
+        budget.charge_heap(logical_bytes, phase)?;
+        let id = budget.allocate_heap_id()?;
+        Ok(Rc::new(Self {
+            data,
+            id,
+            bytes: logical_bytes,
+            ledger: budget.heap_handle(),
+        }))
+    }
+
+    /// compile 時定数用の untracked backing を作る（課金しない）。
+    ///
+    /// bytecode の定数プールに置く空の List/Dict リテラル用。ledger を持たない
+    /// （`Weak::new()`）ため `Drop` は no-op、`AllocationId(0)` は「未割り当て」の
+    /// sentinel である。実行時に最初の mutation（`ListPush`/`DictInsert`）で
+    /// [`Value::detach_list`]/[`Value::detach_dict`] が共有中の定数を検出し、runtime
+    /// 台帳で課金した実 backing へ複製・差し替える（§5.2 COW）。定数自体は live heap を
+    /// 増減させない。
+    pub fn constant(data: T) -> Rc<Self> {
+        Rc::new(Self {
+            data,
+            id: AllocationId(0),
+            bytes: 0,
+            ledger: HeapLedgerWeak::new(),
+        })
+    }
+
+    /// この backing の [`AllocationId`]（同一性・デバッグ用）。
+    pub fn alloc_id(&self) -> AllocationId {
+        self.id
+    }
+
+    /// この backing の課金済み論理サイズ。
+    pub fn logical_bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl<T> Tracked<T> {
+    /// 中身への可変参照（一意所有時の in-place mutation 用、value.rs 内部専用）。
+    ///
+    /// `Rc::get_mut` で一意所有を確認した後にだけ呼ぶ。論理サイズの再計算・課金は
+    /// 呼び出し側（`retrack_*`）の責務で、ここでは data への `&mut` を返すだけ。
+    fn data_mut(&mut self) -> &mut T {
+        &mut self.data
+    }
+}
+
+impl<T: Clone> Tracked<T> {
+    /// 中身の `T` を clone で取り出す（`track_result` の untracked backing 変換用）。
+    ///
+    /// untracked backing（`bytes == 0` / `AllocationId(0)`）に対してのみ呼ぶ。その場合
+    /// `Drop` の release は元々 no-op なので、data を clone しても二重計上・二重解放は
+    /// 起きない。tracked backing に使うと clone 後の元 `Tracked` の Drop が release して
+    /// しまうため使わない。
+    pub fn clone_data(&self) -> T {
+        self.data.clone()
+    }
+}
+
+impl<T> Deref for Tracked<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.data
+    }
+}
+
+impl<T> Drop for Tracked<T> {
+    fn drop(&mut self) {
+        // この backing を指す最後の Rc が落ちた瞬間に呼ばれる（§5.2 release）。
+        // 台帳がまだ生きていれば論理サイズを戻す。engine drop 後なら no-op。
+        if let Some(ledger) = self.ledger.upgrade() {
+            ledger.borrow_mut().release(self.bytes);
+        }
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for Tracked<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 論理サイズや id は出さず、中身だけを表示する（既存の Debug 互換）。
+        self.data.fmt(f)
+    }
+}
+
+/// tracked な `List` backing（`Vec<Value>`）。
+pub type TrackedList = Tracked<Vec<Value>>;
+/// tracked な `Dict` backing（`BTreeMap<String, Value>`）。
+pub type TrackedDict = Tracked<BTreeMap<String, Value>>;
+
+/// [`Value::index_set_tracked`] へ渡す、正規化済みの index 代入ターゲット。
+///
+/// 呼び出し側が index の型・範囲（List は負数正規化・範囲内、Dict は key 文字列）を
+/// 検査してから構築する。
+pub enum IndexTarget {
+    /// List の 0 始まり index（負数は呼び出し側で正規化済み）。
+    ListIndex(usize),
+    /// Dict の key。
+    DictKey(String),
+}
 
 /// 関数値の同一性を表す識別子（AUD-048）
 ///
@@ -189,10 +329,11 @@ pub enum Value {
     Bool(bool),
     Null,
     /// リスト。copy-on-write（AUD-047）。clone はハンドル共有で O(1)、
-    /// mutation は `Rc::make_mut` を通して書き込み時だけ backing を複製する。
-    List(Rc<Vec<Value>>),
-    /// 辞書。copy-on-write（AUD-047）。List と同じく mutation は `Rc::make_mut` 経由。
-    Dict(Rc<BTreeMap<String, Value>>),
+    /// mutation は書き込み時だけ backing を複製する。backing は [`TrackedList`] で、
+    /// 生成時に heap 課金し最後の参照 drop で release する（REV-015 案A、§5.2）。
+    List(Rc<TrackedList>),
+    /// 辞書。copy-on-write（AUD-047）。List と同じく backing は [`TrackedDict`]。
+    Dict(Rc<TrackedDict>),
     /// 関数値（ツリーウォーク用: ユーザー定義関数を値として扱う）
     /// `Rc` により関数呼び出し・self-binding・クロージャ生成時のディープコピーを回避
     Fn {
@@ -245,8 +386,9 @@ impl PartialEq for Value {
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Null, Value::Null) => true,
             // 共有 backing（同じ Rc）なら要素比較を省く。分離済みでも要素で比較する。
-            (Value::List(a), Value::List(b)) => Rc::ptr_eq(a, b) || a == b,
-            (Value::Dict(a), Value::Dict(b)) => Rc::ptr_eq(a, b) || a == b,
+            // `Tracked` は `Deref` で中身へ透過するため、`***` で `Vec`/`BTreeMap` を比較する。
+            (Value::List(a), Value::List(b)) => Rc::ptr_eq(a, b) || ***a == ***b,
+            (Value::Dict(a), Value::Dict(b)) => Rc::ptr_eq(a, b) || ***a == ***b,
             // 関数値は FunctionId だけで同一性を判定する（AUD-048）。
             // ID は関数式・関数定義を評価して値を生成するたびに新規発番され、
             // clone・代入・引数渡し・collection 格納では保持される。
@@ -298,6 +440,225 @@ impl std::fmt::Debug for Value {
 }
 
 impl Value {
+    /// `Vec<Value>` から heap 課金済みの `Value::List` を作る（REV-015 案A、§5.2）。
+    ///
+    /// §5.1 の List body（24 + 32 × 要素数）を課金してから包む。上限超過は
+    /// `ControlStop` を返し、live heap は増えない。要素自体の Value slot / 子 payload は
+    /// 各要素の allocation（別 `Tracked` や String 課金）で数えるため、ここでは backing
+    /// の body だけを課金する（baseline 走査の per-node 課金とは役割が異なる）。
+    pub fn new_list(
+        items: Vec<Value>,
+        budget: &mut crate::budget::BudgetLedger,
+        phase: ExecutionPhase,
+    ) -> Result<Value, ControlStop> {
+        let bytes = heap_size::list_body(items.len() as u64);
+        Ok(Value::List(Tracked::new(items, bytes, budget, phase)?))
+    }
+
+    /// `BTreeMap<String, Value>` から heap 課金済みの `Value::Dict` を作る（§5.2）。
+    ///
+    /// §5.1 の Dict body（24 + 64 × entry 数 + 各 key の byte 長）を課金する。
+    pub fn new_dict(
+        map: BTreeMap<String, Value>,
+        budget: &mut crate::budget::BudgetLedger,
+        phase: ExecutionPhase,
+    ) -> Result<Value, ControlStop> {
+        let key_bytes_total: u64 = map
+            .keys()
+            .map(|k| k.len() as u64)
+            .fold(0u64, u64::saturating_add);
+        let bytes = heap_size::dict_body(map.len() as u64, key_bytes_total);
+        Ok(Value::Dict(Tracked::new(map, bytes, budget, phase)?))
+    }
+
+    /// `Value::List` の backing を書き込み用に detach し、`&mut Vec<Value>` を得る
+    /// （COW、REV-015 案A）。
+    ///
+    /// - 一意所有（`Rc::strong_count == 1`）なら複製せず in place で返す。呼び出し側は
+    ///   size を変える操作の前後で [`Value::retrack_list`] を使い delta を課金/release する。
+    /// - 共有中なら backing を複製し、新しい `AllocationId` で `charge` して差し替える
+    ///   （旧 backing は `self` が握る Rc が落ちた時点で release）。複製直後は要素数が
+    ///   同じなので追加課金は複製ぶんの body サイズであり、`Tracked::new` が担う。
+    ///
+    /// 返す `&mut Vec` への push 等で要素数が増える場合の delta 課金は、呼び出し側が
+    /// 操作後に [`Value::recharge_list_delta`] で行う。ここでは detach だけを担当する。
+    fn detach_list<'a>(
+        list: &'a mut Rc<TrackedList>,
+        budget: &mut crate::budget::BudgetLedger,
+        phase: ExecutionPhase,
+    ) -> Result<&'a mut Vec<Value>, ControlStop> {
+        // untracked な compile 時定数（id==0）は、たとえ一意所有でも実 backing へ
+        // 複製して runtime 台帳に載せる（定数を直接書き換えて live 集計から漏らさない）。
+        if list.id.0 != 0 && Rc::strong_count(list) == 1 && Rc::weak_count(list) == 0 {
+            // 一意所有かつ tracked 済み。複製せず in place で書き換える。
+            // Rc::get_mut は strong==1 && weak==0 のとき Some。
+            let tracked = Rc::get_mut(list).expect("strong==1 && weak==0 のとき get_mut は Some");
+            return Ok(&mut tracked.data);
+        }
+        // 共有中または未 tracked。複製して新しい tracked backing を作る（§5.2 COW）。
+        let cloned: Vec<Value> = (**list).clone();
+        let bytes = heap_size::list_body(cloned.len() as u64);
+        let fresh = Tracked::new(cloned, bytes, budget, phase)?;
+        *list = fresh;
+        let tracked = Rc::get_mut(list).expect("新規 Rc は一意所有");
+        Ok(&mut tracked.data)
+    }
+
+    /// `Value::Dict` の backing を書き込み用に detach する（COW）。詳細は
+    /// [`Value::detach_list`] と同じ。
+    fn detach_dict<'a>(
+        dict: &'a mut Rc<TrackedDict>,
+        budget: &mut crate::budget::BudgetLedger,
+        phase: ExecutionPhase,
+    ) -> Result<&'a mut BTreeMap<String, Value>, ControlStop> {
+        if dict.id.0 != 0 && Rc::strong_count(dict) == 1 && Rc::weak_count(dict) == 0 {
+            let tracked = Rc::get_mut(dict).expect("strong==1 && weak==0 のとき get_mut は Some");
+            return Ok(&mut tracked.data);
+        }
+        let cloned: BTreeMap<String, Value> = (**dict).clone();
+        let key_bytes_total: u64 = cloned
+            .keys()
+            .map(|k| k.len() as u64)
+            .fold(0u64, u64::saturating_add);
+        let bytes = heap_size::dict_body(cloned.len() as u64, key_bytes_total);
+        let fresh = Tracked::new(cloned, bytes, budget, phase)?;
+        *dict = fresh;
+        let tracked = Rc::get_mut(dict).expect("新規 Rc は一意所有");
+        Ok(&mut tracked.data)
+    }
+
+    /// 一意所有 backing の要素数が変わったとき、live heap を旧サイズから新サイズへ
+    /// 調整する（in place 書き換え用の delta 課金）。
+    ///
+    /// 共有 backing を detach した直後は要素数が変わっていないのでこの調整は不要
+    /// （`Tracked::new` が既に新サイズを課金済み）。in place 経路（push/pop/index-set）で
+    /// 呼ぶ。増加分は `charge`、減少分は `release`。id や `Tracked.bytes` は据え置くと
+    /// 二重計上になるため、`bytes` を新サイズへ更新する。
+    fn retrack_list(
+        list: &mut Rc<TrackedList>,
+        old_bytes: u64,
+        budget: &mut crate::budget::BudgetLedger,
+        phase: ExecutionPhase,
+    ) -> Result<(), ControlStop> {
+        let new_bytes = heap_size::list_body(list.data.len() as u64);
+        if new_bytes > old_bytes {
+            budget.charge_heap(new_bytes - old_bytes, phase)?;
+        } else if new_bytes < old_bytes {
+            budget.release_heap(old_bytes - new_bytes);
+        }
+        if let Some(tracked) = Rc::get_mut(list) {
+            tracked.bytes = new_bytes;
+        }
+        Ok(())
+    }
+
+    /// 一意所有 Dict backing の delta 課金（[`Value::retrack_list`] の Dict 版）。
+    fn retrack_dict(
+        dict: &mut Rc<TrackedDict>,
+        old_bytes: u64,
+        budget: &mut crate::budget::BudgetLedger,
+        phase: ExecutionPhase,
+    ) -> Result<(), ControlStop> {
+        let key_bytes_total: u64 = dict
+            .data
+            .keys()
+            .map(|k| k.len() as u64)
+            .fold(0u64, u64::saturating_add);
+        let new_bytes = heap_size::dict_body(dict.data.len() as u64, key_bytes_total);
+        if new_bytes > old_bytes {
+            budget.charge_heap(new_bytes - old_bytes, phase)?;
+        } else if new_bytes < old_bytes {
+            budget.release_heap(old_bytes - new_bytes);
+        }
+        if let Some(tracked) = Rc::get_mut(dict) {
+            tracked.bytes = new_bytes;
+        }
+        Ok(())
+    }
+
+    /// `self`（`Value::List`）末尾へ 1 要素を push する（delta 課金、REV-015 案A）。
+    ///
+    /// COW detach（共有なら複製・課金、単独なら in place）→ push →要素数増加ぶんの
+    /// delta（+32 byte）を課金する。共有からの複製時は `detach_list` が新サイズを課金済み
+    /// なので、`retrack_list` は複製後サイズ基準の delta（=+32）だけを追加課金する。
+    /// `self` が List でなければ呼び出し側の型エラー（ここでは何もしない）。
+    pub fn list_push_tracked(
+        &mut self,
+        item: Value,
+        budget: &mut crate::budget::BudgetLedger,
+        phase: ExecutionPhase,
+    ) -> Result<(), ControlStop> {
+        if let Value::List(list) = self {
+            Value::detach_list(list, budget, phase)?;
+            let old_bytes = list.bytes;
+            {
+                let data = Rc::get_mut(list).expect("detach 後は一意所有").data_mut();
+                data.push(item);
+            }
+            Value::retrack_list(list, old_bytes, budget, phase)?;
+        }
+        Ok(())
+    }
+
+    /// `self`（`Value::List`）末尾要素を除去する（delta 課金）。空なら何もしない。
+    pub fn list_pop_tracked(
+        &mut self,
+        budget: &mut crate::budget::BudgetLedger,
+        phase: ExecutionPhase,
+    ) -> Result<(), ControlStop> {
+        if let Value::List(list) = self {
+            if list.data.is_empty() {
+                return Ok(());
+            }
+            Value::detach_list(list, budget, phase)?;
+            let old_bytes = list.bytes;
+            {
+                let data = Rc::get_mut(list).expect("detach 後は一意所有").data_mut();
+                data.pop();
+            }
+            Value::retrack_list(list, old_bytes, budget, phase)?;
+        }
+        Ok(())
+    }
+
+    /// `self[index] = value`（List/Dict）を tracked backing 上で行う（delta 課金）。
+    ///
+    /// 呼び出し側は index 型・範囲・collection 上限を検査済みで、正規化した
+    /// `list_index`（List）または `dict_key`（Dict）を渡す。List の index 代入は要素数
+    /// 不変で delta 0、Dict の新規 key 追加は key 長ぶんを課金する。
+    pub fn index_set_tracked(
+        &mut self,
+        target: IndexTarget,
+        value: Value,
+        budget: &mut crate::budget::BudgetLedger,
+        phase: ExecutionPhase,
+    ) -> Result<(), ControlStop> {
+        match (self, target) {
+            (Value::List(list), IndexTarget::ListIndex(idx)) => {
+                Value::detach_list(list, budget, phase)?;
+                let old_bytes = list.bytes;
+                {
+                    let data = Rc::get_mut(list).expect("detach 後は一意所有").data_mut();
+                    if idx < data.len() {
+                        data[idx] = value;
+                    }
+                }
+                Value::retrack_list(list, old_bytes, budget, phase)?;
+            }
+            (Value::Dict(dict), IndexTarget::DictKey(key)) => {
+                Value::detach_dict(dict, budget, phase)?;
+                let old_bytes = dict.bytes;
+                {
+                    let data = Rc::get_mut(dict).expect("detach 後は一意所有").data_mut();
+                    data.insert(key, value);
+                }
+                Value::retrack_dict(dict, old_bytes, budget, phase)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// 真偽判定（if / while の条件で使う）
     pub fn is_truthy(&self) -> bool {
         match self {
@@ -367,8 +728,14 @@ mod tests {
         assert!(Value::Int(-1).is_truthy());
         assert!(Value::Float(0.1).is_truthy());
         assert!(Value::Str("hello".to_string()).is_truthy());
-        assert!(Value::List(Rc::new(vec![Value::Int(1)])).is_truthy());
-        assert!(Value::Dict(Rc::new(BTreeMap::from([("a".into(), Value::Int(1))]))).is_truthy());
+        assert!(Value::List(Tracked::constant(vec![Value::Int(1)])).is_truthy());
+        assert!(
+            Value::Dict(Tracked::constant(BTreeMap::from([(
+                "a".into(),
+                Value::Int(1)
+            )])))
+            .is_truthy()
+        );
     }
 
     #[test]
@@ -378,8 +745,8 @@ mod tests {
         assert!(!Value::Int(0).is_truthy());
         assert!(!Value::Float(0.0).is_truthy());
         assert!(!Value::Str("".to_string()).is_truthy());
-        assert!(!Value::List(Rc::new(vec![])).is_truthy());
-        assert!(!Value::Dict(Rc::new(BTreeMap::new())).is_truthy());
+        assert!(!Value::List(Tracked::constant(vec![])).is_truthy());
+        assert!(!Value::Dict(Tracked::constant(BTreeMap::new())).is_truthy());
     }
 
     #[test]
@@ -390,11 +757,19 @@ mod tests {
         assert_eq!(Value::Bool(true).to_string(), "true");
         assert_eq!(Value::Null.to_string(), "null");
         assert_eq!(
-            Value::List(Rc::new(vec![Value::Int(1), Value::Str("a".into())])).to_string(),
+            Value::List(Tracked::constant(vec![
+                Value::Int(1),
+                Value::Str("a".into())
+            ]))
+            .to_string(),
             "[1, \"a\"]"
         );
         assert_eq!(
-            Value::Dict(Rc::new(BTreeMap::from([("x".into(), Value::Int(10))]))).to_string(),
+            Value::Dict(Tracked::constant(BTreeMap::from([(
+                "x".into(),
+                Value::Int(10)
+            )])))
+            .to_string(),
             "{\"x\": 10}"
         );
     }
@@ -587,5 +962,186 @@ mod tests {
         assert!(!NumericOrdering::UnorderedNaN.is_le());
         assert!(!NumericOrdering::UnorderedNaN.is_gt());
         assert!(!NumericOrdering::UnorderedNaN.is_ge());
+    }
+
+    // ---- REV-015 案A: tracked collection の per-drop release / delta 課金 ----
+
+    use crate::budget::{BudgetConfig, BudgetLedger, ExecutionPhase};
+
+    fn heap_ledger(limit: u64) -> BudgetLedger {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+        config.max_live_heap_bytes = limit;
+        BudgetLedger::with_config(config)
+    }
+
+    #[test]
+    fn tracked_list_charges_on_new_and_releases_on_drop() {
+        let mut budget = heap_ledger(1_000_000);
+        assert_eq!(budget.live_heap_bytes(), 0);
+        // 3 要素 List body = 24 + 32*3 = 120。
+        let list = Value::new_list(
+            vec![Value::Int(1), Value::Int(2), Value::Int(3)],
+            &mut budget,
+            ExecutionPhase::Run,
+        )
+        .unwrap();
+        assert_eq!(budget.live_heap_bytes(), heap_size::list_body(3));
+        // 最後の参照 drop で live heap が戻る（§5.2）。
+        drop(list);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn tracked_dict_charges_body_with_key_bytes_and_releases_on_drop() {
+        let mut budget = heap_ledger(1_000_000);
+        let mut map = BTreeMap::new();
+        map.insert("ab".to_string(), Value::Int(1));
+        map.insert("cde".to_string(), Value::Int(2));
+        let dict = Value::new_dict(map, &mut budget, ExecutionPhase::Run).unwrap();
+        // 2 entry, key bytes 2+3=5 → 24 + 64*2 + 5 = 157。
+        assert_eq!(budget.live_heap_bytes(), heap_size::dict_body(2, 5));
+        drop(dict);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn rc_clone_shares_without_extra_charge_and_releases_once() {
+        let mut budget = heap_ledger(1_000_000);
+        let list = Value::new_list(vec![Value::Int(1)], &mut budget, ExecutionPhase::Run).unwrap();
+        let one = budget.live_heap_bytes();
+        assert_eq!(one, heap_size::list_body(1));
+        // clone は Rc ハンドル共有。追加課金しない（§5.2）。
+        let alias = list.clone();
+        assert_eq!(budget.live_heap_bytes(), one);
+        // 1 本目を drop してもまだ alias が生きているので release されない。
+        drop(list);
+        assert_eq!(budget.live_heap_bytes(), one);
+        // 最後の参照が落ちて初めて release。
+        drop(alias);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn untracked_constant_does_not_charge_or_release() {
+        let budget = heap_ledger(1_000_000);
+        // Tracked::constant は課金しない（compile 時定数用）。台帳の live は 0 のまま。
+        let c = Value::List(Tracked::constant(vec![Value::Int(1), Value::Int(2)]));
+        assert_eq!(budget.live_heap_bytes(), 0);
+        drop(c);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn push_charges_delta_only() {
+        let mut budget = heap_ledger(1_000_000);
+        let mut list = Value::new_list(vec![], &mut budget, ExecutionPhase::Run).unwrap();
+        let empty = budget.live_heap_bytes();
+        assert_eq!(empty, heap_size::list_body(0)); // 24
+        // push 1 要素 → +32（1 要素ぶんの body delta）。全体再課金ではない。
+        list.list_push_tracked(Value::Int(1), &mut budget, ExecutionPhase::Run)
+            .unwrap();
+        assert_eq!(budget.live_heap_bytes(), heap_size::list_body(1));
+        list.list_push_tracked(Value::Int(2), &mut budget, ExecutionPhase::Run)
+            .unwrap();
+        assert_eq!(budget.live_heap_bytes(), heap_size::list_body(2));
+        // pop で delta release。
+        list.list_pop_tracked(&mut budget, ExecutionPhase::Run)
+            .unwrap();
+        assert_eq!(budget.live_heap_bytes(), heap_size::list_body(1));
+        drop(list);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn cow_detach_on_shared_push_charges_new_backing_and_releases_old_on_drop() {
+        let mut budget = heap_ledger(1_000_000);
+        let base = Value::new_list(
+            vec![Value::Int(1), Value::Int(2)],
+            &mut budget,
+            ExecutionPhase::Run,
+        )
+        .unwrap();
+        let base_bytes = budget.live_heap_bytes();
+        assert_eq!(base_bytes, heap_size::list_body(2));
+        // 共有してから push すると COW で新 backing を作る（§5.2: 新 AllocationId）。
+        let mut shared = base.clone();
+        // clone は無課金。
+        assert_eq!(budget.live_heap_bytes(), base_bytes);
+        shared
+            .list_push_tracked(Value::Int(3), &mut budget, ExecutionPhase::Run)
+            .unwrap();
+        // 新 backing（3 要素）を課金。旧 backing（2 要素）は base がまだ握るので live。
+        assert_eq!(
+            budget.live_heap_bytes(),
+            heap_size::list_body(2) + heap_size::list_body(3)
+        );
+        // base を drop すると旧 backing が release。
+        drop(base);
+        assert_eq!(budget.live_heap_bytes(), heap_size::list_body(3));
+        drop(shared);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn index_set_same_size_is_zero_delta() {
+        let mut budget = heap_ledger(1_000_000);
+        let mut list = Value::new_list(
+            vec![Value::Int(1), Value::Int(2)],
+            &mut budget,
+            ExecutionPhase::Run,
+        )
+        .unwrap();
+        let before = budget.live_heap_bytes();
+        // 要素の入れ替えは要素数不変 → live heap delta 0。
+        list.index_set_tracked(
+            IndexTarget::ListIndex(0),
+            Value::Int(99),
+            &mut budget,
+            ExecutionPhase::Run,
+        )
+        .unwrap();
+        assert_eq!(budget.live_heap_bytes(), before);
+        drop(list);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn nested_list_releases_inner_on_outer_drop() {
+        let mut budget = heap_ledger(1_000_000);
+        let inner = Value::new_list(vec![Value::Int(1)], &mut budget, ExecutionPhase::Run).unwrap();
+        let inner_bytes = budget.live_heap_bytes();
+        // 外側 List に内側 List を格納。内側は共有（clone）されるので追加課金なし。
+        let outer = Value::new_list(vec![inner.clone()], &mut budget, ExecutionPhase::Run).unwrap();
+        assert_eq!(
+            budget.live_heap_bytes(),
+            inner_bytes + heap_size::list_body(1)
+        );
+        // inner の変数参照を落としても、outer が内側を握るので release されない。
+        drop(inner);
+        assert_eq!(
+            budget.live_heap_bytes(),
+            inner_bytes + heap_size::list_body(1)
+        );
+        // outer を drop すると外側 backing と、最後の参照になった内側 backing が両方 release。
+        drop(outer);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn heap_limit_trips_at_allocation() {
+        // 上限を 2 要素 List body ちょうどに設定。3 要素は超過する。
+        let mut budget = heap_ledger(heap_size::list_body(2));
+        let ok = Value::new_list(
+            vec![Value::Int(1), Value::Int(2)],
+            &mut budget,
+            ExecutionPhase::Run,
+        );
+        assert!(ok.is_ok());
+        // ok が live なので次の allocation は必ず超過。
+        let over = Value::new_list(vec![Value::Int(1)], &mut budget, ExecutionPhase::Run);
+        assert!(matches!(
+            over,
+            Err(crate::budget::ControlStop::BudgetExceeded(_))
+        ));
     }
 }
