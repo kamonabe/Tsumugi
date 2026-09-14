@@ -85,6 +85,8 @@ pub enum ErrorKind {
     StringLimit,
     /// source/import 予算上限超過（single/count/bytes、REV-015 Slice 2）
     SourceLimit,
+    /// heap 予算上限超過（live heap bytes、REV-015 Slice 2）
+    HeapLimit,
     /// 型変換失敗（to_int / to_float）
     Conversion,
     /// 組み込み関数への不正な型の引数
@@ -117,6 +119,7 @@ impl ErrorKind {
             Self::CollectionLimit => "collection_limit",
             Self::StringLimit => "string_limit",
             Self::SourceLimit => "source_limit",
+            Self::HeapLimit => "heap_limit",
             Self::Conversion => "conversion",
             Self::BuiltinType => "builtin_type",
             Self::Iteration => "iteration",
@@ -626,6 +629,18 @@ impl TsumugiError {
             ErrorKind::SourceLimit,
             format!(
                 "import の総バイト数が上限を超えました (上限: {} バイト)",
+                limit
+            ),
+        )
+    }
+
+    /// live heap の総 byte 数上限超過（REV-015 Slice 2、live HeapBytes）
+    pub fn heap_limit(line: usize, limit: u64) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::HeapLimit,
+            format!(
+                "ヒープの総バイト数が上限を超えました (上限: {} バイト)",
                 limit
             ),
         )
