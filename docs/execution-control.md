@@ -2,11 +2,11 @@
 
 最終更新: 2026-09-11
 
-設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は string / source / import accounting サブスライスを実装済みで、heap/I-O accounting は未着手）
+設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は string / source / import accounting と heap accounting 基盤（`AllocationLedger`・§5.1 論理サイズ・§5.2 context baseline 走査）を実装済みで、heap の per-drop release（実行中の per-allocation 課金と最後の参照 drop での release）と I-O accounting は未着手）
 
 ## 1. 位置づけ
 
-本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleStringBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線）と source / import accounting サブスライス（per-item `SingleSourceBytes`・cumulative `SourceCount`/`SourceBytes`・`ImportCount`/`ImportBytes` を Link フェーズで root と import へ tree/VM 共通で課金）も実装済みである。Slice 2 の残り（heap/I-O accounting、string リテラル/連結/f-string 経路、context baseline 走査）と Slice 3 以降（continuation、cancel/pause、scheduler、VM parity）は未実装である。
+本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleSourceBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線）と source / import accounting サブスライス（per-item `SingleSourceBytes`・cumulative `SourceCount`/`SourceBytes`・`ImportCount`/`ImportBytes` を Link フェーズで root と import へ tree/VM 共通で課金）、および heap accounting 基盤サブスライス（`AllocationId`・`AllocationLedger`・§5.1 論理サイズ関数・`HeapBytes` reserve/超過写像・§5.2 context baseline 走査を Link フェーズで tree/VM 共通に課金）も実装済みである。Slice 2 の残り（heap の per-drop release と実行中の per-allocation 課金、I-O accounting、string リテラル/連結/f-string 経路）と Slice 3 以降（continuation、cancel/pause、scheduler、VM parity）は未実装である。
 
 本文書は次の既存仕様と一体で実装する。
 
@@ -734,9 +734,29 @@ run-turn queueはEngine全体でFIFO round-robinとし、continuation自体で�
   `TSUMUGI_MAX_SOURCE_BYTES` / `TSUMUGI_MAX_IMPORT_COUNT` / `TSUMUGI_MAX_IMPORT_BYTES`
   を追加。既定上限では観測挙動を変えない。
 - input/output/host count+bytesとreserve/commit/refundを実装（未実装）
-- `AllocationId`とper-execution ledgerを導入（未実装）
-- Value、String、List、Dict、function、AST/chunk、import、journalを論理heapへ接続（未実装）
-- baseline context graphの反復走査を実装（未実装）
+- heap accounting 基盤（✅ 実装済み）: `AllocationId(u64)` と per-execution
+  `AllocationLedger` を `src/budget.rs` に導入した。§5.1 の論理サイズ表を `heap_size`
+  純関数群として固定し（Value slot / String body / List・Dict body / tree・VM function
+  instance / AST root・node / bytecode chunk / import record / continuation frame /
+  handler / rollback journal entry）、`BudgetLedger::charge_heap` / `release_heap` が
+  live heap を checked add / saturating sub で管理する。上限超過・overflow は §7.2 の
+  固定優先順位（`HeapBytes` は Fuel の次）で `BudgetExceeded(HeapBytes)`、`AllocationId`
+  の発行 overflow は 0 へ wrap せず `ControlStop::InternalFailure(AllocationIdExhausted)`
+  にする。`usage()` が `live_heap_bytes` / `peak_heap_bytes` を反映する。§5.2 の context
+  baseline 走査を `charge_context_baseline` に実装し、`Link` フェーズで最初の文を実行する
+  前に、既存 context（tree は全 scope の変数 cell、VM は value stack と top-level cell）
+  から到達する heap graph を反復 worklist + `Rc` pointer visited set で走査して live heap
+  へ課金する。baseline が上限を超えれば 1 文も実行せず `BudgetExceeded(HeapBytes)`。tree
+  （`Evaluator::charge_link`）と VM（`Vm::charge_link`）が共通規則で課金し、走査前に live
+  heap を 0 へ戻して REPL 入力間の二重計上を避ける。legacy env
+  `TSUMUGI_MAX_LIVE_HEAP_BYTES` を追加。既定上限では観測挙動を変えない。
+- heap の per-drop release（未実装、後続 PR）: 実行中の per-allocation 課金と、object への
+  最後の execution 内参照が drop した時点での live heap release は、`Value`（`List`/`Dict`/
+  cell）へ `AllocationId` を持たせる忠実版として後続 PR で実装する。本 PR の基盤（ledger・
+  論理サイズ・baseline）を土台に、`charge_heap`/`release_heap`/`allocate_heap_id` を各
+  allocation/drop site へ配線する。それまで live heap は baseline 確定後 submission 内で
+  一定に保つ。
+- Value、String、List、Dict、function、AST/chunk、import、journalを実行中の論理heapへ接続（未実装、上記 per-drop release と同 PR）
 
 ### Slice 3: explicit continuation
 

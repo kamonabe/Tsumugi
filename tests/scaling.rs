@@ -457,3 +457,84 @@ fn cow_read_allocation_stays_linear_in_both_engines() {
         }
     }
 }
+
+/// REV-015 Slice 2（§5.2 context baseline / §15.2 heap）:
+/// 論理 baseline heap が要素数に線形であることを、公開 `BudgetLedger` API で固定する。
+///
+/// 実アロケータではなく論理台帳を測るため決定的で、`MEASURE_LOCK` は不要。
+/// List backing は要素数 n に対し `24 + 32*n` + 要素ごとの Value slot 32 なので、
+/// baseline は n に対して線形に増える（O(n)）。
+#[test]
+fn context_baseline_heap_is_linear_in_element_count() {
+    use std::rc::Rc;
+    use tsumugi::budget::{BudgetConfig, BudgetLedger, ExecutionPhase};
+    use tsumugi::value::Value;
+
+    fn baseline_for(n: usize) -> u64 {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+        config.max_live_heap_bytes = u64::MAX;
+        let mut ledger = BudgetLedger::with_config(config);
+        let list = Value::List(Rc::new((0..n as i64).map(Value::Int).collect::<Vec<_>>()));
+        ledger
+            .charge_context_baseline([list], ExecutionPhase::Link)
+            .expect("baseline 課金に失敗");
+        ledger.usage().live_heap_bytes
+    }
+
+    // n を 10 倍にしたら baseline も概ね 10 倍（固定 header 分だけ超える）に収まる。
+    let small = baseline_for(100);
+    let large = baseline_for(1_000);
+    assert!(small > 0, "baseline が計測できていません");
+
+    let ratio = large as f64 / small as f64;
+    assert!(
+        (9.0..=11.0).contains(&ratio),
+        "baseline heap が要素数に線形ではありません: n=100 で {small} バイト, \
+         n=1000 で {large} バイト（比 {ratio:.2}、期待 9.0..=11.0）"
+    );
+}
+
+/// §5.2 visited set: 同じ backing を複数 root から指しても baseline は 1 回だけ課金する。
+/// 共有した場合と分離した場合で、共有側が厳密に小さいことを固定する。
+#[test]
+fn context_baseline_dedups_shared_backing() {
+    use std::rc::Rc;
+    use tsumugi::budget::{BudgetConfig, BudgetLedger, ExecutionPhase};
+    use tsumugi::value::Value;
+
+    fn ledger() -> BudgetLedger {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+        config.max_live_heap_bytes = u64::MAX;
+        BudgetLedger::with_config(config)
+    }
+
+    let shared_backing = Rc::new((0..200i64).map(Value::Int).collect::<Vec<_>>());
+    let mut shared = ledger();
+    shared
+        .charge_context_baseline(
+            [
+                Value::List(Rc::clone(&shared_backing)),
+                Value::List(Rc::clone(&shared_backing)),
+            ],
+            ExecutionPhase::Link,
+        )
+        .expect("baseline 課金に失敗");
+
+    let mut distinct = ledger();
+    distinct
+        .charge_context_baseline(
+            [
+                Value::List(Rc::new((0..200i64).map(Value::Int).collect::<Vec<_>>())),
+                Value::List(Rc::new((0..200i64).map(Value::Int).collect::<Vec<_>>())),
+            ],
+            ExecutionPhase::Link,
+        )
+        .expect("baseline 課金に失敗");
+
+    assert!(
+        shared.usage().live_heap_bytes < distinct.usage().live_heap_bytes,
+        "共有 backing が dedup されていません: shared={} distinct={}",
+        shared.usage().live_heap_bytes,
+        distinct.usage().live_heap_bytes
+    );
+}

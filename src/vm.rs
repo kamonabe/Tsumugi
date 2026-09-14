@@ -183,6 +183,40 @@ impl Vm {
         self.frames.len().saturating_sub(1)
     }
 
+    /// heap baseline 走査の root を集める（REV-015 Slice 2、§5.2 context baseline）。
+    ///
+    /// VM の execution 跨ぎ state は value stack と top-level frame の `locals_cells`
+    /// （top-level 変数の cell 化済み値）である。両者が保持する `Value` を root として
+    /// 返す。
+    ///
+    /// top-level 変数が closure capture 等で cell 化されると、`ensure_local_cell` は
+    /// stack slot の値を新しい cell へ clone するが stack slot は stale なまま残す
+    /// （cell が source of truth）。top-level frame は `base == 0` なので slot `i` は
+    /// stack index `i` に対応する。cell がある slot の stale な stack 値を root へ含める
+    /// と 1 変数を二重計上し、全変数を 1 回だけ数える tree engine（`Env::baseline_roots`）
+    /// と baseline 量が食い違う。よって cell 化済み slot の stack 値は除外し、cell 側だけ
+    /// を root にする。List / Dict / 関数値は `Rc` 共有なので clone は handle 複製 O(1)、
+    /// 走査側が pointer 同一性で backing を dedup する。
+    fn baseline_roots(&self) -> Vec<Value> {
+        let top_cells = self
+            .frames
+            .first()
+            .map(|frame| frame.locals_cells.as_slice())
+            .unwrap_or(&[]);
+        let mut roots: Vec<Value> = Vec::new();
+        for (i, v) in self.stack.iter().enumerate() {
+            // slot i が cell 化済みなら stack 値は stale。cell 側で数える。
+            let cell_ified = matches!(top_cells.get(i), Some(Some(_)));
+            if !cell_ified {
+                roots.push(v.clone());
+            }
+        }
+        for cell in top_cells.iter().flatten() {
+            roots.push(cell.borrow().clone());
+        }
+        roots
+    }
+
     /// root source と import source を予算へ課金する（REV-015 Slice 2、§5.3）。
     ///
     /// `Link` フェーズの課金であり、`run` の前に呼ぶ。tree evaluator の
@@ -195,6 +229,16 @@ impl Vm {
         root_source_bytes: u64,
         loaded: &[crate::module::LoadedModule],
     ) -> Result<(), TsumugiError> {
+        // context baseline live heap を課金する（REV-015 Slice 2、§5.2）。tree engine の
+        // `Evaluator::charge_link` と同じく、走査前に live heap を 0 へ戻して現在の
+        // context（stack slot と top-level cell）から到達する live 量を積み直す。
+        // baseline が上限を超えるなら 1 文も実行しない。per-allocation 課金・per-drop
+        // release は本 PR の範囲外（後続 PR）。
+        self.budget.restore_live_heap_bytes(0);
+        let baseline_roots = self.baseline_roots();
+        self.budget
+            .charge_context_baseline(baseline_roots, ExecutionPhase::Link)
+            .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, 0))?;
         self.budget
             .charge_source(root_source_bytes, ExecutionPhase::Link)
             .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, 0))?;

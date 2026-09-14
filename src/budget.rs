@@ -26,6 +26,7 @@
 //! - budget 超過は script の `try` / `catch` から捕捉できない。本モジュールは
 //!   [`ControlStop`] を返すだけで、engine 側が catch 不能な terminal として扱う。
 
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -321,6 +322,13 @@ impl BudgetConfig {
         {
             config.max_import_bytes = v;
         }
+        // heap accounting（REV-015 Slice 2）の legacy 上限入口。未設定は §3.1 の既定値。
+        if let Some(v) = std::env::var("TSUMUGI_MAX_LIVE_HEAP_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            config.max_live_heap_bytes = v;
+        }
         config
     }
 
@@ -501,6 +509,16 @@ pub enum ControlStop {
         observed: MonotonicInstant,
     },
     BudgetExceeded(BudgetExceeded),
+    /// 内部不変条件の破れ（§5.2）。現状は `AllocationId` 発行の overflow だけを
+    /// 表す。budget 超過と同じく catch 不能 terminal であり、0 へ wrap しない。
+    InternalFailure(InternalFailure),
+}
+
+/// 内部不変条件の破れ（§5.2 / §7.1）。catch 不能 terminal として扱う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InternalFailure {
+    /// `AllocationId(u64)` を使い切った。0 へ wrap せず terminal にする。
+    AllocationIdExhausted,
 }
 
 // =============================================================================
@@ -547,6 +565,210 @@ pub struct CumulativeRequest {
 }
 
 // =============================================================================
+// heap accounting（§5.1 論理サイズ / §5.2 AllocationLedger）
+// =============================================================================
+
+/// heap-owned object 1 個へ発番する識別子（§5.2）。
+///
+/// execution ごとに 1 から単調増加する。同一 object を複数の `Rc` から参照しても、
+/// この ID が同じである限り [`AllocationLedger`] は 1 回だけ課金する。発番の overflow
+/// は 0 へ wrap せず [`InternalFailure::AllocationIdExhausted`] にする（§5.2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AllocationId(pub u64);
+
+/// §5.1 の論理サイズ表。allocator・platform・Rust compiler に依存しない固定値を
+/// `HEAP_ACCOUNTING_REVISION = 1` として返す純関数群。
+///
+/// header 定数は byte 長・要素数から独立しており、object の種別だけで決まる。
+/// payload（String body の byte 長、collection の要素数、Dict key の byte 長など）は
+/// 各関数の引数で受け取る。すべて `u64` で計算し、overflow は呼び出し側の
+/// `checked_*` 課金経路（[`AllocationLedger::charge`]）で `HeapBytes` 超過へ写像する。
+pub mod heap_size {
+    /// `Value` slot または captured cell 1 個（§5.1）。
+    pub const VALUE_SLOT: u64 = 32;
+    /// captured cell（`Rc<RefCell<Value>>`）1 個。§5.1 では Value slot と同じ 32。
+    pub const CAPTURED_CELL: u64 = 32;
+
+    /// UTF-8 `String` body（header 24 + byte 長）。header に payload を含めない。
+    pub fn string_body(byte_len: u64) -> u64 {
+        24u64.saturating_add(byte_len)
+    }
+
+    /// `List` body（header 24 + 32 × 要素数）。
+    pub fn list_body(element_count: u64) -> u64 {
+        24u64.saturating_add(element_count.saturating_mul(32))
+    }
+
+    /// `Dict` body（header 24 + 64 × entry 数 + 各 key の UTF-8 byte 長）。
+    /// key payload の合計 `key_bytes_total` は呼び出し側が合算して渡す。
+    pub fn dict_body(entry_count: u64, key_bytes_total: u64) -> u64 {
+        24u64
+            .saturating_add(entry_count.saturating_mul(64))
+            .saturating_add(key_bytes_total)
+    }
+
+    /// tree function instance（64 + 16 × captured cell reference 数）。
+    pub fn tree_function(captured_count: u64) -> u64 {
+        64u64.saturating_add(captured_count.saturating_mul(16))
+    }
+
+    /// VM function instance（48 + 16 × upvalue reference 数）。
+    pub fn vm_function(upvalue_count: u64) -> u64 {
+        48u64.saturating_add(upvalue_count.saturating_mul(16))
+    }
+
+    /// AST program root（64 固定）。
+    pub const AST_ROOT: u64 = 64;
+
+    /// AST node（64 + node が所有する identifier / string literal の byte 長）。
+    pub fn ast_node(owned_bytes: u64) -> u64 {
+        64u64.saturating_add(owned_bytes)
+    }
+
+    /// bytecode chunk（64 + 16 × opcode 数 + 32 × constant slot 数）。
+    pub fn bytecode_chunk(opcode_count: u64, constant_count: u64) -> u64 {
+        64u64
+            .saturating_add(opcode_count.saturating_mul(16))
+            .saturating_add(constant_count.saturating_mul(32))
+    }
+
+    /// imported module record（96 + normalized module ID の UTF-8 byte 長）。
+    pub fn imported_module_record(module_id_bytes: u64) -> u64 {
+        96u64.saturating_add(module_id_bytes)
+    }
+
+    /// continuation frame（96 + 32 × frame が所有する local slot 数）。
+    pub fn continuation_frame(local_count: u64) -> u64 {
+        96u64.saturating_add(local_count.saturating_mul(32))
+    }
+
+    /// exception handler / loop handler（32 固定）。
+    pub const HANDLER: u64 = 32;
+
+    /// rollback journal entry（48 + 保持する旧 value の到達 payload）。
+    pub fn rollback_journal_entry(retained_payload: u64) -> u64 {
+        48u64.saturating_add(retained_payload)
+    }
+}
+
+/// execution ごとの heap allocation 台帳（§5.2）。
+///
+/// 単調増加する [`AllocationId`] を配り、同じ ID を二度課金しない。live heap byte 数を
+/// 管理し、新規 allocation 前に `HeapBytes` 上限を checked add で検査する。object への
+/// 最後の execution 内参照が消えたら [`AllocationLedger::release`] で live heap を戻す
+/// （cumulative の string/source/I-O counter は減らさない。§7-6）。
+///
+/// # PR 分割メモ（REV-015 Slice 2）
+///
+/// 本 PR（heap 基盤）は「生成時に論理サイズを課金し、境界で live heap を突き合わせる」
+/// 方式で `charge` / `release` / `peak` を提供する。`Value` へ [`AllocationId`] を持たせ
+/// drop 通知で正確に per-drop release する忠実版は後続 PR で載せる。したがって本台帳の
+/// `charge`/`release` は呼び出し側（engine）が allocation site と boundary reconciliation
+/// から明示的に driveする。
+pub struct AllocationLedger {
+    /// 次に配る AllocationId。1 から単調増加する（0 は「未割り当て」を表す）。
+    next_id: u64,
+    /// 現在 live な論理 heap byte 数。
+    live_bytes: u64,
+    /// これまでに観測した live_bytes の最大値（§3 peak）。
+    peak_bytes: u64,
+    /// live 上限（`BudgetConfig::max_live_heap_bytes`）。
+    limit: u64,
+}
+
+impl AllocationLedger {
+    /// live 上限から空の台帳を作る。
+    pub fn new(limit: u64) -> Self {
+        Self {
+            next_id: 1,
+            live_bytes: 0,
+            peak_bytes: 0,
+            limit,
+        }
+    }
+
+    /// 新しい [`AllocationId`] を 1 個発番する（§5.2）。
+    ///
+    /// overflow は 0 へ wrap せず [`InternalFailure::AllocationIdExhausted`] を返す。
+    pub fn allocate_id(&mut self) -> Result<AllocationId, ControlStop> {
+        let id = self.next_id;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(ControlStop::InternalFailure(
+                InternalFailure::AllocationIdExhausted,
+            ))?;
+        Ok(AllocationId(id))
+    }
+
+    /// 新規 object 1 個の論理サイズ `bytes` を live heap へ課金する（§5.2）。
+    ///
+    /// `live_bytes + bytes` を checked add で計算し、上限超過 / overflow は
+    /// `BudgetExceeded(HeapBytes)` を返す（§7.1: overflow も超過として扱い
+    /// `requested = u64::MAX`）。成功時は live_bytes を増やし peak を `max` 更新する。
+    pub fn charge(&mut self, bytes: u64, phase: ExecutionPhase) -> Result<(), ControlStop> {
+        let projected = self.live_bytes.checked_add(bytes);
+        match projected {
+            Some(total) if total <= self.limit => {
+                self.live_bytes = total;
+                if total > self.peak_bytes {
+                    self.peak_bytes = total;
+                }
+                Ok(())
+            }
+            Some(_) => Err(ControlStop::BudgetExceeded(BudgetExceeded {
+                resource: BudgetResource::HeapBytes,
+                limit: self.limit,
+                used: self.live_bytes,
+                reserved: 0,
+                requested: bytes,
+                unit: BudgetUnit::Bytes,
+                phase,
+            })),
+            None => Err(ControlStop::BudgetExceeded(BudgetExceeded {
+                resource: BudgetResource::HeapBytes,
+                limit: self.limit,
+                used: self.live_bytes,
+                reserved: 0,
+                requested: u64::MAX,
+                unit: BudgetUnit::Bytes,
+                phase,
+            })),
+        }
+    }
+
+    /// object の最後の execution 内参照が消えたときに live heap を戻す（§5.2 / §7-6）。
+    ///
+    /// live byte の減少であり、cumulative counter の refund ではない。二重 release で
+    /// 0 未満へ回らないよう saturating で引く（§7.1 の禁止は saturating *更新* による
+    /// 上限迂回であり、release の 0 下限 clamp は許される）。peak は据え置く。
+    pub fn release(&mut self, bytes: u64) {
+        self.live_bytes = self.live_bytes.saturating_sub(bytes);
+    }
+
+    /// 現在の live heap byte 数。
+    pub fn live_bytes(&self) -> u64 {
+        self.live_bytes
+    }
+
+    /// これまでの live heap byte 数の最大値（§3 peak）。
+    pub fn peak_bytes(&self) -> u64 {
+        self.peak_bytes
+    }
+
+    /// live 上限を再設定する（`set_max_live_heap_bytes` 互換の内部入口）。
+    pub fn set_limit(&mut self, limit: u64) {
+        self.limit = limit;
+    }
+
+    /// live heap byte 数を指定値へ復元する（REPL 未捕捉エラー時の rollback 用）。
+    /// peak は据え置く。
+    pub fn restore_live_bytes(&mut self, live_bytes: u64) {
+        self.live_bytes = live_bytes;
+    }
+}
+
+// =============================================================================
 // 課金台帳（BudgetLedger）
 // =============================================================================
 
@@ -568,12 +790,15 @@ pub struct BudgetLedger {
     reserved: BudgetCounters,
     peaks: BudgetPeaks,
     cancellation: CancellationToken,
+    /// live heap accounting（§5.2、REV-015 Slice 2）。
+    heap: AllocationLedger,
 }
 
 impl BudgetLedger {
     /// config と cancellation token から台帳を作る。
     pub fn new(config: BudgetConfig, cancellation: CancellationToken) -> Self {
         Self {
+            heap: AllocationLedger::new(config.max_live_heap_bytes),
             config,
             committed: BudgetCounters::default(),
             reserved: BudgetCounters::default(),
@@ -592,9 +817,11 @@ impl BudgetLedger {
         BudgetUsage {
             committed: self.committed,
             reserved: self.reserved,
-            live_heap_bytes: 0,
+            live_heap_bytes: self.heap.live_bytes(),
+            // reserved_heap は per-drop release 導入（後続 PR）まで常に 0。本 PR の
+            // heap 課金は生成時に live へ直接 commit する方式で reserve を保持しない。
             reserved_heap_bytes: 0,
-            peak_heap_bytes: 0,
+            peak_heap_bytes: self.heap.peak_bytes(),
             peaks: self.peaks,
         }
     }
@@ -1141,6 +1368,167 @@ impl BudgetLedger {
         self.config.total_fuel = total_fuel;
     }
 
+    // -------------------------------------------------------------------------
+    // heap accounting（§5.2、REV-015 Slice 2）
+    // -------------------------------------------------------------------------
+
+    /// 新しい [`AllocationId`] を 1 個発番する（§5.2）。
+    ///
+    /// overflow は [`ControlStop::InternalFailure`]（`AllocationIdExhausted`）。
+    pub fn allocate_heap_id(&mut self) -> Result<AllocationId, ControlStop> {
+        self.heap.allocate_id()
+    }
+
+    /// 新規 heap object 1 個の論理サイズ `bytes` を live heap へ課金する（§5.2）。
+    ///
+    /// [`heap_size`] の各関数で算出した論理サイズを渡す。上限超過 / overflow は
+    /// `BudgetExceeded(HeapBytes)`。cancel を charge 前に確認する（§7-1）。
+    pub fn charge_heap(&mut self, bytes: u64, phase: ExecutionPhase) -> Result<(), ControlStop> {
+        self.check_cancel()?;
+        self.check_deadline()?;
+        self.heap.charge(bytes, phase)
+    }
+
+    /// object の最後の execution 内参照が消えたときに live heap を戻す（§5.2 / §7-6）。
+    ///
+    /// cumulative counter は減らさない。二重 release でも 0 未満へ回らない。
+    pub fn release_heap(&mut self, bytes: u64) {
+        self.heap.release(bytes);
+    }
+
+    /// 現在の live heap byte 数（REPL rollback の snapshot 用）。
+    pub fn live_heap_bytes(&self) -> u64 {
+        self.heap.live_bytes()
+    }
+
+    /// live heap byte 数を指定値へ復元する（REPL 未捕捉エラー時の rollback 用）。
+    /// peak は据え置く。
+    pub fn restore_live_heap_bytes(&mut self, live_heap_bytes: u64) {
+        self.heap.restore_live_bytes(live_heap_bytes);
+    }
+
+    /// live heap 上限を再設定する。
+    pub fn set_max_live_heap_bytes(&mut self, limit: u64) {
+        self.config.max_live_heap_bytes = limit;
+        self.heap.set_limit(limit);
+    }
+
+    /// `ExecutionContext` に既存の変数・closure・collection を、新 execution の
+    /// baseline live heap として課金する（§5.2 末尾 / §15.2 「context baseline」）。
+    ///
+    /// `Link` フェーズで最初の文を実行する前に呼ぶ。root として渡された `Value` 群から
+    /// 到達する heap object を反復 worklist で走査し、§5.1 の論理サイズで live heap へ
+    /// 課金する。再帰走査は使わず、同じ heap object（`Rc` pointer 同一性）を visited set
+    /// で 1 回だけ数える。baseline が上限を超える場合は `BudgetExceeded(HeapBytes)` を
+    /// 返し、呼び出し側は 1 文も実行しない。
+    ///
+    /// # 走査の根と clone について
+    ///
+    /// tree engine は各変数 cell が保持する `Value`、VM は globals / stack slot が保持する
+    /// `Value` を root として渡す。root は所有 `Value` として受け取る。`List` / `Dict` /
+    /// `Fn.captured` / cell は `Rc` 共有なので clone は handle 複製の O(1) であり、実体は
+    /// 複製しない（String body だけは実 copy だが baseline 走査は 1 回きり）。共有 backing
+    /// は pointer 同一性で dedup するため、同じ object を複数 root から指しても 1 回だけ
+    /// 課金する（§5.2）。
+    pub fn charge_context_baseline<I>(
+        &mut self,
+        roots: I,
+        phase: ExecutionPhase,
+    ) -> Result<(), ControlStop>
+    where
+        I: IntoIterator<Item = crate::value::Value>,
+    {
+        self.check_cancel()?;
+        self.check_deadline()?;
+
+        use crate::value::Value;
+        use std::collections::HashSet;
+
+        // 訪問済み heap object を pointer 同一性で除外する（§5.2 visited set）。
+        // List / Dict / captured cell / VmFn upvalue cell / Fn captured map は Rc 共有
+        // され得るため、backing の pointer で dedup する。String は現行 `Value::Str`
+        // では共有 backing を持たないため body ごとに課金する（§5.3 と同じ扱い）。
+        let mut visited: HashSet<usize> = HashSet::new();
+        let mut worklist: Vec<Value> = roots.into_iter().collect();
+
+        while let Some(v) = worklist.pop() {
+            // この Value slot 自体を課金する（§5.1 Value slot = 32）。
+            self.heap.charge(heap_size::VALUE_SLOT, phase)?;
+            match v {
+                Value::Str(s) => {
+                    self.heap
+                        .charge(heap_size::string_body(s.len() as u64), phase)?;
+                }
+                Value::List(items) => {
+                    let ptr = Rc::as_ptr(&items) as usize;
+                    if !visited.insert(ptr) {
+                        continue;
+                    }
+                    self.heap
+                        .charge(heap_size::list_body(items.len() as u64), phase)?;
+                    for item in items.iter() {
+                        worklist.push(item.clone());
+                    }
+                }
+                Value::Dict(map) => {
+                    let ptr = Rc::as_ptr(&map) as usize;
+                    if !visited.insert(ptr) {
+                        continue;
+                    }
+                    let key_bytes_total: u64 = map
+                        .keys()
+                        .map(|k| k.len() as u64)
+                        .fold(0u64, u64::saturating_add);
+                    self.heap.charge(
+                        heap_size::dict_body(map.len() as u64, key_bytes_total),
+                        phase,
+                    )?;
+                    for item in map.values() {
+                        worklist.push(item.clone());
+                    }
+                }
+                Value::Fn { captured, .. } => {
+                    let ptr = Rc::as_ptr(&captured) as usize;
+                    if !visited.insert(ptr) {
+                        continue;
+                    }
+                    // tree function instance（64 + 16 × captured cell 数、§5.1）。
+                    self.heap
+                        .charge(heap_size::tree_function(captured.len() as u64), phase)?;
+                    // captured cell 1 個ずつ（§5.1 captured cell = 32）と、その中身を辿る。
+                    for cell in captured.values() {
+                        let cell_ptr = Rc::as_ptr(cell) as usize;
+                        if visited.insert(cell_ptr) {
+                            self.heap.charge(heap_size::CAPTURED_CELL, phase)?;
+                            worklist.push(cell.borrow().clone());
+                        }
+                    }
+                }
+                Value::VmFn { upvalues, .. } => {
+                    // VM function instance（48 + 16 × upvalue 数、§5.1）。VmFn 自体は Rc
+                    // 共有されないため body ごとに課金する。
+                    self.heap
+                        .charge(heap_size::vm_function(upvalues.len() as u64), phase)?;
+                    for cell in upvalues.iter() {
+                        let cell_ptr = Rc::as_ptr(cell) as usize;
+                        if visited.insert(cell_ptr) {
+                            self.heap.charge(heap_size::CAPTURED_CELL, phase)?;
+                            worklist.push(cell.borrow().clone());
+                        }
+                    }
+                }
+                Value::Error { message, .. } => {
+                    // Error の message を live な String body として 1 個数える（§5.1）。
+                    self.heap
+                        .charge(heap_size::string_body(message.len() as u64), phase)?;
+                }
+                // Int / Float / Bool / Null は Value slot だけで、追加 payload なし。
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// collection 要素数上限（config 値）。共有 builtin handler へ渡す。
     pub fn max_collection_elements(&self) -> u64 {
         self.config.max_collection_elements
@@ -1201,10 +1589,14 @@ pub fn control_stop_to_error(
             BudgetResource::SourceBytes => TsumugiError::source_bytes_limit(line, e.limit),
             BudgetResource::ImportCount => TsumugiError::import_count_limit(line, e.limit),
             BudgetResource::ImportBytes => TsumugiError::import_bytes_limit(line, e.limit),
+            BudgetResource::HeapBytes => TsumugiError::heap_limit(line, e.limit),
             _ => TsumugiError::step_limit(line, e.limit),
         },
         ControlStop::Cancelled | ControlStop::DeadlineExceeded { .. } => {
             TsumugiError::step_limit(line, committed_fuel)
+        }
+        ControlStop::InternalFailure(InternalFailure::AllocationIdExhausted) => {
+            TsumugiError::internal(line, "AllocationId を割り当てできません")
         }
     }
 }
@@ -1834,5 +2226,314 @@ mod tests {
         for (i, r) in order.iter().enumerate() {
             assert_eq!(r.priority() as usize, i + 1, "{r:?}");
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // heap accounting（§5.1 論理サイズ / §5.2 AllocationLedger、§15.2 heap）
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn heap_size_table_matches_spec_5_1() {
+        // §5.1 の論理サイズ表の値をそのまま固定する。
+        assert_eq!(heap_size::VALUE_SLOT, 32);
+        assert_eq!(heap_size::CAPTURED_CELL, 32);
+        assert_eq!(heap_size::string_body(0), 24);
+        assert_eq!(heap_size::string_body(10), 34);
+        assert_eq!(heap_size::list_body(0), 24);
+        assert_eq!(heap_size::list_body(3), 24 + 32 * 3);
+        assert_eq!(heap_size::dict_body(0, 0), 24);
+        // entry 2 個、key 合計 5 byte。
+        assert_eq!(heap_size::dict_body(2, 5), 24 + 64 * 2 + 5);
+        assert_eq!(heap_size::tree_function(0), 64);
+        assert_eq!(heap_size::tree_function(2), 64 + 16 * 2);
+        assert_eq!(heap_size::vm_function(0), 48);
+        assert_eq!(heap_size::vm_function(3), 48 + 16 * 3);
+        assert_eq!(heap_size::AST_ROOT, 64);
+        assert_eq!(heap_size::ast_node(0), 64);
+        assert_eq!(heap_size::ast_node(7), 71);
+        assert_eq!(heap_size::bytecode_chunk(0, 0), 64);
+        assert_eq!(heap_size::bytecode_chunk(4, 2), 64 + 16 * 4 + 32 * 2);
+        assert_eq!(heap_size::imported_module_record(0), 96);
+        assert_eq!(heap_size::imported_module_record(8), 104);
+        assert_eq!(heap_size::continuation_frame(0), 96);
+        assert_eq!(heap_size::continuation_frame(2), 96 + 32 * 2);
+        assert_eq!(heap_size::HANDLER, 32);
+        assert_eq!(heap_size::rollback_journal_entry(0), 48);
+        assert_eq!(heap_size::rollback_journal_entry(16), 64);
+    }
+
+    #[test]
+    fn heap_size_helpers_saturate_on_overflow() {
+        // overflow は panic せず u64::MAX へ飽和する（課金側で HeapBytes 超過へ写像）。
+        assert_eq!(heap_size::list_body(u64::MAX), u64::MAX);
+        assert_eq!(heap_size::string_body(u64::MAX), u64::MAX);
+        assert_eq!(heap_size::dict_body(u64::MAX, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn allocation_id_is_monotonic_from_one() {
+        let mut ledger = AllocationLedger::new(1_000);
+        assert_eq!(ledger.allocate_id().unwrap(), AllocationId(1));
+        assert_eq!(ledger.allocate_id().unwrap(), AllocationId(2));
+        assert_eq!(ledger.allocate_id().unwrap(), AllocationId(3));
+    }
+
+    #[test]
+    fn allocation_id_overflow_is_internal_failure_not_wrap() {
+        let mut ledger = AllocationLedger::new(0);
+        // next_id を最後の 1 個へ寄せる。allocate_id は id を返した後 next_id を
+        // checked_add(1) するため、配れる最後の id は u64::MAX - 1。
+        ledger.next_id = u64::MAX - 1;
+        assert_eq!(ledger.allocate_id().unwrap(), AllocationId(u64::MAX - 1));
+        // 次は next_id == u64::MAX で checked_add(1) が None。0 へ wrap せず InternalFailure。
+        assert_eq!(
+            ledger.allocate_id(),
+            Err(ControlStop::InternalFailure(
+                InternalFailure::AllocationIdExhausted
+            ))
+        );
+    }
+
+    #[test]
+    fn heap_charge_at_limit_succeeds_and_plus_one_exceeds() {
+        let mut ledger = AllocationLedger::new(100);
+        assert!(ledger.charge(60, ExecutionPhase::Run).is_ok());
+        assert!(ledger.charge(40, ExecutionPhase::Run).is_ok());
+        assert_eq!(ledger.live_bytes(), 100);
+        assert_eq!(ledger.peak_bytes(), 100);
+        // +1 は HeapBytes 超過。used は現在の live、requested は要求量。
+        let err = ledger.charge(1, ExecutionPhase::Run).unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::HeapBytes);
+                assert_eq!(e.limit, 100);
+                assert_eq!(e.used, 100);
+                assert_eq!(e.requested, 1);
+                assert_eq!(e.unit, BudgetUnit::Bytes);
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+        // 超過は live を変えない。
+        assert_eq!(ledger.live_bytes(), 100);
+    }
+
+    #[test]
+    fn heap_charge_overflow_reports_requested_u64_max() {
+        let mut ledger = AllocationLedger::new(u64::MAX);
+        assert!(ledger.charge(10, ExecutionPhase::Run).is_ok());
+        // live(10) + u64::MAX は overflow。§7.1: requested = u64::MAX。
+        let err = ledger.charge(u64::MAX, ExecutionPhase::Run).unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::HeapBytes);
+                assert_eq!(e.requested, u64::MAX);
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn heap_release_recovers_live_but_not_peak() {
+        let mut ledger = AllocationLedger::new(100);
+        assert!(ledger.charge(80, ExecutionPhase::Run).is_ok());
+        assert_eq!(ledger.live_bytes(), 80);
+        assert_eq!(ledger.peak_bytes(), 80);
+        ledger.release(50);
+        assert_eq!(ledger.live_bytes(), 30);
+        // peak は据え置き。
+        assert_eq!(ledger.peak_bytes(), 80);
+        // release で空いた分を再度確保できる（mass allocate/free 相当）。
+        assert!(ledger.charge(70, ExecutionPhase::Run).is_ok());
+        assert_eq!(ledger.live_bytes(), 100);
+        assert_eq!(ledger.peak_bytes(), 100);
+    }
+
+    #[test]
+    fn heap_release_saturates_at_zero() {
+        let mut ledger = AllocationLedger::new(100);
+        assert!(ledger.charge(10, ExecutionPhase::Run).is_ok());
+        // 二重 release でも 0 未満へ回らない。
+        ledger.release(50);
+        assert_eq!(ledger.live_bytes(), 0);
+    }
+
+    #[test]
+    fn zero_heap_limit_forbids_first_nonzero_charge() {
+        let mut ledger = AllocationLedger::new(0);
+        // 0 byte 課金は上限 0 ちょうどで成功。
+        assert!(ledger.charge(0, ExecutionPhase::Run).is_ok());
+        // 1 byte は超過。
+        assert!(matches!(
+            ledger.charge(1, ExecutionPhase::Run),
+            Err(ControlStop::BudgetExceeded(BudgetExceeded {
+                resource: BudgetResource::HeapBytes,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn budget_ledger_usage_reflects_live_and_peak_heap() {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+        config.max_live_heap_bytes = 1_000;
+        let mut l = ledger(config);
+        assert!(l.charge_heap(300, ExecutionPhase::Run).is_ok());
+        assert!(l.charge_heap(200, ExecutionPhase::Run).is_ok());
+        assert_eq!(l.usage().live_heap_bytes, 500);
+        assert_eq!(l.usage().peak_heap_bytes, 500);
+        l.release_heap(400);
+        assert_eq!(l.usage().live_heap_bytes, 100);
+        // peak は据え置き。
+        assert_eq!(l.usage().peak_heap_bytes, 500);
+    }
+
+    #[test]
+    fn heap_charge_is_cancelled_before_charge() {
+        let token = CancellationToken::new();
+        let mut config = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+        config.max_live_heap_bytes = 1_000;
+        let mut l = BudgetLedger::new(config, token.clone());
+        token.cancel();
+        assert_eq!(
+            l.charge_heap(10, ExecutionPhase::Run),
+            Err(ControlStop::Cancelled)
+        );
+    }
+
+    // ---- context baseline 走査（§5.2 / §15.2） ----
+
+    use crate::value::{FunctionId, Value};
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::rc::Rc as StdRc;
+
+    fn heap_ledger(limit: u64) -> BudgetLedger {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+        config.max_live_heap_bytes = limit;
+        ledger(config)
+    }
+
+    #[test]
+    fn baseline_charges_scalar_value_slot_only() {
+        let mut l = heap_ledger(1_000);
+        l.charge_context_baseline([Value::Int(7)], ExecutionPhase::Link)
+            .unwrap();
+        // Value slot だけ（32）。
+        assert_eq!(l.usage().live_heap_bytes, heap_size::VALUE_SLOT);
+    }
+
+    #[test]
+    fn baseline_charges_string_body() {
+        let mut l = heap_ledger(1_000);
+        l.charge_context_baseline([Value::Str("hello".to_string())], ExecutionPhase::Link)
+            .unwrap();
+        // Value slot 32 + String body(24 + 5)。
+        assert_eq!(
+            l.usage().live_heap_bytes,
+            heap_size::VALUE_SLOT + heap_size::string_body(5)
+        );
+    }
+
+    #[test]
+    fn baseline_charges_list_and_elements() {
+        let mut l = heap_ledger(10_000);
+        let list = Value::List(StdRc::new(vec![Value::Int(1), Value::Int(2)]));
+        l.charge_context_baseline([list], ExecutionPhase::Link)
+            .unwrap();
+        // list Value slot 32 + list body(24 + 32*2) + 各要素 Value slot 32*2。
+        let expected = heap_size::VALUE_SLOT + heap_size::list_body(2) + heap_size::VALUE_SLOT * 2;
+        assert_eq!(l.usage().live_heap_bytes, expected);
+    }
+
+    #[test]
+    fn baseline_charges_dict_with_key_bytes() {
+        let mut l = heap_ledger(10_000);
+        let mut map = BTreeMap::new();
+        map.insert("ab".to_string(), Value::Int(1));
+        map.insert("cde".to_string(), Value::Int(2));
+        let dict = Value::Dict(StdRc::new(map));
+        l.charge_context_baseline([dict], ExecutionPhase::Link)
+            .unwrap();
+        // dict Value slot 32 + dict body(24 + 64*2 + key bytes(2+3)) + 各値 Value slot 32*2。
+        let expected =
+            heap_size::VALUE_SLOT + heap_size::dict_body(2, 5) + heap_size::VALUE_SLOT * 2;
+        assert_eq!(l.usage().live_heap_bytes, expected);
+    }
+
+    #[test]
+    fn baseline_shared_rc_charged_once() {
+        // 同じ List backing を 2 つの root から指しても 1 回だけ課金する（§5.2 visited）。
+        let mut l_shared = heap_ledger(100_000);
+        let shared = StdRc::new(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        let a = Value::List(StdRc::clone(&shared));
+        let b = Value::List(StdRc::clone(&shared));
+        l_shared
+            .charge_context_baseline([a, b], ExecutionPhase::Link)
+            .unwrap();
+
+        // 別 backing の等価な 2 List だと body と要素が 2 回課金される。
+        let mut l_distinct = heap_ledger(100_000);
+        let c = Value::List(StdRc::new(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+        ]));
+        let d = Value::List(StdRc::new(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+        ]));
+        l_distinct
+            .charge_context_baseline([c, d], ExecutionPhase::Link)
+            .unwrap();
+
+        // shared は body+要素を 1 回だけ、distinct は 2 回課金するので厳密に少ない。
+        assert!(l_shared.usage().live_heap_bytes < l_distinct.usage().live_heap_bytes);
+        // shared: 2 root Value slot + body 1 回 + 要素 3 個の Value slot。
+        let shared_expected =
+            heap_size::VALUE_SLOT * 2 + heap_size::list_body(3) + heap_size::VALUE_SLOT * 3;
+        assert_eq!(l_shared.usage().live_heap_bytes, shared_expected);
+    }
+
+    #[test]
+    fn baseline_charges_tree_function_and_captured_cell() {
+        let mut l = heap_ledger(10_000);
+        // captured cell 1 個（中身は Int）を持つ tree 関数値。
+        let cell: crate::value::SharedValue = StdRc::new(RefCell::new(Value::Int(5)));
+        let mut captured = std::collections::HashMap::new();
+        captured.insert("x".to_string(), cell);
+        let func = Value::Fn {
+            id: FunctionId(1),
+            def: StdRc::new(crate::value::FnDef {
+                name: "f".to_string(),
+                params: vec![],
+                body: vec![],
+            }),
+            captured: StdRc::new(captured),
+        };
+        l.charge_context_baseline([func], ExecutionPhase::Link)
+            .unwrap();
+        // fn Value slot 32 + tree_function(1) + captured cell 32 + cell 内 Int の Value slot 32。
+        let expected = heap_size::VALUE_SLOT
+            + heap_size::tree_function(1)
+            + heap_size::CAPTURED_CELL
+            + heap_size::VALUE_SLOT;
+        assert_eq!(l.usage().live_heap_bytes, expected);
+    }
+
+    #[test]
+    fn baseline_overflow_reports_heap_bytes() {
+        // 上限を root 1 個ぶんに満たない値にすると HeapBytes 超過になる。
+        let mut l = heap_ledger(10);
+        let err = l
+            .charge_context_baseline([Value::Int(1)], ExecutionPhase::Link)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ControlStop::BudgetExceeded(BudgetExceeded {
+                resource: BudgetResource::HeapBytes,
+                ..
+            })
+        ));
     }
 }

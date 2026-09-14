@@ -135,6 +135,19 @@ impl Evaluator {
         root_source_bytes: u64,
         loaded: &[crate::module::LoadedModule],
     ) -> Result<(), TsumugiError> {
+        // context baseline live heap を課金する（REV-015 Slice 2、§5.2）。
+        // `ExecutionContext` に残る既存の変数・closure・collection を、最初の文を
+        // 実行する前に live heap へ数える。baseline が上限を超えるなら 1 文も実行しない。
+        //
+        // baseline は「現在の context から到達する live 量」を表すため、走査前に live
+        // heap を 0 へ戻してから積み直す。REPL の複数入力で同じ cell を重複計上しない。
+        // 本 PR は実行中の per-allocation 課金・per-drop release を含まないため、live
+        // heap は baseline 確定後 submission 内で一定に保たれる（正確な追跡は後続 PR）。
+        self.budget.restore_live_heap_bytes(0);
+        let baseline_roots = self.env.baseline_roots();
+        self.budget
+            .charge_context_baseline(baseline_roots, ExecutionPhase::Link)
+            .map_err(|stop| self.control_stop_to_error(stop, 0))?;
         self.budget
             .charge_source(root_source_bytes, ExecutionPhase::Link)
             .map_err(|stop| self.control_stop_to_error(stop, 0))?;

@@ -2482,3 +2482,91 @@ fn aud033_comment_only_buffer_at_eof_exits_zero() {
         );
     }
 }
+
+#[test]
+fn repl_context_baseline_heap_limit_rejects_next_input_before_executing() {
+    // REV-015 Slice 2（§5.2 context baseline / §15.2 heap）:
+    // 最初の入力で大きな List を変数へ束縛して context state を作る。次の入力は Link
+    // フェーズで baseline live heap を走査し、上限を超えるため 1 文も実行せずに拒否される。
+    // 拒否された入力の副作用（print）は出ない。tree/VM で観測挙動を一致させる。
+    //
+    // 上限 500 byte: 空 baseline（最初の入力）は 0 で通過し、100 要素の List を持つ
+    // 2 本目の baseline（>6000 byte）は超過する。
+    let source = concat!(
+        "let big = range(0, 100)\n",
+        "print(\"first-ok\")\n",
+        "print(len(big))\n",
+    );
+
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_LIVE_HEAP_BYTES", "500")]);
+        let (stdout, stderr) = output_text(&output);
+        let visible = repl_visible_lines(&stdout, use_vm);
+
+        // REPL 自体は後続入力を続行して正常終了する（catch 不能 terminal は入力単位）。
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+
+        // 最初の入力（束縛のみ、print なし）は成功する。
+        // 2 本目の `print("first-ok")` は自身の baseline 走査で拒否され、出力されない。
+        assert!(
+            !visible.contains(&"first-ok"),
+            "{mode}: baseline 超過の入力を実行してしまった: stdout={stdout}"
+        );
+        // heap 上限診断が観測される。
+        assert!(
+            stderr.contains("ヒープ"),
+            "{mode}: heap 上限診断が観測されない: stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn file_run_default_heap_limit_does_not_change_observable_output() {
+    // 既定の heap 上限では、collection を作る通常スクリプトの観測挙動は変わらない
+    // （baseline は fresh context で 0、本 PR は実行中の per-allocation 課金を含まない）。
+    // tree/VM 両方で同じ出力になることを確認する。
+    let script =
+        "let xs = range(0, 50)\nprint(len(xs))\nlet d = {\"a\": 1, \"b\": 2}\nprint(len(d))\n";
+    let dir = TestDir::new("heap-default");
+    let path = std::path::Path::new(dir.as_str()).join("heap_default.tsg");
+    std::fs::write(&path, script).expect("スクリプトの書き込みに失敗");
+
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        let mut cmd = Command::new(tsumugi_bin());
+        if use_vm {
+            cmd.arg("--vm");
+        }
+        cmd.arg(path.to_str().unwrap());
+        let output = cmd.output().expect("tsumugi バイナリの実行に失敗");
+        let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+        let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
+
+        assert!(output.status.success(), "{mode}が異常終了: {stderr}");
+        assert_eq!(normalize(&stdout), "50\n2", "{mode}の出力が不正: {stdout}");
+    }
+}
+
+#[test]
+fn vm_context_baseline_does_not_double_count_cellified_top_level_var() {
+    // REV-015 Slice 2（§5.2）: VM は top-level 変数が closure に捕捉されると
+    // `ensure_local_cell` で値を cell へ clone するが stack slot は stale なまま残す。
+    // baseline 走査が stack と cell の両方を数えると 1 変数を二重計上する。`baseline_roots`
+    // が cell 化済み slot の stale stack 値を除外することを、観測可能な受理境界で固定する。
+    //
+    // 注: tree と VM の関数 instance 論理サイズは §5.1 で意図的に異なる（tree 64+16n /
+    // VM 48+16n）ため、ここでは tree/VM の byte 一致ではなく「VM が二重計上しない」
+    // ことだけを検証する。二重計上すると n の Value slot 32 が余計に乗り、同じ上限で
+    // 拒否されて "5" が出なくなる。210 byte はその境界の上側に置く。
+    let source = concat!("let n = 5\n", "let get = fn() n end\n", "print(get())\n");
+
+    let output = run_repl_process(source, true, &[("TSUMUGI_MAX_LIVE_HEAP_BYTES", "210")]);
+    let (stdout, stderr) = output_text(&output);
+    let visible = repl_visible_lines(&stdout, true);
+    assert!(output.status.success(), "VM REPLが異常終了: {stderr}");
+    assert!(
+        visible.contains(&"5"),
+        "VM が捕捉変数を二重計上して baseline を超えた疑い: stdout={stdout} stderr={stderr}"
+    );
+}
