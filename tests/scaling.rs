@@ -649,3 +649,143 @@ fn push_delta_charging_live_heap_is_linear_not_quadratic() {
         "push 後 live heap が要素数に線形でない: n=100 で {small}, n=1000 で {large}（比 {ratio:.2}）"
     );
 }
+
+/// REV-015 PR-b / §15.2: String body の per-drop release で live heap が回復する。
+/// 同じ論理サイズの String を N 回作っては drop すると、live heap は N に依存せず
+/// 高々 1 個ぶんに収まる（O(1)）。全体を保持し続ければ O(N) になるのと対比する。
+///
+/// 実アロケータではなく論理台帳を測るため決定的で、`MEASURE_LOCK` は不要。
+#[test]
+fn string_live_heap_is_bounded_across_allocate_and_free() {
+    use tsumugi::budget::{BudgetConfig, BudgetLedger, ExecutionPhase};
+    use tsumugi::value::Value;
+
+    fn ledger() -> BudgetLedger {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+        config.max_live_heap_bytes = u64::MAX;
+        BudgetLedger::with_config(config)
+    }
+
+    // 作っては即 drop（変数への再代入相当）を N 回。live heap は常に高々 1 個ぶん。
+    fn hold_one_after(n: usize) -> u64 {
+        let mut budget = ledger();
+        let mut held: Option<Value> = None;
+        for _ in 0..n {
+            let s = Value::new_str("x".repeat(40), &mut budget, ExecutionPhase::Run).unwrap();
+            held = Some(s); // 直前の held を上書き → drop → release。
+        }
+        drop(held);
+        budget.live_heap_bytes()
+    }
+
+    // 全部保持すると live は N に比例する（対照）。
+    fn holding_all(n: usize) -> u64 {
+        let mut budget = ledger();
+        let mut all = Vec::new();
+        for _ in 0..n {
+            all.push(Value::new_str("x".repeat(40), &mut budget, ExecutionPhase::Run).unwrap());
+        }
+        let live = budget.live_heap_bytes();
+        drop(all);
+        live
+    }
+
+    // 作っては捨てると、最後に held を drop したので live は 0。N=10 と N=1000 で不変。
+    assert_eq!(hold_one_after(10), 0);
+    assert_eq!(hold_one_after(1000), 0);
+
+    // 全保持は N に比例（release と対照的に線形増加する）。
+    let ten = holding_all(10);
+    let thousand = holding_all(1000);
+    assert!(ten > 0);
+    let ratio = thousand as f64 / ten as f64;
+    assert!(
+        (95.0..=105.0).contains(&ratio),
+        "全保持 String live heap が N に線形でない: N=10 で {ten}, N=1000 で {thousand}（比 {ratio:.1}）"
+    );
+}
+
+/// REV-015 PR-b / §5.2: 同じ String backing を `Rc::clone` で共有しても追加課金せず、
+/// 最後の参照 drop で 1 回だけ release する。共有と分離で live heap を対比する。
+#[test]
+fn shared_string_backing_is_charged_once() {
+    use std::rc::Rc;
+    use tsumugi::budget::{BudgetConfig, BudgetLedger, ExecutionPhase};
+    use tsumugi::value::Value;
+
+    let mut config = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+    config.max_live_heap_bytes = u64::MAX;
+    let mut budget = BudgetLedger::with_config(config);
+
+    // 1 本目を課金。
+    let base = Value::new_str("shared-body".to_string(), &mut budget, ExecutionPhase::Run).unwrap();
+    let one = budget.live_heap_bytes();
+    assert!(one > 0);
+
+    // Rc::clone で共有（無課金、§5.2）。live heap は変わらない。
+    let Value::Str(ref backing) = base else {
+        panic!("Str が返るはず");
+    };
+    let alias = Value::Str(Rc::clone(backing));
+    assert_eq!(
+        budget.live_heap_bytes(),
+        one,
+        "共有で追加課金してはならない"
+    );
+
+    // 1 本目を drop してもまだ alias が生きているので release されない。
+    drop(base);
+    assert_eq!(
+        budget.live_heap_bytes(),
+        one,
+        "共有中の drop で release してはならない"
+    );
+
+    // 最後の参照が落ちて初めて release。
+    drop(alias);
+    assert_eq!(
+        budget.live_heap_bytes(),
+        0,
+        "最後の参照 drop で release されていない"
+    );
+}
+
+/// REV-015 PR-b: engine 実行後、builtin が生成した String（track_result 経由で live
+/// heap に載る）が engine の破棄で解放され、残存量が生成量に依存しないことを固定する。
+/// tree/VM 両対応。参照循環で String が残ると N に比例して残存する。
+#[test]
+fn strings_produced_by_builtins_are_released_in_both_engines() {
+    // 実行後に残る量は生成した String 数に依存しないはず。固定コスト（lazy 初期化）を
+    // 吸収するため上限は 16KiB とする。
+    const LIMIT_BYTES: usize = 16 * 1024;
+    const SMALL: usize = 200;
+    const LARGE: usize = 2_000;
+
+    // upper() は builtin なので dispatch 境界の track_result で live heap に載る。
+    // 生成した String をどこにも溜めないので、実行終了後は残らないはず。
+    fn source(n: usize) -> String {
+        format!("let s = \"payload-string\"\nfor i in range(0, {n})\n    let u = upper(s)\nend\n")
+    }
+
+    // 他の測定が失敗してもロックを使い続けられるようにpoisonは無視する
+    let _guard = MEASURE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree-walk" };
+        let small = retained_bytes(&source(SMALL), use_vm);
+        let large = retained_bytes(&source(LARGE), use_vm);
+
+        assert!(
+            large < LIMIT_BYTES,
+            "{mode}: builtin が生成した String が解放されていません。\
+             n={SMALL}で{small}バイト, n={LARGE}で{large}バイト残存（上限 {LIMIT_BYTES}）"
+        );
+        assert!(
+            large <= small + LIMIT_BYTES,
+            "{mode}: 残存量が生成 String 数に比例しています。\
+             n={SMALL}で{small}バイト, n={LARGE}で{large}バイト残存"
+        );
+    }
+}

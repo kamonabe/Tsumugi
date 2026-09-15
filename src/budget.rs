@@ -1184,8 +1184,10 @@ impl BudgetLedger {
     /// `StringAllocations` < `StringBytes`）で先頭 1 件を primary にする。cancel /
     /// deadline は [`Self::reserve_all`] が charge 前に確認する。成功時は
     /// `peaks.single_string_bytes` を `max` 更新する。substring が既存 body を共有する
-    /// 実装なら新規 allocation として数えないが、現行の `Value::Str(String)` は常に
-    /// 新規 copy なので生成のたびに課金する（§5.3）。
+    /// 実装なら新規 allocation として数えないが、現行の連結・substring は依然 body を
+    /// copy するので生成のたびに課金する（§5.3）。この cumulative 会計は解放しても
+    /// 減らさず、String body の live heap per-drop 追跡（`Value::new_str` /
+    /// `track_result`、REV-015 PR-b）とは独立した別会計である。
     pub fn charge_string(
         &mut self,
         byte_len: u64,
@@ -1321,15 +1323,15 @@ impl BudgetLedger {
         Ok(())
     }
 
-    /// dispatch 結果の `Value` から到達する新規 String body をすべて課金する
+    /// dispatch 結果の `Value` から到達する新規 String body の cumulative 会計を課金する
     /// （REV-015 Slice 2、string accounting）。
     ///
-    /// 現行の `Value::Str(String)` は共有 backing を持たず、builtin が返す String は
-    /// 必ず新規 copy なので、結果内の各 String body を [`Self::charge_string`] で
-    /// 課金する。List / Dict の backing byte は heap accounting（別サブスライス）の
-    /// 対象で、ここでは走査して内部の String body だけを課金する。Dict の key も
-    /// String body なので課金する。再帰は使わず worklist で走査し、深い構造でも
-    /// host stack を消費しない。
+    /// 結果内の各 String body を [`Self::charge_string`] で cumulative 課金する。List /
+    /// Dict の backing byte と String body の live heap（per-drop）は
+    /// [`Self::track_result`] が担うため、engine の dispatch 境界では `track_result` を
+    /// 使う。本メソッドは cumulative 会計だけを行う補助関数として残す（live heap は
+    /// 触らない）。Dict の key も String body なので課金する。再帰は使わず worklist で
+    /// 走査し、深い構造でも host stack を消費しない。
     ///
     /// per-item / cumulative のいずれかを超えた時点で `ControlStop` を返し、以降の
     /// 課金は行わない（部分的に committed が進むが、超過は catch 不能 terminal なので
@@ -1388,9 +1390,19 @@ impl BudgetLedger {
         use crate::value::Value;
         match value {
             Value::Str(s) => {
-                // 新規 String body を課金する（string accounting）。
-                self.charge_string(s.len() as u64, phase)?;
-                Ok(Value::Str(s))
+                if s.alloc_id().0 != 0 {
+                    // 既に tracked（live heap 課金済み）。cumulative 会計も生成時に
+                    // 済んでいるので据え置く（§5.2 共有二重課金防止）。
+                    return Ok(Value::Str(s));
+                }
+                // untracked（builtin_core / literal などが untracked で作った String）。
+                // cumulative の string accounting（§5.3、解放で減らない累積値）を課金し、
+                // さらに live heap（§5.1 String body）へ tracked backing として課金する。
+                // untracked backing の Drop は no-op なので clone_data で中身を取り出す。
+                let text: String = s.clone_data();
+                drop(s);
+                self.charge_string(text.len() as u64, phase)?;
+                Value::new_str(text, self, phase)
             }
             Value::List(list) => {
                 if list.alloc_id().0 != 0 {
@@ -1542,9 +1554,9 @@ impl BudgetLedger {
         use std::collections::HashSet;
 
         // 訪問済み heap object を pointer 同一性で除外する（§5.2 visited set）。
-        // List / Dict / captured cell / VmFn upvalue cell / Fn captured map は Rc 共有
-        // され得るため、backing の pointer で dedup する。String は現行 `Value::Str`
-        // では共有 backing を持たないため body ごとに課金する（§5.3 と同じ扱い）。
+        // String / List / Dict / captured cell / VmFn upvalue cell / Fn captured map は
+        // Rc 共有され得るため、backing の pointer で dedup し、共有 backing は 1 回だけ
+        // 課金する（§5.2）。String backing は `Rc<TrackedStr>`（REV-015 PR-b）。
         let mut visited: HashSet<usize> = HashSet::new();
         let mut worklist: Vec<Value> = roots.into_iter().collect();
 
@@ -1553,6 +1565,10 @@ impl BudgetLedger {
             self.heap_charge_raw(heap_size::VALUE_SLOT, phase)?;
             match v {
                 Value::Str(s) => {
+                    let ptr = Rc::as_ptr(&s) as usize;
+                    if !visited.insert(ptr) {
+                        continue;
+                    }
                     self.heap_charge_raw(heap_size::string_body(s.len() as u64), phase)?;
                 }
                 Value::List(items) => {
@@ -2517,8 +2533,11 @@ mod tests {
     #[test]
     fn baseline_charges_string_body() {
         let mut l = heap_ledger(1_000);
-        l.charge_context_baseline([Value::Str("hello".to_string())], ExecutionPhase::Link)
-            .unwrap();
+        l.charge_context_baseline(
+            [Value::str_constant("hello".to_string())],
+            ExecutionPhase::Link,
+        )
+        .unwrap();
         // Value slot 32 + String body(24 + 5)。
         assert_eq!(
             l.usage().live_heap_bytes,
@@ -2675,10 +2694,33 @@ mod tests {
     #[test]
     fn track_result_charges_strings_like_before() {
         let mut l = heap_ledger(1_000_000);
-        // track_result は string accounting も包含する（charge_result_strings 相当）。
-        let v = Value::Str("hello".to_string());
-        l.track_result(v, ExecutionPhase::Run).unwrap();
+        // track_result は string accounting（cumulative）も包含する。
+        let v = Value::str_constant("hello".to_string());
+        let tracked = l.track_result(v, ExecutionPhase::Run).unwrap();
         assert_eq!(l.usage().committed.string_allocations, 1);
         assert_eq!(l.usage().committed.string_bytes, 5);
+        // さらに live heap（§5.1 String body = 24 + 5）へ tracked backing として課金する。
+        assert_eq!(l.usage().live_heap_bytes, heap_size::string_body(5));
+        // 最後の参照 drop で live heap が戻る（§5.2）。cumulative は据え置き（§5.3）。
+        drop(tracked);
+        assert_eq!(l.usage().live_heap_bytes, 0);
+        assert_eq!(l.usage().committed.string_allocations, 1);
+        assert_eq!(l.usage().committed.string_bytes, 5);
+    }
+
+    #[test]
+    fn track_result_leaves_already_tracked_string_uncharged_again() {
+        let mut l = heap_ledger(1_000_000);
+        // 既に tracked な String（new_str 経由）。
+        let tracked = Value::new_str("hi".to_string(), &mut l, ExecutionPhase::Run).unwrap();
+        let live_before = l.usage().live_heap_bytes;
+        let alloc_before = l.usage().committed.string_allocations;
+        assert_eq!(live_before, heap_size::string_body(2));
+        // track_result は tracked（id != 0）を再課金しない（live も cumulative も）。
+        let again = l.track_result(tracked, ExecutionPhase::Run).unwrap();
+        assert_eq!(l.usage().live_heap_bytes, live_before);
+        assert_eq!(l.usage().committed.string_allocations, alloc_before);
+        drop(again);
+        assert_eq!(l.usage().live_heap_bytes, 0);
     }
 }

@@ -16,9 +16,9 @@ use tsumugi::value::Value;
 
 /// Str 引数から `path_join` を呼ぶ。
 fn join(parts: &[&str]) -> String {
-    let args: Vec<Value> = parts.iter().map(|s| Value::Str((*s).to_string())).collect();
+    let args: Vec<Value> = parts.iter().map(|s| Value::str_from(s)).collect();
     match builtin_path_join(&args, 1) {
-        Ok(Value::Str(s)) => s,
+        Ok(Value::Str(s)) => s.as_str().to_string(),
         other => panic!("Str が返るはず: {other:?}"),
     }
 }
@@ -96,7 +96,7 @@ fn components_containing_separators() {
 
 #[test]
 fn non_str_at_first_position_errors() {
-    let args = vec![Value::Int(1), Value::Str("b".to_string())];
+    let args = vec![Value::Int(1), Value::str_from("b")];
     let error = builtin_path_join(&args, 7).expect_err("非 Str 第1引数はエラーになる");
     assert_eq!(error.kind(), Some(ErrorKind::BuiltinType));
     assert_eq!(
@@ -110,11 +110,7 @@ fn non_str_at_first_position_errors() {
 fn non_str_at_middle_position_errors_and_reports_first() {
     // 最初の非 Str 引数について報告する（§9.4）。後続の非 Str があっても
     // position は最初のものになる。
-    let args = vec![
-        Value::Str("a".to_string()),
-        Value::Int(123),
-        Value::Bool(true),
-    ];
+    let args = vec![Value::str_from("a"), Value::Int(123), Value::Bool(true)];
     let error = builtin_path_join(&args, 1).expect_err("非 Str 中間引数はエラーになる");
     assert_eq!(error.kind(), Some(ErrorKind::BuiltinType));
     assert_eq!(
@@ -125,7 +121,7 @@ fn non_str_at_middle_position_errors_and_reports_first() {
 
 #[test]
 fn non_str_at_last_position_errors() {
-    let args = vec![Value::Str("a".to_string()), Value::Float(1.5)];
+    let args = vec![Value::str_from("a"), Value::Float(1.5)];
     let error = builtin_path_join(&args, 1).expect_err("非 Str 末尾引数はエラーになる");
     assert_eq!(error.kind(), Some(ErrorKind::BuiltinType));
     assert_eq!(
@@ -148,7 +144,7 @@ fn various_non_str_types_report_their_type_name() {
         ),
     ];
     for (value, type_name) in cases {
-        let args = vec![Value::Str("a".to_string()), value];
+        let args = vec![Value::str_from("a"), value];
         let error = builtin_path_join(&args, 1).expect_err("非 Str はエラーになる");
         assert_eq!(error.kind(), Some(ErrorKind::BuiltinType));
         assert_eq!(

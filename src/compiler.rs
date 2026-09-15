@@ -609,7 +609,8 @@ impl Compiler {
                 self.chunk.emit_constant(Value::Float(*n), line);
             }
             Expr::Str(s) => {
-                self.chunk.emit_constant(Value::Str(s.clone()), line);
+                self.chunk
+                    .emit_constant(Value::str_constant(s.clone()), line);
             }
             Expr::Bool(b) => {
                 self.chunk.emit_constant(Value::Bool(*b), line);
@@ -752,7 +753,8 @@ impl Compiler {
                 for part in parts {
                     match part {
                         FStrExprPart::Literal(s) => {
-                            self.chunk.emit_constant(Value::Str(s.clone()), line);
+                            self.chunk
+                                .emit_constant(Value::str_constant(s.clone()), line);
                         }
                         FStrExprPart::Expr(expr) => {
                             self.compile_expr(expr, line)?;

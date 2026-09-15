@@ -209,7 +209,7 @@ impl Evaluator {
                                 line_buf.pop();
                             }
                         }
-                        Value::Str(line_buf)
+                        Value::str_constant(line_buf)
                     }
                     Err(_) => Value::Null,
                 }))
@@ -222,7 +222,7 @@ impl Evaluator {
                 let argv: Vec<Value> = self
                     .script_args()
                     .iter()
-                    .map(|arg| Value::Str(arg.clone()))
+                    .map(|arg| Value::str_constant(arg.clone()))
                     .collect();
                 self.check_collection(argv.len(), line)?;
                 let listed = Value::new_list(argv, &mut self.budget, ExecutionPhase::Run)

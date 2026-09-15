@@ -1220,7 +1220,7 @@ impl Vm {
                 let stack_index = self.stack.len().saturating_sub(1);
                 self.checkpoint_stack_slot(stack_index);
                 let k = match key {
-                    Value::Str(k) => k,
+                    Value::Str(k) => k.to_string(),
                     other => return Err(TsumugiError::dict_key_type(line, &other)),
                 };
                 // 新規 key のときだけ候補サイズを確定して collection 検査する。
@@ -1270,15 +1270,18 @@ impl Vm {
                     }
                     Value::Dict(ref map) => {
                         let size = map.len();
-                        let keys: Vec<Value> = map.keys().map(|k| Value::Str(k.clone())).collect();
+                        let keys: Vec<Value> =
+                            map.keys().map(|k| Value::str_constant(k.clone())).collect();
                         self.check_collection(size, line)?;
                         Value::new_list(keys, &mut self.budget, ExecutionPhase::Run)
                             .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?
                     }
                     Value::Str(ref s) => {
                         let size = s.chars().count();
-                        let chars: Vec<Value> =
-                            s.chars().map(|c| Value::Str(c.to_string())).collect();
+                        let chars: Vec<Value> = s
+                            .chars()
+                            .map(|c| Value::str_constant(c.to_string()))
+                            .collect();
                         self.check_collection(size, line)?;
                         Value::new_list(chars, &mut self.budget, ExecutionPhase::Run)
                             .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?
@@ -1330,7 +1333,7 @@ impl Vm {
                 for val in parts {
                     result.push_str(&val.to_string());
                 }
-                self.stack.push(Value::Str(result));
+                self.stack.push(Value::str_constant(result));
             }
             OpCode::ReturnValue | OpCode::Return => {
                 // 通常は run_frames() が処理する。不正な呼び出しでもpanicさせない。
@@ -1464,14 +1467,14 @@ impl Vm {
                 };
                 chars
                     .get(idx)
-                    .map(|c| Value::Str(c.to_string()))
+                    .map(|c| Value::str_constant(c.to_string()))
                     .ok_or_else(|| TsumugiError::str_index_out_of_range(line, *i, chars.len()))
             }
             Value::Dict(map) => {
                 let Value::Str(key) = index else {
                     return Err(TsumugiError::dict_key_type(line, index));
                 };
-                Ok(map.get(key).cloned().unwrap_or(Value::Null))
+                Ok(map.get(key.as_str()).cloned().unwrap_or(Value::Null))
             }
             Value::Error {
                 error_type,
@@ -1482,8 +1485,8 @@ impl Vm {
                     return Err(TsumugiError::dict_key_type(line, index));
                 };
                 match key.as_str() {
-                    "type" => Ok(Value::Str(error_type.clone())),
-                    "message" => Ok(Value::Str(message.clone())),
+                    "type" => Ok(Value::str_constant(error_type.clone())),
+                    "message" => Ok(Value::str_constant(message.clone())),
                     "line" => Ok(Value::Int(*err_line as i64)),
                     _ => Ok(Value::Null),
                 }
@@ -1574,7 +1577,7 @@ impl Vm {
                                 buf.pop();
                             }
                         }
-                        Ok(Value::Str(buf))
+                        Ok(Value::str_constant(buf))
                     }
                     Err(_) => Ok(Value::Null),
                 }
@@ -1604,7 +1607,7 @@ impl Vm {
                 let argv: Vec<Value> = self
                     .script_args
                     .iter()
-                    .map(|arg| Value::Str(arg.clone()))
+                    .map(|arg| Value::str_constant(arg.clone()))
                     .collect();
                 self.check_collection(argv.len(), line)?;
                 Value::new_list(argv, &mut self.budget, ExecutionPhase::Run)
@@ -1733,9 +1736,15 @@ impl Vm {
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + *b as f64)),
-            (Value::Str(a), Value::Str(b)) => Ok(Value::Str(format!("{}{}", a, b))),
-            (Value::Str(a), Value::Error { .. }) => Ok(Value::Str(format!("{}{}", a, right))),
-            (Value::Error { .. }, Value::Str(b)) => Ok(Value::Str(format!("{}{}", left, b))),
+            (Value::Str(a), Value::Str(b)) => {
+                Ok(Value::str_constant(format!("{}{}", a.as_str(), b.as_str())))
+            }
+            (Value::Str(a), Value::Error { .. }) => {
+                Ok(Value::str_constant(format!("{}{}", a.as_str(), right)))
+            }
+            (Value::Error { .. }, Value::Str(b)) => {
+                Ok(Value::str_constant(format!("{}{}", left, b.as_str())))
+            }
             _ => Err(TsumugiError::arithmetic_type(
                 line,
                 crate::ast::BinOpKind::Add,
