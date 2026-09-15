@@ -1060,6 +1060,15 @@ impl Vm {
 
                 // 関数式の評価ごとに一意な FunctionId を発番する（AUD-048）。
                 let id = self.allocate_function_id(line)?;
+                // VM function instance header（§5.1 vm_function = 48 + 16×upvalue）を
+                // live heap へ課金する（REV-015 PR-c）。upvalue cell 実体は
+                // ensure_local_cell / upvalue_cell 側で課金済みなので header ぶんだけ。
+                let header = crate::value::Value::new_vm_fn_header(
+                    upvalue_cells.len() as u64,
+                    &self.budget.heap_handle(),
+                    ExecutionPhase::Run,
+                )
+                .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
                 self.stack.push(Value::VmFn {
                     id,
                     name: prototype.name.clone(),
@@ -1067,6 +1076,7 @@ impl Vm {
                     params: prototype.params.clone(),
                     chunk: prototype.chunk.clone(),
                     upvalues: upvalue_cells,
+                    header,
                 });
             }
             OpCode::PrepareCall => {
@@ -1910,6 +1920,7 @@ mod tests {
             params: Vec::new(),
             chunk: Rc::new(recursive),
             upvalues: Vec::new(),
+            header: Value::fn_header_untracked(),
         };
         let mut main = Chunk::new();
         main.emit_constant(function, 1);

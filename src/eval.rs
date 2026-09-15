@@ -106,6 +106,21 @@ impl Evaluator {
             .map_err(|stop| self.control_stop_to_error(stop, line))
     }
 
+    /// tree function instance header（§5.1 tree_function）を課金してトークンを作る
+    /// （REV-015 PR-c）。captured cell 実体は cell 側で別途課金するため header ぶんだけ。
+    fn new_fn_header(
+        &self,
+        captured_count: usize,
+        line: usize,
+    ) -> Result<Rc<crate::value::FnHeader>, TsumugiError> {
+        Value::new_tree_fn_header(
+            captured_count as u64,
+            &self.budget.heap_handle(),
+            ExecutionPhase::Run,
+        )
+        .map_err(|stop| self.control_stop_to_error(stop, line))
+    }
+
     /// collection 要素数の per-item 検査（REV-015 Slice 1）。
     ///
     /// 既存の `check_collection_size_public` を置き換える入口。上限超過時は
@@ -439,6 +454,7 @@ impl Evaluator {
                     self.env
                         .capture_referenced(&crate::ast::referenced_names(body)),
                 );
+                let header = self.new_fn_header(captured.len(), *line)?;
                 self.env_set(
                     name,
                     Value::Fn {
@@ -449,6 +465,7 @@ impl Evaluator {
                             body: body.clone(),
                         }),
                         captured,
+                        header,
                     },
                     *line,
                 )?;
@@ -608,6 +625,7 @@ impl Evaluator {
                     self.env
                         .capture_referenced(&crate::ast::referenced_names(body)),
                 );
+                let header = self.new_fn_header(captured.len(), line)?;
                 Ok(Value::Fn {
                     id,
                     def: Rc::new(FnDef {
@@ -616,6 +634,7 @@ impl Evaluator {
                         body: body.clone(),
                     }),
                     captured,
+                    header,
                 })
             }
 

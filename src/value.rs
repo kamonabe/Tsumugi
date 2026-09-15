@@ -17,6 +17,13 @@ use crate::chunk::Chunk;
 pub type SharedValue = Rc<TrackedCell>;
 /// tracked な変数 cell backing（`RefCell<Value>`）。
 pub type TrackedCell = Tracked<RefCell<Value>>;
+/// 関数 instance header の heap 課金トークン（REV-015 PR-c）。
+///
+/// data を持たない（`()`）tracked allocation で、生成時に §5.1 の function instance
+/// header（tree: 64 + 16×captured / VM: 48 + 16×upvalue）を live heap へ課金し、最後の
+/// 参照 drop で release する。captured / upvalue cell 実体は cell 側で別途課金するため、
+/// header だけをこのトークンで持つ（二重計上を避ける）。
+pub type FnHeader = Tracked<()>;
 
 /// heap 課金付きの collection backing（REV-015 案A、per-drop release）。
 ///
@@ -398,6 +405,11 @@ pub enum Value {
         def: Rc<FnDef>,
         /// 定義時にキャプチャした変数セル。セル自体は参照共有される
         captured: Rc<HashMap<String, SharedValue>>,
+        /// tree function instance header（§5.1 tree_function = 64 + 16×captured）の
+        /// heap 課金トークン（REV-015 PR-c）。生成時に課金し、最後の参照 drop で release
+        /// する。captured cell 実体は cell 側（`SharedValue`）で別途課金するため、ここでは
+        /// header ぶんだけを持つ。`clone`（＝関数値の共有）は `Rc` ハンドル共有で無課金。
+        header: Rc<FnHeader>,
     },
     /// VM用関数値（コンパイル済みバイトコード）
     /// Rc<Chunk> により関数呼び出し・クロージャ生成時のディープコピーを回避
@@ -410,6 +422,10 @@ pub enum Value {
         chunk: Rc<Chunk>,
         /// クロージャがキャプチャした値（参照キャプチャ方式）
         upvalues: Vec<SharedValue>,
+        /// VM function instance header（§5.1 vm_function = 48 + 16×upvalue）の heap 課金
+        /// トークン（REV-015 PR-c）。生成時に課金し、最後の参照 drop で release する。
+        /// upvalue cell 実体は cell 側で別途課金するため header ぶんだけを持つ。
+        header: Rc<FnHeader>,
     },
     /// 構造化エラー値（try/catch で捕捉したエラー）
     /// Display では message を返すため、既存の文字列結合と互換性がある。
@@ -559,6 +575,32 @@ impl Value {
     /// heap 課金しない untracked な変数 cell を作る（台帳を持たない文脈用）。
     pub fn cell_untracked(value: Value) -> SharedValue {
         Tracked::constant(RefCell::new(value))
+    }
+
+    /// tree function instance header（§5.1 tree_function = 64 + 16×captured）の heap 課金
+    /// トークンを作る（REV-015 PR-c）。生成時に live heap へ課金し drop で release する。
+    /// 台帳を持たない文脈では untracked（無課金）で包む。
+    pub fn new_tree_fn_header(
+        captured_count: u64,
+        ledger: &crate::budget::HeapLedgerWeak,
+        phase: ExecutionPhase,
+    ) -> Result<Rc<FnHeader>, ControlStop> {
+        Tracked::new_via_handle((), heap_size::tree_function(captured_count), ledger, phase)
+    }
+
+    /// VM function instance header（§5.1 vm_function = 48 + 16×upvalue）の heap 課金
+    /// トークンを作る（REV-015 PR-c）。生成時に live heap へ課金し drop で release する。
+    pub fn new_vm_fn_header(
+        upvalue_count: u64,
+        ledger: &crate::budget::HeapLedgerWeak,
+        phase: ExecutionPhase,
+    ) -> Result<Rc<FnHeader>, ControlStop> {
+        Tracked::new_via_handle((), heap_size::vm_function(upvalue_count), ledger, phase)
+    }
+
+    /// heap 課金しない untracked な関数 header トークンを作る（台帳を持たない文脈用）。
+    pub fn fn_header_untracked() -> Rc<FnHeader> {
+        Tracked::constant(())
     }
 
     /// `BTreeMap<String, Value>` から heap 課金済みの `Value::Dict` を作る（§5.2）。

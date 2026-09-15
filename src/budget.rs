@@ -2620,6 +2620,7 @@ mod tests {
                 body: vec![],
             }),
             captured: StdRc::new(captured),
+            header: Value::fn_header_untracked(),
         };
         l.charge_context_baseline([func], ExecutionPhase::Link)
             .unwrap();
