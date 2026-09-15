@@ -191,13 +191,14 @@ impl Evaluator {
         root_source_bytes: u64,
         loaded: &[crate::module::LoadedModule],
     ) -> Result<(), TsumugiError> {
-        // live heap は tracked collection の生成/drop で逐次維持する（REV-015 案A）。
-        // per-drop release 導入後は、REPL 入力境界で live heap を 0 へ戻して baseline を
-        // 再走査すると、既に tracked（自己 release する）collection を二重計上してしまう。
-        // よって collection を per-drop 追跡する本 PR では charge_link での baseline 再課金を
-        // 行わない。埋め込み host が注入する非 collection の pre-existing 状態（String /
-        // 関数 instance / cell）の baseline 課金は、それらを per-drop 化する後続 PR で
-        // 再導入する。`charge_context_baseline` 自体は単体テスト・後続 PR 用に残す。
+        // live heap は tracked backing の生成/drop で逐次維持する（REV-015 案A/PR-b/PR-c）。
+        // collection・String・変数 cell・関数 instance header はすべて per-drop 追跡され、
+        // 生成時に課金し最後の参照 drop で release する。よって同じ台帳を跨ぐ REPL 入力では
+        // pre-existing な言語状態の live heap が自動的に持ち越され、Link 境界で baseline を
+        // 再走査する必要がない（再走査するとむしろ tracked 分を二重計上する）。したがって
+        // `charge_link` では baseline 課金を行わない。`charge_context_baseline`
+        // （全 heap object を 1 回ずつ論理課金する純関数）は、execution ごとに台帳を作り直す
+        // 埋め込み API（fresh ledger モデル、後続 Phase）用に残し、単体テストで固定する。
         self.budget
             .charge_source(root_source_bytes, ExecutionPhase::Link)
             .map_err(|stop| self.control_stop_to_error(stop, 0))?;

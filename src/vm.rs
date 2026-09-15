@@ -194,11 +194,12 @@ impl Vm {
         root_source_bytes: u64,
         loaded: &[crate::module::LoadedModule],
     ) -> Result<(), TsumugiError> {
-        // live heap は tracked collection の生成/drop で逐次維持する（REV-015 案A）。
-        // per-drop release 導入後は charge_link で baseline を 0 へ戻して再走査すると
-        // 既に tracked な collection を二重計上するため、baseline 再課金は行わない
-        // （tree engine の `Evaluator::charge_link` と対称）。非 collection の pre-existing
-        // 状態の baseline は後続 PR で再導入する。
+        // live heap は tracked backing の生成/drop で逐次維持する（REV-015 案A/PR-b/PR-c）。
+        // collection・String・cell・関数 instance header はすべて per-drop 追跡されるため、
+        // 同じ台帳を跨ぐ実行では pre-existing な live heap が自動的に持ち越され、Link 境界で
+        // baseline を再走査する必要がない（再走査すると tracked 分を二重計上する）。よって
+        // baseline 再課金は行わない（tree engine の `Evaluator::charge_link` と対称）。
+        // `charge_context_baseline` は fresh ledger モデルの埋め込み API 用に残す。
         self.budget
             .charge_source(root_source_bytes, ExecutionPhase::Link)
             .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, 0))?;
