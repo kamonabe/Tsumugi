@@ -2511,7 +2511,6 @@ mod tests {
     // ---- context baseline 走査（§5.2 / §15.2） ----
 
     use crate::value::{FunctionId, Tracked, Value};
-    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::rc::Rc as StdRc;
 
@@ -2610,7 +2609,7 @@ mod tests {
     fn baseline_charges_tree_function_and_captured_cell() {
         let mut l = heap_ledger(10_000);
         // captured cell 1 個（中身は Int）を持つ tree 関数値。
-        let cell: crate::value::SharedValue = StdRc::new(RefCell::new(Value::Int(5)));
+        let cell: crate::value::SharedValue = Value::cell_untracked(Value::Int(5));
         let mut captured = std::collections::HashMap::new();
         captured.insert("x".to_string(), cell);
         let func = Value::Fn {
@@ -2621,6 +2620,7 @@ mod tests {
                 body: vec![],
             }),
             captured: StdRc::new(captured),
+            header: Value::fn_header_untracked(),
         };
         l.charge_context_baseline([func], ExecutionPhase::Link)
             .unwrap();

@@ -1,6 +1,5 @@
 //! 仮想マシン: バイトコード（Chunk）を実行するスタックマシン
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -195,11 +194,12 @@ impl Vm {
         root_source_bytes: u64,
         loaded: &[crate::module::LoadedModule],
     ) -> Result<(), TsumugiError> {
-        // live heap は tracked collection の生成/drop で逐次維持する（REV-015 案A）。
-        // per-drop release 導入後は charge_link で baseline を 0 へ戻して再走査すると
-        // 既に tracked な collection を二重計上するため、baseline 再課金は行わない
-        // （tree engine の `Evaluator::charge_link` と対称）。非 collection の pre-existing
-        // 状態の baseline は後続 PR で再導入する。
+        // live heap は tracked backing の生成/drop で逐次維持する（REV-015 案A/PR-b/PR-c）。
+        // collection・String・cell・関数 instance header はすべて per-drop 追跡されるため、
+        // 同じ台帳を跨ぐ実行では pre-existing な live heap が自動的に持ち越され、Link 境界で
+        // baseline を再走査する必要がない（再走査すると tracked 分を二重計上する）。よって
+        // baseline 再課金は行わない（tree engine の `Evaluator::charge_link` と対称）。
+        // `charge_context_baseline` は fresh ledger モデルの埋め込み API 用に残す。
         self.budget
             .charge_source(root_source_bytes, ExecutionPhase::Link)
             .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, 0))?;
@@ -641,9 +641,12 @@ impl Vm {
                 return Ok(Rc::clone(cell));
             }
         }
-        // スタックから現在の値を取り出してセルを作成
+        // スタックから現在の値を取り出してセルを作成する。§5.1 captured cell（32 byte）を
+        // live heap へ課金し、最後の参照 drop で release する（REV-015 PR-c）。
         let value = self.stack[at].clone();
-        let cell = Rc::new(RefCell::new(value));
+        let cell =
+            crate::value::Value::new_cell(value, &self.budget.heap_handle(), ExecutionPhase::Run)
+                .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
         if let Some(entry) = self.frame_mut(line)?.locals_cells.get_mut(slot) {
             *entry = Some(Rc::clone(&cell));
         }
@@ -1058,6 +1061,15 @@ impl Vm {
 
                 // 関数式の評価ごとに一意な FunctionId を発番する（AUD-048）。
                 let id = self.allocate_function_id(line)?;
+                // VM function instance header（§5.1 vm_function = 48 + 16×upvalue）を
+                // live heap へ課金する（REV-015 PR-c）。upvalue cell 実体は
+                // ensure_local_cell / upvalue_cell 側で課金済みなので header ぶんだけ。
+                let header = crate::value::Value::new_vm_fn_header(
+                    upvalue_cells.len() as u64,
+                    &self.budget.heap_handle(),
+                    ExecutionPhase::Run,
+                )
+                .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
                 self.stack.push(Value::VmFn {
                     id,
                     name: prototype.name.clone(),
@@ -1065,6 +1077,7 @@ impl Vm {
                     params: prototype.params.clone(),
                     chunk: prototype.chunk.clone(),
                     upvalues: upvalue_cells,
+                    header,
                 });
             }
             OpCode::PrepareCall => {
@@ -1908,6 +1921,7 @@ mod tests {
             params: Vec::new(),
             chunk: Rc::new(recursive),
             upvalues: Vec::new(),
+            header: Value::fn_header_untracked(),
         };
         let mut main = Chunk::new();
         main.emit_constant(function, 1);

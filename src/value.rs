@@ -8,8 +8,22 @@ use crate::ast::Stmt;
 use crate::budget::{AllocationId, ControlStop, ExecutionPhase, HeapLedgerWeak, heap_size};
 use crate::chunk::Chunk;
 
-/// 共有可能な変数セル（参照キャプチャ用）
-pub type SharedValue = Rc<RefCell<Value>>;
+/// 共有可能な変数セル（参照キャプチャ用）。
+///
+/// backing は [`TrackedCell`] で、生成時に §5.1 の captured cell（32 byte 固定）を
+/// live heap へ課金し、最後の参照 drop で release する（REV-015 PR-c、§5.2）。
+/// `Rc::clone`（closure capture・代入）は無課金の共有。cell の中身の書き換えは
+/// `Deref` 経由の `RefCell` 内部可変で行い、サイズは 32 固定なので再課金しない。
+pub type SharedValue = Rc<TrackedCell>;
+/// tracked な変数 cell backing（`RefCell<Value>`）。
+pub type TrackedCell = Tracked<RefCell<Value>>;
+/// 関数 instance header の heap 課金トークン（REV-015 PR-c）。
+///
+/// data を持たない（`()`）tracked allocation で、生成時に §5.1 の function instance
+/// header（tree: 64 + 16×captured / VM: 48 + 16×upvalue）を live heap へ課金し、最後の
+/// 参照 drop で release する。captured / upvalue cell 実体は cell 側で別途課金するため、
+/// header だけをこのトークンで持つ（二重計上を避ける）。
+pub type FnHeader = Tracked<()>;
 
 /// heap 課金付きの collection backing（REV-015 案A、per-drop release）。
 ///
@@ -74,6 +88,46 @@ impl<T> Tracked<T> {
             bytes: 0,
             ledger: HeapLedgerWeak::new(),
         })
+    }
+
+    /// heap 台帳への弱参照だけを使って課金してから包む（`&mut BudgetLedger` を持てない
+    /// 文脈用、REV-015 PR-c）。
+    ///
+    /// [`Tracked::new`] は `&mut BudgetLedger` を要求するが、変数 cell は `Env`（tree）や
+    /// frame（VM）が所有し、`Value` ツリーに現れないため dispatch 境界の `track_result`
+    /// では拾えない。cell の生成点は `&mut BudgetLedger` を持たないことがあるので、
+    /// 台帳への `Weak` を直接受け取り、`upgrade` して `charge` / `allocate_id` する。
+    ///
+    /// - `ledger` が `upgrade` できない（＝台帳がない / drop 済み）場合は課金せず untracked
+    ///   （`AllocationId(0)`・`bytes = 0`・`Drop` no-op）で包む。`Env` 単体テストのように
+    ///   台帳を持たない文脈では live heap を増減させない。
+    /// - `charge` が上限超過・overflow なら `ControlStop` を返し、`Tracked` は作られない。
+    pub fn new_via_handle(
+        data: T,
+        logical_bytes: u64,
+        ledger: &HeapLedgerWeak,
+        phase: ExecutionPhase,
+    ) -> Result<Rc<Self>, ControlStop> {
+        let Some(strong) = ledger.upgrade() else {
+            // 台帳なし: untracked で包む（課金・release とも no-op）。
+            return Ok(Rc::new(Self {
+                data,
+                id: AllocationId(0),
+                bytes: 0,
+                ledger: HeapLedgerWeak::new(),
+            }));
+        };
+        let id = {
+            let mut l = strong.borrow_mut();
+            l.charge(logical_bytes, phase)?;
+            l.allocate_id()?
+        };
+        Ok(Rc::new(Self {
+            data,
+            id,
+            bytes: logical_bytes,
+            ledger: ledger.clone(),
+        }))
     }
 
     /// この backing の [`AllocationId`]（同一性・デバッグ用）。
@@ -351,6 +405,11 @@ pub enum Value {
         def: Rc<FnDef>,
         /// 定義時にキャプチャした変数セル。セル自体は参照共有される
         captured: Rc<HashMap<String, SharedValue>>,
+        /// tree function instance header（§5.1 tree_function = 64 + 16×captured）の
+        /// heap 課金トークン（REV-015 PR-c）。生成時に課金し、最後の参照 drop で release
+        /// する。captured cell 実体は cell 側（`SharedValue`）で別途課金するため、ここでは
+        /// header ぶんだけを持つ。`clone`（＝関数値の共有）は `Rc` ハンドル共有で無課金。
+        header: Rc<FnHeader>,
     },
     /// VM用関数値（コンパイル済みバイトコード）
     /// Rc<Chunk> により関数呼び出し・クロージャ生成時のディープコピーを回避
@@ -363,6 +422,10 @@ pub enum Value {
         chunk: Rc<Chunk>,
         /// クロージャがキャプチャした値（参照キャプチャ方式）
         upvalues: Vec<SharedValue>,
+        /// VM function instance header（§5.1 vm_function = 48 + 16×upvalue）の heap 課金
+        /// トークン（REV-015 PR-c）。生成時に課金し、最後の参照 drop で release する。
+        /// upvalue cell 実体は cell 側で別途課金するため header ぶんだけを持つ。
+        header: Rc<FnHeader>,
     },
     /// 構造化エラー値（try/catch で捕捉したエラー）
     /// Display では message を返すため、既存の文字列結合と互換性がある。
@@ -493,6 +556,51 @@ impl Value {
     /// `&str` から untracked な `Value::Str` を作る（`str_constant` の借用版）。
     pub fn str_from(s: &str) -> Value {
         Value::str_constant(s.to_string())
+    }
+
+    /// heap 課金済みの変数 cell（[`SharedValue`]）を作る（REV-015 PR-c、§5.2）。
+    ///
+    /// §5.1 の captured cell（32 byte 固定）を heap 台帳への弱参照経由で課金し、最後の
+    /// 参照 drop で release する。cell は `Env`（tree）/ frame（VM）が所有し `Value` ツリー
+    /// に現れないため、`&mut BudgetLedger` ではなく台帳への `Weak` を直接受け取る。台帳を
+    /// 持たない文脈（`Env` 単体テストなど）では untracked（無課金）で包む。
+    pub fn new_cell(
+        value: Value,
+        ledger: &crate::budget::HeapLedgerWeak,
+        phase: ExecutionPhase,
+    ) -> Result<SharedValue, ControlStop> {
+        Tracked::new_via_handle(RefCell::new(value), heap_size::CAPTURED_CELL, ledger, phase)
+    }
+
+    /// heap 課金しない untracked な変数 cell を作る（台帳を持たない文脈用）。
+    pub fn cell_untracked(value: Value) -> SharedValue {
+        Tracked::constant(RefCell::new(value))
+    }
+
+    /// tree function instance header（§5.1 tree_function = 64 + 16×captured）の heap 課金
+    /// トークンを作る（REV-015 PR-c）。生成時に live heap へ課金し drop で release する。
+    /// 台帳を持たない文脈では untracked（無課金）で包む。
+    pub fn new_tree_fn_header(
+        captured_count: u64,
+        ledger: &crate::budget::HeapLedgerWeak,
+        phase: ExecutionPhase,
+    ) -> Result<Rc<FnHeader>, ControlStop> {
+        Tracked::new_via_handle((), heap_size::tree_function(captured_count), ledger, phase)
+    }
+
+    /// VM function instance header（§5.1 vm_function = 48 + 16×upvalue）の heap 課金
+    /// トークンを作る（REV-015 PR-c）。生成時に live heap へ課金し drop で release する。
+    pub fn new_vm_fn_header(
+        upvalue_count: u64,
+        ledger: &crate::budget::HeapLedgerWeak,
+        phase: ExecutionPhase,
+    ) -> Result<Rc<FnHeader>, ControlStop> {
+        Tracked::new_via_handle((), heap_size::vm_function(upvalue_count), ledger, phase)
+    }
+
+    /// heap 課金しない untracked な関数 header トークンを作る（台帳を持たない文脈用）。
+    pub fn fn_header_untracked() -> Rc<FnHeader> {
+        Tracked::constant(())
     }
 
     /// `BTreeMap<String, Value>` から heap 課金済みの `Value::Dict` を作る（§5.2）。
@@ -1220,6 +1328,73 @@ mod tests {
         // outer を drop すると List backing と、最後の参照になった String backing が両方 release。
         drop(outer);
         assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn new_cell_charges_captured_cell_and_releases_on_drop() {
+        let budget = heap_ledger(1_000_000);
+        assert_eq!(budget.live_heap_bytes(), 0);
+        // captured cell = 32 byte 固定。
+        let cell =
+            Value::new_cell(Value::Int(1), &budget.heap_handle(), ExecutionPhase::Run).unwrap();
+        assert_eq!(budget.live_heap_bytes(), heap_size::CAPTURED_CELL);
+        // clone（closure capture・共有）は Rc ハンドル共有で無課金。
+        let alias = Rc::clone(&cell);
+        assert_eq!(budget.live_heap_bytes(), heap_size::CAPTURED_CELL);
+        drop(cell);
+        assert_eq!(budget.live_heap_bytes(), heap_size::CAPTURED_CELL);
+        // 最後の参照 drop で release。
+        drop(alias);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn cell_untracked_does_not_charge() {
+        let budget = heap_ledger(1_000_000);
+        let c = Value::cell_untracked(Value::Int(1));
+        assert_eq!(budget.live_heap_bytes(), 0);
+        drop(c);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn tree_fn_header_charges_and_releases_on_drop() {
+        let budget = heap_ledger(1_000_000);
+        // captured 2 個 → tree_function(2) = 64 + 16*2 = 96。cell 実体は別課金なので含めない。
+        let header =
+            Value::new_tree_fn_header(2, &budget.heap_handle(), ExecutionPhase::Run).unwrap();
+        assert_eq!(budget.live_heap_bytes(), heap_size::tree_function(2));
+        // 関数値の clone（共有）は header の Rc ハンドル共有で無課金。
+        let alias = Rc::clone(&header);
+        assert_eq!(budget.live_heap_bytes(), heap_size::tree_function(2));
+        drop(header);
+        assert_eq!(budget.live_heap_bytes(), heap_size::tree_function(2));
+        drop(alias);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn vm_fn_header_charges_and_releases_on_drop() {
+        let budget = heap_ledger(1_000_000);
+        // upvalue 3 個 → vm_function(3) = 48 + 16*3 = 96。
+        let header =
+            Value::new_vm_fn_header(3, &budget.heap_handle(), ExecutionPhase::Run).unwrap();
+        assert_eq!(budget.live_heap_bytes(), heap_size::vm_function(3));
+        drop(header);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn cell_charge_trips_at_limit() {
+        // captured cell 1 個ちょうどの上限。2 個目は超過する。
+        let budget = heap_ledger(heap_size::CAPTURED_CELL);
+        let ok = Value::new_cell(Value::Int(1), &budget.heap_handle(), ExecutionPhase::Run);
+        assert!(ok.is_ok());
+        let over = Value::new_cell(Value::Int(2), &budget.heap_handle(), ExecutionPhase::Run);
+        assert!(matches!(
+            over,
+            Err(crate::budget::ControlStop::BudgetExceeded(_))
+        ));
     }
 
     #[test]

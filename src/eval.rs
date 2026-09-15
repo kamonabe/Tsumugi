@@ -44,10 +44,15 @@ impl Evaluator {
 
     /// 明示 `BudgetConfig` で評価器を作る（埋め込み host 向け）。
     pub fn with_budget(config: BudgetConfig) -> Self {
+        let budget = BudgetLedger::with_config(config);
+        let mut env = Env::new();
+        // cell 生成時の captured cell 課金のため、budget の heap 台帳を Env へ配る
+        // （REV-015 PR-c）。
+        env.set_heap_ledger(budget.heap_handle());
         Self {
-            env: Env::new(),
+            env,
             call_stack: Vec::new(),
-            budget: BudgetLedger::with_config(config),
+            budget,
             loader: crate::module::ModuleLoader::new(),
             next_function_id: 0,
             script_args: Vec::new(),
@@ -89,6 +94,31 @@ impl Evaluator {
         self.budget
             .charge_fuel(1, ExecutionPhase::Run)
             .map_err(|stop| self.control_stop_to_error(stop, line))
+    }
+
+    /// 変数 cell を作って現在スコープへ束縛する（REV-015 PR-c）。
+    ///
+    /// `Env::set` は cell の §5.1 captured cell（32 byte）を live heap へ課金するため
+    /// fallible になった。超過 `ControlStop` を既存 `TsumugiError` へ写像する。
+    fn env_set(&mut self, name: &str, value: Value, line: usize) -> Result<(), TsumugiError> {
+        self.env
+            .set(name, value)
+            .map_err(|stop| self.control_stop_to_error(stop, line))
+    }
+
+    /// tree function instance header（§5.1 tree_function）を課金してトークンを作る
+    /// （REV-015 PR-c）。captured cell 実体は cell 側で別途課金するため header ぶんだけ。
+    fn new_fn_header(
+        &self,
+        captured_count: usize,
+        line: usize,
+    ) -> Result<Rc<crate::value::FnHeader>, TsumugiError> {
+        Value::new_tree_fn_header(
+            captured_count as u64,
+            &self.budget.heap_handle(),
+            ExecutionPhase::Run,
+        )
+        .map_err(|stop| self.control_stop_to_error(stop, line))
     }
 
     /// collection 要素数の per-item 検査（REV-015 Slice 1）。
@@ -161,13 +191,14 @@ impl Evaluator {
         root_source_bytes: u64,
         loaded: &[crate::module::LoadedModule],
     ) -> Result<(), TsumugiError> {
-        // live heap は tracked collection の生成/drop で逐次維持する（REV-015 案A）。
-        // per-drop release 導入後は、REPL 入力境界で live heap を 0 へ戻して baseline を
-        // 再走査すると、既に tracked（自己 release する）collection を二重計上してしまう。
-        // よって collection を per-drop 追跡する本 PR では charge_link での baseline 再課金を
-        // 行わない。埋め込み host が注入する非 collection の pre-existing 状態（String /
-        // 関数 instance / cell）の baseline 課金は、それらを per-drop 化する後続 PR で
-        // 再導入する。`charge_context_baseline` 自体は単体テスト・後続 PR 用に残す。
+        // live heap は tracked backing の生成/drop で逐次維持する（REV-015 案A/PR-b/PR-c）。
+        // collection・String・変数 cell・関数 instance header はすべて per-drop 追跡され、
+        // 生成時に課金し最後の参照 drop で release する。よって同じ台帳を跨ぐ REPL 入力では
+        // pre-existing な言語状態の live heap が自動的に持ち越され、Link 境界で baseline を
+        // 再走査する必要がない（再走査するとむしろ tracked 分を二重計上する）。したがって
+        // `charge_link` では baseline 課金を行わない。`charge_context_baseline`
+        // （全 heap object を 1 回ずつ論理課金する純関数）は、execution ごとに台帳を作り直す
+        // 埋め込み API（fresh ledger モデル、後続 Phase）用に残し、単体テストで固定する。
         self.budget
             .charge_source(root_source_bytes, ExecutionPhase::Link)
             .map_err(|stop| self.control_stop_to_error(stop, 0))?;
@@ -268,7 +299,7 @@ impl Evaluator {
         match stmt {
             Stmt::Let { name, value, line } => {
                 let val = self.eval_expr(value, *line)?;
-                self.env.set(name, val);
+                self.env_set(name, val, *line)?;
                 Ok(EvalResult::Val)
             }
 
@@ -389,7 +420,11 @@ impl Evaluator {
 
                 for item in items {
                     self.env.push_scope();
-                    self.env.set(var, item);
+                    // cell 課金の超過でも iteration scope を必ず解放する（pop 後に ? する）。
+                    if let Err(e) = self.env_set(var, item, *line) {
+                        self.env.pop_scope();
+                        return Err(e);
+                    }
                     let body_result = self.exec_block(body);
                     // whileと同様に、エラー・return・break・continueの全経路で
                     // iteration scopeを先に解放する。
@@ -420,7 +455,8 @@ impl Evaluator {
                     self.env
                         .capture_referenced(&crate::ast::referenced_names(body)),
                 );
-                self.env.set(
+                let header = self.new_fn_header(captured.len(), *line)?;
+                self.env_set(
                     name,
                     Value::Fn {
                         id,
@@ -430,8 +466,10 @@ impl Evaluator {
                             body: body.clone(),
                         }),
                         captured,
+                        header,
                     },
-                );
+                    *line,
+                )?;
                 Ok(EvalResult::Val)
             }
 
@@ -455,14 +493,19 @@ impl Evaluator {
                 match self.exec_scoped_block(try_body) {
                     Ok(result) => Ok(result),
                     Err(e) => {
+                        let err_line = e.line();
                         let error_value = Value::Error {
                             error_type: e.error_type().to_string(),
                             message: e.message().to_string(),
-                            line: e.line(),
+                            line: err_line,
                         };
 
                         self.env.push_scope();
-                        self.env.set(var, error_value);
+                        // cell 課金の超過でも catch scope を必ず解放する。
+                        if let Err(charge_err) = self.env_set(var, error_value, err_line) {
+                            self.env.pop_scope();
+                            return Err(charge_err);
+                        }
                         let catch_result = self.exec_block(catch_body);
                         // error・return・break・continueの全経路でcatch scopeを先に解放する。
                         self.env.pop_scope();
@@ -583,6 +626,7 @@ impl Evaluator {
                     self.env
                         .capture_referenced(&crate::ast::referenced_names(body)),
                 );
+                let header = self.new_fn_header(captured.len(), line)?;
                 Ok(Value::Fn {
                     id,
                     def: Rc::new(FnDef {
@@ -591,6 +635,7 @@ impl Evaluator {
                         body: body.clone(),
                     }),
                     captured,
+                    header,
                 })
             }
 
@@ -876,12 +921,19 @@ impl Evaluator {
         }
         // 名前付き関数は呼び出し時の関数値を宣言名へ束縛する。
         // 定義時captureへ自身を入れず、Rc cycleを避ける。
-        if func_name != "<lambda>" {
-            self.env.set(func_name, func_value.clone());
+        // cell 課金の超過でも call frame を必ず解放してから返す（REV-015 PR-c）。
+        if func_name != "<lambda>"
+            && let Err(e) = self.env.set(func_name, func_value.clone())
+        {
+            self.env.pop_call_frame(saved_scopes);
+            return Err(self.control_stop_to_error(e, line));
         }
         // parameterはself-bindingと同名ならshadowする。
         for (param, val) in params.iter().zip(arg_values) {
-            self.env.set(param, val);
+            if let Err(e) = self.env.set(param, val) {
+                self.env.pop_call_frame(saved_scopes);
+                return Err(self.control_stop_to_error(e, line));
+            }
         }
 
         // コールスタックに記録

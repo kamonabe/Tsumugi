@@ -47,12 +47,19 @@ impl Evaluator {
                     self.env.set_shared(k, cell.clone());
                 }
                 // 通常callと同じく、名前付き関数を宣言名へself-bindする。
-                if name != "<lambda>" {
-                    self.env.set(name, func.clone());
+                // cell 課金の超過でも call frame を解放してから返す（REV-015 PR-c）。
+                if name != "<lambda>"
+                    && let Err(e) = self.env.set(name, func.clone())
+                {
+                    self.env.pop_call_frame(saved_scopes);
+                    return Err(self.control_stop_to_error(e, line));
                 }
                 // parameterはself-bindingと同名ならshadowする。
                 for (param, val) in params.iter().zip(arg_values) {
-                    self.env.set(param, val);
+                    if let Err(e) = self.env.set(param, val) {
+                        self.env.pop_call_frame(saved_scopes);
+                        return Err(self.control_stop_to_error(e, line));
+                    }
                 }
 
                 use crate::error::TraceFrame;

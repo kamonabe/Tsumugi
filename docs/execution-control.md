@@ -2,11 +2,11 @@
 
 最終更新: 2026-09-11
 
-設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は string / source / import accounting、heap accounting 基盤（`AllocationLedger`・§5.1 論理サイズ）、collection（`List`/`Dict`）の per-drop release（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、tree/VM 両対応）、および String body の per-drop release（PR-b、`Value::Str` を `Rc<Tracked<String>>` 化）を実装済み。残りは cell / 関数 instance / AST / chunk / journal の per-drop 追跡と I-O accounting。VM の push/pop は full-clone 経路のため configured 上限で tree と live/peak が食い違い得るが、charge trace の tree/VM 完全一致は第14節 Slice 6（VM が experimental の間）で解消する）
+設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は string / source / import accounting、heap accounting 基盤（`AllocationLedger`・§5.1 論理サイズ）、collection（`List`/`Dict`）の per-drop release（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、tree/VM 両対応）、および String body の per-drop release（PR-b、`Value::Str` を `Rc<Tracked<String>>` 化）、cell と tree/VM 関数 instance の per-drop release（PR-c、`SharedValue` を `Rc<Tracked<RefCell<Value>>>` 化し `Value::Fn`/`VmFn` に header token を持たせる）を実装済み。残りは AST / chunk / import record / rollback journal の per-drop 追跡（PR-d）と I-O accounting。VM の push/pop は full-clone 経路のため configured 上限で tree と live/peak が食い違い得るが、charge trace の tree/VM 完全一致は第14節 Slice 6（VM が experimental の間）で解消する）
 
 ## 1. 位置づけ
 
-本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleStringBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線）と source / import accounting サブスライス（per-item `SingleSourceBytes`・cumulative `SourceCount`/`SourceBytes`・`ImportCount`/`ImportBytes` を Link フェーズで root と import へ tree/VM 共通で課金）、heap accounting 基盤サブスライス（`AllocationId`・`AllocationLedger`・§5.1 論理サイズ関数・`HeapBytes` reserve/超過写像）、collection（`List`/`Dict`）の per-drop release サブスライス（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、COW は delta 課金、tree/VM 両対応）、および String body の per-drop release サブスライス（PR-b、`Value::Str` を `Rc<Tracked<String>>` 化し、builtin 結果を dispatch 境界の `track_result` で live heap 課金・最後の参照 drop で release）も実装済みである。Slice 2 の残り（cell / 関数 instance / AST / chunk / journal の per-drop 追跡、I-O accounting、string リテラル/連結/f-string 経路、非 collection の baseline 再導入）と Slice 3 以降（continuation、cancel/pause、scheduler、VM charge parity）は未実装である。
+本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleStringBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線）と source / import accounting サブスライス（per-item `SingleSourceBytes`・cumulative `SourceCount`/`SourceBytes`・`ImportCount`/`ImportBytes` を Link フェーズで root と import へ tree/VM 共通で課金）、heap accounting 基盤サブスライス（`AllocationId`・`AllocationLedger`・§5.1 論理サイズ関数・`HeapBytes` reserve/超過写像）、collection（`List`/`Dict`）の per-drop release サブスライス（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、COW は delta 課金、tree/VM 両対応）、および String body の per-drop release サブスライス（PR-b、`Value::Str` を `Rc<Tracked<String>>` 化し、builtin 結果を dispatch 境界の `track_result` で live heap 課金・最後の参照 drop で release）、cell と tree/VM 関数 instance の per-drop release サブスライス（PR-c、cell 生成点で captured cell を課金し `Value::Fn`/`VmFn` の header token で function instance header を課金、drop で release）も実装済みである。Slice 2 の残り（AST / chunk / import record / rollback journal の per-drop 追跡、I-O accounting、string リテラル/連結/f-string 経路）と Slice 3 以降（continuation、cancel/pause、scheduler、VM charge parity）は未実装である。
 
 本文書は次の既存仕様と一体で実装する。
 
@@ -770,9 +770,8 @@ run-turn queueはEngine全体でFIFO round-robinとし、continuation自体で�
     `x=[]` は untracked 定数のまま変数へ渡り、最初の mutation まで body 24 byte を課金
     しない。いずれも既定上限では観測に影響しないが、configured 上限では tree と live/peak
     が食い違い得る。VM が experimental の間の既知差として許容する。
-- 未実装（後続 PR）: cell（`SharedValue`）・tree/VM 関数 instance・String body・AST/chunk・
-  import record・rollback journal の per-drop 追跡。これらは per-drop 化に加えて、上で
-  外した baseline 課金（非 collection の pre-existing 状態）の再導入も担う。
+- 未実装（後続 PR）: AST / bytecode chunk / imported module record / rollback journal の
+  per-drop 追跡（PR-d）。cell・tree/VM 関数 instance・String body は PR-b/PR-c で実装済み。
   - サブスライス分割（実装順）: collection per-drop（案A PR-a、✅ 済み）に続けて、
     依存の少ない順に切り出す。
     - **PR-b: String body の per-drop 追跡（✅ 実装済み）** — `Value::Str` の backing を
@@ -785,8 +784,21 @@ run-turn queueはEngine全体でFIFO round-robinとし、continuation自体で�
       共有しないため、単独で切り出せる。§5.3 の「substring が既存 body を共有する実装なら
       新規 allocation として数えない」共有最適化は本 PR の範囲外（`Rc<Tracked<String>>`
       は共有可能な backing だが、現行の連結・substring は依然 copy を作る）。
-    - PR-c: cell（`SharedValue`）＋ tree/VM 関数 instance の per-drop 追跡。cell は
-      関数 instance（captured / upvalue）の前提となるため一体で扱う。
+    - **PR-c: cell（`SharedValue`）＋ tree/VM 関数 instance の per-drop 追跡（✅ 実装済み）**
+      — `SharedValue` の backing を `RefCell<Value>` から `Rc<Tracked<RefCell<Value>>>`
+      へ変更し、cell 生成点（tree=`Env::set`、VM=`ensure_local_cell`）で §5.1 captured
+      cell（32 byte）を live heap へ課金し、最後の参照 drop で release する。`Env` に heap
+      台帳への `Weak` を持たせ `Env::set` を fallible 化した（呼び出し元へ `?` 伝播）。
+      関数 instance は `Value::Fn` / `Value::VmFn` へ `header: Rc<Tracked<()>>` を持たせ、
+      生成時（FnDef/Lambda 評価・`MakeClosure`）に §5.1 の header（tree: 64 + 16×captured
+      / VM: 48 + 16×upvalue）を課金し drop で release する。captured / upvalue cell 実体は
+      cell 側で別途課金するため header ぶんだけ計上し、二重計上しない。`Rc::clone`（共有・
+      capture）は無課金。cell は関数 instance（captured / upvalue）の前提となるため一体で
+      扱った。collection・String・cell・関数 header がすべて per-drop 追跡されたことで、
+      同じ台帳を跨ぐ REPL/実行では pre-existing な live heap が自動的に持ち越され、Link
+      境界での baseline 再走査は不要になった（`charge_link` は baseline 課金を行わない。
+      `charge_context_baseline` は fresh ledger モデルの埋め込み API 用に温存）。既定上限
+      では観測挙動を変えない。
     - PR-d: AST / bytecode chunk / imported module record / rollback journal の per-drop
       追跡。Link / compile フェーズおよび AUD-024 journal との結合を伴う。
   - 各サブスライスは per-drop 化と同時に、`charge_context_baseline` から外した
