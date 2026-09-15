@@ -473,7 +473,7 @@ mod tests {
     fn constant_containing_string_verifies() {
         // 定数に文字列を載せた LoadConst は範囲内なら通る。
         let mut chunk = Chunk::new();
-        let idx = chunk.add_constant(Value::Str("ok".to_string()));
+        let idx = chunk.add_constant(Value::str_constant("ok".to_string()));
         chunk.emit(OpCode::LoadConst(idx), 1);
         chunk.emit(OpCode::Pop, 1);
         chunk.emit(OpCode::Return, 1);

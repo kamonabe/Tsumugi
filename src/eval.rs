@@ -373,12 +373,14 @@ impl Evaluator {
                     }
                     Value::Dict(map) => {
                         self.check_collection(map.len(), *line)?;
-                        map.keys().map(|k| Value::Str(k.clone())).collect()
+                        map.keys().map(|k| Value::str_constant(k.clone())).collect()
                     }
                     Value::Str(s) => {
                         let size = s.chars().count();
                         self.check_collection(size, *line)?;
-                        s.chars().map(|c| Value::Str(c.to_string())).collect()
+                        s.chars()
+                            .map(|c| Value::str_constant(c.to_string()))
+                            .collect()
                     }
                     _ => {
                         return Err(TsumugiError::not_iterable(*line, &collection));
@@ -500,7 +502,7 @@ impl Evaluator {
         match expr {
             Expr::Int(n) => Ok(Value::Int(*n)),
             Expr::Float(f) => Ok(Value::Float(*f)),
-            Expr::Str(s) => Ok(Value::Str(s.clone())),
+            Expr::Str(s) => Ok(Value::str_constant(s.clone())),
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Null => Ok(Value::Null),
 
@@ -520,7 +522,7 @@ impl Evaluator {
                 let mut map = BTreeMap::new();
                 for (key_expr, val_expr) in pairs {
                     let key = match self.eval_expr(key_expr, line)? {
-                        Value::Str(s) => s,
+                        Value::Str(s) => s.to_string(),
                         other => {
                             return Err(TsumugiError::dict_key_type(line, &other));
                         }
@@ -619,7 +621,7 @@ impl Evaluator {
                         }
                     }
                 }
-                Ok(Value::Str(result))
+                Ok(Value::str_constant(result))
             }
         }
     }
@@ -654,13 +656,13 @@ impl Evaluator {
                     return Err(TsumugiError::str_index_out_of_range(line, *i, count));
                 }
                 let ch = s.chars().nth(actual as usize).unwrap();
-                Ok(Value::Str(ch.to_string()))
+                Ok(Value::str_constant(ch.to_string()))
             }
             Value::Dict(map) => {
                 let Value::Str(key) = index else {
                     return Err(TsumugiError::dict_key_type(line, index));
                 };
-                Ok(map.get(key).cloned().unwrap_or(Value::Null))
+                Ok(map.get(key.as_str()).cloned().unwrap_or(Value::Null))
             }
             Value::Error {
                 error_type,
@@ -671,8 +673,8 @@ impl Evaluator {
                     return Err(TsumugiError::dict_key_type(line, index));
                 };
                 match key.as_str() {
-                    "type" => Ok(Value::Str(error_type.clone())),
-                    "message" => Ok(Value::Str(message.clone())),
+                    "type" => Ok(Value::str_constant(error_type.clone())),
+                    "message" => Ok(Value::str_constant(message.clone())),
                     "line" => Ok(Value::Int(*err_line as i64)),
                     _ => Ok(Value::Null),
                 }
@@ -742,13 +744,15 @@ impl Evaluator {
             (Value::Float(l), BinOpKind::Mod, Value::Int(r)) => Ok(Value::Float(l % *r as f64)),
 
             // 文字列結合
-            (Value::Str(l), BinOpKind::Add, Value::Str(r)) => Ok(Value::Str(format!("{}{}", l, r))),
+            (Value::Str(l), BinOpKind::Add, Value::Str(r)) => {
+                Ok(Value::str_constant(format!("{}{}", l.as_str(), r.as_str())))
+            }
             // 文字列 + Error（Error は Display で message を返す）
             (Value::Str(l), BinOpKind::Add, r @ Value::Error { .. }) => {
-                Ok(Value::Str(format!("{}{}", l, r)))
+                Ok(Value::str_constant(format!("{}{}", l.as_str(), r)))
             }
             (l @ Value::Error { .. }, BinOpKind::Add, Value::Str(r)) => {
-                Ok(Value::Str(format!("{}{}", l, r)))
+                Ok(Value::str_constant(format!("{}{}", l, r.as_str())))
             }
 
             // 大小比較は数値だけを対象にする。IntとFloatは跨いで厳密比較する

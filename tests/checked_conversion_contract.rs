@@ -219,7 +219,7 @@ fn file_size_of_real_file_is_positive_int() {
     let path_str = path.to_string_lossy().to_string();
 
     // sandbox 未設定時は allow-all（fail-open）なので読める。
-    match builtin_file_size(&[Value::Str(path_str)], 1) {
+    match builtin_file_size(&[Value::str_constant(path_str)], 1) {
         Ok(Value::Int(n)) => assert_eq!(n, 5, "file_size はバイト数を返す"),
         other => panic!("Int が返るはず: {other:?}"),
     }
@@ -232,7 +232,7 @@ fn missing_file_returns_null() {
     let path = std::env::temp_dir().join("tsg_aud036_missing_file_xyz.txt");
     let _ = std::fs::remove_file(&path);
     let path_str = path.to_string_lossy().to_string();
-    match builtin_file_size(&[Value::Str(path_str)], 1) {
+    match builtin_file_size(&[Value::str_constant(path_str)], 1) {
         Ok(Value::Null) => {}
         other => panic!("存在しないファイルは Null: {other:?}"),
     }

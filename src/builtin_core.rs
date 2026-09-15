@@ -179,7 +179,7 @@ pub fn assign_index(
         }
         Value::Dict(map) => {
             let key = match index {
-                Value::Str(s) => s.clone(),
+                Value::Str(s) => s.to_string(),
                 other => {
                     return Err(TsumugiError::dict_key_type(line, other));
                 }
@@ -260,7 +260,7 @@ pub fn builtin_keys(
     check_arity("keys", args, 1, line)?;
     if let Value::Dict(map) = &args[0] {
         check_collection_size(map.len(), max_collection, line)?;
-        let keys: Vec<Value> = map.keys().map(|k| Value::Str(k.clone())).collect();
+        let keys: Vec<Value> = map.keys().map(|k| Value::str_constant(k.clone())).collect();
         Ok(Value::List(Tracked::constant(keys)))
     } else {
         Err(TsumugiError::builtin_arg_type(
@@ -289,7 +289,7 @@ pub fn builtin_values(
 pub fn builtin_has_key(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("has_key", args, 2, line)?;
     match (&args[0], &args[1]) {
-        (Value::Dict(map), Value::Str(key)) => Ok(Value::Bool(map.contains_key(key))),
+        (Value::Dict(map), Value::Str(key)) => Ok(Value::Bool(map.contains_key(key.as_str()))),
         (Value::Dict(_), other) => Err(TsumugiError::builtin_arg_type(
             line, "has_key", 2, "Str", other,
         )),
@@ -312,7 +312,7 @@ pub fn builtin_type(args: &[Value], line: usize) -> Result<Value, TsumugiError> 
         Value::Fn { .. } | Value::VmFn { .. } => "fn",
         Value::Error { .. } => "error",
     };
-    Ok(Value::Str(t.to_string()))
+    Ok(Value::str_from(t))
 }
 
 pub fn builtin_slice(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
@@ -352,9 +352,11 @@ pub fn builtin_slice(args: &[Value], line: usize) -> Result<Value, TsumugiError>
             let en = end.min(chars.len());
             // start > end の場合は空文字列を返す（パニックしない）
             if st > en {
-                return Ok(Value::Str(String::new()));
+                return Ok(Value::str_constant(String::new()));
             }
-            Ok(Value::Str(chars[st..en].iter().collect()))
+            Ok(Value::str_constant(
+                chars[st..en].iter().collect::<String>(),
+            ))
         }
         other => Err(TsumugiError::builtin_arg_type(
             line, "slice", 1, "List/Str", other,
@@ -375,7 +377,7 @@ pub fn builtin_contains(args: &[Value], line: usize) -> Result<Value, TsumugiErr
         }
         Value::Dict(map) => {
             if let Value::Str(key) = &args[1] {
-                Ok(Value::Bool(map.contains_key(key)))
+                Ok(Value::Bool(map.contains_key(key.as_str())))
             } else {
                 Ok(Value::Bool(false))
             }
@@ -411,7 +413,7 @@ pub fn builtin_reverse(args: &[Value], line: usize) -> Result<Value, TsumugiErro
             rev.reverse();
             Ok(Value::List(Tracked::constant(rev)))
         }
-        Value::Str(s) => Ok(Value::Str(s.chars().rev().collect())),
+        Value::Str(s) => Ok(Value::str_constant(s.chars().rev().collect::<String>())),
         other => Err(TsumugiError::builtin_arg_type(
             line, "reverse", 1, "List/Str", other,
         )),
@@ -469,7 +471,7 @@ pub fn builtin_split(
     let mut parts = Vec::new();
     for part in s.split(sep.as_str()) {
         check_collection_size(parts.len().saturating_add(1), max_collection, line)?;
-        parts.push(Value::Str(part.to_string()));
+        parts.push(Value::str_constant(part.to_string()));
     }
     Ok(Value::List(Tracked::constant(parts)))
 }
@@ -483,25 +485,25 @@ pub fn builtin_join(args: &[Value], line: usize) -> Result<Value, TsumugiError> 
     };
     let sep = require_str(&args[1], "join", 2, line)?;
     let parts: Vec<String> = list.iter().map(|v| v.to_string()).collect();
-    Ok(Value::Str(parts.join(sep)))
+    Ok(Value::str_constant(parts.join(sep)))
 }
 
 pub fn builtin_trim(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("trim", args, 1, line)?;
     let s = require_str(&args[0], "trim", 1, line)?;
-    Ok(Value::Str(s.trim().to_string()))
+    Ok(Value::str_constant(s.trim().to_string()))
 }
 
 pub fn builtin_upper(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("upper", args, 1, line)?;
     let s = require_str(&args[0], "upper", 1, line)?;
-    Ok(Value::Str(s.to_uppercase()))
+    Ok(Value::str_constant(s.to_uppercase()))
 }
 
 pub fn builtin_lower(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("lower", args, 1, line)?;
     let s = require_str(&args[0], "lower", 1, line)?;
-    Ok(Value::Str(s.to_lowercase()))
+    Ok(Value::str_constant(s.to_lowercase()))
 }
 
 pub fn builtin_starts_with(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
@@ -523,7 +525,7 @@ pub fn builtin_replace(args: &[Value], line: usize) -> Result<Value, TsumugiErro
     let s = require_str(&args[0], "replace", 1, line)?;
     let old = require_str(&args[1], "replace", 2, line)?;
     let new = require_str(&args[2], "replace", 3, line)?;
-    Ok(Value::Str(s.replace(old.as_str(), new.as_str())))
+    Ok(Value::str_constant(s.replace(old.as_str(), new.as_str())))
 }
 
 // =============================================================================
@@ -634,7 +636,7 @@ pub fn builtin_to_int(args: &[Value], line: usize) -> Result<Value, TsumugiError
 
 pub fn builtin_to_str(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("to_str", args, 1, line)?;
-    Ok(Value::Str(args[0].to_string()))
+    Ok(Value::str_constant(args[0].to_string()))
 }
 
 pub fn builtin_to_float(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
@@ -831,7 +833,7 @@ pub fn builtin_format_time(args: &[Value], line: usize) -> Result<Value, Tsumugi
         ));
     };
     let fmt = require_str(&args[1], "format_time", 2, line)?;
-    Ok(Value::Str(format_unix_timestamp(*ts, fmt)))
+    Ok(Value::str_constant(format_unix_timestamp(*ts, fmt)))
 }
 
 // =============================================================================
@@ -864,7 +866,7 @@ pub fn builtin_read_file(args: &[Value], line: usize) -> Result<Value, TsumugiEr
     if let Value::Str(path) = &args[0] {
         let safe_path = crate::sandbox::check_path(path, line)?;
         match std::fs::read_to_string(&safe_path) {
-            Ok(content) => Ok(Value::Str(content)),
+            Ok(content) => Ok(Value::str_constant(content)),
             Err(_) => Ok(Value::Null),
         }
     } else {
@@ -891,7 +893,7 @@ pub fn builtin_read_lines(
                 let mut lines = Vec::new();
                 for content_line in content.lines() {
                     check_collection_size(lines.len().saturating_add(1), max_collection, line)?;
-                    lines.push(Value::Str(content_line.to_string()));
+                    lines.push(Value::str_constant(content_line.to_string()));
                 }
                 Ok(Value::List(Tracked::constant(lines)))
             }
@@ -913,7 +915,7 @@ pub fn builtin_write_file(args: &[Value], line: usize) -> Result<Value, TsumugiE
     if let Value::Str(path) = &args[0] {
         let safe_path = crate::sandbox::check_path(path, line)?;
         let content = match &args[1] {
-            Value::Str(s) => s.clone(),
+            Value::Str(s) => s.to_string(),
             other => other.to_string(),
         };
         Ok(Value::Bool(std::fs::write(&safe_path, &content).is_ok()))
@@ -933,7 +935,7 @@ pub fn builtin_append_file(args: &[Value], line: usize) -> Result<Value, Tsumugi
     if let Value::Str(path) = &args[0] {
         let safe_path = crate::sandbox::check_path(path, line)?;
         let content = match &args[1] {
-            Value::Str(s) => s.clone(),
+            Value::Str(s) => s.to_string(),
             other => other.to_string(),
         };
         use std::fs::OpenOptions;
@@ -1024,8 +1026,8 @@ pub fn builtin_env(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
             // 許可リスト外のキーへのアクセスは null を返す（エラーにはしない）
             return Ok(Value::Null);
         }
-        match std::env::var(key) {
-            Ok(val) => Ok(Value::Str(val)),
+        match std::env::var(key.as_str()) {
+            Ok(val) => Ok(Value::str_constant(val)),
             Err(_) => Ok(Value::Null),
         }
     } else {
@@ -1072,10 +1074,10 @@ pub fn builtin_path_join(args: &[Value], line: usize) -> Result<Value, TsumugiEr
     let mut path = std::path::PathBuf::new();
     for arg in args {
         if let Value::Str(s) = arg {
-            path.push(s);
+            path.push(s.as_str());
         }
     }
-    Ok(Value::Str(path.to_string_lossy().to_string()))
+    Ok(Value::str_constant(path.to_string_lossy().to_string()))
 }
 
 pub fn builtin_mkdir(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
@@ -1155,7 +1157,9 @@ pub fn builtin_list_dir(
                 let mut names = Vec::new();
                 for entry in entries.flatten() {
                     check_collection_size(names.len().saturating_add(1), max_collection, line)?;
-                    names.push(Value::Str(entry.file_name().to_string_lossy().to_string()));
+                    names.push(Value::str_constant(
+                        entry.file_name().to_string_lossy().to_string(),
+                    ));
                 }
                 names.sort_by_key(|v| v.to_string());
                 Ok(Value::List(Tracked::constant(names)))

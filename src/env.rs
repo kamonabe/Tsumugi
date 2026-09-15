@@ -296,10 +296,10 @@ mod tests {
     #[test]
     fn inner_scope_sees_outer() {
         let mut env = Env::new();
-        env.set("outer", Value::Str("visible".to_string()));
+        env.set("outer", Value::str_from("visible"));
 
         env.push_scope();
-        assert_eq!(env.get("outer"), Some(Value::Str("visible".to_string())));
+        assert_eq!(env.get("outer"), Some(Value::str_from("visible")));
         env.pop_scope();
     }
 

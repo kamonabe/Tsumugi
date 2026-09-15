@@ -2,11 +2,11 @@
 
 最終更新: 2026-09-11
 
-設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は string / source / import accounting、heap accounting 基盤（`AllocationLedger`・§5.1 論理サイズ）、および collection（`List`/`Dict`）の per-drop release（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、tree/VM 両対応）を実装済み。残りは cell / 関数 instance / String / AST / chunk / journal の per-drop 追跡と I-O accounting。VM の push/pop は full-clone 経路のため configured 上限で tree と live/peak が食い違い得るが、charge trace の tree/VM 完全一致は第14節 Slice 6（VM が experimental の間）で解消する）
+設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は string / source / import accounting、heap accounting 基盤（`AllocationLedger`・§5.1 論理サイズ）、collection（`List`/`Dict`）の per-drop release（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、tree/VM 両対応）、および String body の per-drop release（PR-b、`Value::Str` を `Rc<Tracked<String>>` 化）を実装済み。残りは cell / 関数 instance / AST / chunk / journal の per-drop 追跡と I-O accounting。VM の push/pop は full-clone 経路のため configured 上限で tree と live/peak が食い違い得るが、charge trace の tree/VM 完全一致は第14節 Slice 6（VM が experimental の間）で解消する）
 
 ## 1. 位置づけ
 
-本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleSourceBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線）と source / import accounting サブスライス（per-item `SingleSourceBytes`・cumulative `SourceCount`/`SourceBytes`・`ImportCount`/`ImportBytes` を Link フェーズで root と import へ tree/VM 共通で課金）、heap accounting 基盤サブスライス（`AllocationId`・`AllocationLedger`・§5.1 論理サイズ関数・`HeapBytes` reserve/超過写像）、および collection（`List`/`Dict`）の per-drop release サブスライス（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、COW は delta 課金、tree/VM 両対応）も実装済みである。Slice 2 の残り（cell / 関数 instance / String / AST / chunk / journal の per-drop 追跡、I-O accounting、string リテラル/連結/f-string 経路、非 collection の baseline 再導入）と Slice 3 以降（continuation、cancel/pause、scheduler、VM charge parity）は未実装である。
+本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleStringBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線）と source / import accounting サブスライス（per-item `SingleSourceBytes`・cumulative `SourceCount`/`SourceBytes`・`ImportCount`/`ImportBytes` を Link フェーズで root と import へ tree/VM 共通で課金）、heap accounting 基盤サブスライス（`AllocationId`・`AllocationLedger`・§5.1 論理サイズ関数・`HeapBytes` reserve/超過写像）、collection（`List`/`Dict`）の per-drop release サブスライス（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、COW は delta 課金、tree/VM 両対応）、および String body の per-drop release サブスライス（PR-b、`Value::Str` を `Rc<Tracked<String>>` 化し、builtin 結果を dispatch 境界の `track_result` で live heap 課金・最後の参照 drop で release）も実装済みである。Slice 2 の残り（cell / 関数 instance / AST / chunk / journal の per-drop 追跡、I-O accounting、string リテラル/連結/f-string 経路、非 collection の baseline 再導入）と Slice 3 以降（continuation、cancel/pause、scheduler、VM charge parity）は未実装である。
 
 本文書は次の既存仕様と一体で実装する。
 
@@ -717,8 +717,10 @@ run-turn queueはEngine全体でFIFO round-robinとし、continuation自体で�
   出し側から共通で配線する。`control_stop_to_error` を `budget` へ集約し両 engine の
   error 写像を一本化。legacy env `TSUMUGI_MAX_SINGLE_STRING_BYTES` /
   `TSUMUGI_MAX_STRING_ALLOCATIONS` / `TSUMUGI_MAX_STRING_BYTES` を追加。既定上限では
-  観測挙動を変えない。string リテラル・`+` 連結・f-string 経路の課金は tree/VM で
-  dispatch を経由しないため本サブスライスの範囲外（後続）。
+  観測挙動を変えない。この cumulative 会計は §5.3 のとおり解放しても減らさず、String body の
+  live heap（`HeapBytes`）per-drop 追跡（PR-b、下記）とは独立した別会計である。string
+  リテラル・`+` 連結・f-string 経路の課金は tree/VM で dispatch を経由しないため本
+  サブスライスの範囲外（後続）。
 - source / import accounting（✅ 実装済み）: per-item `SingleSourceBytes` と cumulative
   `SourceCount`/`SourceBytes`、`ImportCount`/`ImportBytes` を
   `BudgetLedger::charge_source` / `charge_import` で課金する。§5.3 のとおり root を
@@ -771,6 +773,24 @@ run-turn queueはEngine全体でFIFO round-robinとし、continuation自体で�
 - 未実装（後続 PR）: cell（`SharedValue`）・tree/VM 関数 instance・String body・AST/chunk・
   import record・rollback journal の per-drop 追跡。これらは per-drop 化に加えて、上で
   外した baseline 課金（非 collection の pre-existing 状態）の再導入も担う。
+  - サブスライス分割（実装順）: collection per-drop（案A PR-a、✅ 済み）に続けて、
+    依存の少ない順に切り出す。
+    - **PR-b: String body の per-drop 追跡（✅ 実装済み）** — `Value::Str` の backing を
+      `String` から `Rc<Tracked<String>>` へ変更し、§5.1 の String body（24 + byte 長）を
+      生成時に live heap（`HeapBytes`）へ課金し、最後の参照 drop で release する。
+      collection と同じ `Tracked<T>` + dispatch 境界 `track_result` パターンを横展開する。
+      cumulative `StringAllocations`/`StringBytes`（§5.3、解放で減らさない累積値）は
+      **据え置き**、live heap 課金を**追加**する。両会計は独立で、既定上限では観測挙動を
+      変えない。`Value::Str` は他の per-drop 対象（cell / 関数 instance）と backing を
+      共有しないため、単独で切り出せる。§5.3 の「substring が既存 body を共有する実装なら
+      新規 allocation として数えない」共有最適化は本 PR の範囲外（`Rc<Tracked<String>>`
+      は共有可能な backing だが、現行の連結・substring は依然 copy を作る）。
+    - PR-c: cell（`SharedValue`）＋ tree/VM 関数 instance の per-drop 追跡。cell は
+      関数 instance（captured / upvalue）の前提となるため一体で扱う。
+    - PR-d: AST / bytecode chunk / imported module record / rollback journal の per-drop
+      追跡。Link / compile フェーズおよび AUD-024 journal との結合を伴う。
+  - 各サブスライスは per-drop 化と同時に、`charge_context_baseline` から外した
+    非 collection の baseline 課金（対象種別ぶん）を engine の `charge_link` へ再導入する。
 
 ### Slice 3: explicit continuation
 

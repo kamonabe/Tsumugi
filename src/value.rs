@@ -137,6 +137,9 @@ impl<T: std::fmt::Debug> std::fmt::Debug for Tracked<T> {
 pub type TrackedList = Tracked<Vec<Value>>;
 /// tracked な `Dict` backing（`BTreeMap<String, Value>`）。
 pub type TrackedDict = Tracked<BTreeMap<String, Value>>;
+/// tracked な `Str` backing（`String`）。生成時に §5.1 の String body を課金し、
+/// 最後の参照 drop で release する（REV-015 PR-b、§5.2）。
+pub type TrackedStr = Tracked<String>;
 
 /// [`Value::index_set_tracked`] へ渡す、正規化済みの index 代入ターゲット。
 ///
@@ -325,7 +328,12 @@ pub struct FnDef {
 pub enum Value {
     Int(i64),
     Float(f64),
-    Str(String),
+    /// 文字列。backing は [`TrackedStr`] で、生成時に heap 課金し最後の参照 drop で
+    /// release する（REV-015 PR-b、§5.2）。読み取りは `Deref<Target = String>` 経由で
+    /// 透過する。cumulative `StringAllocations`/`StringBytes` 会計（§5.3）は別で、
+    /// 解放しても減らさない。連結・substring は現行どおり新しい backing を作る
+    /// （§5.3 の共有最適化は本 PR の範囲外）。
+    Str(Rc<TrackedStr>),
     Bool(bool),
     Null,
     /// リスト。copy-on-write（AUD-047）。clone はハンドル共有で O(1)、
@@ -382,7 +390,8 @@ impl PartialEq for Value {
             (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => {
                 NumericOrder::numeric_eq(self, other)
             }
-            (Value::Str(a), Value::Str(b)) => a == b,
+            // 共有 backing（同じ Rc）なら省略。分離済みでも中身の String で比較する。
+            (Value::Str(a), Value::Str(b)) => Rc::ptr_eq(a, b) || ***a == ***b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Null, Value::Null) => true,
             // 共有 backing（同じ Rc）なら要素比較を省く。分離済みでも要素で比較する。
@@ -417,7 +426,7 @@ impl std::fmt::Debug for Value {
         match self {
             Value::Int(n) => write!(f, "Int({})", n),
             Value::Float(n) => write!(f, "Float({})", n),
-            Value::Str(s) => write!(f, "Str({:?})", s),
+            Value::Str(s) => write!(f, "Str({:?})", s.as_str()),
             Value::Bool(b) => write!(f, "Bool({})", b),
             Value::Null => write!(f, "Null"),
             Value::List(items) => write!(f, "List({:?})", items),
@@ -453,6 +462,37 @@ impl Value {
     ) -> Result<Value, ControlStop> {
         let bytes = heap_size::list_body(items.len() as u64);
         Ok(Value::List(Tracked::new(items, bytes, budget, phase)?))
+    }
+
+    /// `String` から heap 課金済みの `Value::Str` を作る（REV-015 PR-b、§5.2）。
+    ///
+    /// §5.1 の String body（24 + UTF-8 byte 長）を live heap（`HeapBytes`）へ課金してから
+    /// 包む。上限超過は `ControlStop` を返し、live heap は増えない。cumulative
+    /// `StringAllocations`/`StringBytes`（§5.3）はこのヘルパでは触らない。builtin
+    /// 経由で生成する String はこの live heap 課金を dispatch 境界の `track_result` が
+    /// 担うため、builtin_core は [`Value::str_constant`] で untracked に作る。
+    pub fn new_str(
+        s: String,
+        budget: &mut crate::budget::BudgetLedger,
+        phase: ExecutionPhase,
+    ) -> Result<Value, ControlStop> {
+        let bytes = heap_size::string_body(s.len() as u64);
+        Ok(Value::Str(Tracked::new(s, bytes, budget, phase)?))
+    }
+
+    /// heap 課金しない untracked な `Value::Str` を作る。
+    ///
+    /// compile 時定数・builtin_core の生成・パターンマッチ束縛の再構築など、runtime 台帳を
+    /// 持たない文脈で使う。`AllocationId(0)`・`Drop` no-op で live heap を増減させない。
+    /// runtime で live heap に載せたい場合は dispatch 境界の `track_result` か
+    /// [`Value::new_str`] を通す（§5.2 COW と同じ昇格規則）。
+    pub fn str_constant(s: String) -> Value {
+        Value::Str(Tracked::constant(s))
+    }
+
+    /// `&str` から untracked な `Value::Str` を作る（`str_constant` の借用版）。
+    pub fn str_from(s: &str) -> Value {
+        Value::str_constant(s.to_string())
     }
 
     /// `BTreeMap<String, Value>` から heap 課金済みの `Value::Dict` を作る（§5.2）。
@@ -682,7 +722,7 @@ impl std::fmt::Display for Value {
         match self {
             Value::Int(n) => write!(f, "{}", n),
             Value::Float(n) => write!(f, "{}", n),
-            Value::Str(s) => write!(f, "{}", s),
+            Value::Str(s) => write!(f, "{}", s.as_str()),
             Value::Bool(b) => write!(f, "{}", b),
             Value::Null => write!(f, "null"),
             Value::List(items) => {
@@ -712,7 +752,7 @@ impl std::fmt::Display for Value {
 /// Display 用に値を repr 形式（文字列はクォート付き）で表示する
 fn format_value_repr(v: &Value) -> String {
     match v {
-        Value::Str(s) => format!("\"{}\"", s),
+        Value::Str(s) => format!("\"{}\"", s.as_str()),
         other => other.to_string(),
     }
 }
@@ -727,7 +767,7 @@ mod tests {
         assert!(Value::Int(1).is_truthy());
         assert!(Value::Int(-1).is_truthy());
         assert!(Value::Float(0.1).is_truthy());
-        assert!(Value::Str("hello".to_string()).is_truthy());
+        assert!(Value::str_from("hello").is_truthy());
         assert!(Value::List(Tracked::constant(vec![Value::Int(1)])).is_truthy());
         assert!(
             Value::Dict(Tracked::constant(BTreeMap::from([(
@@ -744,7 +784,7 @@ mod tests {
         assert!(!Value::Null.is_truthy());
         assert!(!Value::Int(0).is_truthy());
         assert!(!Value::Float(0.0).is_truthy());
-        assert!(!Value::Str("".to_string()).is_truthy());
+        assert!(!Value::str_from("").is_truthy());
         assert!(!Value::List(Tracked::constant(vec![])).is_truthy());
         assert!(!Value::Dict(Tracked::constant(BTreeMap::new())).is_truthy());
     }
@@ -753,15 +793,11 @@ mod tests {
     fn display() {
         assert_eq!(Value::Int(42).to_string(), "42");
         assert_eq!(Value::Float(2.5).to_string(), "2.5");
-        assert_eq!(Value::Str("hi".to_string()).to_string(), "hi");
+        assert_eq!(Value::str_from("hi").to_string(), "hi");
         assert_eq!(Value::Bool(true).to_string(), "true");
         assert_eq!(Value::Null.to_string(), "null");
         assert_eq!(
-            Value::List(Tracked::constant(vec![
-                Value::Int(1),
-                Value::Str("a".into())
-            ]))
-            .to_string(),
+            Value::List(Tracked::constant(vec![Value::Int(1), Value::str_from("a")])).to_string(),
             "[1, \"a\"]"
         );
         assert_eq!(
@@ -822,10 +858,7 @@ mod tests {
 
     #[test]
     fn numeric_order_non_numeric_is_none() {
-        assert_eq!(
-            NumericOrder::compare(&int(1), &Value::Str("a".into())),
-            None
-        );
+        assert_eq!(NumericOrder::compare(&int(1), &Value::str_from("a")), None);
         assert_eq!(NumericOrder::compare(&Value::Bool(true), &int(1)), None);
     }
 
@@ -1125,6 +1158,82 @@ mod tests {
         // outer を drop すると外側 backing と、最後の参照になった内側 backing が両方 release。
         drop(outer);
         assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn tracked_str_charges_on_new_and_releases_on_drop() {
+        let mut budget = heap_ledger(1_000_000);
+        assert_eq!(budget.live_heap_bytes(), 0);
+        // String body = 24 + byte 長。"hello" は 5 byte。
+        let s = Value::new_str("hello".to_string(), &mut budget, ExecutionPhase::Run).unwrap();
+        assert_eq!(budget.live_heap_bytes(), heap_size::string_body(5));
+        // 最後の参照 drop で live heap が戻る（§5.2）。
+        drop(s);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn str_rc_clone_shares_without_extra_charge_and_releases_once() {
+        let mut budget = heap_ledger(1_000_000);
+        let s = Value::new_str("shared".to_string(), &mut budget, ExecutionPhase::Run).unwrap();
+        let one = budget.live_heap_bytes();
+        assert_eq!(one, heap_size::string_body(6));
+        // clone は Rc ハンドル共有。追加課金しない（§5.2）。
+        let alias = s.clone();
+        assert_eq!(budget.live_heap_bytes(), one);
+        // 1 本目を drop してもまだ alias が生きているので release されない。
+        drop(s);
+        assert_eq!(budget.live_heap_bytes(), one);
+        // 最後の参照が落ちて初めて release。
+        drop(alias);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn str_constant_does_not_charge_or_release() {
+        let budget = heap_ledger(1_000_000);
+        // str_constant は課金しない（untracked、AllocationId(0)）。台帳の live は 0 のまま。
+        let c = Value::str_from("literal");
+        assert_eq!(budget.live_heap_bytes(), 0);
+        drop(c);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn string_in_list_releases_on_outer_drop() {
+        let mut budget = heap_ledger(1_000_000);
+        // tracked String を tracked List に格納。String は共有（clone）されるので追加課金なし。
+        let s = Value::new_str("body".to_string(), &mut budget, ExecutionPhase::Run).unwrap();
+        let str_bytes = budget.live_heap_bytes();
+        assert_eq!(str_bytes, heap_size::string_body(4));
+        let outer = Value::new_list(vec![s.clone()], &mut budget, ExecutionPhase::Run).unwrap();
+        assert_eq!(
+            budget.live_heap_bytes(),
+            str_bytes + heap_size::list_body(1)
+        );
+        // s の変数参照を落としても、outer が String backing を握るので release されない。
+        drop(s);
+        assert_eq!(
+            budget.live_heap_bytes(),
+            str_bytes + heap_size::list_body(1)
+        );
+        // outer を drop すると List backing と、最後の参照になった String backing が両方 release。
+        drop(outer);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn string_heap_limit_trips_at_allocation() {
+        // 上限を "hi"（body 24+2=26）ちょうどに設定。次の allocation は超過する。
+        let mut budget = heap_ledger(heap_size::string_body(2));
+        let ok = Value::new_str("hi".to_string(), &mut budget, ExecutionPhase::Run);
+        assert!(ok.is_ok());
+        // ok が live なので次の allocation は必ず超過。
+        let over = Value::new_str("x".to_string(), &mut budget, ExecutionPhase::Run);
+        assert!(matches!(
+            over,
+            Err(crate::budget::ControlStop::BudgetExceeded(_))
+        ));
     }
 
     #[test]
