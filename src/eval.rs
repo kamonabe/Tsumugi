@@ -44,10 +44,15 @@ impl Evaluator {
 
     /// 明示 `BudgetConfig` で評価器を作る（埋め込み host 向け）。
     pub fn with_budget(config: BudgetConfig) -> Self {
+        let budget = BudgetLedger::with_config(config);
+        let mut env = Env::new();
+        // cell 生成時の captured cell 課金のため、budget の heap 台帳を Env へ配る
+        // （REV-015 PR-c）。
+        env.set_heap_ledger(budget.heap_handle());
         Self {
-            env: Env::new(),
+            env,
             call_stack: Vec::new(),
-            budget: BudgetLedger::with_config(config),
+            budget,
             loader: crate::module::ModuleLoader::new(),
             next_function_id: 0,
             script_args: Vec::new(),
@@ -88,6 +93,16 @@ impl Evaluator {
     fn count_step(&mut self, line: usize) -> Result<(), TsumugiError> {
         self.budget
             .charge_fuel(1, ExecutionPhase::Run)
+            .map_err(|stop| self.control_stop_to_error(stop, line))
+    }
+
+    /// 変数 cell を作って現在スコープへ束縛する（REV-015 PR-c）。
+    ///
+    /// `Env::set` は cell の §5.1 captured cell（32 byte）を live heap へ課金するため
+    /// fallible になった。超過 `ControlStop` を既存 `TsumugiError` へ写像する。
+    fn env_set(&mut self, name: &str, value: Value, line: usize) -> Result<(), TsumugiError> {
+        self.env
+            .set(name, value)
             .map_err(|stop| self.control_stop_to_error(stop, line))
     }
 
@@ -268,7 +283,7 @@ impl Evaluator {
         match stmt {
             Stmt::Let { name, value, line } => {
                 let val = self.eval_expr(value, *line)?;
-                self.env.set(name, val);
+                self.env_set(name, val, *line)?;
                 Ok(EvalResult::Val)
             }
 
@@ -389,7 +404,11 @@ impl Evaluator {
 
                 for item in items {
                     self.env.push_scope();
-                    self.env.set(var, item);
+                    // cell 課金の超過でも iteration scope を必ず解放する（pop 後に ? する）。
+                    if let Err(e) = self.env_set(var, item, *line) {
+                        self.env.pop_scope();
+                        return Err(e);
+                    }
                     let body_result = self.exec_block(body);
                     // whileと同様に、エラー・return・break・continueの全経路で
                     // iteration scopeを先に解放する。
@@ -420,7 +439,7 @@ impl Evaluator {
                     self.env
                         .capture_referenced(&crate::ast::referenced_names(body)),
                 );
-                self.env.set(
+                self.env_set(
                     name,
                     Value::Fn {
                         id,
@@ -431,7 +450,8 @@ impl Evaluator {
                         }),
                         captured,
                     },
-                );
+                    *line,
+                )?;
                 Ok(EvalResult::Val)
             }
 
@@ -455,14 +475,19 @@ impl Evaluator {
                 match self.exec_scoped_block(try_body) {
                     Ok(result) => Ok(result),
                     Err(e) => {
+                        let err_line = e.line();
                         let error_value = Value::Error {
                             error_type: e.error_type().to_string(),
                             message: e.message().to_string(),
-                            line: e.line(),
+                            line: err_line,
                         };
 
                         self.env.push_scope();
-                        self.env.set(var, error_value);
+                        // cell 課金の超過でも catch scope を必ず解放する。
+                        if let Err(charge_err) = self.env_set(var, error_value, err_line) {
+                            self.env.pop_scope();
+                            return Err(charge_err);
+                        }
                         let catch_result = self.exec_block(catch_body);
                         // error・return・break・continueの全経路でcatch scopeを先に解放する。
                         self.env.pop_scope();
@@ -876,12 +901,19 @@ impl Evaluator {
         }
         // 名前付き関数は呼び出し時の関数値を宣言名へ束縛する。
         // 定義時captureへ自身を入れず、Rc cycleを避ける。
-        if func_name != "<lambda>" {
-            self.env.set(func_name, func_value.clone());
+        // cell 課金の超過でも call frame を必ず解放してから返す（REV-015 PR-c）。
+        if func_name != "<lambda>"
+            && let Err(e) = self.env.set(func_name, func_value.clone())
+        {
+            self.env.pop_call_frame(saved_scopes);
+            return Err(self.control_stop_to_error(e, line));
         }
         // parameterはself-bindingと同名ならshadowする。
         for (param, val) in params.iter().zip(arg_values) {
-            self.env.set(param, val);
+            if let Err(e) = self.env.set(param, val) {
+                self.env.pop_call_frame(saved_scopes);
+                return Err(self.control_stop_to_error(e, line));
+            }
         }
 
         // コールスタックに記録

@@ -1,7 +1,7 @@
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use crate::budget::{ControlStop, ExecutionPhase, HeapLedgerWeak};
 use crate::value::{SharedValue, Value};
 
 /// 関数呼び出しから戻るための復元情報
@@ -59,6 +59,11 @@ pub struct Env {
     /// REPL submission 中だけ有効な undo journal（AUD-024）。
     /// `None` のときは記録しない（ファイル実行など非トランザクション実行）。
     journal: Option<SubmissionJournal>,
+    /// cell 生成時に §5.1 captured cell を課金する heap 台帳への弱参照（REV-015 PR-c）。
+    ///
+    /// `Weak::new()`（default）のときは untracked cell を作り課金しない。埋め込み host /
+    /// engine が [`Env::set_heap_ledger`] で台帳ハンドルを注入する。
+    heap_ledger: HeapLedgerWeak,
 }
 
 impl Env {
@@ -67,7 +72,16 @@ impl Env {
             scopes: vec![HashMap::new()], // グローバルスコープ
             frame_base: 0,
             journal: None,
+            heap_ledger: HeapLedgerWeak::new(),
         }
+    }
+
+    /// cell 課金に使う heap 台帳への弱参照を設定する（REV-015 PR-c）。
+    ///
+    /// engine（`Evaluator`）が自身の budget から `heap_handle()` を渡す。設定後に作る
+    /// cell は §5.1 captured cell（32 byte）を live heap へ課金し、drop で release する。
+    pub fn set_heap_ledger(&mut self, ledger: HeapLedgerWeak) {
+        self.heap_ledger = ledger;
     }
 
     /// REPL submission のトランザクションを開始する（AUD-024）。
@@ -175,13 +189,20 @@ impl Env {
         self.scopes.pop();
     }
 
-    /// 現在のスコープに変数を定義（新しい SharedValue セルを作成）
-    pub fn set(&mut self, name: &str, value: Value) {
+    /// 現在のスコープに変数を定義（新しい SharedValue セルを作成）。
+    ///
+    /// cell 生成時に §5.1 captured cell（32 byte）を live heap へ課金する（REV-015 PR-c）。
+    /// 上限超過は `ControlStop` を返し、binding は追加されない（journal 記録も cell 課金の
+    /// 後に行うため、失敗時に journal を汚さない）。
+    pub fn set(&mut self, name: &str, value: Value) -> Result<(), ControlStop> {
         if let Some(scope) = self.scopes.len().checked_sub(1) {
+            // cell を先に課金・生成する。超過ならここで返し、journal も binding も触らない。
+            let cell = Value::new_cell(value, &self.heap_ledger, ExecutionPhase::Run)?;
             // binding の追加・置換前に元エントリを journal へ記録する（AUD-024）。
             self.journal_scope_entry(scope, name);
-            self.scopes[scope].insert(name.to_string(), Rc::new(RefCell::new(value)));
+            self.scopes[scope].insert(name.to_string(), cell);
         }
+        Ok(())
     }
 
     /// 現在のスコープに既存の SharedValue セルを直接挿入（クロージャの参照共有用）
@@ -270,7 +291,7 @@ mod tests {
     #[test]
     fn set_and_get() {
         let mut env = Env::new();
-        env.set("x", Value::Int(10));
+        env.set("x", Value::Int(10)).unwrap();
         assert_eq!(env.get("x"), Some(Value::Int(10)));
     }
 
@@ -283,10 +304,10 @@ mod tests {
     #[test]
     fn scope_shadowing() {
         let mut env = Env::new();
-        env.set("x", Value::Int(1));
+        env.set("x", Value::Int(1)).unwrap();
 
         env.push_scope();
-        env.set("x", Value::Int(2));
+        env.set("x", Value::Int(2)).unwrap();
         assert_eq!(env.get("x"), Some(Value::Int(2)));
 
         env.pop_scope();
@@ -296,7 +317,7 @@ mod tests {
     #[test]
     fn inner_scope_sees_outer() {
         let mut env = Env::new();
-        env.set("outer", Value::str_from("visible"));
+        env.set("outer", Value::str_from("visible")).unwrap();
 
         env.push_scope();
         assert_eq!(env.get("outer"), Some(Value::str_from("visible")));
@@ -306,7 +327,7 @@ mod tests {
     #[test]
     fn update_existing_variable() {
         let mut env = Env::new();
-        env.set("x", Value::Int(1));
+        env.set("x", Value::Int(1)).unwrap();
         assert!(env.update("x", Value::Int(2)).is_ok());
         assert_eq!(env.get("x"), Some(Value::Int(2)));
     }
@@ -320,7 +341,7 @@ mod tests {
     #[test]
     fn update_outer_scope_variable() {
         let mut env = Env::new();
-        env.set("x", Value::Int(1));
+        env.set("x", Value::Int(1)).unwrap();
         env.push_scope();
         // 内側スコープから外側の変数を更新できる
         assert!(env.update("x", Value::Int(99)).is_ok());
@@ -331,9 +352,9 @@ mod tests {
     #[test]
     fn call_frame_hides_caller_locals_but_keeps_globals() {
         let mut env = Env::new();
-        env.set("global_var", Value::Int(1));
+        env.set("global_var", Value::Int(1)).unwrap();
         env.push_scope();
-        env.set("caller_local", Value::Int(2));
+        env.set("caller_local", Value::Int(2)).unwrap();
 
         let frame = env.push_call_frame();
         // グローバルは見えるが、呼び出し元のローカルは見えない
@@ -341,7 +362,7 @@ mod tests {
         assert_eq!(env.get("caller_local"), None);
 
         // フレーム内のローカルはフレーム内だけで有効
-        env.set("callee_local", Value::Int(3));
+        env.set("callee_local", Value::Int(3)).unwrap();
         assert_eq!(env.get("callee_local"), Some(Value::Int(3)));
 
         env.pop_call_frame(frame);
@@ -353,12 +374,12 @@ mod tests {
     #[test]
     fn call_frame_updates_globals_through_shared_cells() {
         let mut env = Env::new();
-        env.set("counter", Value::Int(0));
+        env.set("counter", Value::Int(0)).unwrap();
 
         let frame = env.push_call_frame();
         assert!(env.update("counter", Value::Int(5)).is_ok());
         // フレーム内で作ったローカルは呼び出し元へ漏れない
-        env.set("counter", Value::Int(99));
+        env.set("counter", Value::Int(99)).unwrap();
         env.pop_call_frame(frame);
 
         assert_eq!(env.get("counter"), Some(Value::Int(5)));
@@ -367,10 +388,10 @@ mod tests {
     #[test]
     fn nested_call_frames_isolate_each_level() {
         let mut env = Env::new();
-        env.set("g", Value::Int(0));
+        env.set("g", Value::Int(0)).unwrap();
 
         let outer = env.push_call_frame();
-        env.set("outer_local", Value::Int(1));
+        env.set("outer_local", Value::Int(1)).unwrap();
 
         let inner = env.push_call_frame();
         assert_eq!(
@@ -390,10 +411,10 @@ mod tests {
     fn block_scopes_inside_a_call_frame_stay_visible() {
         let mut env = Env::new();
         let frame = env.push_call_frame();
-        env.set("param", Value::Int(1));
+        env.set("param", Value::Int(1)).unwrap();
 
         env.push_scope();
-        env.set("block_local", Value::Int(2));
+        env.set("block_local", Value::Int(2)).unwrap();
         assert_eq!(env.get("param"), Some(Value::Int(1)));
         assert_eq!(env.get("block_local"), Some(Value::Int(2)));
         env.pop_scope();
@@ -406,8 +427,8 @@ mod tests {
     fn capture_referenced_takes_only_named_cells() {
         // 言及されない名前は捕捉しない（AUD-042の参照循環対策）
         let mut env = Env::new();
-        env.set("wanted", Value::Int(1));
-        env.set("container", Value::Int(2));
+        env.set("wanted", Value::Int(1)).unwrap();
+        env.set("container", Value::Int(2)).unwrap();
 
         let names = HashSet::from(["wanted".to_string(), "missing".to_string()]);
         let captured = env.capture_referenced(&names);
@@ -421,9 +442,9 @@ mod tests {
     #[test]
     fn capture_referenced_prefers_inner_scope_and_shares_cells() {
         let mut env = Env::new();
-        env.set("x", Value::Int(1));
+        env.set("x", Value::Int(1)).unwrap();
         env.push_scope();
-        env.set("x", Value::Int(2));
+        env.set("x", Value::Int(2)).unwrap();
 
         let captured = env.capture_referenced(&HashSet::from(["x".to_string()]));
         assert_eq!(*captured["x"].borrow(), Value::Int(2));
@@ -437,7 +458,7 @@ mod tests {
     fn shared_capture() {
         // クロージャが変数セルを共有し、外側からの更新が反映される
         let mut env = Env::new();
-        env.set("counter", Value::Int(0));
+        env.set("counter", Value::Int(0)).unwrap();
         let cell = env.get_cell("counter").unwrap();
 
         // 外側から更新
@@ -452,11 +473,11 @@ mod tests {
     #[test]
     fn rollback_reverts_new_binding_and_assignment() {
         let mut env = Env::new();
-        env.set("x", Value::Int(1));
+        env.set("x", Value::Int(1)).unwrap();
 
         env.begin_submission();
         env.update("x", Value::Int(2)).unwrap(); // 既存cellの書換
-        env.set("y", Value::Int(9)); // 新規binding
+        env.set("y", Value::Int(9)).unwrap(); // 新規binding
         env.rollback_submission();
 
         assert_eq!(env.get("x"), Some(Value::Int(1)), "代入が巻き戻っていない");
@@ -466,11 +487,11 @@ mod tests {
     #[test]
     fn commit_keeps_changes() {
         let mut env = Env::new();
-        env.set("x", Value::Int(1));
+        env.set("x", Value::Int(1)).unwrap();
 
         env.begin_submission();
         env.update("x", Value::Int(2)).unwrap();
-        env.set("y", Value::Int(9));
+        env.set("y", Value::Int(9)).unwrap();
         env.commit_submission();
 
         assert_eq!(env.get("x"), Some(Value::Int(2)));
@@ -481,11 +502,11 @@ mod tests {
     fn rollback_reverts_redeclaration_to_original_cell() {
         // 再宣言は新cellを作る（AUD-016）。rollbackで元cellへ戻す。
         let mut env = Env::new();
-        env.set("x", Value::Int(1));
+        env.set("x", Value::Int(1)).unwrap();
         let original = env.get_cell("x").unwrap();
 
         env.begin_submission();
-        env.set("x", Value::Int(2)); // 再宣言 = 新cell
+        env.set("x", Value::Int(2)).unwrap(); // 再宣言 = 新cell
         assert!(!Rc::ptr_eq(&original, &env.get_cell("x").unwrap()));
         env.rollback_submission();
 
@@ -501,7 +522,7 @@ mod tests {
     fn rollback_reverts_shared_cell_seen_by_closure() {
         // closureが共有するcellの破壊的更新も巻き戻す。
         let mut env = Env::new();
-        env.set("count", Value::Int(0));
+        env.set("count", Value::Int(0)).unwrap();
         let captured = env.get_cell("count").unwrap();
 
         env.begin_submission();
@@ -520,7 +541,7 @@ mod tests {
     fn journal_records_original_only_once_per_cell() {
         // 同じcellを複数回変更しても、最初の元値へ戻る。
         let mut env = Env::new();
-        env.set("x", Value::Int(1));
+        env.set("x", Value::Int(1)).unwrap();
 
         env.begin_submission();
         env.update("x", Value::Int(2)).unwrap();
@@ -534,7 +555,7 @@ mod tests {
     fn no_journal_outside_submission() {
         // トランザクション外の変更は記録されず、rollbackは何もしない。
         let mut env = Env::new();
-        env.set("x", Value::Int(1));
+        env.set("x", Value::Int(1)).unwrap();
         env.update("x", Value::Int(2)).unwrap();
         env.rollback_submission(); // journalなし: no-op
         assert_eq!(env.get("x"), Some(Value::Int(2)));

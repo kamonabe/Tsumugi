@@ -1,6 +1,5 @@
 //! 仮想マシン: バイトコード（Chunk）を実行するスタックマシン
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -641,9 +640,12 @@ impl Vm {
                 return Ok(Rc::clone(cell));
             }
         }
-        // スタックから現在の値を取り出してセルを作成
+        // スタックから現在の値を取り出してセルを作成する。§5.1 captured cell（32 byte）を
+        // live heap へ課金し、最後の参照 drop で release する（REV-015 PR-c）。
         let value = self.stack[at].clone();
-        let cell = Rc::new(RefCell::new(value));
+        let cell =
+            crate::value::Value::new_cell(value, &self.budget.heap_handle(), ExecutionPhase::Run)
+                .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
         if let Some(entry) = self.frame_mut(line)?.locals_cells.get_mut(slot) {
             *entry = Some(Rc::clone(&cell));
         }

@@ -8,8 +8,15 @@ use crate::ast::Stmt;
 use crate::budget::{AllocationId, ControlStop, ExecutionPhase, HeapLedgerWeak, heap_size};
 use crate::chunk::Chunk;
 
-/// 共有可能な変数セル（参照キャプチャ用）
-pub type SharedValue = Rc<RefCell<Value>>;
+/// 共有可能な変数セル（参照キャプチャ用）。
+///
+/// backing は [`TrackedCell`] で、生成時に §5.1 の captured cell（32 byte 固定）を
+/// live heap へ課金し、最後の参照 drop で release する（REV-015 PR-c、§5.2）。
+/// `Rc::clone`（closure capture・代入）は無課金の共有。cell の中身の書き換えは
+/// `Deref` 経由の `RefCell` 内部可変で行い、サイズは 32 固定なので再課金しない。
+pub type SharedValue = Rc<TrackedCell>;
+/// tracked な変数 cell backing（`RefCell<Value>`）。
+pub type TrackedCell = Tracked<RefCell<Value>>;
 
 /// heap 課金付きの collection backing（REV-015 案A、per-drop release）。
 ///
@@ -74,6 +81,46 @@ impl<T> Tracked<T> {
             bytes: 0,
             ledger: HeapLedgerWeak::new(),
         })
+    }
+
+    /// heap 台帳への弱参照だけを使って課金してから包む（`&mut BudgetLedger` を持てない
+    /// 文脈用、REV-015 PR-c）。
+    ///
+    /// [`Tracked::new`] は `&mut BudgetLedger` を要求するが、変数 cell は `Env`（tree）や
+    /// frame（VM）が所有し、`Value` ツリーに現れないため dispatch 境界の `track_result`
+    /// では拾えない。cell の生成点は `&mut BudgetLedger` を持たないことがあるので、
+    /// 台帳への `Weak` を直接受け取り、`upgrade` して `charge` / `allocate_id` する。
+    ///
+    /// - `ledger` が `upgrade` できない（＝台帳がない / drop 済み）場合は課金せず untracked
+    ///   （`AllocationId(0)`・`bytes = 0`・`Drop` no-op）で包む。`Env` 単体テストのように
+    ///   台帳を持たない文脈では live heap を増減させない。
+    /// - `charge` が上限超過・overflow なら `ControlStop` を返し、`Tracked` は作られない。
+    pub fn new_via_handle(
+        data: T,
+        logical_bytes: u64,
+        ledger: &HeapLedgerWeak,
+        phase: ExecutionPhase,
+    ) -> Result<Rc<Self>, ControlStop> {
+        let Some(strong) = ledger.upgrade() else {
+            // 台帳なし: untracked で包む（課金・release とも no-op）。
+            return Ok(Rc::new(Self {
+                data,
+                id: AllocationId(0),
+                bytes: 0,
+                ledger: HeapLedgerWeak::new(),
+            }));
+        };
+        let id = {
+            let mut l = strong.borrow_mut();
+            l.charge(logical_bytes, phase)?;
+            l.allocate_id()?
+        };
+        Ok(Rc::new(Self {
+            data,
+            id,
+            bytes: logical_bytes,
+            ledger: ledger.clone(),
+        }))
     }
 
     /// この backing の [`AllocationId`]（同一性・デバッグ用）。
@@ -493,6 +540,25 @@ impl Value {
     /// `&str` から untracked な `Value::Str` を作る（`str_constant` の借用版）。
     pub fn str_from(s: &str) -> Value {
         Value::str_constant(s.to_string())
+    }
+
+    /// heap 課金済みの変数 cell（[`SharedValue`]）を作る（REV-015 PR-c、§5.2）。
+    ///
+    /// §5.1 の captured cell（32 byte 固定）を heap 台帳への弱参照経由で課金し、最後の
+    /// 参照 drop で release する。cell は `Env`（tree）/ frame（VM）が所有し `Value` ツリー
+    /// に現れないため、`&mut BudgetLedger` ではなく台帳への `Weak` を直接受け取る。台帳を
+    /// 持たない文脈（`Env` 単体テストなど）では untracked（無課金）で包む。
+    pub fn new_cell(
+        value: Value,
+        ledger: &crate::budget::HeapLedgerWeak,
+        phase: ExecutionPhase,
+    ) -> Result<SharedValue, ControlStop> {
+        Tracked::new_via_handle(RefCell::new(value), heap_size::CAPTURED_CELL, ledger, phase)
+    }
+
+    /// heap 課金しない untracked な変数 cell を作る（台帳を持たない文脈用）。
+    pub fn cell_untracked(value: Value) -> SharedValue {
+        Tracked::constant(RefCell::new(value))
     }
 
     /// `BTreeMap<String, Value>` から heap 課金済みの `Value::Dict` を作る（§5.2）。
