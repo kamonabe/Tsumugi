@@ -789,3 +789,83 @@ fn strings_produced_by_builtins_are_released_in_both_engines() {
         );
     }
 }
+
+/// REV-015 PR-c: 変数 cell と関数 instance header の per-drop release で live heap が
+/// 回復する。同じ論理サイズの cell / 関数 header を N 回作っては drop すると、live heap
+/// は N に依存せず高々 1 個ぶんに収まる（O(1)）。全体保持と対比する。
+///
+/// 実アロケータではなく論理台帳を測るため決定的で、`MEASURE_LOCK` は不要。
+#[test]
+fn cell_and_fn_header_live_heap_is_bounded_across_allocate_and_free() {
+    use tsumugi::budget::{BudgetConfig, BudgetLedger, ExecutionPhase, HeapLedgerWeak};
+    use tsumugi::value::Value;
+
+    fn ledger() -> BudgetLedger {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+        config.max_live_heap_bytes = u64::MAX;
+        BudgetLedger::with_config(config)
+    }
+
+    // 作っては即 drop（scope 離脱相当）を N 回。live heap は常に高々 1 個ぶん。
+    fn hold_one_cell(n: usize, handle: &HeapLedgerWeak) {
+        let mut held = None;
+        for _ in 0..n {
+            held = Some(Value::new_cell(Value::Int(1), handle, ExecutionPhase::Run).unwrap());
+        }
+        drop(held);
+    }
+
+    let budget = ledger();
+    let handle = budget.heap_handle();
+    hold_one_cell(10, &handle);
+    assert_eq!(budget.live_heap_bytes(), 0, "cell: N=10 で解放漏れ");
+    hold_one_cell(1000, &handle);
+    assert_eq!(budget.live_heap_bytes(), 0, "cell: N=1000 で解放漏れ");
+
+    // 関数 instance header も同様に per-drop で戻る。
+    let mut held = None;
+    for _ in 0..1000 {
+        held = Some(Value::new_tree_fn_header(2, &handle, ExecutionPhase::Run).unwrap());
+    }
+    drop(held);
+    assert_eq!(budget.live_heap_bytes(), 0, "fn header: 解放漏れ");
+}
+
+/// REV-015 PR-c: engine 実行後、大量に定義したクロージャ（cell + 関数 instance header
+/// を含む）が engine の破棄で解放され、残存量が定義数に依存しないことを tree/VM 両方で
+/// 固定する。cell / header が per-drop されないと定義数に比例して残存する。
+#[test]
+fn closures_defined_in_a_loop_are_released_in_both_engines() {
+    // 実行後に残る量は定義したクロージャ数に依存しないはず。固定コスト吸収で上限 16KiB。
+    const LIMIT_BYTES: usize = 16 * 1024;
+    const SMALL: usize = 200;
+    const LARGE: usize = 2_000;
+
+    // ループ内でクロージャを定義するが、どこにも溜めない（各反復で drop される）。
+    // クロージャは外側の n だけを参照し、cell と関数 header を確保する。
+    fn source(n: usize) -> String {
+        format!("let base = 7\nfor i in range(0, {n})\n    let f = fn(x) x + base end\nend\n")
+    }
+
+    // 他の測定が失敗してもロックを使い続けられるようにpoisonは無視する
+    let _guard = MEASURE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree-walk" };
+        let small = retained_bytes(&source(SMALL), use_vm);
+        let large = retained_bytes(&source(LARGE), use_vm);
+
+        assert!(
+            large < LIMIT_BYTES,
+            "{mode}: ループ内で定義したクロージャが解放されていません。\
+             n={SMALL}で{small}バイト, n={LARGE}で{large}バイト残存（上限 {LIMIT_BYTES}）"
+        );
+        assert!(
+            large <= small + LIMIT_BYTES,
+            "{mode}: 残存量がクロージャ定義数に比例しています。\
+             n={SMALL}で{small}バイト, n={LARGE}で{large}バイト残存"
+        );
+    }
+}

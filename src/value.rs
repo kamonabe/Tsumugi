@@ -1331,6 +1331,73 @@ mod tests {
     }
 
     #[test]
+    fn new_cell_charges_captured_cell_and_releases_on_drop() {
+        let budget = heap_ledger(1_000_000);
+        assert_eq!(budget.live_heap_bytes(), 0);
+        // captured cell = 32 byte 固定。
+        let cell =
+            Value::new_cell(Value::Int(1), &budget.heap_handle(), ExecutionPhase::Run).unwrap();
+        assert_eq!(budget.live_heap_bytes(), heap_size::CAPTURED_CELL);
+        // clone（closure capture・共有）は Rc ハンドル共有で無課金。
+        let alias = Rc::clone(&cell);
+        assert_eq!(budget.live_heap_bytes(), heap_size::CAPTURED_CELL);
+        drop(cell);
+        assert_eq!(budget.live_heap_bytes(), heap_size::CAPTURED_CELL);
+        // 最後の参照 drop で release。
+        drop(alias);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn cell_untracked_does_not_charge() {
+        let budget = heap_ledger(1_000_000);
+        let c = Value::cell_untracked(Value::Int(1));
+        assert_eq!(budget.live_heap_bytes(), 0);
+        drop(c);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn tree_fn_header_charges_and_releases_on_drop() {
+        let budget = heap_ledger(1_000_000);
+        // captured 2 個 → tree_function(2) = 64 + 16*2 = 96。cell 実体は別課金なので含めない。
+        let header =
+            Value::new_tree_fn_header(2, &budget.heap_handle(), ExecutionPhase::Run).unwrap();
+        assert_eq!(budget.live_heap_bytes(), heap_size::tree_function(2));
+        // 関数値の clone（共有）は header の Rc ハンドル共有で無課金。
+        let alias = Rc::clone(&header);
+        assert_eq!(budget.live_heap_bytes(), heap_size::tree_function(2));
+        drop(header);
+        assert_eq!(budget.live_heap_bytes(), heap_size::tree_function(2));
+        drop(alias);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn vm_fn_header_charges_and_releases_on_drop() {
+        let budget = heap_ledger(1_000_000);
+        // upvalue 3 個 → vm_function(3) = 48 + 16*3 = 96。
+        let header =
+            Value::new_vm_fn_header(3, &budget.heap_handle(), ExecutionPhase::Run).unwrap();
+        assert_eq!(budget.live_heap_bytes(), heap_size::vm_function(3));
+        drop(header);
+        assert_eq!(budget.live_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn cell_charge_trips_at_limit() {
+        // captured cell 1 個ちょうどの上限。2 個目は超過する。
+        let budget = heap_ledger(heap_size::CAPTURED_CELL);
+        let ok = Value::new_cell(Value::Int(1), &budget.heap_handle(), ExecutionPhase::Run);
+        assert!(ok.is_ok());
+        let over = Value::new_cell(Value::Int(2), &budget.heap_handle(), ExecutionPhase::Run);
+        assert!(matches!(
+            over,
+            Err(crate::budget::ControlStop::BudgetExceeded(_))
+        ));
+    }
+
+    #[test]
     fn string_heap_limit_trips_at_allocation() {
         // 上限を "hi"（body 24+2=26）ちょうどに設定。次の allocation は超過する。
         let mut budget = heap_ledger(heap_size::string_body(2));
