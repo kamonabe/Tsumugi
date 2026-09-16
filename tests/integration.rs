@@ -2637,8 +2637,13 @@ fn heap_released_after_repl_rollback_in_both_engines() {
     //   束縛が rollback され、確保した List が drop → release される。
     // 入力3: さらに 100 要素 List を束縛。入力2 が release されていれば 3224*2 で収まる。
     //
-    // 上限 7000（≒ 2 * 3224 + 余白）。入力2 が release されないと、入力3 時点で
-    // 3224(入力1) + 3224(入力2 の残骸) + 3224(入力3) = 9672 > 7000 で入力3 が失敗する。
+    // 上限（≒ 2 * 3224 + 余白）。入力2 が release されないと、入力3 時点で
+    // 3224(入力1) + 3224(入力2 の残骸) + 3224(入力3) = 9672 > 上限 で入力3 が失敗する。
+    //
+    // collection に加えて、tree は実行対象 AST（§5.1）を、VM は bytecode chunk（§5.1）を
+    // live heap へ課金する（REV-015 PR-d）。どちらの engine も入力2 のピーク live が
+    // 3224*2（a + b の collection）に AST / chunk ぶんの余白を足した量になる。上限 7400 は
+    // 「入力2 の残骸が release されないと入力3（c）が失敗する」性質を両 engine で保つ。
     let source = concat!(
         "let a = range(0, 100)\n",
         "if true\n  let b = range(0, 100)\n  let oops = (1 / 0)\nend\n",
@@ -2648,7 +2653,7 @@ fn heap_released_after_repl_rollback_in_both_engines() {
 
     for use_vm in [false, true] {
         let mode = if use_vm { "VM" } else { "tree" };
-        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_LIVE_HEAP_BYTES", "7000")]);
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_LIVE_HEAP_BYTES", "7400")]);
         let (stdout, stderr) = output_text(&output);
         let visible = repl_visible_lines(&stdout, use_vm);
         assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
