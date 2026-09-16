@@ -467,6 +467,138 @@ pub(crate) fn referenced_names(body: &[Stmt]) -> std::collections::HashSet<Strin
     names
 }
 
+/// AST program（root + 全 node）の §5.1 論理サイズ合計を計算する（REV-015 PR-d）。
+///
+/// `AST program root`（64）に、各 Stmt / Expr node の `ast_node(owned_bytes)`
+/// （= 64 + その node が所有する identifier / string literal の UTF-8 byte 長）を足す。
+/// owned bytes は node が直接保持する `String`（変数名・関数名・parameter 名・import
+/// path・文字列リテラル・f-string の literal 部分）の byte 長で、子 node が持つ文字列は
+/// その子 node 側で数える（二重計上しない）。深度は `MAX_AST_DEPTH` で有限に抑えられて
+/// いるが、ここでは再帰を使わず worklist で走査して host stack を消費しない。
+///
+/// tree evaluator は AST を直接実行するため、この論理サイズを Link フェーズで live heap
+/// へ課金する。VM は AST を bytecode へ compile するため、代わりに bytecode chunk を
+/// 課金する（§5.3「AST または bytecode」）。
+pub(crate) fn ast_heap_size(program: &Program) -> u64 {
+    use crate::budget::heap_size;
+
+    let mut total = heap_size::AST_ROOT;
+    let mut worklist: Vec<AstNode<'_>> = program.iter().map(AstNode::Stmt).collect();
+
+    // 文字列 slice の byte 長を saturating で足し込むヘルパ。
+    fn owned(bytes: &mut u64, s: &str) {
+        *bytes = bytes.saturating_add(s.len() as u64);
+    }
+
+    while let Some(node) = worklist.pop() {
+        let mut owned_bytes = 0u64;
+        match node {
+            AstNode::Stmt(stmt) => match stmt {
+                Stmt::Let { name, value, .. } | Stmt::Assign { name, value, .. } => {
+                    owned(&mut owned_bytes, name);
+                    worklist.push(AstNode::Expr(value));
+                }
+                Stmt::IndexAssign {
+                    name, index, value, ..
+                } => {
+                    owned(&mut owned_bytes, name);
+                    worklist.push(AstNode::Expr(index));
+                    worklist.push(AstNode::Expr(value));
+                }
+                Stmt::Return { value, .. } | Stmt::ExprStmt { expr: value, .. } => {
+                    worklist.push(AstNode::Expr(value));
+                }
+                Stmt::If {
+                    condition,
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    worklist.push(AstNode::Expr(condition));
+                    worklist.extend(then_body.iter().map(AstNode::Stmt));
+                    worklist.extend(else_body.iter().map(AstNode::Stmt));
+                }
+                Stmt::While {
+                    condition, body, ..
+                } => {
+                    worklist.push(AstNode::Expr(condition));
+                    worklist.extend(body.iter().map(AstNode::Stmt));
+                }
+                Stmt::For {
+                    var, iter, body, ..
+                } => {
+                    owned(&mut owned_bytes, var);
+                    worklist.push(AstNode::Expr(iter));
+                    worklist.extend(body.iter().map(AstNode::Stmt));
+                }
+                Stmt::FnDef {
+                    name, params, body, ..
+                } => {
+                    owned(&mut owned_bytes, name);
+                    for p in params {
+                        owned(&mut owned_bytes, p);
+                    }
+                    worklist.extend(body.iter().map(AstNode::Stmt));
+                }
+                Stmt::Import { path, .. } => owned(&mut owned_bytes, path),
+                Stmt::TryCatch {
+                    try_body,
+                    var,
+                    catch_body,
+                    ..
+                } => {
+                    owned(&mut owned_bytes, var);
+                    worklist.extend(try_body.iter().map(AstNode::Stmt));
+                    worklist.extend(catch_body.iter().map(AstNode::Stmt));
+                }
+                Stmt::Break { .. } | Stmt::Continue { .. } => {}
+            },
+            AstNode::Expr(expr) => match expr {
+                Expr::Str(s) => owned(&mut owned_bytes, s),
+                Expr::Ident(name) => owned(&mut owned_bytes, name),
+                Expr::List(items) => worklist.extend(items.iter().map(AstNode::Expr)),
+                Expr::Dict(pairs) => {
+                    for (key, value) in pairs {
+                        worklist.push(AstNode::Expr(key));
+                        worklist.push(AstNode::Expr(value));
+                    }
+                }
+                Expr::BinOp { left, right, .. } => {
+                    worklist.push(AstNode::Expr(left));
+                    worklist.push(AstNode::Expr(right));
+                }
+                Expr::UnaryOp { expr, .. } => worklist.push(AstNode::Expr(expr)),
+                Expr::Call { callee, args } => {
+                    worklist.push(AstNode::Expr(callee));
+                    worklist.extend(args.iter().map(AstNode::Expr));
+                }
+                Expr::Lambda { params, body } => {
+                    for p in params {
+                        owned(&mut owned_bytes, p);
+                    }
+                    worklist.extend(body.iter().map(AstNode::Stmt));
+                }
+                Expr::Index { object, index } => {
+                    worklist.push(AstNode::Expr(object));
+                    worklist.push(AstNode::Expr(index));
+                }
+                Expr::FStr(parts) => {
+                    for part in parts {
+                        match part {
+                            FStrExprPart::Literal(s) => owned(&mut owned_bytes, s),
+                            FStrExprPart::Expr(child) => worklist.push(AstNode::Expr(child)),
+                        }
+                    }
+                }
+                Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Null => {}
+            },
+        }
+        total = total.saturating_add(heap_size::ast_node(owned_bytes));
+    }
+
+    total
+}
+
 /// Parserが複合式を構築するたびに、危険な深さへ到達していないか確認する。
 pub(crate) fn expr_depth_exceeds_limit(expr: &Expr) -> bool {
     excessive_depth_line(vec![(AstNode::Expr(expr), 1, 0)]).is_some()
@@ -532,6 +664,48 @@ mod tests {
             );
         }
         assert!(!names.contains("unrelated"));
+    }
+
+    fn parse_program(source: &str) -> Program {
+        let tokens = crate::lexer::Lexer::new(source).tokenize();
+        crate::parser::Parser::new(tokens)
+            .parse()
+            .expect("パースに失敗")
+    }
+
+    #[test]
+    fn ast_heap_size_counts_root_nodes_and_owned_bytes() {
+        use crate::budget::heap_size;
+
+        // 単一の式文 `1`: root(64) + ExprStmt node(64) + Int node(64、owned 0)。
+        let program = parse_program("1\n");
+        assert_eq!(
+            ast_heap_size(&program),
+            heap_size::AST_ROOT + heap_size::ast_node(0) + heap_size::ast_node(0)
+        );
+
+        // `let x = "ab"`: root + Let node(owned "x"=1) + Str node(owned "ab"=2)。
+        let program = parse_program("let x = \"ab\"\n");
+        assert_eq!(
+            ast_heap_size(&program),
+            heap_size::AST_ROOT + heap_size::ast_node(1) + heap_size::ast_node(2)
+        );
+
+        // 識別子参照は名前の byte 長を owned として数える。
+        // `let name = value`: root + Let("name"=4) + Ident("value"=5)。
+        let program = parse_program("let name = value\n");
+        assert_eq!(
+            ast_heap_size(&program),
+            heap_size::AST_ROOT + heap_size::ast_node(4) + heap_size::ast_node(5)
+        );
+    }
+
+    #[test]
+    fn ast_heap_size_is_monotonic_in_program_size() {
+        // 文を増やすほど論理サイズは単調増加する（root は 1 回だけ）。
+        let small = ast_heap_size(&parse_program("let a = 1\n"));
+        let large = ast_heap_size(&parse_program("let a = 1\nlet b = 2\nlet c = 3\n"));
+        assert!(large > small, "AST が大きいほど論理サイズも大きいはず");
     }
 
     #[test]

@@ -44,7 +44,11 @@ impl Evaluator {
                 }
                 let saved_scopes = self.env.push_call_frame();
                 for (k, cell) in captured.iter() {
-                    self.env.set_shared(k, cell.clone());
+                    // journal entry の課金超過でも call frame を解放してから返す（REV-015 PR-d）。
+                    if let Err(e) = self.env.set_shared(k, cell.clone()) {
+                        self.env.pop_call_frame(saved_scopes);
+                        return Err(self.control_stop_to_error(e, line));
+                    }
                 }
                 // 通常callと同じく、名前付き関数を宣言名へself-bindする。
                 // cell 課金の超過でも call frame を解放してから返す（REV-015 PR-c）。
@@ -295,7 +299,9 @@ impl Evaluator {
                     self.check_collection(v.len().saturating_add(1), line)?;
                 }
                 // 書き戻し前に元値を記録する（AUD-024）。
-                self.env.journal_cell(&cell);
+                self.env
+                    .journal_cell(&cell)
+                    .map_err(|stop| self.control_stop_to_error(stop, line))?;
                 // tracked backing へ delta 課金付きで push する（REV-015 案A）。
                 self.budget_list_push(&cell, value, line)?;
                 Ok(Some(Value::Null))
@@ -322,7 +328,9 @@ impl Evaluator {
                     }
                 };
                 // 書き戻し前に元値を記録する（AUD-024）。
-                self.env.journal_cell(&cell);
+                self.env
+                    .journal_cell(&cell)
+                    .map_err(|stop| self.control_stop_to_error(stop, line))?;
                 // tracked backing から delta release 付きで末尾を除く（REV-015 案A）。
                 self.budget_list_pop(&cell, line)?;
                 Ok(Some(popped))

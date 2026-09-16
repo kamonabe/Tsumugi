@@ -383,11 +383,22 @@ fn run_repl_vm() {
                         let linked_program = linked.as_ref().unwrap_or(&program);
                         // source/import 予算を Link フェーズで課金する（REV-015 Slice 2）。
                         // 超過なら compile も実行もせず、loader を巻き戻す。
-                        if let Err(e) = vm.charge_link(input.len() as u64, &loaded) {
-                            loader = loader_checkpoint;
-                            eprintln!("  エラー: {}", e);
-                            input.clear();
-                            continue;
+                        match vm.charge_link(input.len() as u64, &loaded) {
+                            Ok(record_tokens) => {
+                                // imported module record token を loader へ登録し、
+                                // `loaded` set と寿命を揃える（REV-015 PR-d）。runtime error
+                                // 時の `loader = loader_checkpoint` で checkpoint 以降の
+                                // token が drop され live heap が release される。
+                                for (path, token) in record_tokens {
+                                    loader.register_record_token(path, token);
+                                }
+                            }
+                            Err(e) => {
+                                loader = loader_checkpoint;
+                                eprintln!("  エラー: {}", e);
+                                input.clear();
+                                continue;
+                            }
                         }
                         match compiler.compile_repl_line(linked_program) {
                             Ok(chunk) => {
@@ -446,8 +457,14 @@ fn execute_vm_with_path(
     let mut vm = Vm::new(chunk);
     vm.set_script_args(script_args);
     // source/import 予算を Link フェーズで課金する（REV-015 Slice 2）。
-    vm.charge_link(source.len() as u64, &loaded)
+    // imported module record token（REV-015 PR-d）は loader へ登録し、実行のあいだ
+    // 生かしておく（loader は関数終了で drop され live heap も release される）。
+    let record_tokens = vm
+        .charge_link(source.len() as u64, &loaded)
         .map_err(|e| vec![e])?;
+    for (path, token) in record_tokens {
+        loader.register_record_token(path, token);
+    }
     vm.run().map_err(|e| vec![e])
 }
 

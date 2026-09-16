@@ -1,12 +1,12 @@
 # Tsumugi 実行予算・協調実行仕様
 
-最終更新: 2026-09-11
+最終更新: 2026-09-16
 
-設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は string / source / import accounting、heap accounting 基盤（`AllocationLedger`・§5.1 論理サイズ）、collection（`List`/`Dict`）の per-drop release（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、tree/VM 両対応）、および String body の per-drop release（PR-b、`Value::Str` を `Rc<Tracked<String>>` 化）、cell と tree/VM 関数 instance の per-drop release（PR-c、`SharedValue` を `Rc<Tracked<RefCell<Value>>>` 化し `Value::Fn`/`VmFn` に header token を持たせる）を実装済み。残りは AST / chunk / import record / rollback journal の per-drop 追跡（PR-d）と I-O accounting。VM の push/pop は full-clone 経路のため configured 上限で tree と live/peak が食い違い得るが、charge trace の tree/VM 完全一致は第14節 Slice 6（VM が experimental の間）で解消する）
+設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は string / source / import accounting、heap accounting 基盤（`AllocationLedger`・§5.1 論理サイズ）、collection（`List`/`Dict`）の per-drop release（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、tree/VM 両対応）、および String body の per-drop release（PR-b、`Value::Str` を `Rc<Tracked<String>>` 化）、cell と tree/VM 関数 instance の per-drop release（PR-c、`SharedValue` を `Rc<Tracked<RefCell<Value>>>` 化し `Value::Fn`/`VmFn` に header token を持たせる）、および AST / bytecode chunk / imported module record / rollback journal の per-drop 追跡（PR-d、`HeapToken = Tracked<()>` トークンで所有構造側から課金・release。tree は AST、VM は bytecode chunk を課金）を実装済み。残りは I-O accounting と string リテラル/連結/f-string 経路の課金。VM の push/pop は full-clone 経路のため configured 上限で tree と live/peak が食い違い得るが、charge trace の tree/VM 完全一致は第14節 Slice 6（VM が experimental の間）で解消する）
 
 ## 1. 位置づけ
 
-本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleStringBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線）と source / import accounting サブスライス（per-item `SingleSourceBytes`・cumulative `SourceCount`/`SourceBytes`・`ImportCount`/`ImportBytes` を Link フェーズで root と import へ tree/VM 共通で課金）、heap accounting 基盤サブスライス（`AllocationId`・`AllocationLedger`・§5.1 論理サイズ関数・`HeapBytes` reserve/超過写像）、collection（`List`/`Dict`）の per-drop release サブスライス（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、COW は delta 課金、tree/VM 両対応）、および String body の per-drop release サブスライス（PR-b、`Value::Str` を `Rc<Tracked<String>>` 化し、builtin 結果を dispatch 境界の `track_result` で live heap 課金・最後の参照 drop で release）、cell と tree/VM 関数 instance の per-drop release サブスライス（PR-c、cell 生成点で captured cell を課金し `Value::Fn`/`VmFn` の header token で function instance header を課金、drop で release）も実装済みである。Slice 2 の残り（AST / chunk / import record / rollback journal の per-drop 追跡、I-O accounting、string リテラル/連結/f-string 経路）と Slice 3 以降（continuation、cancel/pause、scheduler、VM charge parity）は未実装である。
+本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleStringBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線）と source / import accounting サブスライス（per-item `SingleSourceBytes`・cumulative `SourceCount`/`SourceBytes`・`ImportCount`/`ImportBytes` を Link フェーズで root と import へ tree/VM 共通で課金）、heap accounting 基盤サブスライス（`AllocationId`・`AllocationLedger`・§5.1 論理サイズ関数・`HeapBytes` reserve/超過写像）、collection（`List`/`Dict`）の per-drop release サブスライス（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、COW は delta 課金、tree/VM 両対応）、および String body の per-drop release サブスライス（PR-b、`Value::Str` を `Rc<Tracked<String>>` 化し、builtin 結果を dispatch 境界の `track_result` で live heap 課金・最後の参照 drop で release）、cell と tree/VM 関数 instance の per-drop release サブスライス（PR-c、cell 生成点で captured cell を課金し `Value::Fn`/`VmFn` の header token で function instance header を課金、drop で release）、および AST / bytecode chunk / imported module record / rollback journal の per-drop 追跡サブスライス（PR-d、所有構造側が `HeapToken = Tracked<()>` トークンで §5.1 論理サイズを課金し drop で release。§5.3「AST または bytecode」に従い tree は AST・VM は bytecode chunk を課金、import record は両 engine、rollback journal entry は両 engine で entry の固定 overhead を課金）も実装済みである。Slice 2 の残り（I-O accounting、string リテラル/連結/f-string 経路）と Slice 3 以降（continuation、cancel/pause、scheduler、VM charge parity）は未実装である。
 
 本文書は次の既存仕様と一体で実装する。
 
@@ -799,10 +799,41 @@ run-turn queueはEngine全体でFIFO round-robinとし、continuation自体で�
       境界での baseline 再走査は不要になった（`charge_link` は baseline 課金を行わない。
       `charge_context_baseline` は fresh ledger モデルの埋め込み API 用に温存）。既定上限
       では観測挙動を変えない。
-    - PR-d: AST / bytecode chunk / imported module record / rollback journal の per-drop
-      追跡。Link / compile フェーズおよび AUD-024 journal との結合を伴う。
-  - 各サブスライスは per-drop 化と同時に、`charge_context_baseline` から外した
-    非 collection の baseline 課金（対象種別ぶん）を engine の `charge_link` へ再導入する。
+    - **PR-d: AST / bytecode chunk / imported module record / rollback journal の per-drop
+      追跡（✅ 実装済み）** — `Value` ツリーに現れず所有構造側が保持する heap object を、
+      関数 header（PR-c）と同じ課金トークン（`HeapToken = Tracked<()>`、`Value::new_heap_token`
+      で §5.1 論理サイズを課金し drop で release）で追跡する。§5.3「AST または bytecode」に
+      従い、tree engine は AST を、VM は bytecode chunk を課金する（両者は同じ source の
+      別 artifact で、engine ごとに一方だけを持つ）。
+      - **imported module record**（両 engine）: `ModuleLoader` が canonical path をキーに
+        record token（`imported_module_record` = 96 + module ID の UTF-8 byte 長）を保持し、
+        `loaded` set と寿命を揃える。`charge_link` が Link フェーズで課金し、`forget`
+        （未捕捉エラー rollback）または loader drop で release する。VM は loader を所有
+        しないため、`Vm::charge_link` が token を返し、loader 所有者（CLI 入口）が登録する。
+      - **AST**（tree のみ）: linked program（root + 全 Stmt / Expr node）の §5.1 論理サイズ
+        （`AST program root` 64 + 各 node の `ast_node` = 64 + 所有 identifier / string literal
+        の byte 長）を `Evaluator::charge_link` が Link フェーズで一括課金し、execution の
+        寿命で token を保持する。REPL は入力ごとに前 AST token を release してから課金する。
+      - **bytecode chunk**（VM のみ）: root chunk と全 prototype chunk（`MakeClosure` が
+        `VmFn` へ clone 共有する `Rc<Chunk>`）を transitive に走査し、各 distinct chunk を
+        1 回ずつ `bytecode_chunk`（64 + 16×opcode + 32×constant）で課金する（§5.2 の共有は
+        1 回課金）。`Vm::run` は execution 寿命で保持し、`run_repl_chunk` は入力単位で
+        入れ替えて release する。持続 closure が prototype chunk を retain する REPL ケースの
+        parity 差は第14節 Slice 6（VM が experimental の間）で扱う。
+      - **rollback journal entry**（両 engine、AUD-024）: undo journal（tree=`SubmissionJournal`、
+        VM=`ReplStackCheckpoint`）が entry ごとに `rollback_journal_entry` の固定 overhead
+        （48 byte）を課金するトークンを積み、submission の commit / rollback で journal ごと
+        drop して release する（§10「work 量は journal entry 数で有限」）。保持する旧 value の
+        到達 payload（List / Dict / String body）は、entry の握る `Rc` が対象 backing の
+        `Tracked` を生かし続けるため既に live heap に計上されており、ここで再課金しない
+        （§5.2 の共有は 1 回課金）。tree は journal 記録経路を fallible 化して超過を伝播し、
+        VM は infallible な checkpoint 経路の超過を保留して次の per-instruction step 課金
+        境界で surface する。既定上限では観測挙動を変えない。
+  - `charge_context_baseline`（全 heap object を 1 回ずつ論理課金する純関数）は、collection・
+    String・cell・関数 header・AST・chunk・import record・journal がすべて per-drop 追跡された
+    ことで engine の `charge_link` からは呼ばない（tracked 分を二重計上するため）。execution
+    ごとに台帳を作り直す埋め込み API（fresh ledger モデル、後続 Phase）用に温存し、単体
+    テストで固定する。
 
 ### Slice 3: explicit continuation
 

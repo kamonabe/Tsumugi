@@ -4,6 +4,19 @@ use std::rc::Rc;
 use crate::budget::{ControlStop, ExecutionPhase, HeapLedgerWeak};
 use crate::value::{SharedValue, Value};
 
+/// [`Env::update`] の失敗理由。
+///
+/// 変数未定義（`Undefined`）と、rollback journal entry の heap 課金超過（`Budget`）を
+/// 区別する（REV-015 PR-d）。従来は `()` を返していたが、journal entry の課金が
+/// 追加されたため予算超過を伝播できるようにした。
+#[derive(Debug)]
+pub enum UpdateError {
+    /// 更新対象の変数が見つからない。
+    Undefined,
+    /// journal entry の heap 課金が上限を超えた。
+    Budget(ControlStop),
+}
+
 /// 関数呼び出しから戻るための復元情報
 ///
 /// スコープスタックを退避・複製せず、位置だけを覚えて巻き戻す（AUD-046）。
@@ -21,7 +34,7 @@ pub struct CallFrame {
 /// 記録するのは「最初の書き換え時点」の元値だけで、同じ場所を複数回変更しても
 /// 元値は一度しか積まない。COW（AUD-047）により List/Dict の値クローンは
 /// ハンドル共有O(1)なので、記録量は変更した場所の数に比例する。
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 struct SubmissionJournal {
     /// undo 操作を後ろから順に適用する。
     undo_log: Vec<UndoEntry>,
@@ -29,6 +42,20 @@ struct SubmissionJournal {
     seen_cells: HashSet<usize>,
     /// 元エントリを記録済みのscope binding（scope index と名前）。
     seen_scope_entries: HashSet<(usize, String)>,
+    /// 各 undo entry の rollback journal entry（§5.1）を live heap へ課金するトークン
+    /// （REV-015 PR-d）。undo_log と 1:1 で積み、journal が drop（commit/rollback）される
+    /// ときにまとめて release される。entry 数に比例した有限量だけを課金する（§10）。
+    entry_tokens: Vec<Rc<crate::value::HeapToken>>,
+}
+
+impl std::fmt::Debug for SubmissionJournal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubmissionJournal")
+            .field("undo_log", &self.undo_log)
+            .field("seen_cells", &self.seen_cells)
+            .field("seen_scope_entries", &self.seen_scope_entries)
+            .finish_non_exhaustive()
+    }
 }
 
 /// journal に積む1件のundo操作。
@@ -130,43 +157,79 @@ impl Env {
         }
     }
 
+    /// rollback journal entry 1 件の §5.1 論理サイズを live heap へ課金するトークンを作る
+    /// （REV-015 PR-d）。
+    ///
+    /// entry の固定 overhead（48 byte）だけを課金する。保持する旧 value の到達 payload
+    /// （List/Dict/String body）は、その shared backing の `Tracked`（PR-a/b/c）が entry の
+    /// 握る `Rc` で生き続けるため既に live heap に計上されている。ここで payload を再課金
+    /// すると二重計上になる（§5.2 の「共有は 1 回だけ課金」）。台帳を持たない文脈では
+    /// untracked（無課金）で包む。
+    fn new_journal_entry_token(&self) -> Result<Rc<crate::value::HeapToken>, ControlStop> {
+        Value::new_heap_token(
+            crate::budget::heap_size::rollback_journal_entry(0),
+            &self.heap_ledger,
+            ExecutionPhase::Run,
+        )
+    }
+
     /// scope の binding を書き換える前に、その位置の元の cell を journal へ記録する。
-    fn journal_scope_entry(&mut self, scope: usize, name: &str) {
-        let Some(journal) = self.journal.as_mut() else {
-            return;
-        };
+    fn journal_scope_entry(&mut self, scope: usize, name: &str) -> Result<(), ControlStop> {
+        if self.journal.is_none() {
+            return Ok(());
+        }
         let key = (scope, name.to_string());
-        if !journal.seen_scope_entries.insert(key) {
-            return;
+        if self
+            .journal
+            .as_ref()
+            .is_some_and(|j| j.seen_scope_entries.contains(&key))
+        {
+            return Ok(());
         }
         let original = self
             .scopes
             .get(scope)
             .and_then(|map| map.get(name).cloned());
+        // entry token を先に課金する。超過ならここで返し、journal を汚さない。
+        let token = self.new_journal_entry_token()?;
+        let journal = self.journal.as_mut().expect("journal present");
+        journal.seen_scope_entries.insert(key);
         journal.undo_log.push(UndoEntry::ScopeEntry {
             scope,
             name: name.to_string(),
             original,
         });
+        journal.entry_tokens.push(token);
+        Ok(())
     }
 
     /// cell の中身を書き換える前に、その cell の元の値を journal へ記録する。
     ///
     /// index 代入・push・pop など `Env` の外で `borrow_mut` するコードは、
     /// 変更前に必ずこれを呼ぶ。COW により Value クローンはハンドル共有O(1)。
-    pub fn journal_cell(&mut self, cell: &SharedValue) {
-        let Some(journal) = self.journal.as_mut() else {
-            return;
-        };
+    pub fn journal_cell(&mut self, cell: &SharedValue) -> Result<(), ControlStop> {
+        if self.journal.is_none() {
+            return Ok(());
+        }
         let id = Rc::as_ptr(cell) as usize;
-        if !journal.seen_cells.insert(id) {
-            return;
+        if self
+            .journal
+            .as_ref()
+            .is_some_and(|j| j.seen_cells.contains(&id))
+        {
+            return Ok(());
         }
         let original = cell.borrow().clone();
+        // entry token を先に課金する。超過ならここで返し、journal を汚さない。
+        let token = self.new_journal_entry_token()?;
+        let journal = self.journal.as_mut().expect("journal present");
+        journal.seen_cells.insert(id);
         journal.undo_log.push(UndoEntry::CellValue {
             cell: Rc::clone(cell),
             original,
         });
+        journal.entry_tokens.push(token);
+        Ok(())
     }
 
     /// 現在のcall frameから見えるスコープを内側→外側の順に返す
@@ -199,31 +262,37 @@ impl Env {
             // cell を先に課金・生成する。超過ならここで返し、journal も binding も触らない。
             let cell = Value::new_cell(value, &self.heap_ledger, ExecutionPhase::Run)?;
             // binding の追加・置換前に元エントリを journal へ記録する（AUD-024）。
-            self.journal_scope_entry(scope, name);
+            self.journal_scope_entry(scope, name)?;
             self.scopes[scope].insert(name.to_string(), cell);
         }
         Ok(())
     }
 
-    /// 現在のスコープに既存の SharedValue セルを直接挿入（クロージャの参照共有用）
-    pub fn set_shared(&mut self, name: &str, cell: SharedValue) {
+    /// 現在のスコープに既存の SharedValue セルを直接挿入（クロージャの参照共有用）。
+    ///
+    /// journal entry の課金が heap 上限を超えると `ControlStop` を返す（REV-015 PR-d）。
+    pub fn set_shared(&mut self, name: &str, cell: SharedValue) -> Result<(), ControlStop> {
         if let Some(scope) = self.scopes.len().checked_sub(1) {
-            self.journal_scope_entry(scope, name);
+            self.journal_scope_entry(scope, name)?;
             self.scopes[scope].insert(name.to_string(), cell);
         }
+        Ok(())
     }
 
-    /// 既存の変数を更新（内側→外側へ探索）。見つからなければ Err を返す
-    /// 同じ SharedValue セルの中身を書き換えるため、参照を共有しているクロージャにも反映される
-    pub fn update(&mut self, name: &str, value: Value) -> Result<(), ()> {
+    /// 既存の変数を更新（内側→外側へ探索）。
+    ///
+    /// 同じ SharedValue セルの中身を書き換えるため、参照を共有しているクロージャにも
+    /// 反映される。変数が見つからない場合と journal entry の課金が heap 上限を超えた
+    /// 場合を区別して返す（REV-015 PR-d）。
+    pub fn update(&mut self, name: &str, value: Value) -> Result<(), UpdateError> {
         match self.get_cell(name) {
             Some(cell) => {
                 // cell の元値を journal へ記録してから書き換える（AUD-024）。
-                self.journal_cell(&cell);
+                self.journal_cell(&cell).map_err(UpdateError::Budget)?;
                 *cell.borrow_mut() = value;
                 Ok(())
             }
-            None => Err(()),
+            None => Err(UpdateError::Undefined),
         }
     }
 

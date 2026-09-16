@@ -35,6 +35,12 @@ pub struct Evaluator {
     /// `args()` が返すスクリプト引数の snapshot（AUD-018）。
     /// process argv ではなく実行 context に属し、埋め込み host が実行単位で注入する。
     script_args: Vec<String>,
+    /// 実行対象 AST（linked program、root + node）の §5.1 論理サイズを live heap へ
+    /// 課金するトークン（REV-015 PR-d）。AST は実行のあいだ生き続けるため execution の
+    /// 寿命でトークンを保持する。REPL では入力ごとに charge_link で入れ替えて release し、
+    /// 前入力の AST を持ち越さない。VM は AST を bytecode へ compile するため、代わりに
+    /// bytecode chunk を課金する（§5.3「AST または bytecode」）。
+    ast_token: Option<Rc<crate::value::HeapToken>>,
 }
 
 impl Evaluator {
@@ -56,6 +62,7 @@ impl Evaluator {
             loader: crate::module::ModuleLoader::new(),
             next_function_id: 0,
             script_args: Vec::new(),
+            ast_token: None,
         }
     }
 
@@ -190,6 +197,7 @@ impl Evaluator {
         &mut self,
         root_source_bytes: u64,
         loaded: &[crate::module::LoadedModule],
+        linked_program: &Program,
     ) -> Result<(), TsumugiError> {
         // live heap は tracked backing の生成/drop で逐次維持する（REV-015 案A/PR-b/PR-c）。
         // collection・String・変数 cell・関数 instance header はすべて per-drop 追跡され、
@@ -209,7 +217,29 @@ impl Evaluator {
             self.budget
                 .charge_import(module.byte_len, ExecutionPhase::Link)
                 .map_err(|stop| self.control_stop_to_error(stop, module.line))?;
+            // imported module record を live heap へ課金する（REV-015 PR-d）。
+            // module ID は normalized（canonical）path の UTF-8 byte 長で数える。token は
+            // loader が `loaded` set と寿命を揃えて保持し、`forget`（rollback）または
+            // loader drop で release する。
+            let module_id_bytes = module.path.as_os_str().len() as u64;
+            let token = Value::new_heap_token(
+                crate::budget::heap_size::imported_module_record(module_id_bytes),
+                &self.budget.heap_handle(),
+                ExecutionPhase::Link,
+            )
+            .map_err(|stop| self.control_stop_to_error(stop, module.line))?;
+            self.loader
+                .register_record_token(module.path.clone(), token);
         }
+        // 実行対象 AST（linked program）を live heap へ課金する（REV-015 PR-d）。前入力の
+        // AST token を先に drop（release）してから今回ぶんを課金し、二重計上しない。tree
+        // engine は AST を直接実行するため execution の寿命でトークンを保持する。
+        self.ast_token = None;
+        let ast_bytes = crate::ast::ast_heap_size(linked_program);
+        let ast_token =
+            Value::new_heap_token(ast_bytes, &self.budget.heap_handle(), ExecutionPhase::Link)
+                .map_err(|stop| self.control_stop_to_error(stop, 0))?;
+        self.ast_token = Some(ast_token);
         Ok(())
     }
 
@@ -219,13 +249,13 @@ impl Evaluator {
     /// 深度の失敗は、最初の文を実行する前に報告される。
     pub fn run(&mut self, program: &Program, root_source_bytes: u64) -> Result<(), TsumugiError> {
         let (linked, newly_loaded) = self.loader.link(program)?;
-        // source/import 予算を Link フェーズで課金する（REV-015 Slice 2）。
+        let target = linked.as_ref().unwrap_or(program);
+        // source/import 予算と AST heap を Link フェーズで課金する（REV-015 Slice 2 / PR-d）。
         // 超過なら 1 文も実行せず、解決済みマーカーを巻き戻す。
-        if let Err(e) = self.charge_link(root_source_bytes, &newly_loaded) {
+        if let Err(e) = self.charge_link(root_source_bytes, &newly_loaded, target) {
             self.loader.forget(&newly_loaded);
             return Err(e);
         }
-        let target = linked.as_ref().unwrap_or(program);
         let result = self.exec_program(target);
         if result.is_err() {
             // 実行が完了しなかったmoduleは解決済みにしない（同じパスを再試行できる）
@@ -257,14 +287,14 @@ impl Evaluator {
                 return Err(e);
             }
         };
-        // source/import 予算を Link フェーズで課金する（REV-015 Slice 2）。
+        let target = linked.as_ref().unwrap_or(program);
+        // source/import 予算と AST heap を Link フェーズで課金する（REV-015 Slice 2 / PR-d）。
         // 超過なら 1 文も実行せず、language-state も import marker も巻き戻す。
-        if let Err(e) = self.charge_link(root_source_bytes, &newly_loaded) {
+        if let Err(e) = self.charge_link(root_source_bytes, &newly_loaded, target) {
             self.env.rollback_submission();
             self.loader.forget(&newly_loaded);
             return Err(e);
         }
-        let target = linked.as_ref().unwrap_or(program);
         let result = self.exec_program(target);
         if result.is_err() {
             // language-state を入力開始時点へ戻す。
@@ -305,8 +335,14 @@ impl Evaluator {
 
             Stmt::Assign { name, value, line } => {
                 let val = self.eval_expr(value, *line)?;
-                if self.env.update(name, val).is_err() {
-                    return Err(TsumugiError::assign_undefined(*line, name));
+                match self.env.update(name, val) {
+                    Ok(()) => {}
+                    Err(crate::env::UpdateError::Undefined) => {
+                        return Err(TsumugiError::assign_undefined(*line, name));
+                    }
+                    Err(crate::env::UpdateError::Budget(stop)) => {
+                        return Err(self.control_stop_to_error(stop, *line));
+                    }
                 }
                 Ok(EvalResult::Val)
             }
@@ -327,7 +363,9 @@ impl Evaluator {
                 let val = self.eval_expr(value, *line)?;
 
                 // REPL transaction のため、cellのin-place変更前に元値を記録する（AUD-024）。
-                self.env.journal_cell(&cell);
+                self.env
+                    .journal_cell(&cell)
+                    .map_err(|stop| self.control_stop_to_error(stop, *line))?;
                 // 更新はcellへのin-place代入。index/valueの評価中に同じbindingが
                 // 変更されていても、その最新状態に対して書き込む。
                 let max_collection = self.budget.max_collection_elements();
@@ -917,7 +955,11 @@ impl Evaluator {
         // レキシカルスコープ: 呼び出し元のスコープを退避し、独立環境で実行
         let saved_scopes = self.env.push_call_frame();
         for (k, cell) in captured.iter() {
-            self.env.set_shared(k, cell.clone());
+            // journal entry の課金超過でも call frame を必ず解放してから返す（REV-015 PR-d）。
+            if let Err(e) = self.env.set_shared(k, cell.clone()) {
+                self.env.pop_call_frame(saved_scopes);
+                return Err(self.control_stop_to_error(e, line));
+            }
         }
         // 名前付き関数は呼び出し時の関数値を宣言名へ束縛する。
         // 定義時captureへ自身を入れず、Rc cycleを避ける。
