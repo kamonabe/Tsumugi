@@ -78,6 +78,11 @@ struct ReplStackCheckpoint {
     /// `frames` checkpointを戻してもcellの中身は戻らない。破壊的更新の前に
     /// 元値を記録し、未捕捉エラー時に復元する（AUD-024）。
     cell_originals: HashMap<usize, (SharedValue, Value)>,
+    /// 各 journal entry（stack slot / cell の退避）の rollback journal entry（§5.1）を
+    /// live heap へ課金するトークン（REV-015 PR-d）。entry と 1:1 で積み、checkpoint が
+    /// drop（commit=`take`、rollback=`restore`）されるときにまとめて release される。
+    /// entry 数に比例した有限量だけを課金する（§10）。
+    entry_tokens: Vec<Rc<crate::value::HeapToken>>,
 }
 
 /// スタックベースの仮想マシン
@@ -101,6 +106,20 @@ pub struct Vm {
 
     /// 例外ハンドラスタック（try/catch）
     try_handlers: Vec<TryHandler>,
+
+    /// rollback journal entry の heap 課金が上限を超えたとき、次の per-instruction step
+    /// 課金境界で surface する保留エラー（REV-015 PR-d）。checkpoint 記録は `pop` など
+    /// 多数の infallible 経路から呼ばれるため、その場で `Result` を返さず、ここへ退避し
+    /// て `count_step` で `BudgetExceeded(HeapBytes)` を返す。既定上限では発生しない。
+    pending_heap_stop: Option<ControlStop>,
+
+    /// 実行中に adopt した bytecode chunk 木（root + 全 prototype chunk）の §5.1
+    /// bytecode chunk を live heap へ課金するトークン（REV-015 PR-d）。chunk は実行の
+    /// あいだ生き続ける（root frame・prototype・`VmFn` が `Rc<Chunk>` を共有する）ため、
+    /// VM が execution の寿命でトークンを保持し、VM drop で release する。REPL では入力
+    /// ごとの chunk を毎回 adopt し直すため、`run_repl_chunk` が入力の完了時に前回分を
+    /// 入れ替えて release する。
+    chunk_tokens: Vec<Rc<crate::value::HeapToken>>,
 
     /// 関数値へ発番する次の FunctionId（AUD-048）。単調増加し、
     /// REPL の失敗入力でも巻き戻さない。
@@ -127,6 +146,8 @@ impl Vm {
             globals: HashMap::new(),
             budget: BudgetLedger::with_config(BudgetConfig::from_legacy_env()),
             try_handlers: Vec::new(),
+            pending_heap_stop: None,
+            chunk_tokens: Vec::new(),
             next_function_id: 0,
             script_args: Vec::new(),
         }
@@ -141,6 +162,8 @@ impl Vm {
             globals: HashMap::new(),
             budget: BudgetLedger::with_config(BudgetConfig::from_legacy_env()),
             try_handlers: Vec::new(),
+            pending_heap_stop: None,
+            chunk_tokens: Vec::new(),
             next_function_id: 0,
             script_args: Vec::new(),
         }
@@ -193,13 +216,17 @@ impl Vm {
         &mut self,
         root_source_bytes: u64,
         loaded: &[crate::module::LoadedModule],
-    ) -> Result<(), TsumugiError> {
+    ) -> Result<Vec<(std::path::PathBuf, Rc<crate::value::HeapToken>)>, TsumugiError> {
         // live heap は tracked backing の生成/drop で逐次維持する（REV-015 案A/PR-b/PR-c）。
         // collection・String・cell・関数 instance header はすべて per-drop 追跡されるため、
         // 同じ台帳を跨ぐ実行では pre-existing な live heap が自動的に持ち越され、Link 境界で
         // baseline を再走査する必要がない（再走査すると tracked 分を二重計上する）。よって
         // baseline 再課金は行わない（tree engine の `Evaluator::charge_link` と対称）。
         // `charge_context_baseline` は fresh ledger モデルの埋め込み API 用に残す。
+        //
+        // imported module record の live heap token は呼び出し側（loader 所有者）が
+        // `loaded` set と寿命を揃えて保持できるよう戻り値で返す（REV-015 PR-d）。
+        let mut record_tokens: Vec<(std::path::PathBuf, Rc<crate::value::HeapToken>)> = Vec::new();
         self.budget
             .charge_source(root_source_bytes, ExecutionPhase::Link)
             .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, 0))?;
@@ -210,12 +237,70 @@ impl Vm {
             self.budget
                 .charge_import(module.byte_len, ExecutionPhase::Link)
                 .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, module.line))?;
+            // imported module record を live heap へ課金する（REV-015 PR-d）。tree engine
+            // の `Evaluator::charge_link` と同じ規則（canonical path の UTF-8 byte 長）で
+            // 課金し、token を呼び出し側（`ModuleLoader` を所有する main.rs）へ返して
+            // `loaded` set と寿命を揃えて保持させる。VM は loader を所有しないため、
+            // tree engine のように内部で登録できない。
+            let module_id_bytes = module.path.as_os_str().len() as u64;
+            let token = Value::new_heap_token(
+                crate::budget::heap_size::imported_module_record(module_id_bytes),
+                &self.budget.heap_handle(),
+                ExecutionPhase::Link,
+            )
+            .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, module.line))?;
+            record_tokens.push((module.path.clone(), token));
+        }
+        Ok(record_tokens)
+    }
+
+    /// bytecode chunk 木（`chunk` を root とし、全 prototype chunk を transitive に含む）の
+    /// §5.1 bytecode chunk を live heap へ課金し、トークンを返す（REV-015 PR-d）。
+    ///
+    /// 各 distinct chunk を 1 回ずつ課金する（§5.2）。prototype の `Rc<Chunk>` は
+    /// `MakeClosure` で `VmFn` へ clone 共有されるが、それは同じ backing の共有なので
+    /// 追加課金しない。charge は `Compile` フェーズ相当（adopt 時）に行う。再帰は
+    /// prototype 木の深さに比例するが、深さは compile 時の関数ネストで有限。
+    fn charge_chunk_tree(
+        &mut self,
+        chunk: &Chunk,
+    ) -> Result<Vec<Rc<crate::value::HeapToken>>, TsumugiError> {
+        let mut tokens = Vec::new();
+        self.charge_chunk_tree_into(chunk, &mut tokens)?;
+        Ok(tokens)
+    }
+
+    fn charge_chunk_tree_into(
+        &mut self,
+        chunk: &Chunk,
+        tokens: &mut Vec<Rc<crate::value::HeapToken>>,
+    ) -> Result<(), TsumugiError> {
+        let bytes = crate::budget::heap_size::bytecode_chunk(
+            chunk.code.len() as u64,
+            chunk.constants.len() as u64,
+        );
+        let token =
+            Value::new_heap_token(bytes, &self.budget.heap_handle(), ExecutionPhase::Compile)
+                .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, 0))?;
+        tokens.push(token);
+        for prototype in &chunk.prototypes {
+            self.charge_chunk_tree_into(&prototype.chunk, tokens)?;
         }
         Ok(())
     }
 
     /// チャンクを実行する
     pub fn run(&mut self) -> Result<(), TsumugiError> {
+        // adopt 済み root chunk 木を live heap へ課金する（REV-015 PR-d）。root frame は
+        // `Vm::new` で設定済みなので、その chunk を辿る。token は execution の寿命で保持し
+        // VM drop で release する。
+        if self.chunk_tokens.is_empty()
+            && let Some(root) = self.frames.first()
+        {
+            let root_chunk = Rc::clone(&root.chunk);
+            let tokens = self.charge_chunk_tree(&root_chunk)?;
+            self.chunk_tokens = tokens;
+        }
         self.run_frames(0)?;
         Ok(())
     }
@@ -232,10 +317,13 @@ impl Vm {
         let handlers_checkpoint = self.try_handlers.clone();
         let steps_checkpoint = self.budget.committed_fuel();
         debug_assert!(self.repl_stack_checkpoint.is_none());
+        // 新しい transaction 開始時に保留 heap 超過をクリアする（REV-015 PR-d）。
+        self.pending_heap_stop = None;
         self.repl_stack_checkpoint = Some(ReplStackCheckpoint {
             stack_len: self.stack.len(),
             originals: HashMap::new(),
             cell_originals: HashMap::new(),
+            entry_tokens: Vec::new(),
         });
 
         // top-levelでcell化された変数は入力間でも同じcellを使う。
@@ -245,8 +333,9 @@ impl Vm {
             .first()
             .map(|frame| frame.locals_cells.clone())
             .unwrap_or_default();
+        let root_chunk = Rc::new(chunk);
         let frame = CallFrame {
-            chunk: Rc::new(chunk),
+            chunk: Rc::clone(&root_chunk),
             ip: 0,
             base: 0,
             upvalues: Vec::new(),
@@ -261,6 +350,27 @@ impl Vm {
         }
         // fuel 予算はリセット（各入力で予算を全額使えるように）
         self.budget.reset_fuel();
+
+        // 入力の bytecode chunk 木を live heap へ課金する（REV-015 PR-d）。REPL の
+        // top-level chunk は入力完了後に言語状態へ retain されない（結果 binding だけが
+        // 残る）ため、入力単位で保持・release する。前回入力の chunk token を先に drop
+        // （release）してから今回ぶんを課金し、両者を同時に live 計上して二重課金しない。
+        // 持続 closure が prototype chunk を retain するケースは VM の既知 heap parity
+        // gap（第14節 Slice 6）として扱う。
+        self.chunk_tokens.clear();
+        let chunk_tokens = match self.charge_chunk_tree(&root_chunk) {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                // 課金超過なら 1 命令も実行せず、checkpoint を破棄して state を巻き戻す。
+                self.repl_stack_checkpoint = None;
+                self.frames = frames_checkpoint;
+                self.globals = globals_checkpoint;
+                self.try_handlers = handlers_checkpoint;
+                self.budget.restore_fuel(steps_checkpoint);
+                return Err(error);
+            }
+        };
+        self.chunk_tokens = chunk_tokens;
 
         match self.run_frames(0) {
             Ok(_) => {
@@ -418,6 +528,11 @@ impl Vm {
 
     /// ステップ（fuel）を 1 課金し、上限チェックする（REV-015 Slice 1）。
     fn count_step(&mut self, line: usize) -> Result<(), TsumugiError> {
+        // 直前の checkpoint 記録で rollback journal entry の heap 課金が上限を超えていた
+        // 場合、ここで surface する（REV-015 PR-d）。既定上限では発生しない。
+        if let Some(stop) = self.pending_heap_stop.take() {
+            return Err(Self::control_stop_to_error(&self.budget, stop, line));
+        }
         self.budget
             .charge_fuel(1, ExecutionPhase::Run)
             .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))
@@ -1366,6 +1481,31 @@ impl Vm {
         Ok(())
     }
 
+    /// rollback journal entry 1 件の §5.1 論理サイズ（固定 overhead 48 byte）を live heap
+    /// へ課金するトークンを作る（REV-015 PR-d）。
+    ///
+    /// checkpoint 記録は `pop` など多数の infallible 経路から呼ばれるため、その場で
+    /// `Result` を返さず、超過時は `pending_heap_stop` へ退避して次の per-instruction
+    /// step 課金境界（[`Vm::count_step`]）で surface する。保持する旧 value の到達
+    /// payload（List/Dict/String body）は shared backing の `Tracked` が entry の握る
+    /// `Rc` で生き続けるため既に live heap に計上されており、ここで再課金しない（§5.2）。
+    /// 台帳を持たない文脈では untracked（無課金）で包む。
+    fn charge_journal_entry(&mut self) -> Option<Rc<crate::value::HeapToken>> {
+        match Value::new_heap_token(
+            crate::budget::heap_size::rollback_journal_entry(0),
+            &self.budget.heap_handle(),
+            ExecutionPhase::Run,
+        ) {
+            Ok(token) => Some(token),
+            Err(stop) => {
+                if self.pending_heap_stop.is_none() {
+                    self.pending_heap_stop = Some(stop);
+                }
+                None
+            }
+        }
+    }
+
     /// REPL checkpointに含まれる既存stack slotを、最初の書換・削除時だけ記録する。
     fn checkpoint_stack_slot(&mut self, index: usize) {
         let should_record = self
@@ -1381,8 +1521,14 @@ impl Vm {
         let Some(value) = self.stack.get(index).cloned() else {
             return;
         };
-        if let Some(checkpoint) = &mut self.repl_stack_checkpoint {
-            checkpoint.originals.entry(index).or_insert(value);
+        // journal entry の live heap を課金する（REV-015 PR-d）。超過は
+        // `pending_heap_stop` に退避し、次の step 課金境界で surface する。
+        let token = self.charge_journal_entry();
+        if let Some(checkpoint) = &mut self.repl_stack_checkpoint
+            && checkpoint.originals.insert(index, value).is_none()
+            && let Some(token) = token
+        {
+            checkpoint.entry_tokens.push(token);
         }
     }
 
@@ -1424,17 +1570,26 @@ impl Vm {
     /// cellのRcポインタ同一性で判定し、1入力につき最初の1回だけ記録する。
     /// REPL transaction中でなければ何もしない。
     fn checkpoint_cell(&mut self, cell: &SharedValue) {
-        let Some(checkpoint) = self.repl_stack_checkpoint.as_mut() else {
-            return;
-        };
         let id = Rc::as_ptr(cell) as usize;
-        if checkpoint.cell_originals.contains_key(&id) {
+        let already_recorded = self
+            .repl_stack_checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.cell_originals.contains_key(&id));
+        if self.repl_stack_checkpoint.is_none() || already_recorded {
             return;
         }
         let original = cell.borrow().clone();
-        checkpoint
-            .cell_originals
-            .insert(id, (Rc::clone(cell), original));
+        // journal entry の live heap を課金する（REV-015 PR-d）。超過は
+        // `pending_heap_stop` に退避し、次の step 課金境界で surface する。
+        let token = self.charge_journal_entry();
+        if let Some(checkpoint) = self.repl_stack_checkpoint.as_mut() {
+            checkpoint
+                .cell_originals
+                .insert(id, (Rc::clone(cell), original));
+            if let Some(token) = token {
+                checkpoint.entry_tokens.push(token);
+            }
+        }
     }
 
     /// スタックからpop

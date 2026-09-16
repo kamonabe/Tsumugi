@@ -25,6 +25,14 @@ pub type TrackedCell = Tracked<RefCell<Value>>;
 /// header だけをこのトークンで持つ（二重計上を避ける）。
 pub type FnHeader = Tracked<()>;
 
+/// heap object 汎用の課金トークン（REV-015 PR-d）。
+///
+/// [`FnHeader`] と同じ data を持たない（`()`）tracked allocation で、`Value` ツリーに
+/// 現れず所有構造側が保持する heap object（AST program root / node、bytecode chunk、
+/// imported module record、rollback journal entry）の per-drop 追跡に使う。生成時に
+/// §5.1 の論理サイズを live heap へ課金し、最後の参照 drop で release する。
+pub type HeapToken = Tracked<()>;
+
 /// heap 課金付きの collection backing（REV-015 案A、per-drop release）。
 ///
 /// `T`（`Vec<Value>` または `BTreeMap<String, Value>`）と、その論理サイズ・
@@ -600,6 +608,27 @@ impl Value {
 
     /// heap 課金しない untracked な関数 header トークンを作る（台帳を持たない文脈用）。
     pub fn fn_header_untracked() -> Rc<FnHeader> {
+        Tracked::constant(())
+    }
+
+    /// 論理サイズ `bytes` の heap 課金トークン（`Tracked<()>`）を作る（REV-015 PR-d）。
+    ///
+    /// AST / bytecode chunk / imported module record / rollback journal entry のように
+    /// `Value` ツリーに現れず所有構造側（`ModuleLoader` / `Vm` / `Env` など）が保持する
+    /// heap object を per-drop 追跡するための汎用トークン。関数 header（PR-c）と同じ
+    /// `Tracked<()>` + 台帳への `Weak` 経由の課金パターンで、生成時に §5.1 の論理サイズ
+    /// `bytes` を live heap へ課金し、この token を握る最後の `Rc` が drop した時点で
+    /// release する。台帳を持たない文脈では untracked（無課金）で包む。
+    pub fn new_heap_token(
+        bytes: u64,
+        ledger: &crate::budget::HeapLedgerWeak,
+        phase: ExecutionPhase,
+    ) -> Result<Rc<HeapToken>, ControlStop> {
+        Tracked::new_via_handle((), bytes, ledger, phase)
+    }
+
+    /// heap 課金しない untracked な heap token を作る（台帳を持たない文脈用）。
+    pub fn heap_token_untracked() -> Rc<HeapToken> {
         Tracked::constant(())
     }
 

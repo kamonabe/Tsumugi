@@ -7,12 +7,14 @@
 //!
 //! ツリーウォーク版とVM版が同じ実装を共有するので、評価時点がengine間でずれない。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use crate::ast::{Program, Stmt};
 use crate::error::{ErrorKind, TsumugiError};
 use crate::limits::MAX_IMPORT_DEPTH;
+use crate::value::HeapToken;
 
 fn import_error(line: usize, message: impl Into<String>) -> TsumugiError {
     TsumugiError::runtime_with_kind(line, ErrorKind::Import, message)
@@ -36,12 +38,26 @@ pub struct LoadedModule {
 ///
 /// 解決済みモジュールの集合はセッション内で保持する。REPLでは入力をまたいで同じ
 /// モジュールを二重に展開しないために使い、リンクが失敗した入力の分は巻き戻す。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ModuleLoader {
     /// 相対パスの基準ディレクトリ
     base_dir: PathBuf,
     /// 解決済みモジュールの正規パス（循環importの検出と二重展開の防止）
     loaded: HashSet<PathBuf>,
+    /// 解決済みモジュールの imported module record（§5.1）を live heap へ課金する
+    /// トークン（REV-015 PR-d）。canonical path をキーに保持し、`loaded` set と寿命を
+    /// 揃える。`forget` で該当トークンを drop して release し、loader 全体の drop でも
+    /// 残存トークンが release される。
+    record_tokens: HashMap<PathBuf, Rc<HeapToken>>,
+}
+
+impl std::fmt::Debug for ModuleLoader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModuleLoader")
+            .field("base_dir", &self.base_dir)
+            .field("loaded", &self.loaded)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ModuleLoader {
@@ -49,6 +65,7 @@ impl ModuleLoader {
         Self {
             base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             loaded: HashSet::new(),
+            record_tokens: HashMap::new(),
         }
     }
 
@@ -70,7 +87,21 @@ impl ModuleLoader {
     pub fn forget(&mut self, modules: &[LoadedModule]) {
         for module in modules {
             self.loaded.remove(&module.path);
+            // imported module record の live heap を release する（REV-015 PR-d）。
+            // token を drop すると `Tracked::Drop` が台帳へ release を通知する。
+            self.record_tokens.remove(&module.path);
         }
+    }
+
+    /// 初めて解決した import module の imported module record トークンを登録する
+    /// （REV-015 PR-d）。
+    ///
+    /// engine の `charge_link` が §5.1 `imported_module_record` を課金して作った token を、
+    /// canonical path をキーに保持する。`forget` で該当 module を未解決へ戻すとき同時に
+    /// drop して live heap を release する。同一 path の再登録（通常は起きない）では新しい
+    /// token で置き換え、旧 token は drop される。
+    pub fn register_record_token(&mut self, path: PathBuf, token: Rc<HeapToken>) {
+        self.record_tokens.insert(path, token);
     }
 
     /// top-level import を解決し、展開済みプログラムと新たに解決したパスを返す。
