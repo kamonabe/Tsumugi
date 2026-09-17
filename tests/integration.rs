@@ -1722,6 +1722,76 @@ fn string_allocations_limit_gates_shared_builtin_in_both_engines() {
 }
 
 #[test]
+fn single_string_limit_gates_string_literal_in_both_engines() {
+    // REV-015 Slice 2: 文字列リテラルは dispatch を経由しないが、materialize 時に
+    // 課金される。6 byte の "123456" を上限 5 で拒否する。
+    let source = "print(\"123456\")\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_SINGLE_STRING_BYTES", "5")]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("文字列の長さが上限を超えました"),
+            "{mode}で文字列リテラルに single string 上限が適用されていない: {stderr}"
+        );
+        assert!(
+            !stdout.contains("123456"),
+            "{mode}で拒否された文字列リテラルが出力された: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn single_string_limit_gates_concatenation_in_both_engines() {
+    // REV-015 Slice 2: `+` 連結の結果 body も dispatch を経由しないが課金される。
+    // "AAAAA"+"BBBBB" が 10 byte の結果を生成し、上限 8 で拒否する。オペランド
+    // リテラルは各 5 byte で上限内なので、超過するのは連結結果である。
+    let source = "print(\"AAAAA\" + \"BBBBB\")\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_SINGLE_STRING_BYTES", "8")]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("文字列の長さが上限を超えました"),
+            "{mode}で連結結果に single string 上限が適用されていない: {stderr}"
+        );
+        assert!(
+            !stdout.contains("AAAAABBBBB"),
+            "{mode}で拒否された連結結果が出力された: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn single_string_limit_gates_fstring_in_both_engines() {
+    // REV-015 Slice 2: f-string の生成 body も dispatch を経由しないが課金される。
+    // f"{x}{x}" が "123123"(6 byte) を生成し、上限 5 で拒否する。
+    let source = "let x = 123\nprint(f\"{x}{x}\")\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_SINGLE_STRING_BYTES", "5")]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("文字列の長さが上限を超えました"),
+            "{mode}で f-string に single string 上限が適用されていない: {stderr}"
+        );
+        assert!(
+            !stdout.contains("123123"),
+            "{mode}で拒否された f-string が出力された: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn single_source_limit_gates_root_source_in_both_engines() {
     // REV-015 Slice 2: root source の生 byte 長が max_single_source_bytes を
     // 超えると、両 engine で source 上限エラーになり 1 文も実行しない。

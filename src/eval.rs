@@ -583,7 +583,14 @@ impl Evaluator {
         match expr {
             Expr::Int(n) => Ok(Value::Int(*n)),
             Expr::Float(f) => Ok(Value::Float(*f)),
-            Expr::Str(s) => Ok(Value::str_constant(s.clone())),
+            Expr::Str(s) => {
+                // 文字列リテラルは dispatch を経由しないため、ここで cumulative string
+                // accounting と live heap を課金する（REV-015 Slice 2）。track_result は
+                // untracked な String を charge_string + new_str で tracked へ昇格させる。
+                self.budget
+                    .track_result(Value::str_constant(s.clone()), ExecutionPhase::Run)
+                    .map_err(|stop| self.control_stop_to_error(stop, line))
+            }
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Null => Ok(Value::Null),
 
@@ -643,7 +650,14 @@ impl Evaluator {
                     _ => {
                         let l = self.eval_expr(left, line)?;
                         let r = self.eval_expr(right, line)?;
-                        self.eval_binop(&l, op, &r, line)
+                        let result = self.eval_binop(&l, op, &r, line)?;
+                        // 文字列結合（`+`）が新規生成する String body を課金する
+                        // （REV-015 Slice 2）。track_result は untracked な String だけを
+                        // charge_string + new_str で昇格させ、数値/真偽値など他の binop
+                        // 結果はそのまま返す。
+                        self.budget
+                            .track_result(result, ExecutionPhase::Run)
+                            .map_err(|stop| self.control_stop_to_error(stop, line))
                     }
                 }
             }
@@ -704,7 +718,10 @@ impl Evaluator {
                         }
                     }
                 }
-                Ok(Value::str_constant(result))
+                // f-string の生成 body も dispatch を経由しないため課金する（REV-015 Slice 2）。
+                self.budget
+                    .track_result(Value::str_constant(result), ExecutionPhase::Run)
+                    .map_err(|stop| self.control_stop_to_error(stop, line))
             }
         }
     }
