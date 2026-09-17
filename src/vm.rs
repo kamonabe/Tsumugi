@@ -971,12 +971,31 @@ impl Vm {
         match instruction {
             OpCode::LoadConst(idx) => {
                 let value = self.constant(idx, line)?;
+                // 文字列リテラルは dispatch を経由しないため、materialize 時に課金する
+                // （REV-015 Slice 2）。定数表の String は untracked なので track_result が
+                // cumulative string accounting と live heap（new_str）へ昇格させる。Int /
+                // Float / Bool や空 collection 定数は untracked のまま素通しする（後者の
+                // 課金差は Slice 6 の VM charge parity で扱う既知差）。
+                let value = if matches!(value, Value::Str(_)) {
+                    self.budget
+                        .track_result(value, ExecutionPhase::Run)
+                        .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?
+                } else {
+                    value
+                };
                 self.stack.push(value);
             }
             OpCode::Add => {
                 let right = self.pop(line)?;
                 let left = self.pop(line)?;
                 let result = self.binary_add(left, right, line)?;
+                // 文字列結合（`+`）が新規生成する String body を課金する
+                // （REV-015 Slice 2）。track_result は untracked な String だけを昇格させ、
+                // 数値など他の結果はそのまま返す。
+                let result = self
+                    .budget
+                    .track_result(result, ExecutionPhase::Run)
+                    .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
                 self.stack.push(result);
             }
             OpCode::Sub => {
@@ -1461,7 +1480,12 @@ impl Vm {
                 for val in parts {
                     result.push_str(&val.to_string());
                 }
-                self.stack.push(Value::str_constant(result));
+                // f-string の生成 body も dispatch を経由しないため課金する（REV-015 Slice 2）。
+                let value = self
+                    .budget
+                    .track_result(Value::str_constant(result), ExecutionPhase::Run)
+                    .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
+                self.stack.push(value);
             }
             OpCode::ReturnValue | OpCode::Return => {
                 // 通常は run_frames() が処理する。不正な呼び出しでもpanicさせない。
