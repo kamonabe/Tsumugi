@@ -330,6 +330,55 @@ impl BudgetConfig {
         {
             config.max_live_heap_bytes = v;
         }
+        // I-O accounting（REV-015 Slice 2）の legacy 上限入口。未設定は §3.1 の既定値。
+        if let Some(v) = std::env::var("TSUMUGI_MAX_INPUT_CALLS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            config.max_input_calls = v;
+        }
+        if let Some(v) = std::env::var("TSUMUGI_MAX_INPUT_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            config.max_input_bytes = v;
+        }
+        if let Some(v) = std::env::var("TSUMUGI_MAX_OUTPUT_CALLS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            config.max_output_calls = v;
+        }
+        if let Some(v) = std::env::var("TSUMUGI_MAX_OUTPUT_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            config.max_output_bytes = v;
+        }
+        if let Some(v) = std::env::var("TSUMUGI_MAX_HOST_CALLS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            config.max_host_calls = v;
+        }
+        if let Some(v) = std::env::var("TSUMUGI_MAX_HOST_REQUEST_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            config.max_host_request_bytes = v;
+        }
+        if let Some(v) = std::env::var("TSUMUGI_MAX_HOST_RESPONSE_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            config.max_host_response_bytes = v;
+        }
+        if let Some(v) = std::env::var("TSUMUGI_MAX_HOST_CALL_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            config.max_host_call_bytes = v;
+        }
         config
     }
 
@@ -1323,6 +1372,212 @@ impl BudgetLedger {
         Ok(())
     }
 
+    /// `input` 系 host call 1 回を課金する（§6.1 / §7、REV-015 Slice 2、I-O accounting）。
+    ///
+    /// `payload_bytes` は host 境界で実際に受け取った UTF-8 payload の byte 長で、Rust
+    /// object の capacity や transport header は含めない（§6.1）。§6.1 のとおり stdio は
+    /// host call でもあるため、input 固有 counter に加えて host call counter へも課金する。
+    /// input は host へ渡す request payload を持たないため `host_request_bytes` は 0 とし、
+    /// 受け取った payload を `input_bytes` / `host_response_bytes` / `host_call_bytes` へ
+    /// 課金する。
+    ///
+    /// 次を 1 個の atomic reservation として扱う（§7）。どれか 1 つでも上限を超える場合は
+    /// 何も reserve せず、§7.2 の固定優先順位で先頭 1 件を primary な [`BudgetExceeded`]
+    /// として返す。cancel / deadline は [`Self::reserve_all`] が charge 前に確認する。
+    ///
+    /// - `InputCalls` += 1
+    /// - `InputBytes` += `payload_bytes`
+    /// - `HostCalls` += 1
+    /// - `HostResponseBytes` += `payload_bytes`
+    /// - `HostCallBytes` += `payload_bytes`
+    ///
+    /// 呼び出し側は §6.1「dispatch 開始時に count を課金」の順序に合わせ、payload byte 長が
+    /// 確定してからこのメソッドを 1 回呼ぶ（count と bytes を同じ atomic reservation で
+    /// まとめて課金する）。既定上限では観測挙動を変えない。
+    pub fn charge_input(
+        &mut self,
+        payload_bytes: u64,
+        phase: ExecutionPhase,
+    ) -> Result<(), ControlStop> {
+        let requests = [
+            CumulativeRequest {
+                resource: BudgetResource::InputCalls,
+                amount: 1,
+            },
+            CumulativeRequest {
+                resource: BudgetResource::InputBytes,
+                amount: payload_bytes,
+            },
+            CumulativeRequest {
+                resource: BudgetResource::HostCalls,
+                amount: 1,
+            },
+            CumulativeRequest {
+                resource: BudgetResource::HostResponseBytes,
+                amount: payload_bytes,
+            },
+            CumulativeRequest {
+                resource: BudgetResource::HostCallBytes,
+                amount: payload_bytes,
+            },
+        ];
+        self.reserve_all(&requests, phase)?;
+        self.commit(BudgetResource::InputCalls, 1, 1);
+        self.commit(BudgetResource::InputBytes, payload_bytes, payload_bytes);
+        self.commit(BudgetResource::HostCalls, 1, 1);
+        self.commit(
+            BudgetResource::HostResponseBytes,
+            payload_bytes,
+            payload_bytes,
+        );
+        self.commit(BudgetResource::HostCallBytes, payload_bytes, payload_bytes);
+        Ok(())
+    }
+
+    /// `output`（`print`）系 host call 1 回を課金する（§6.1 / §7、REV-015 Slice 2）。
+    ///
+    /// `payload_bytes` は host へ渡す UTF-8 payload の byte 長。§6.1 のとおり stdio は
+    /// host call でもあるため、output 固有 counter に加えて host call counter へも課金する。
+    /// output は host から受け取る response を持たないため `host_response_bytes` は 0 と
+    /// し、渡す payload を `output_bytes` / `host_request_bytes` / `host_call_bytes` へ
+    /// 課金する。
+    ///
+    /// 次を 1 個の atomic reservation として扱う（§7）。§7.2 の固定優先順位で先頭 1 件を
+    /// primary にする。cancel / deadline は charge 前に確認する。
+    ///
+    /// - `OutputCalls` += 1
+    /// - `OutputBytes` += `payload_bytes`
+    /// - `HostCalls` += 1
+    /// - `HostRequestBytes` += `payload_bytes`
+    /// - `HostCallBytes` += `payload_bytes`
+    ///
+    /// §6.1「dispatch 開始時に count を課金」に従い、payload を host へ渡す前
+    /// （`write_stdout_line` の前）に呼ぶ。既定上限では観測挙動を変えない。
+    pub fn charge_output(
+        &mut self,
+        payload_bytes: u64,
+        phase: ExecutionPhase,
+    ) -> Result<(), ControlStop> {
+        let requests = [
+            CumulativeRequest {
+                resource: BudgetResource::OutputCalls,
+                amount: 1,
+            },
+            CumulativeRequest {
+                resource: BudgetResource::OutputBytes,
+                amount: payload_bytes,
+            },
+            CumulativeRequest {
+                resource: BudgetResource::HostCalls,
+                amount: 1,
+            },
+            CumulativeRequest {
+                resource: BudgetResource::HostRequestBytes,
+                amount: payload_bytes,
+            },
+            CumulativeRequest {
+                resource: BudgetResource::HostCallBytes,
+                amount: payload_bytes,
+            },
+        ];
+        self.reserve_all(&requests, phase)?;
+        self.commit(BudgetResource::OutputCalls, 1, 1);
+        self.commit(BudgetResource::OutputBytes, payload_bytes, payload_bytes);
+        self.commit(BudgetResource::HostCalls, 1, 1);
+        self.commit(
+            BudgetResource::HostRequestBytes,
+            payload_bytes,
+            payload_bytes,
+        );
+        self.commit(BudgetResource::HostCallBytes, payload_bytes, payload_bytes);
+        Ok(())
+    }
+
+    /// stdio 以外の host call（filesystem 等）の request 側を課金する（§6.1 / §7、
+    /// REV-015 Slice 2、I-O accounting）。
+    ///
+    /// §6.1「capability 判定前に count を課金し、request payload を課金する」に従い、host
+    /// 境界へ入る（副作用が始まる）前に呼ぶ。`request_bytes` は host へ渡す payload
+    /// （書き込み内容など）の byte 長で、Rust object の capacity や transport header は
+    /// 含めない。read 系のように request payload を持たない call は 0 を渡す。
+    ///
+    /// 次を 1 個の atomic reservation として扱う（§7）。§7.2 の固定優先順位で先頭 1 件を
+    /// primary にする。cancel / deadline は charge 前に確認する。response byte は host
+    /// 境界を越えて結果が確定した後に [`Self::charge_host_response_bytes`] で別途課金する
+    /// （§6.1「response は受け取った後に課金」）。両メソッドで 1 回の host call を表す。
+    ///
+    /// - `HostCalls` += 1
+    /// - `HostRequestBytes` += `request_bytes`
+    /// - `HostCallBytes` += `request_bytes`
+    pub fn charge_host_call_request(
+        &mut self,
+        request_bytes: u64,
+        phase: ExecutionPhase,
+    ) -> Result<(), ControlStop> {
+        let requests = [
+            CumulativeRequest {
+                resource: BudgetResource::HostCalls,
+                amount: 1,
+            },
+            CumulativeRequest {
+                resource: BudgetResource::HostRequestBytes,
+                amount: request_bytes,
+            },
+            CumulativeRequest {
+                resource: BudgetResource::HostCallBytes,
+                amount: request_bytes,
+            },
+        ];
+        self.reserve_all(&requests, phase)?;
+        self.commit(BudgetResource::HostCalls, 1, 1);
+        self.commit(
+            BudgetResource::HostRequestBytes,
+            request_bytes,
+            request_bytes,
+        );
+        self.commit(BudgetResource::HostCallBytes, request_bytes, request_bytes);
+        Ok(())
+    }
+
+    /// host call の response 側を課金する（§6.1 / §7、REV-015 Slice 2）。
+    ///
+    /// [`Self::charge_host_call_request`] で request 側（count 含む）を課金済みの host call
+    /// について、host 境界から受け取った response payload を課金する。`response_bytes` は
+    /// 受け取った payload（読み込み内容など）の byte 長。response を持たない call は 0 を
+    /// 渡すか呼び出さない。count はここでは増やさない（1 回の host call は request 側で
+    /// 1 回だけ数える、§6.1）。
+    ///
+    /// - `HostResponseBytes` += `response_bytes`
+    /// - `HostCallBytes` += `response_bytes`
+    pub fn charge_host_response_bytes(
+        &mut self,
+        response_bytes: u64,
+        phase: ExecutionPhase,
+    ) -> Result<(), ControlStop> {
+        let requests = [
+            CumulativeRequest {
+                resource: BudgetResource::HostResponseBytes,
+                amount: response_bytes,
+            },
+            CumulativeRequest {
+                resource: BudgetResource::HostCallBytes,
+                amount: response_bytes,
+            },
+        ];
+        self.reserve_all(&requests, phase)?;
+        self.commit(
+            BudgetResource::HostResponseBytes,
+            response_bytes,
+            response_bytes,
+        );
+        self.commit(
+            BudgetResource::HostCallBytes,
+            response_bytes,
+            response_bytes,
+        );
+        Ok(())
+    }
+
     /// dispatch 結果の `Value` から到達する新規 String body の cumulative 会計を課金する
     /// （REV-015 Slice 2、string accounting）。
     ///
@@ -1668,10 +1923,10 @@ impl BudgetLedger {
 /// tree evaluator と VM の両方から呼び、resource → error kind/message の対応を
 /// 1 箇所へ集約して parity を保証する。trace は各 engine が呼び出し側で付ける。
 ///
-/// Slice 1/2 で発生し得るのは fuel（= step）・collection・string 超過。cancel /
-/// deadline は ledger の charge 経路にまだ配線しておらず（Slice 4）、到達した場合も
-/// 安全側で step 上限として扱う。`committed_fuel` は cancel/deadline fallback の
-/// 上限表示に使う。
+/// Slice 1/2 で発生し得るのは fuel（= step）・collection・string・source/import・heap・
+/// I-O（input/output/host call の count/bytes）超過。cancel / deadline は ledger の
+/// charge 経路にまだ配線しておらず（Slice 4）、到達した場合も安全側で step 上限として
+/// 扱う。`committed_fuel` は cancel/deadline fallback の上限表示に使う。
 pub fn control_stop_to_error(
     stop: ControlStop,
     committed_fuel: u64,
@@ -1698,6 +1953,18 @@ pub fn control_stop_to_error(
             BudgetResource::ImportCount => TsumugiError::import_count_limit(line, e.limit),
             BudgetResource::ImportBytes => TsumugiError::import_bytes_limit(line, e.limit),
             BudgetResource::HeapBytes => TsumugiError::heap_limit(line, e.limit),
+            BudgetResource::InputCalls => TsumugiError::input_calls_limit(line, e.limit),
+            BudgetResource::InputBytes => TsumugiError::input_bytes_limit(line, e.limit),
+            BudgetResource::OutputCalls => TsumugiError::output_calls_limit(line, e.limit),
+            BudgetResource::OutputBytes => TsumugiError::output_bytes_limit(line, e.limit),
+            BudgetResource::HostCalls => TsumugiError::host_calls_limit(line, e.limit),
+            BudgetResource::HostRequestBytes => {
+                TsumugiError::host_request_bytes_limit(line, e.limit)
+            }
+            BudgetResource::HostResponseBytes => {
+                TsumugiError::host_response_bytes_limit(line, e.limit)
+            }
+            BudgetResource::HostCallBytes => TsumugiError::host_call_bytes_limit(line, e.limit),
             _ => TsumugiError::step_limit(line, e.limit),
         },
         ControlStop::Cancelled | ControlStop::DeadlineExceeded { .. } => {
@@ -2144,6 +2411,206 @@ mod tests {
             }
             other => panic!("unexpected stop: {other:?}"),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // I-O accounting（input / output / host call、§6, §15.1）
+    // -------------------------------------------------------------------------
+
+    /// I/O 上限を十分に大きく設定した config（他 resource は既定）。
+    fn io_config() -> BudgetConfig {
+        BudgetConfig::for_legacy(1_000_000, 1_000_000)
+    }
+
+    #[test]
+    fn charge_input_co_charges_input_and_host_counters() {
+        let mut l = ledger(io_config());
+        l.charge_input(5, ExecutionPhase::Run).unwrap();
+        let u = l.usage().committed;
+        assert_eq!(u.input_calls, 1);
+        assert_eq!(u.input_bytes, 5);
+        // stdio は host call でもある（§6.1）。request は 0、response = payload。
+        assert_eq!(u.host_calls, 1);
+        assert_eq!(u.host_request_bytes, 0);
+        assert_eq!(u.host_response_bytes, 5);
+        assert_eq!(u.host_call_bytes, 5);
+    }
+
+    #[test]
+    fn charge_output_co_charges_output_and_host_counters() {
+        let mut l = ledger(io_config());
+        l.charge_output(7, ExecutionPhase::Run).unwrap();
+        let u = l.usage().committed;
+        assert_eq!(u.output_calls, 1);
+        assert_eq!(u.output_bytes, 7);
+        // stdio は host call でもある（§6.1）。request = payload、response は 0。
+        assert_eq!(u.host_calls, 1);
+        assert_eq!(u.host_request_bytes, 7);
+        assert_eq!(u.host_response_bytes, 0);
+        assert_eq!(u.host_call_bytes, 7);
+    }
+
+    #[test]
+    fn input_calls_at_limit_succeeds_and_plus_one_exceeds() {
+        let mut config = io_config();
+        config.max_input_calls = 2;
+        let mut l = ledger(config);
+        l.charge_input(0, ExecutionPhase::Run).unwrap();
+        l.charge_input(0, ExecutionPhase::Run).unwrap();
+        let err = l.charge_input(0, ExecutionPhase::Run).unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::InputCalls);
+                assert_eq!(e.limit, 2);
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn input_bytes_limit_is_enforced() {
+        let mut config = io_config();
+        config.max_input_bytes = 4;
+        let mut l = ledger(config);
+        let err = l.charge_input(5, ExecutionPhase::Run).unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::InputBytes);
+                assert_eq!(e.limit, 4);
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn output_bytes_limit_is_enforced() {
+        let mut config = io_config();
+        config.max_output_bytes = 3;
+        let mut l = ledger(config);
+        let err = l.charge_output(4, ExecutionPhase::Run).unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::OutputBytes);
+                assert_eq!(e.limit, 3);
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn output_calls_limit_takes_priority_over_host_calls() {
+        // §7.2: OutputCalls(14) は HostCalls(16) より優先。両方 0 上限で OutputCalls。
+        let mut config = io_config();
+        config.max_output_calls = 0;
+        config.max_host_calls = 0;
+        let mut l = ledger(config);
+        let err = l.charge_output(0, ExecutionPhase::Run).unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::OutputCalls);
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn charge_host_call_request_then_response_counts_one_call() {
+        let mut l = ledger(io_config());
+        // filesystem write（request）→ read result なし の 2 phase を 1 call として数える。
+        l.charge_host_call_request(10, ExecutionPhase::Run).unwrap();
+        l.charge_host_response_bytes(6, ExecutionPhase::Run)
+            .unwrap();
+        let u = l.usage().committed;
+        assert_eq!(u.host_calls, 1, "count は request 側で 1 回だけ");
+        assert_eq!(u.host_request_bytes, 10);
+        assert_eq!(u.host_response_bytes, 6);
+        assert_eq!(u.host_call_bytes, 16);
+    }
+
+    #[test]
+    fn host_calls_limit_is_enforced() {
+        let mut config = io_config();
+        config.max_host_calls = 1;
+        let mut l = ledger(config);
+        l.charge_host_call_request(0, ExecutionPhase::Run).unwrap();
+        let err = l
+            .charge_host_call_request(0, ExecutionPhase::Run)
+            .unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::HostCalls);
+                assert_eq!(e.limit, 1);
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_request_bytes_limit_is_enforced() {
+        let mut config = io_config();
+        config.max_host_request_bytes = 5;
+        let mut l = ledger(config);
+        let err = l
+            .charge_host_call_request(6, ExecutionPhase::Run)
+            .unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::HostRequestBytes);
+                assert_eq!(e.limit, 5);
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_response_bytes_limit_is_enforced() {
+        let mut config = io_config();
+        config.max_host_response_bytes = 5;
+        let mut l = ledger(config);
+        l.charge_host_call_request(0, ExecutionPhase::Run).unwrap();
+        let err = l
+            .charge_host_response_bytes(6, ExecutionPhase::Run)
+            .unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::HostResponseBytes);
+                assert_eq!(e.limit, 5);
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_call_bytes_limit_is_enforced_across_request_and_response() {
+        let mut config = io_config();
+        config.max_host_call_bytes = 8;
+        let mut l = ledger(config);
+        // request 5 は通る（call_bytes 5 <= 8）。
+        l.charge_host_call_request(5, ExecutionPhase::Run).unwrap();
+        // response 4 で call_bytes 5+4=9 > 8。
+        let err = l
+            .charge_host_response_bytes(4, ExecutionPhase::Run)
+            .unwrap_err();
+        match err {
+            ControlStop::BudgetExceeded(e) => {
+                assert_eq!(e.resource, BudgetResource::HostCallBytes);
+                assert_eq!(e.limit, 8);
+            }
+            other => panic!("unexpected stop: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn input_cancel_is_checked_before_charge() {
+        let token = CancellationToken::new();
+        let config = io_config();
+        let mut l = BudgetLedger::new(config, token.clone());
+        token.cancel();
+        let err = l.charge_input(0, ExecutionPhase::Run).unwrap_err();
+        assert!(matches!(err, ControlStop::Cancelled));
+        // cancel で何も課金しない。
+        assert_eq!(l.usage().committed.input_calls, 0);
+        assert_eq!(l.usage().committed.host_calls, 0);
     }
 
     // -------------------------------------------------------------------------

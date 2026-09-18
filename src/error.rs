@@ -87,6 +87,8 @@ pub enum ErrorKind {
     SourceLimit,
     /// heap 予算上限超過（live heap bytes、REV-015 Slice 2）
     HeapLimit,
+    /// I-O 予算上限超過（input/output/host call の count/bytes、REV-015 Slice 2）
+    IoLimit,
     /// 型変換失敗（to_int / to_float）
     Conversion,
     /// 組み込み関数への不正な型の引数
@@ -120,6 +122,7 @@ impl ErrorKind {
             Self::StringLimit => "string_limit",
             Self::SourceLimit => "source_limit",
             Self::HeapLimit => "heap_limit",
+            Self::IoLimit => "io_limit",
             Self::Conversion => "conversion",
             Self::BuiltinType => "builtin_type",
             Self::Iteration => "iteration",
@@ -641,6 +644,96 @@ impl TsumugiError {
             ErrorKind::HeapLimit,
             format!(
                 "ヒープの総バイト数が上限を超えました (上限: {} バイト)",
+                limit
+            ),
+        )
+    }
+
+    /// input 呼び出し回数上限超過（REV-015 Slice 2、cumulative InputCalls）
+    pub fn input_calls_limit(line: usize, limit: u64) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::IoLimit,
+            format!("input の呼び出し回数が上限を超えました (上限: {})", limit),
+        )
+    }
+
+    /// input の総 byte 数上限超過（REV-015 Slice 2、cumulative InputBytes）
+    pub fn input_bytes_limit(line: usize, limit: u64) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::IoLimit,
+            format!(
+                "input の総バイト数が上限を超えました (上限: {} バイト)",
+                limit
+            ),
+        )
+    }
+
+    /// output 呼び出し回数上限超過（REV-015 Slice 2、cumulative OutputCalls）
+    pub fn output_calls_limit(line: usize, limit: u64) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::IoLimit,
+            format!("output の呼び出し回数が上限を超えました (上限: {})", limit),
+        )
+    }
+
+    /// output の総 byte 数上限超過（REV-015 Slice 2、cumulative OutputBytes）
+    pub fn output_bytes_limit(line: usize, limit: u64) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::IoLimit,
+            format!(
+                "output の総バイト数が上限を超えました (上限: {} バイト)",
+                limit
+            ),
+        )
+    }
+
+    /// host call 回数上限超過（REV-015 Slice 2、cumulative HostCalls）
+    pub fn host_calls_limit(line: usize, limit: u64) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::IoLimit,
+            format!(
+                "host call の呼び出し回数が上限を超えました (上限: {})",
+                limit
+            ),
+        )
+    }
+
+    /// host call request の総 byte 数上限超過（REV-015 Slice 2、cumulative HostRequestBytes）
+    pub fn host_request_bytes_limit(line: usize, limit: u64) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::IoLimit,
+            format!(
+                "host call request の総バイト数が上限を超えました (上限: {} バイト)",
+                limit
+            ),
+        )
+    }
+
+    /// host call response の総 byte 数上限超過（REV-015 Slice 2、cumulative HostResponseBytes）
+    pub fn host_response_bytes_limit(line: usize, limit: u64) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::IoLimit,
+            format!(
+                "host call response の総バイト数が上限を超えました (上限: {} バイト)",
+                limit
+            ),
+        )
+    }
+
+    /// host call の総 byte 数上限超過（REV-015 Slice 2、cumulative HostCallBytes）
+    pub fn host_call_bytes_limit(line: usize, limit: u64) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::IoLimit,
+            format!(
+                "host call の総バイト数が上限を超えました (上限: {} バイト)",
                 limit
             ),
         )

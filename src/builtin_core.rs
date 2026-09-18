@@ -861,6 +861,60 @@ pub fn write_stdout_line(text: &str, line: usize) -> Result<(), TsumugiError> {
 // ファイルI/O系（サンドボックスチェック付き）
 // =============================================================================
 
+/// この builtin が host 境界（filesystem 等）を越える host call かどうか（§6.1、
+/// REV-015 Slice 2、I-O accounting）。
+///
+/// stdio（`print` / `input`）は各 engine が固有実装を持ち、`charge_output` /
+/// `charge_input` で別途課金するためここには含めない。本 Slice では読み書きの payload
+/// byte が明確な filesystem read/write builtin を host call として課金対象にする。
+/// path 判定・env・clock 等その他の host 境界 builtin の課金は Phase 2 の capability /
+/// host function 配線で扱う。
+pub fn is_host_call_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "read_lines" | "write_file" | "append_file"
+    )
+}
+
+/// host call の request payload byte 長（host へ渡す内容）。§6.1、REV-015 Slice 2。
+///
+/// write/append は書き込む内容の byte 長、read 系は request payload を持たないため 0。
+/// path 引数の byte は本 Slice では request に含めない（write 内容だけを payload とする）。
+pub fn host_call_request_bytes(name: &str, args: &[Value]) -> u64 {
+    match name {
+        "write_file" | "append_file" => match args.get(1) {
+            Some(Value::Str(s)) => s.len() as u64,
+            Some(other) => other.to_string().len() as u64,
+            None => 0,
+        },
+        _ => 0,
+    }
+}
+
+/// host call の response payload byte 長（host から受け取る内容）。§6.1、REV-015 Slice 2。
+///
+/// read_file は読み込んだ文字列の byte 長、read_lines は各行の byte 長の合計。write /
+/// append は response payload を持たないため 0（返り値の `Bool` は payload ではない）。
+pub fn host_call_response_bytes(name: &str, result: &Value) -> u64 {
+    match name {
+        "read_file" => match result {
+            Value::Str(s) => s.len() as u64,
+            _ => 0,
+        },
+        "read_lines" => match result {
+            Value::List(items) => items
+                .iter()
+                .map(|v| match v {
+                    Value::Str(s) => s.len() as u64,
+                    _ => 0,
+                })
+                .fold(0u64, |acc, n| acc.saturating_add(n)),
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
 pub fn builtin_read_file(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("read_file", args, 1, line)?;
     if let Value::Str(path) = &args[0] {
