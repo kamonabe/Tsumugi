@@ -1281,7 +1281,14 @@ impl Vm {
                 }
                 values.reverse();
                 let output: Vec<String> = values.iter().map(|v| v.to_string()).collect();
-                crate::builtin_core::write_stdout_line(&output.join(" "), line)?;
+                let payload = output.join(" ");
+                // output（stdio host call）を課金する（§6.1、REV-015 Slice 2、I-O accounting）。
+                // tree engine（builtin.rs の print）と同じ論理位置で payload を host へ渡す
+                // 前に課金する。
+                self.budget
+                    .charge_output(payload.len() as u64, ExecutionPhase::Run)
+                    .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
+                crate::builtin_core::write_stdout_line(&payload, line)?;
             }
             OpCode::Pop => {
                 // 単一 pop 時もセルをクリア
@@ -1743,9 +1750,27 @@ impl Vm {
         args: Vec<Value>,
         line: usize,
     ) -> Result<Value, TsumugiError> {
+        // filesystem host call の count + request bytes を、境界へ入る（副作用が始まる）
+        // 前に課金する（§6.1、REV-015 Slice 2、I-O accounting）。tree engine（builtin.rs
+        // の PureCore wrapper）と同じ論理位置・同じ規則で課金する。read 系は request 0 byte。
+        let is_host_call = crate::builtin_core::is_host_call_builtin(name);
+        if is_host_call {
+            let request_bytes = crate::builtin_core::host_call_request_bytes(name, &args);
+            self.budget
+                .charge_host_call_request(request_bytes, ExecutionPhase::Run)
+                .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
+        }
         // まず共通モジュールで処理を試みる
         let max_collection = self.budget.max_collection_elements();
         if let Some(result) = crate::builtin_core::dispatch(name, &args, max_collection, line)? {
+            // filesystem host call の response bytes（読み込み内容）を、結果が確定した後に
+            // 課金する（§6.1）。write 系は response 0 byte。
+            if is_host_call {
+                let response_bytes = crate::builtin_core::host_call_response_bytes(name, &result);
+                self.budget
+                    .charge_host_response_bytes(response_bytes, ExecutionPhase::Run)
+                    .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
+            }
             // builtin が生成した untracked collection を tracked 化しつつ heap 課金し、
             // 新規 String body も課金する（REV-015 案A / Slice 2）。
             let tracked = self
@@ -1760,8 +1785,8 @@ impl Vm {
             "input" => {
                 crate::builtin_core::check_arity(name, &args, 0, line)?;
                 let mut buf = String::new();
-                match std::io::stdin().read_line(&mut buf) {
-                    Ok(0) => Ok(Value::Null),
+                let value = match std::io::stdin().read_line(&mut buf) {
+                    Ok(0) => Value::Null,
                     Ok(_) => {
                         if buf.ends_with('\n') {
                             buf.pop();
@@ -1769,10 +1794,20 @@ impl Vm {
                                 buf.pop();
                             }
                         }
-                        Ok(Value::str_constant(buf))
+                        Value::str_constant(buf)
                     }
-                    Err(_) => Ok(Value::Null),
-                }
+                    Err(_) => Value::Null,
+                };
+                // input（stdio host call）を課金する（§6.1、REV-015 Slice 2）。tree engine
+                // と同じく受け取った payload の byte 長を count と併せて課金する。
+                let payload_bytes = match &value {
+                    Value::Str(s) => s.len() as u64,
+                    _ => 0,
+                };
+                self.budget
+                    .charge_input(payload_bytes, ExecutionPhase::Run)
+                    .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
+                Ok(value)
             }
             "exit" => {
                 if args.len() > 1 {

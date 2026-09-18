@@ -1,12 +1,12 @@
 # Tsumugi 実行予算・協調実行仕様
 
-最終更新: 2026-09-16
+最終更新: 2026-09-18
 
-設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は string / source / import accounting、heap accounting 基盤（`AllocationLedger`・§5.1 論理サイズ）、collection（`List`/`Dict`）の per-drop release（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、tree/VM 両対応）、および String body の per-drop release（PR-b、`Value::Str` を `Rc<Tracked<String>>` 化）、cell と tree/VM 関数 instance の per-drop release（PR-c、`SharedValue` を `Rc<Tracked<RefCell<Value>>>` 化し `Value::Fn`/`VmFn` に header token を持たせる）、および AST / bytecode chunk / imported module record / rollback journal の per-drop 追跡（PR-d、`HeapToken = Tracked<()>` トークンで所有構造側から課金・release。tree は AST、VM は bytecode chunk を課金）、および string リテラル/連結/f-string 経路の課金（生成点で `track_result` を通し cumulative + live heap を課金、tree/VM 両対応）を実装済み。残りは I-O accounting。VM の push/pop の full-clone や f-string リテラル部分の個別課金のため configured 上限で tree と live/peak・cumulative が食い違い得るが、charge trace の tree/VM 完全一致は第14節 Slice 6（VM が experimental の間）で解消する）
+設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は完了（string / source / import accounting、heap accounting 基盤（`AllocationLedger`・§5.1 論理サイズ）、collection（`List`/`Dict`）の per-drop release（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、tree/VM 両対応）、および String body の per-drop release（PR-b、`Value::Str` を `Rc<Tracked<RefCell<Value>>>` 化し `Value::Fn`/`VmFn` に header token を持たせる）、および AST / bytecode chunk / imported module record / rollback journal の per-drop 追跡（PR-d、`HeapToken = Tracked<()>` トークンで所有構造側から課金・release。tree は AST、VM は bytecode chunk を課金）、および string リテラル/連結/f-string 経路の課金（生成点で `track_result` を通し cumulative + live heap を課金、tree/VM 両対応）、および I-O accounting（input / output / host call の count + bytes を reserve/commit/refund で課金。stdio は host call として co-charge。host call 対象は filesystem read/write と stdio に限り、その他 host 境界 builtin は Phase 2）を実装済みで、これで Slice 2 は完了。VM の push/pop の full-clone や f-string リテラル部分の個別課金のため configured 上限で tree と live/peak・cumulative が食い違い得るが、charge trace の tree/VM 完全一致は第14節 Slice 6（VM が experimental の間）で解消する）
 
 ## 1. 位置づけ
 
-本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleStringBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線し、さらに string リテラル・`+` 連結・f-string の生成点でも `track_result` で課金）と source / import accounting サブスライス（per-item `SingleSourceBytes`・cumulative `SourceCount`/`SourceBytes`・`ImportCount`/`ImportBytes` を Link フェーズで root と import へ tree/VM 共通で課金）、heap accounting 基盤サブスライス（`AllocationId`・`AllocationLedger`・§5.1 論理サイズ関数・`HeapBytes` reserve/超過写像）、collection（`List`/`Dict`）の per-drop release サブスライス（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、COW は delta 課金、tree/VM 両対応）、および String body の per-drop release サブスライス（PR-b、`Value::Str` を `Rc<Tracked<String>>` 化し、builtin 結果を dispatch 境界の `track_result` で live heap 課金・最後の参照 drop で release）、cell と tree/VM 関数 instance の per-drop release サブスライス（PR-c、cell 生成点で captured cell を課金し `Value::Fn`/`VmFn` の header token で function instance header を課金、drop で release）、および AST / bytecode chunk / imported module record / rollback journal の per-drop 追跡サブスライス（PR-d、所有構造側が `HeapToken = Tracked<()>` トークンで §5.1 論理サイズを課金し drop で release。§5.3「AST または bytecode」に従い tree は AST・VM は bytecode chunk を課金、import record は両 engine、rollback journal entry は両 engine で entry の固定 overhead を課金）、および string リテラル/連結/f-string 経路の課金サブスライス（生成点で `track_result` を通し cumulative + live heap を課金、tree/VM 両対応）も実装済みである。Slice 2 の残り（I-O accounting）と Slice 3 以降（continuation、cancel/pause、scheduler、VM charge parity）は未実装である。
+本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleStringBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線し、さらに string リテラル・`+` 連結・f-string の生成点でも `track_result` で課金）と source / import accounting サブスライス（per-item `SingleSourceBytes`・cumulative `SourceCount`/`SourceBytes`・`ImportCount`/`ImportBytes` を Link フェーズで root と import へ tree/VM 共通で課金）、heap accounting 基盤サブスライス（`AllocationId`・`AllocationLedger`・§5.1 論理サイズ関数・`HeapBytes` reserve/超過写像）、collection（`List`/`Dict`）の per-drop release サブスライス（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、COW は delta 課金、tree/VM 両対応）、および String body の per-drop release サブスライス（PR-b、`Value::Str` を `Rc<Tracked<String>>` 化し、builtin 結果を dispatch 境界の `track_result` で live heap 課金・最後の参照 drop で release）、cell と tree/VM 関数 instance の per-drop release サブスライス（PR-c、cell 生成点で captured cell を課金し `Value::Fn`/`VmFn` の header token で function instance header を課金、drop で release）、および AST / bytecode chunk / imported module record / rollback journal の per-drop 追跡サブスライス（PR-d、所有構造側が `HeapToken = Tracked<()>` トークンで §5.1 論理サイズを課金し drop で release。§5.3「AST または bytecode」に従い tree は AST・VM は bytecode chunk を課金、import record は両 engine、rollback journal entry は両 engine で entry の固定 overhead を課金）、および string リテラル/連結/f-string 経路の課金サブスライス（生成点で `track_result` を通し cumulative + live heap を課金、tree/VM 両対応）、および I-O accounting サブスライス（input / output / host call の count + bytes を reserve/commit/refund（§7）で課金し、stdio を host call として co-charge。tree/VM の `print` / `input` / filesystem dispatch 境界へ共通配線）も実装済みで、Slice 2 は完了した。Slice 3 以降（continuation、cancel/pause、scheduler、VM charge parity）は未実装である。
 
 本文書は次の既存仕様と一体で実装する。
 
@@ -743,7 +743,35 @@ run-turn queueはEngine全体でFIFO round-robinとし、continuation自体で�
   legacy env `TSUMUGI_MAX_SINGLE_SOURCE_BYTES` / `TSUMUGI_MAX_SOURCE_COUNT` /
   `TSUMUGI_MAX_SOURCE_BYTES` / `TSUMUGI_MAX_IMPORT_COUNT` / `TSUMUGI_MAX_IMPORT_BYTES`
   を追加。既定上限では観測挙動を変えない。
-- input/output/host count+bytesとreserve/commit/refundを実装（未実装）
+- I-O accounting（✅ 実装済み）: input / output / host call の count + bytes を
+  reserve/commit/refund（§7）で課金する。`BudgetLedger::charge_input`（`InputCalls` +1・
+  `InputBytes`）・`charge_output`（`OutputCalls` +1・`OutputBytes`）・`charge_host_call_request`
+  （`HostCalls` +1・`HostRequestBytes`）・`charge_host_response_bytes`（`HostResponseBytes`）
+  を追加した。§6.1 のとおり stdio（`print` / `input`）は host call でもあるため、input /
+  output 固有 counter に加えて `HostCalls` / `HostRequestBytes` / `HostResponseBytes` /
+  `HostCallBytes` へも co-charge する（input は request 0・response = payload、output は
+  request = payload・response 0）。host call は request 側（count 含む）を境界へ入る前に、
+  response 側を結果確定後に課金する 2 phase で、`HostCalls` は request 側で 1 回だけ数える。
+  §7.2 の固定優先順位（`InputCalls` < `InputBytes` < `OutputCalls` < `OutputBytes` <
+  `HostCalls` < `HostRequestBytes` < `HostResponseBytes` < `HostCallBytes`）に従い、cancel を
+  charge 前に確認する。tree（`builtin.rs` の `print` / `input` と PureCore dispatch wrapper）と
+  VM（`vm.rs` の `OpCode::Print`・`input` arm・`exec_builtin` dispatch wrapper）が同じ論理
+  位置で共通に課金する。byte 数は host 境界で実際に受け渡す UTF-8 payload の長さ（`print` は
+  join 後の出力・`input` は受け取った行・`write_file`/`append_file` は書き込み内容・
+  `read_file`/`read_lines` は読み込み内容）で、Rust object の capacity や transport header は
+  含めない（§6.1）。本 Slice の host call 対象は payload byte が明確な filesystem read/write
+  builtin（`read_file`/`read_lines`/`write_file`/`append_file`、`builtin_core::is_host_call_builtin`）
+  と stdio に限る。path 判定・env・clock 等その他の host 境界 builtin の課金は Phase 2 の
+  capability / host function 配線で扱う（本 Slice では未対象）。エラー写像は
+  `control_stop_to_error` に I-O resource の arm を追加し、`error.rs` の
+  `input_calls_limit` / `input_bytes_limit` / `output_calls_limit` / `output_bytes_limit` /
+  `host_calls_limit` / `host_request_bytes_limit` / `host_response_bytes_limit` /
+  `host_call_bytes_limit`（`ErrorKind::IoLimit` = `io_limit`）へ tree/VM 共通で写す。legacy env
+  `TSUMUGI_MAX_INPUT_CALLS` / `TSUMUGI_MAX_INPUT_BYTES` / `TSUMUGI_MAX_OUTPUT_CALLS` /
+  `TSUMUGI_MAX_OUTPUT_BYTES` / `TSUMUGI_MAX_HOST_CALLS` / `TSUMUGI_MAX_HOST_REQUEST_BYTES` /
+  `TSUMUGI_MAX_HOST_RESPONSE_BYTES` / `TSUMUGI_MAX_HOST_CALL_BYTES` を追加。既定上限では観測
+  挙動を変えない。descriptor 上限・stream 途中停止・capability 拒否時の課金差
+  （§6.1 後半・§6.2）は host function / capability 面が入る Phase 2/4 で扱う。
 - heap accounting 基盤（✅ 実装済み）: `AllocationId(u64)` と per-execution
   `AllocationLedger` を `src/budget.rs` に導入した。§5.1 の論理サイズ表を `heap_size`
   純関数群として固定し（Value slot / String body / List・Dict body / tree・VM function

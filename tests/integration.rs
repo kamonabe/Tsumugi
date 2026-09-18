@@ -1837,6 +1837,69 @@ fn source_bytes_cumulative_limit_gates_across_inputs_in_both_engines() {
 }
 
 #[test]
+fn output_calls_limit_gates_print_in_both_engines() {
+    // REV-015 Slice 2 (I-O accounting): print は output host call として課金される。
+    // 各 print が output_calls を 1 消費し、上限 2 を 3 回目の print で超える。
+    let source = "print(1)\nprint(2)\nprint(3)\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_OUTPUT_CALLS", "2")]);
+        let (_stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("output の呼び出し回数が上限を超えました"),
+            "{mode}で output calls 上限が適用されていない: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn output_bytes_limit_gates_print_in_both_engines() {
+    // REV-015 Slice 2 (I-O accounting): print の payload byte が output_bytes へ累積課金
+    // される。"aaaaa"(5)+"bbbbb"(5) の累積 10 が上限 8 を超える。
+    let source = "print(\"aaaaa\")\nprint(\"bbbbb\")\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_OUTPUT_BYTES", "8")]);
+        let (_stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("output の総バイト数が上限を超えました"),
+            "{mode}で output bytes 上限が適用されていない: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn host_calls_limit_gates_filesystem_calls_in_both_engines() {
+    // REV-015 Slice 2 (I-O accounting): filesystem builtin は host call として課金される。
+    // stdio(print/input) は別 counter だが host_calls にも計上されるため、host_calls
+    // 上限 0 では最初の print が host call として拒否される。両 engine で一致する。
+    let source = "print(1)\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_HOST_CALLS", "0")]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("host call の呼び出し回数が上限を超えました"),
+            "{mode}で host calls 上限が適用されていない: {stderr}"
+        );
+        // host call 拒否は output 前に起きるため 1 は出力されない。
+        assert!(
+            !stdout.contains("tsumugi> 1") && !stdout.contains("tsumugi:vm> 1"),
+            "{mode}で拒否された print が出力された: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn index_assign_recovers_and_writes_across_inputs_in_both_engines() {
     // 未定義targetはcompile errorではなくcatch可能なruntime errorとして扱い、
     // 入力をまたいでも同じbindingへ書き込めること。
