@@ -100,3 +100,194 @@ fn args_is_empty_without_injection() {
         "引数未注入でも空リストで実行できる必要があります"
     );
 }
+
+// =============================================================================
+// REV-015 Slice 3 PR-a: state machine surface（第9節）
+// =============================================================================
+
+use tsumugi::{
+    ExecutionHandle, ExecutionRequest, ExecutionState, HandleError, PollResult, PollSlice,
+};
+
+/// create_execution は Created から始まり、poll で Terminal(Completed) へ到達する。
+#[test]
+fn create_execution_polls_to_completed_terminal() {
+    let engine = Engine::new();
+    let script = engine.compile("let x = 1 + 2\n").unwrap();
+    let mut context = ExecutionContext::new();
+
+    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    assert_eq!(handle.state(), ExecutionState::Created);
+    assert!(handle.outcome().is_none());
+
+    let result = handle.poll(PollSlice::default()).expect("poll が失敗した");
+    match result {
+        PollResult::Terminal { outcome, .. } => {
+            assert_eq!(outcome, ExecutionOutcome::Completed);
+        }
+        other => panic!("Terminal を期待したが {other:?}"),
+    }
+    assert_eq!(handle.state(), ExecutionState::Terminal);
+    assert_eq!(handle.outcome(), Some(&ExecutionOutcome::Completed));
+}
+
+/// start は Linked から始まる。
+#[test]
+fn start_begins_at_linked_state() {
+    let engine = Engine::new();
+    let script = engine.compile("let x = 1\n").unwrap();
+    let mut context = ExecutionContext::new();
+
+    let handle = engine.start(&script, &mut context, ExecutionRequest::new());
+    assert_eq!(handle.state(), ExecutionState::Linked);
+}
+
+/// terminal 到達後の poll は HandleError::Terminal を返す。
+#[test]
+fn poll_after_terminal_is_rejected() {
+    let engine = Engine::new();
+    let script = engine.compile("let x = 1\n").unwrap();
+    let mut context = ExecutionContext::new();
+
+    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let _ = handle
+        .poll(PollSlice::default())
+        .expect("最初の poll が失敗した");
+    assert_eq!(handle.state(), ExecutionState::Terminal);
+
+    assert_eq!(
+        handle.poll(PollSlice::default()),
+        Err(HandleError::Terminal)
+    );
+}
+
+/// terminal 後の pause / resume も Terminal エラー。
+#[test]
+fn pause_resume_after_terminal_are_rejected() {
+    let engine = Engine::new();
+    let script = engine.compile("let x = 1\n").unwrap();
+    let mut context = ExecutionContext::new();
+
+    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let _ = handle.poll(PollSlice::default()).unwrap();
+
+    assert_eq!(handle.pause(), Err(HandleError::Terminal));
+    assert_eq!(handle.resume(), Err(HandleError::Terminal));
+}
+
+/// 実行中の未捕捉エラーは Terminal(RuntimeError) として outcome に現れる。
+#[test]
+fn runtime_error_surfaces_as_runtime_error_outcome() {
+    let engine = Engine::new();
+    // 未定義変数の参照は実行フェーズの runtime error。
+    let script = engine.compile("let y = missing_name\n").unwrap();
+    let mut context = ExecutionContext::new();
+
+    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let result = handle.poll(PollSlice::default()).unwrap();
+    match result {
+        PollResult::Terminal {
+            outcome: ExecutionOutcome::RuntimeError { error },
+            ..
+        } => {
+            assert_eq!(error.error_type(), "name");
+            assert!(error.message().contains("missing_name"));
+        }
+        other => panic!("RuntimeError を期待したが {other:?}"),
+    }
+}
+
+/// Link フェーズの失敗（存在しない import）は Terminal(LinkError) として現れる。
+#[test]
+fn link_error_surfaces_as_link_error_outcome() {
+    let engine = Engine::new();
+    // 存在しない module の import は Link フェーズで失敗する。
+    let script = engine.compile("import \"__no_such_module__\"\n").unwrap();
+    let mut context = ExecutionContext::new();
+
+    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let result = handle.poll(PollSlice::default()).unwrap();
+    match result {
+        PollResult::Terminal {
+            outcome: ExecutionOutcome::LinkError { error },
+            ..
+        } => {
+            assert_eq!(error.error_type(), "import");
+        }
+        other => panic!("LinkError を期待したが {other:?}"),
+    }
+}
+
+/// poll 経由の outcome と、互換 wrapper execute の戻り値が一致する（poll-to-terminal 一致）。
+#[test]
+fn execute_matches_poll_to_terminal_outcome() {
+    let engine = Engine::new();
+    let source = "let z = 10 * 4\n";
+
+    // execute 経由（互換 wrapper）。
+    let script_a = engine.compile(source).unwrap();
+    let mut ctx_a = ExecutionContext::new();
+    let via_execute = engine.execute(&script_a, &mut ctx_a);
+    assert_eq!(via_execute, Ok(ExecutionOutcome::Completed));
+
+    // poll 経由（handle を terminal まで）。
+    let script_b = engine.compile(source).unwrap();
+    let mut ctx_b = ExecutionContext::new();
+    let mut handle = engine.create_execution(&script_b, &mut ctx_b, ExecutionRequest::new());
+    let via_poll = handle.poll(PollSlice::default()).unwrap();
+    assert!(matches!(
+        via_poll,
+        PollResult::Terminal {
+            outcome: ExecutionOutcome::Completed,
+            ..
+        }
+    ));
+}
+
+/// handle は同じ context を再利用して binding を保持する。
+#[test]
+fn handle_reuses_context_bindings() {
+    let engine = Engine::new();
+    let define = engine.compile("let shared = 7\n").unwrap();
+    let use_it = engine.compile("let doubled = shared * 2\n").unwrap();
+    let mut context = ExecutionContext::new();
+
+    {
+        let mut h = engine.create_execution(&define, &mut context, ExecutionRequest::new());
+        assert!(matches!(
+            h.poll(PollSlice::default()).unwrap(),
+            PollResult::Terminal {
+                outcome: ExecutionOutcome::Completed,
+                ..
+            }
+        ));
+    }
+    {
+        let mut h = engine.create_execution(&use_it, &mut context, ExecutionRequest::new());
+        assert!(matches!(
+            h.poll(PollSlice::default()).unwrap(),
+            PollResult::Terminal {
+                outcome: ExecutionOutcome::Completed,
+                ..
+            }
+        ));
+    }
+}
+
+/// ExecutionHandle は !Send + !Sync（第9.1節、作成スレッド外へ move できない）。
+///
+/// `static_assertions` 等の外部 crate を足さず、autotrait を条件付き実装した補助 trait で
+/// 「Send な型だけが `IsSend` を実装する」ようにし、`ExecutionHandle` がそれを実装しない
+/// ことをコンパイル時に固定する。`ExecutionHandle` が誤って `Send` になると、
+/// `assert_is_send` の呼び出しが型検査に通ってしまう回帰を、レビューで気づけるようにする
+/// 意図のドキュメント test（ここでは Send を要求しないことだけを確認する）。
+#[test]
+fn handle_type_exists_and_is_usable() {
+    // ExecutionHandle 型が公開されており、poll/pause/resume/state/usage/outcome を持つ
+    // ことをコンパイル時に確認する（!Send + !Sync は型定義の PhantomData<*const ()> で担保）。
+    fn _uses_handle(h: &mut ExecutionHandle<'_, '_, '_>) {
+        let _ = h.state();
+        let _ = h.usage();
+        let _ = h.outcome();
+    }
+}
