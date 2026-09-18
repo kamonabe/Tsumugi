@@ -2,7 +2,7 @@
 
 最終更新: 2026-09-18
 
-設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は完了（string / source / import accounting、heap accounting 基盤（`AllocationLedger`・§5.1 論理サイズ）、collection（`List`/`Dict`）の per-drop release（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、tree/VM 両対応）、および String body の per-drop release（PR-b、`Value::Str` を `Rc<Tracked<RefCell<Value>>>` 化し `Value::Fn`/`VmFn` に header token を持たせる）、および AST / bytecode chunk / imported module record / rollback journal の per-drop 追跡（PR-d、`HeapToken = Tracked<()>` トークンで所有構造側から課金・release。tree は AST、VM は bytecode chunk を課金）、および string リテラル/連結/f-string 経路の課金（生成点で `track_result` を通し cumulative + live heap を課金、tree/VM 両対応）、および I-O accounting（input / output / host call の count + bytes を reserve/commit/refund で課金。stdio は host call として co-charge。host call 対象は filesystem read/write と stdio に限り、その他 host 境界 builtin は Phase 2）を実装済みで、これで Slice 2 は完了。VM の push/pop の full-clone や f-string リテラル部分の個別課金のため configured 上限で tree と live/peak・cumulative が食い違い得るが、charge trace の tree/VM 完全一致は第14節 Slice 6（VM が experimental の間）で解消する）
+設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は完了（string / source / import accounting、heap accounting 基盤（`AllocationLedger`・§5.1 論理サイズ）、collection（`List`/`Dict`）の per-drop release（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、tree/VM 両対応）、および String body の per-drop release（PR-b、`Value::Str` を `Rc<Tracked<RefCell<Value>>>` 化し `Value::Fn`/`VmFn` に header token を持たせる）、および AST / bytecode chunk / imported module record / rollback journal の per-drop 追跡（PR-d、`HeapToken = Tracked<()>` トークンで所有構造側から課金・release。tree は AST、VM は bytecode chunk を課金）、および string リテラル/連結/f-string 経路の課金（生成点で `track_result` を通し cumulative + live heap を課金、tree/VM 両対応）、および I-O accounting（input / output / host call の count + bytes を reserve/commit/refund で課金。stdio は host call として co-charge。host call 対象は filesystem read/write と stdio に限り、その他 host 境界 builtin は Phase 2）を実装済みで、これで Slice 2 は完了。VM の push/pop の full-clone や f-string リテラル部分の個別課金のため configured 上限で tree と live/peak・cumulative が食い違い得るが、charge trace の tree/VM 完全一致は第14節 Slice 6（VM が experimental の間）で解消する。次は Slice 3（explicit continuation）で、blast radius が大きいため PR-a（公開 state-machine surface + poll-to-terminal core）→ PR-b（statement / block / loop の明示 frame）→ PR-c（関数呼び出し・try handler の明示 frame）→ PR-d（slice fuel + yield）へ分割する。詳細は第14節 Slice 3 を参照）
 
 ## 1. 位置づけ
 
@@ -876,6 +876,45 @@ run-turn queueはEngine全体でFIFO round-robinとし、continuation自体で�
 - tree evaluatorの再帰的な実行状態を明示frame/cursorへ変換
 - `ExecutionHandle`と全`ExecutionState`、`poll`、slice fuel、yieldを実装
 - 同期`Engine::execute`はhandleをterminalまでpollする互換wrapperにする
+
+Slice 3 は実行の「形」を変える最初の slice であり blast radius が大きいため、Slice 2 と
+同様に依存の少ない順で 4 つの sub-PR へ分割する。各 PR は独立して緑（`cargo fmt --check`
+/ `cargo clippy --all-targets -- -D warnings` / `cargo test`）にし、前 PR の受入基準を満たして
+から次へ進む。VM の continuation / charge parity は第14節 Slice 6（VM が experimental の間）
+で扱い、Slice 3 は tree evaluator を対象とする。cancel / pause / transaction（AUD-024 の
+journal は既に一部実装済み）と admission / scheduler / host pending は Slice 4/5 の範囲で、
+Slice 3 には含めない。
+
+- **PR-a: 公開 state-machine surface + poll-to-terminal core（⬜ 未実装、最初の一手）** —
+  §9 の公開型（`ExecutionHandle` / `ExecutionState`（`Created` / `Linked` / `Ready` /
+  `Running` / `Yielded(YieldReason)` / `Paused(PausedState)` / `Terminal`）/ `PollSlice` /
+  `PollResult` / `HandleError` / `ExecutionRequest`）と、拡張版 `ExecutionOutcome`（§9 の
+  terminal payload）を `engine.rs` / `lib.rs` へ追加する。`Engine::create_execution`（Created
+  から）/ `Engine::start`（Linked から）と `poll` を実装するが、**この PR の `poll` は初回に
+  既存の再帰 `Evaluator::run` を一気に terminal まで回して `PollResult::Terminal` を返す**
+  （continuation の書き換えはまだ行わない）。同期 `Engine::execute` は handle を terminal まで
+  poll する互換 wrapper にする。§1.1 の統合規則（`ExecutionRequest.budget` は有限
+  `BudgetConfig`、公開 `ExecutionHandle` は `!Send + !Sync`、state は §9 の enum だけ）を満たす。
+  状態遷移（`Created→Linked→Ready→Running→Terminal`）・`HandleError::Terminal` /
+  `InvalidState` の合法/不合法 matrix・terminal 後の再 poll 拒否をテストで固定する。
+  allocation 形状を変えないため scaling / golden スイートに影響しない。後続 PR は、この
+  安定した handle の裏側を差し替える形で進める。
+- **PR-b: statement / block / loop の明示 frame stack（⬜ 未実装）** —
+  `exec_program` / `exec_block` / `exec_stmt` の Rust 再帰を、ヒープ上の frame stack + cursor
+  と driver ループへ置き換える。`EvalResult`（`Return` / `Break` / `Continue`）で Rust
+  スタックを巻き戻していた制御フローを、loop / block frame 上の保留 control-flow 状態へ移す
+  （§9.3）。`eval_expr` は当面再帰のまま（式は浅く bounded）。§5.1 の `continuation_frame`
+  （96 + local slot 32×count）heap 課金をここで配線する。
+- **PR-c: 関数呼び出し・try handler の明示 frame（⬜ 未実装）** —
+  `eval_call` を、Tsumugi の関数呼び出しが Rust 再帰ではなくヒープ call frame を push する形へ
+  変換する（VM の `CallFrame` / `push_call_frame` をミラーし、Slice 6 で収束できるよう設計を
+  揃える）。`try` handler stack も明示化する（VM の `TryHandler` をミラー）。これで深い再帰
+  driver が不要になり、`main.rs` の 8 MiB 実行スレッドも不要化できる（縮小は必須ではない）。
+- **PR-d: slice fuel + yield（⬜ 未実装）** —
+  `budget.remaining_fuel()` の上に slice-fuel accounting 層を足し、driver ループの charge 点で
+  `PollSlice::max_fuel` を確認する。total 残量はあるが slice 残量を超える場合は charge せず
+  `Yielded(SliceFuelExhausted)` を返し、`poll` が保存 frame 状態から再開できるようにする
+  （§4.2）。`ExplicitYield` もここで扱う。`Engine::execute` は引き続き terminal まで poll する。
 
 ### Slice 4: cancellation・pause・transaction
 
