@@ -885,7 +885,7 @@ Slice 3 は実行の「形」を変える最初の slice であり blast radius 
 journal は既に一部実装済み）と admission / scheduler / host pending は Slice 4/5 の範囲で、
 Slice 3 には含めない。
 
-- **PR-a: 公開 state-machine surface + poll-to-terminal core（⬜ 未実装、最初の一手）** —
+- **PR-a: 公開 state-machine surface + poll-to-terminal core（✅ 実装済み、最初の一手）** —
   §9 の公開型（`ExecutionHandle` / `ExecutionState`（`Created` / `Linked` / `Ready` /
   `Running` / `Yielded(YieldReason)` / `Paused(PausedState)` / `Terminal`）/ `PollSlice` /
   `PollResult` / `HandleError` / `ExecutionRequest`）と、拡張版 `ExecutionOutcome`（§9 の
@@ -899,6 +899,27 @@ Slice 3 には含めない。
   `InvalidState` の合法/不合法 matrix・terminal 後の再 poll 拒否をテストで固定する。
   allocation 形状を変えないため scaling / golden スイートに影響しない。後続 PR は、この
   安定した handle の裏側を差し替える形で進める。
+  - 実装（`src/engine.rs` / `src/lib.rs`）: `ExecutionState`（`Created` / `Linked` /
+    `Ready` / `Running` / `Yielded(YieldReason)` / `Paused(PausedState)` / `Terminal`）・
+    `YieldReason`・`PauseReason`・`PausedState`・`ResumeState`・`PollSlice`・`PollResult`・
+    `HandleError`・`ExecutionRequest`・`ExecutionHandle`・拡張 `ExecutionOutcome`
+    （`Completed` / `RuntimeError { error }` / `LinkError { error }`）を追加。`Engine::create_execution`
+    （Created から）/ `Engine::start`（Linked から）/ `ExecutionHandle::poll` を実装し、`poll` は
+    `Created`/`Linked`/`Ready`/`Yielded` から `Running` を経て `run_phased`（Link/Run を区別する
+    `Evaluator` の新 API）を terminal まで回し `PollResult::Terminal { outcome, usage }` を返す。
+    Link 失敗を `LinkError`、実行中失敗（予算 limit 系を含む）を `RuntimeError`、正常完了を
+    `Completed` へ写す。terminal 後の `poll`/`pause`/`resume` は `HandleError::Terminal`。
+    `ExecutionHandle` は `PhantomData<*const ()>` で `!Send + !Sync`。`Engine::execute` /
+    `execute_repl_submission` は handle を terminal まで poll する互換 wrapper で、戻り値契約
+    （`Ok(Completed)` / `Err(TsumugiError)`）を維持する。最終 `BudgetUsage` は `PollResult::Terminal`
+    の `usage` で観測し、outcome には二重に持たせない（§1.1）。
+  - 本 PR で意図的に未実装（型を骨格に留めるか公開しない）: slice fuel での `Yielded`（PR-d）、
+    `pause`/`resume` の実効化（Slice 4。terminal 以外では `InvalidState` を返す骨格）、`Exited`
+    （REV-023）、`Denied`/`HostError`/`BudgetExceeded`/`DeadlineExceeded`/`Cancelled` などの構造化
+    terminal（Slice 4/5・Phase 2。現状予算超過は `RuntimeError` 内）、scheduler / admission /
+    backpressure（Slice 5）、`CapabilitySet` / `ExecutionId` / `LinkOptions`（Phase 2）。
+    `ExecutionRequest` は budget/capability/cancellation を持たない最小骨格で、入口
+    `ExecutionRequest::new()` を維持したまま後続で field を足す。
 - **PR-b: statement / block / loop の明示 frame stack（⬜ 未実装）** —
   `exec_program` / `exec_block` / `exec_stmt` の Rust 再帰を、ヒープ上の frame stack + cursor
   と driver ループへ置き換える。`EvalResult`（`Return` / `Break` / `Continue`）で Rust

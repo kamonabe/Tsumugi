@@ -52,4 +52,8 @@ pub mod vm;
 #[cfg(not(feature = "unstable-bytecode"))]
 pub(crate) mod vm;
 
-pub use engine::{CompiledScript, Engine, ExecutionContext, ExecutionOutcome};
+pub use engine::{
+    CompiledScript, Engine, ExecutionContext, ExecutionHandle, ExecutionOutcome, ExecutionRequest,
+    ExecutionState, HandleError, PauseReason, PausedState, PollResult, PollSlice, ResumeState,
+    YieldReason,
+};

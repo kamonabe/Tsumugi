@@ -19,6 +19,18 @@ enum EvalResult {
     Continue,
 }
 
+/// [`Evaluator::run_phased`] が失敗フェーズを区別するための種別（REV-015 Slice 3 PR-a）。
+///
+/// 埋め込み handle が terminal outcome を `LinkError`（Link 中失敗）と
+/// `RuntimeError`（実行中失敗）へ振り分けるために使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunPhase {
+    /// import 解決・source/import/heap 課金など、最初の文を実行する前のフェーズ。
+    Link,
+    /// スクリプト本体の実行フェーズ。
+    Run,
+}
+
 /// AST を評価して実行する
 pub struct Evaluator {
     pub(crate) env: Env,
@@ -305,6 +317,43 @@ impl Evaluator {
             self.env.commit_submission();
         }
         result
+    }
+
+    /// 現在の予算使用量 snapshot を返す（REV-015 Slice 3 PR-a）。
+    ///
+    /// 埋め込み API の `poll` / terminal outcome が `BudgetUsage` を公開するために使う。
+    pub fn budget_usage(&self) -> crate::budget::BudgetUsage {
+        self.budget.usage()
+    }
+
+    /// [`Self::run`] と同じ実行をしつつ、失敗が Link フェーズか実行フェーズかを返す
+    /// （REV-015 Slice 3 PR-a）。
+    ///
+    /// 埋め込み handle が terminal outcome を `LinkError` と `RuntimeError` に振り分ける
+    /// ために使う。観測挙動は [`Self::run`] と同一で、成功なら `Ok(())`、失敗なら
+    /// 発生フェーズ（`RunPhase::Link` / `RunPhase::Run`）と error を返す。
+    pub fn run_phased(
+        &mut self,
+        program: &Program,
+        root_source_bytes: u64,
+    ) -> Result<(), (RunPhase, TsumugiError)> {
+        let (linked, newly_loaded) = match self.loader.link(program) {
+            Ok(linked) => linked,
+            Err(e) => return Err((RunPhase::Link, e)),
+        };
+        let target = linked.as_ref().unwrap_or(program);
+        if let Err(e) = self.charge_link(root_source_bytes, &newly_loaded, target) {
+            self.loader.forget(&newly_loaded);
+            return Err((RunPhase::Link, e));
+        }
+        match self.exec_program(target) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // 実行が完了しなかった module は解決済みにしない（同じパスを再試行できる）。
+                self.loader.forget(&newly_loaded);
+                Err((RunPhase::Run, e))
+            }
+        }
     }
 
     fn exec_program(&mut self, program: &Program) -> Result<(), TsumugiError> {
