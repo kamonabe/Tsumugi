@@ -72,41 +72,34 @@ impl Evaluator {
                     line,
                 });
 
-                let mut result = Value::Null;
-                for stmt in &def.body {
-                    match self.exec_stmt(stmt) {
-                        Ok(super::EvalResult::Return(v)) => {
-                            result = v;
-                            break;
-                        }
-                        Ok(super::EvalResult::Break) => {
-                            let mut trace = self.call_stack.clone();
-                            trace.reverse();
-                            self.call_stack.pop();
-                            self.env.pop_call_frame(saved_scopes);
-                            return Err(
-                                TsumugiError::break_outside_loop(stmt.line()).with_trace(trace)
-                            );
-                        }
-                        Ok(super::EvalResult::Continue) => {
-                            let mut trace = self.call_stack.clone();
-                            trace.reverse();
-                            self.call_stack.pop();
-                            self.env.pop_call_frame(saved_scopes);
-                            return Err(
-                                TsumugiError::continue_outside_loop(stmt.line()).with_trace(trace)
-                            );
-                        }
-                        Ok(super::EvalResult::Val) => {}
-                        Err(e) => {
-                            let mut trace = self.call_stack.clone();
-                            trace.reverse();
-                            self.call_stack.pop();
-                            self.env.pop_call_frame(saved_scopes);
-                            return Err(e.with_trace(trace));
-                        }
+                // callback 本体も通常の関数呼び出しと同じく明示 frame stack で実行する
+                // （REV-015 Slice 3 PR-b）。ループ外 break/continue はその文の行番号で
+                // エラー化し、call trace を付ける（従来挙動）。
+                let result = match self.drive_body(&def.body) {
+                    Ok(super::EvalResult::Return(v)) => v,
+                    Ok(super::EvalResult::Val) => Value::Null,
+                    Ok(super::EvalResult::Break(err_line)) => {
+                        let mut trace = self.call_stack.clone();
+                        trace.reverse();
+                        self.call_stack.pop();
+                        self.env.pop_call_frame(saved_scopes);
+                        return Err(TsumugiError::break_outside_loop(err_line).with_trace(trace));
                     }
-                }
+                    Ok(super::EvalResult::Continue(err_line)) => {
+                        let mut trace = self.call_stack.clone();
+                        trace.reverse();
+                        self.call_stack.pop();
+                        self.env.pop_call_frame(saved_scopes);
+                        return Err(TsumugiError::continue_outside_loop(err_line).with_trace(trace));
+                    }
+                    Err(e) => {
+                        let mut trace = self.call_stack.clone();
+                        trace.reverse();
+                        self.call_stack.pop();
+                        self.env.pop_call_frame(saved_scopes);
+                        return Err(e.with_trace(trace));
+                    }
+                };
                 self.call_stack.pop();
                 self.env.pop_call_frame(saved_scopes);
                 Ok(result)

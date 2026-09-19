@@ -252,6 +252,21 @@ impl Env {
         self.scopes.pop();
     }
 
+    /// 現在のスコープスタックの深さ（明示 frame stack の scope base 記録用、REV-015 Slice 3 PR-b）。
+    pub fn scope_depth(&self) -> usize {
+        self.scopes.len()
+    }
+
+    /// スコープスタックを指定した深さまで巻き戻す（明示 frame の pop 時に使う）。
+    ///
+    /// `push_scope` を frame 単位で複数回行った場合でも、frame 生成時に記録した
+    /// `scope_depth()` へ一括で戻せる。すでに `len` 以下なら何もしない。
+    pub fn truncate_scopes(&mut self, len: usize) {
+        if self.scopes.len() > len {
+            self.scopes.truncate(len);
+        }
+    }
+
     /// 現在のスコープに変数を定義（新しい SharedValue セルを作成）。
     ///
     /// cell 生成時に §5.1 captured cell（32 byte）を live heap へ課金する（REV-015 PR-c）。
