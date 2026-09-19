@@ -15,8 +15,117 @@ use std::rc::Rc;
 enum EvalResult {
     Val,
     Return(Value),
-    Break,
-    Continue,
+    /// `break`（ループ外で表面化したときのエラー行を保持する）。
+    Break(usize),
+    /// `continue`（同上）。
+    Continue(usize),
+}
+
+/// 明示 frame stack 上で 1 文を実行した結果、driver がどう遷移するか（REV-015 Slice 3 PR-b）。
+///
+/// 従来は `exec_block` / ループ本体が Rust 再帰でブロックへ降り、`EvalResult` を
+/// Rust スタックの巻き戻しで伝播していた。PR-b ではその再帰をヒープ上の frame stack と
+/// cursor + driver ループへ置き換える。`exec_stmt` は 1 文ぶんの「葉」の仕事だけを行い、
+/// 複合文（`if` / `while` / `for` / `try`）に出会ったら子 frame の生成を driver へ指示する。
+enum StmtStep<'p> {
+    /// 通常完了。driver は同じ frame の次の文へ進む。
+    Val,
+    /// `return` / `break` / `continue`。driver は該当境界（call frame / loop）まで
+    /// frame を巻き戻す。
+    Flow(FlowSignal),
+    /// 複合文が子 frame を要求した。driver はこの frame を push してそこから実行を続ける。
+    Enter(Frame<'p>),
+}
+
+/// 明示 frame stack を巻き戻す制御フロー信号（`EvalResult` の非 `Val` 部分に対応）。
+enum FlowSignal {
+    Return(Value),
+    /// `break` とその文の行番号（ループ外エラー表示用）。
+    Break(usize),
+    /// `continue` とその文の行番号。
+    Continue(usize),
+}
+
+/// 明示実行 frame。ヒープ上の frame stack の 1 要素で、Rust 再帰の 1 段に対応する
+/// （REV-015 Slice 3 PR-b、§9.3）。関数呼び出しと式は当面 Rust 再帰のまま（PR-c / 式は浅い）。
+struct Frame<'p> {
+    /// この frame が順に実行する文列（linked program または関数本体から借用）。
+    stmts: &'p [Stmt],
+    /// 次に実行する文の index。
+    cursor: usize,
+    /// frame 種別ごとの状態（loop の反復状態・try handler など）。
+    kind: FrameKind<'p>,
+    /// frame 生成時の `env.scope_depth()`。pop 時にここまでスコープを巻き戻す。
+    scope_base: usize,
+    /// この frame の継続を live heap へ課金したバイト数（§5.1 continuation_frame / HANDLER）。
+    /// pop 時に同量を release する。
+    heap_charge: u64,
+}
+
+impl Frame<'_> {
+    /// この frame が `break` / `continue` を捕捉するループ frame か。
+    fn is_loop(&self) -> bool {
+        matches!(self.kind, FrameKind::While { .. } | FrameKind::For { .. })
+    }
+}
+
+/// `advance_frame` がループ frame の借用を落とした後に実行する動作（driver 内部用）。
+enum LoopAction<'p> {
+    /// `while` frame: 必要なら fuel 課金し、condition 評価で次反復 or 畳む。
+    While {
+        condition: &'p Expr,
+        body: &'p [Stmt],
+        line: usize,
+        charge_step: bool,
+    },
+    /// `for` frame: 必要なら fuel 課金し、次 item があれば本体を積む or 畳む。
+    For {
+        var: &'p str,
+        body: &'p [Stmt],
+        line: usize,
+        charge_step: bool,
+        next_item: Option<Value>,
+    },
+    /// Block / Scoped / Try: 文列を実行し切ったので frame を畳むだけ。
+    PopPlain,
+}
+
+/// [`Frame`] の種別と反復・handler 状態（REV-015 Slice 3 PR-b）。
+enum FrameKind<'p> {
+    /// 独立スコープを持たない素のブロック（program 直下・関数本体・ループ本体の 1 反復）。
+    /// スコープ管理は生成側（loop frame や call）が行う。
+    Block,
+    /// 独立スコープを 1 つ push したブロック（`if` の分岐、`try` 本体、`catch` 本体）。
+    /// pop 時に `scope_base` まで巻き戻す。
+    Scoped,
+    /// `while` ループ。condition を毎回評価し、本体 1 反復を子 Block frame として実行する。
+    /// `pending_step` は「直前の反復本体を実行し終えた（次反復前に fuel 課金が要る）」状態。
+    While {
+        condition: &'p Expr,
+        body: &'p [Stmt],
+        line: usize,
+        pending_step: bool,
+    },
+    /// `for` ループ。開始時に materialize した items を 1 個ずつ束縛して本体を実行する。
+    /// `pending_step` は while と同じく反復完了後の fuel 課金待ちフラグ。
+    For {
+        var: &'p str,
+        body: &'p [Stmt],
+        line: usize,
+        items: Vec<Value>,
+        index: usize,
+        pending_step: bool,
+        /// 反復元コレクション値を保持する。従来の tree 評価器は `for` の対象を局所変数
+        /// `collection` としてループ実行中ずっと生かしていたため、その live heap 課金も
+        /// ループ完了まで維持されていた。frame へ持たせて同じ寿命を保つ（PR-b で挙動不変）。
+        _collection: Value,
+    },
+    /// `try` 本体を実行中。本体で捕捉エラーが出たら `catch` 本体へ切り替える。
+    Try {
+        var: &'p str,
+        catch_body: &'p [Stmt],
+        line: usize,
+    },
 }
 
 /// [`Evaluator::run_phased`] が失敗フェーズを区別するための種別（REV-015 Slice 3 PR-a）。
@@ -358,28 +467,423 @@ impl Evaluator {
 
     fn exec_program(&mut self, program: &Program) -> Result<(), TsumugiError> {
         validate_program_depth(program)?;
-        for stmt in program {
-            match self.exec_stmt(stmt)? {
-                EvalResult::Return(_) => break,
-                EvalResult::Break => {
-                    return Err(TsumugiError::break_outside_loop(stmt.line()));
+        // トップレベルの break/continue は従来どおりその文の行番号でエラー化する
+        // （EvalResult が offending 文の行を保持する）。
+        match self.drive_body(program)? {
+            EvalResult::Return(_) | EvalResult::Val => Ok(()),
+            EvalResult::Break(line) => Err(TsumugiError::break_outside_loop(line)),
+            EvalResult::Continue(line) => Err(TsumugiError::continue_outside_loop(line)),
+        }
+    }
+
+    /// 1 つの文列（program 直下・関数本体・`if`/`try`/ループ本体）を明示 frame stack で
+    /// 実行する driver（REV-015 Slice 3 PR-b）。
+    ///
+    /// Rust 再帰でブロックへ降りていた `exec_block` / `exec_scoped_block` / ループ本体を、
+    /// ヒープ上の frame stack + cursor + driver ループへ置き換える。制御フロー
+    /// （return / break / continue）は Rust スタックの巻き戻しではなく、frame stack を
+    /// 明示的に unwind して処理する（§9.3）。式評価（`eval_expr`）と関数呼び出し
+    /// （`eval_call`）は当面 Rust 再帰のまま（PR-c / 式は bounded）。
+    ///
+    /// 戻り値の `EvalResult` は従来の `exec_block` と同一意味:
+    /// - `Val`: 文列を最後まで実行した
+    /// - `Return(v)`: この文列を含む関数活性が値 `v` で return した
+    /// - `Break` / `Continue`: この文列を囲むループへ抜ける制御フロー
+    ///
+    /// エラーは従来どおり `Err` で伝播する。エラー・return / break / continue の全経路で、
+    /// push 済み frame のスコープ解放と continuation heap の release を行う。
+    fn drive_body(&mut self, root: &'_ [Stmt]) -> Result<EvalResult, TsumugiError> {
+        // frame stack を作り、root 文列を素の Block frame として積む。root は呼び出し側
+        // （exec_program / eval_call / loop 本体）がスコープ・call frame を管理するため、
+        // ここでは新しいスコープを push しない（scope_base は現在の深さ）。
+        let mut frames: Vec<Frame<'_>> = Vec::new();
+        frames.push(Frame {
+            stmts: root,
+            cursor: 0,
+            kind: FrameKind::Block,
+            scope_base: self.env.scope_depth(),
+            heap_charge: 0,
+        });
+
+        loop {
+            // 現在の（最上位）frame を取り出して 1 文進める。
+            let Some(frame) = frames.last_mut() else {
+                // frame が尽きた = root 文列を最後まで実行した。
+                return Ok(EvalResult::Val);
+            };
+
+            // ループ frame は cursor が本体末尾に達したら「1 反復完了」として扱い、
+            // 次反復（condition 再評価 / 次 item）へ進む。advance 中のエラー（condition
+            // 再評価・末尾 count_step・反復スコープ/束縛の課金）も、文実行中のエラーと同じく
+            // 最も近い try/catch へ渡す。従来はループ全体が try 本体で実行されたため、これらの
+            // エラーも catch されていた（tree/VM parity）。
+            if frame.cursor >= frame.stmts.len() {
+                match self.advance_frame(&mut frames) {
+                    Ok(()) => {}
+                    Err(e) => match self.handle_error(&mut frames, e) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            self.unwind_all(&mut frames);
+                            return Err(e);
+                        }
+                    },
                 }
-                EvalResult::Continue => {
-                    return Err(TsumugiError::continue_outside_loop(stmt.line()));
+                continue;
+            }
+
+            // 次の文を実行する。
+            let stmt = &frame.stmts[frame.cursor];
+            frame.cursor += 1;
+            match self.exec_stmt(stmt) {
+                Ok(StmtStep::Val) => {}
+                Ok(StmtStep::Enter(child)) => frames.push(child),
+                Ok(StmtStep::Flow(signal)) => {
+                    if let Some(result) = self.unwind_flow(&mut frames, signal)? {
+                        return Ok(result);
+                    }
                 }
-                EvalResult::Val => {}
+                Err(e) => {
+                    // catch 可能なら最も近い try frame の catch へ切り替える。
+                    match self.handle_error(&mut frames, e) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            self.unwind_all(&mut frames);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 最上位 frame の文列を末尾まで実行し終えたときの遷移（driver 内部用）。
+    ///
+    /// ループ frame なら次反復（`while` は condition 再評価、`for` は次 item）へ進み、
+    /// それ以外の frame（Block / Scoped / Try）は 1 反復ぶんの意味を持たないので pop する。
+    fn advance_frame(&mut self, frames: &mut Vec<Frame<'_>>) -> Result<(), TsumugiError> {
+        // 末尾に到達した最上位 frame の種別に応じて次反復判定を組み立てる。frames の
+        // 借用は begin_*_iteration / pop_frame（どちらも &mut frames を取る）を呼ぶ前に
+        // 必ず落とすため、まず「何をするか」を [`LoopAction`] へ落としてから実行する。
+        let top = frames.last_mut().expect("advance_frame requires a frame");
+        let action = match &mut top.kind {
+            FrameKind::While {
+                condition,
+                body,
+                line,
+                pending_step,
+            } => {
+                let (condition, body, line) = (*condition, *body, *line);
+                let charge_step = *pending_step;
+                *pending_step = false;
+                LoopAction::While {
+                    condition,
+                    body,
+                    line,
+                    charge_step,
+                }
+            }
+            FrameKind::For {
+                var,
+                body,
+                line,
+                items,
+                index,
+                pending_step,
+                ..
+            } => {
+                let (var, body, line) = (*var, *body, *line);
+                let charge_step = *pending_step;
+                *pending_step = false;
+                let next_item = if *index < items.len() {
+                    let item = items[*index].clone();
+                    *index += 1;
+                    Some(item)
+                } else {
+                    None
+                };
+                LoopAction::For {
+                    var,
+                    body,
+                    line,
+                    charge_step,
+                    next_item,
+                }
+            }
+            _ => LoopAction::PopPlain,
+        };
+
+        match action {
+            LoopAction::While {
+                condition,
+                body,
+                line,
+                charge_step,
+            } => {
+                // 直前反復の本体を実行し終えていれば、次反復判定の前に fuel を課金する
+                // （従来 while の末尾 count_step と同じ順序・タイミング）。
+                if charge_step {
+                    self.count_step(line)?;
+                }
+                let cond = self.eval_expr(condition, line)?;
+                if cond.is_truthy() {
+                    // 次反復の本体を積む前に、この While frame の pending_step を立てる。
+                    if let FrameKind::While { pending_step, .. } =
+                        &mut frames.last_mut().expect("while frame present").kind
+                    {
+                        *pending_step = true;
+                    }
+                    self.begin_loop_iteration(frames, body, line)?;
+                } else {
+                    self.pop_frame(frames);
+                }
+            }
+            LoopAction::For {
+                var,
+                body,
+                line,
+                charge_step,
+                next_item,
+            } => {
+                if charge_step {
+                    self.count_step(line)?;
+                }
+                match next_item {
+                    Some(item) => {
+                        if let FrameKind::For { pending_step, .. } =
+                            &mut frames.last_mut().expect("for frame present").kind
+                        {
+                            *pending_step = true;
+                        }
+                        self.begin_for_iteration(frames, var, item, body, line)?;
+                    }
+                    None => self.pop_frame(frames),
+                }
+            }
+            LoopAction::PopPlain => {
+                // Block / Scoped / Try: 文列を実行し切ったので frame を畳む。
+                self.pop_frame(frames);
             }
         }
         Ok(())
     }
 
-    /// 文を実行
-    fn exec_stmt(&mut self, stmt: &Stmt) -> Result<EvalResult, TsumugiError> {
+    /// 制御フロー信号（return / break / continue）で frame stack を巻き戻す（driver 内部用）。
+    ///
+    /// - `Return(v)`: この文列を含む関数活性の境界（= root frame）まで全 frame を畳み、
+    ///   `Some(EvalResult::Return(v))` を返す。呼び出し側（exec_program / eval_call）が
+    ///   関数の戻り値へ写す。
+    /// - `Break` / `Continue`: 最も近いループ frame まで畳む。ループ frame が無ければ
+    ///   `Some(EvalResult::Break/Continue)` を返し、囲む文列（exec_program / eval_call）が
+    ///   `break/continue outside loop` エラーへ写す。ループ frame が有れば、`Break` は
+    ///   その frame を畳んで反復を終え、`Continue` は本体を残り分スキップして次反復の判定へ
+    ///   進める。
+    fn unwind_flow(
+        &mut self,
+        frames: &mut Vec<Frame<'_>>,
+        signal: FlowSignal,
+    ) -> Result<Option<EvalResult>, TsumugiError> {
+        match signal {
+            FlowSignal::Return(v) => {
+                // root frame（呼び出し側が管理）だけ残して全て畳む。
+                while frames.len() > 1 {
+                    self.pop_frame(frames);
+                }
+                // root frame も畳む（このあと drive_body は Return を返す）。
+                self.unwind_all(frames);
+                Ok(Some(EvalResult::Return(v)))
+            }
+            FlowSignal::Break(line) => {
+                loop {
+                    match frames.last().map(|f| f.is_loop()) {
+                        Some(true) => {
+                            // ループ frame を畳んで反復を終える。本体 Block frame は既に
+                            // pop 済みで、次に来るのがループ controller frame。break は
+                            // controller ごと畳んでループを終える。
+                            self.pop_frame(frames);
+                            return Ok(None);
+                        }
+                        Some(false) => {
+                            self.pop_frame(frames);
+                        }
+                        None => return Ok(Some(EvalResult::Break(line))),
+                    }
+                }
+            }
+            FlowSignal::Continue(line) => {
+                loop {
+                    match frames.last().map(|f| f.is_loop()) {
+                        Some(true) => {
+                            // controller frame はそのまま残す。本体 Block frame は
+                            // 下の `Some(false)` 分岐で既に畳んだので、controller が次に
+                            // advance_frame へ入り、fuel 課金 + 次反復開始をする。
+                            return Ok(None);
+                        }
+                        Some(false) => {
+                            self.pop_frame(frames);
+                        }
+                        None => return Ok(Some(EvalResult::Continue(line))),
+                    }
+                }
+            }
+        }
+    }
+
+    /// 実行中エラーを最も近い `try` frame の `catch` へ渡す（driver 内部用）。
+    ///
+    /// try frame より内側の frame を畳んでスコープと continuation heap を解放し、
+    /// try 本体スコープも解放してから catch 本体スコープを push し、error 値を束縛して
+    /// catch 本体を実行する Scoped frame へ差し替える。try frame が無ければ `Err(e)` を
+    /// そのまま返し、呼び出し側で unwind する。従来の `TryCatch` と同じく、fuel/collection/
+    /// heap など全種の `Err` を捕捉する（現行挙動を保つ）。
+    fn handle_error(
+        &mut self,
+        frames: &mut Vec<Frame<'_>>,
+        error: TsumugiError,
+    ) -> Result<(), TsumugiError> {
+        // 最も近い try frame を探す。
+        while let Some(top) = frames.last() {
+            if let FrameKind::Try { .. } = top.kind {
+                break;
+            }
+            self.pop_frame(frames);
+        }
+        let Some(top) = frames.last_mut() else {
+            // try frame が無い: エラーを伝播する。
+            return Err(error);
+        };
+        let FrameKind::Try {
+            var,
+            catch_body,
+            line,
+        } = top.kind
+        else {
+            unreachable!("loop above stops only at a Try frame");
+        };
+
+        // try 本体で push したスコープと continuation heap を解放し、catch 用へ差し替える。
+        self.env.truncate_scopes(top.scope_base);
+        self.budget.release_heap(top.heap_charge);
+
+        let err_line = error.line();
+        let error_value = Value::Error {
+            error_type: error.error_type().to_string(),
+            message: error.message().to_string(),
+            line: err_line,
+        };
+
+        // try 本体ぶんの continuation heap は上で release 済みなので、frame の記録も 0 にする。
+        // これをしないと、この後の charge 失敗や catch 本体の pop で二重 release になる。
+        top.heap_charge = 0;
+
+        // catch 本体は独立スコープ。従来の TryCatch と同じ順序で scope を push し、
+        // continuation heap を課金してから error 値を束縛する。
+        self.env.push_scope();
+        let charge = crate::budget::heap_size::continuation_frame(1);
+        if let Err(stop) = self.budget.charge_heap(charge, ExecutionPhase::Run) {
+            self.env.truncate_scopes(top.scope_base);
+            return Err(self.control_stop_to_error(stop, err_line));
+        }
+        if let Err(e) = self.env_set(var, error_value, err_line) {
+            self.env.truncate_scopes(top.scope_base);
+            self.budget.release_heap(charge);
+            return Err(e);
+        }
+        // Try frame を catch 本体を実行する Scoped frame へ差し替える。
+        top.stmts = catch_body;
+        top.cursor = 0;
+        top.kind = FrameKind::Scoped;
+        top.heap_charge = charge;
+        // scope_base は try frame 生成時と同じ（catch も同じ base へ戻す）。
+        let _ = line;
+        Ok(())
+    }
+
+    /// ループ本体 1 反復ぶんの Block frame を積む（`while` 用、driver 内部用）。
+    ///
+    /// 従来の `while` は反復ごとに `push_scope` / `exec_block` / `pop_scope` していた。
+    /// ここではスコープを push し continuation heap を課金してから本体 Block frame を積む。
+    fn begin_loop_iteration<'p>(
+        &mut self,
+        frames: &mut Vec<Frame<'p>>,
+        body: &'p [Stmt],
+        line: usize,
+    ) -> Result<(), TsumugiError> {
+        let scope_base = self.env.scope_depth();
+        self.env.push_scope();
+        let charge = crate::budget::heap_size::continuation_frame(0);
+        if let Err(stop) = self.budget.charge_heap(charge, ExecutionPhase::Run) {
+            self.env.truncate_scopes(scope_base);
+            return Err(self.control_stop_to_error(stop, line));
+        }
+        frames.push(Frame {
+            stmts: body,
+            cursor: 0,
+            kind: FrameKind::Block,
+            scope_base,
+            heap_charge: charge,
+        });
+        Ok(())
+    }
+
+    /// `for` ループ本体 1 反復ぶんのスコープを作り、ループ変数を束縛して Block frame を積む。
+    fn begin_for_iteration<'p>(
+        &mut self,
+        frames: &mut Vec<Frame<'p>>,
+        var: &'p str,
+        item: Value,
+        body: &'p [Stmt],
+        line: usize,
+    ) -> Result<(), TsumugiError> {
+        let scope_base = self.env.scope_depth();
+        self.env.push_scope();
+        let charge = crate::budget::heap_size::continuation_frame(1);
+        if let Err(stop) = self.budget.charge_heap(charge, ExecutionPhase::Run) {
+            self.env.truncate_scopes(scope_base);
+            return Err(self.control_stop_to_error(stop, line));
+        }
+        // cell 課金の超過でも iteration scope / continuation heap を必ず解放する。
+        if let Err(e) = self.env_set(var, item, line) {
+            self.budget.release_heap(charge);
+            self.env.truncate_scopes(scope_base);
+            return Err(e);
+        }
+        frames.push(Frame {
+            stmts: body,
+            cursor: 0,
+            kind: FrameKind::Block,
+            scope_base,
+            heap_charge: charge,
+        });
+        Ok(())
+    }
+
+    /// 最上位 frame を 1 つ畳み、スコープと continuation heap を解放する（driver 内部用）。
+    fn pop_frame(&mut self, frames: &mut Vec<Frame<'_>>) {
+        if let Some(frame) = frames.pop() {
+            self.env.truncate_scopes(frame.scope_base);
+            self.budget.release_heap(frame.heap_charge);
+        }
+    }
+
+    /// 残る全 frame を畳んでスコープと continuation heap を解放する（エラー / return 時）。
+    fn unwind_all(&mut self, frames: &mut Vec<Frame<'_>>) {
+        while !frames.is_empty() {
+            self.pop_frame(frames);
+        }
+    }
+
+    /// 1 文の「葉」を実行する（REV-015 Slice 3 PR-b で戻り値を [`StmtStep`] 化）。
+    ///
+    /// 単純文はここで完結して `StmtStep::Val` を返す。`return` / `break` / `continue` は
+    /// `StmtStep::Flow` を返し、driver が frame stack を巻き戻す。複合文（`if` / `while` /
+    /// `for` / `try`）は子 frame を組み立てて `StmtStep::Enter` を返し、driver がそれを
+    /// push する。これによりブロック・ループの Rust 再帰がヒープ frame stack へ移る。
+    fn exec_stmt<'p>(&mut self, stmt: &'p Stmt) -> Result<StmtStep<'p>, TsumugiError> {
         match stmt {
             Stmt::Let { name, value, line } => {
                 let val = self.eval_expr(value, *line)?;
                 self.env_set(name, val, *line)?;
-                Ok(EvalResult::Val)
+                Ok(StmtStep::Val)
             }
 
             Stmt::Assign { name, value, line } => {
@@ -393,7 +897,7 @@ impl Evaluator {
                         return Err(self.control_stop_to_error(stop, *line));
                     }
                 }
-                Ok(EvalResult::Val)
+                Ok(StmtStep::Val)
             }
 
             Stmt::IndexAssign {
@@ -427,12 +931,12 @@ impl Evaluator {
                     *line,
                 )?;
 
-                Ok(EvalResult::Val)
+                Ok(StmtStep::Val)
             }
 
             Stmt::Return { value, line } => {
                 let val = self.eval_expr(value, *line)?;
-                Ok(EvalResult::Return(val))
+                Ok(StmtStep::Flow(FlowSignal::Return(val)))
             }
 
             Stmt::If {
@@ -447,7 +951,8 @@ impl Evaluator {
                 } else {
                     else_body
                 };
-                self.exec_scoped_block(body)
+                // 従来の exec_scoped_block を独立スコープ frame として driver へ渡す。
+                Ok(StmtStep::Enter(self.enter_scoped_block(body, *line)?))
             }
 
             Stmt::While {
@@ -455,24 +960,13 @@ impl Evaluator {
                 body,
                 line,
             } => {
-                loop {
-                    let cond = self.eval_expr(condition, *line)?;
-                    if !cond.is_truthy() {
-                        break;
-                    }
-                    self.env.push_scope();
-                    let body_result = self.exec_block(body);
-                    // body内のruntime errorも含め、全ての経路で反復scopeを解放してから
-                    // 制御フローまたはエラーを伝播する。
-                    self.env.pop_scope();
-                    match body_result? {
-                        EvalResult::Return(v) => return Ok(EvalResult::Return(v)),
-                        EvalResult::Break => break,
-                        EvalResult::Continue | EvalResult::Val => {}
-                    }
-                    self.count_step(*line)?;
+                // condition を初回評価し、真なら本体 1 反復ぶんの frame を積んで While frame と
+                // 一緒に driver へ渡す。偽なら frame を積まず即完了する。
+                let cond = self.eval_expr(condition, *line)?;
+                if !cond.is_truthy() {
+                    return Ok(StmtStep::Val);
                 }
-                Ok(EvalResult::Val)
+                Ok(StmtStep::Enter(self.enter_while(condition, body, *line)?))
             }
 
             Stmt::For {
@@ -504,26 +998,12 @@ impl Evaluator {
                         return Err(TsumugiError::not_iterable(*line, &collection));
                     }
                 };
-
-                for item in items {
-                    self.env.push_scope();
-                    // cell 課金の超過でも iteration scope を必ず解放する（pop 後に ? する）。
-                    if let Err(e) = self.env_set(var, item, *line) {
-                        self.env.pop_scope();
-                        return Err(e);
-                    }
-                    let body_result = self.exec_block(body);
-                    // whileと同様に、エラー・return・break・continueの全経路で
-                    // iteration scopeを先に解放する。
-                    self.env.pop_scope();
-                    match body_result? {
-                        EvalResult::Return(v) => return Ok(EvalResult::Return(v)),
-                        EvalResult::Break => break,
-                        EvalResult::Continue | EvalResult::Val => {}
-                    }
-                    self.count_step(*line)?;
+                if items.is_empty() {
+                    return Ok(StmtStep::Val);
                 }
-                Ok(EvalResult::Val)
+                Ok(StmtStep::Enter(
+                    self.enter_for(var, items, collection, body, *line)?,
+                ))
             }
 
             Stmt::FnDef {
@@ -557,12 +1037,12 @@ impl Evaluator {
                     },
                     *line,
                 )?;
-                Ok(EvalResult::Val)
+                Ok(StmtStep::Val)
             }
 
-            Stmt::Break { .. } => Ok(EvalResult::Break),
+            Stmt::Break { line } => Ok(StmtStep::Flow(FlowSignal::Break(*line))),
 
-            Stmt::Continue { .. } => Ok(EvalResult::Continue),
+            Stmt::Continue { line } => Ok(StmtStep::Flow(FlowSignal::Continue(*line))),
 
             // import はリンク時に解決済みなので、ここへは到達しない
             Stmt::Import { line, .. } => Err(TsumugiError::internal(
@@ -574,57 +1054,124 @@ impl Evaluator {
                 try_body,
                 var,
                 catch_body,
-                line: _,
+                line,
             } => {
-                // tryとcatchは別scope。outerへの代入は保持し、block localだけを破棄する。
-                match self.exec_scoped_block(try_body) {
-                    Ok(result) => Ok(result),
-                    Err(e) => {
-                        let err_line = e.line();
-                        let error_value = Value::Error {
-                            error_type: e.error_type().to_string(),
-                            message: e.message().to_string(),
-                            line: err_line,
-                        };
-
-                        self.env.push_scope();
-                        // cell 課金の超過でも catch scope を必ず解放する。
-                        if let Err(charge_err) = self.env_set(var, error_value, err_line) {
-                            self.env.pop_scope();
-                            return Err(charge_err);
-                        }
-                        let catch_result = self.exec_block(catch_body);
-                        // error・return・break・continueの全経路でcatch scopeを先に解放する。
-                        self.env.pop_scope();
-                        catch_result
-                    }
-                }
+                // try と catch は別 scope。try 本体を実行する Try frame を積む。本体で
+                // 捕捉エラーが出たら driver の handle_error が catch 本体へ切り替える。
+                Ok(StmtStep::Enter(
+                    self.enter_try(try_body, var, catch_body, *line)?,
+                ))
             }
 
             Stmt::ExprStmt { expr, line } => {
                 self.eval_expr(expr, *line)?;
-                Ok(EvalResult::Val)
+                Ok(StmtStep::Val)
             }
         }
     }
 
-    /// ブロック（文のリスト）を実行する。
-    fn exec_block(&mut self, stmts: &[Stmt]) -> Result<EvalResult, TsumugiError> {
-        for s in stmts {
-            match self.exec_stmt(s)? {
-                EvalResult::Val => {}
-                other => return Ok(other),
-            }
-        }
-        Ok(EvalResult::Val)
-    }
-
-    /// 独立scopeでブロックを実行し、全ての終了経路でscopeを解放する。
-    fn exec_scoped_block(&mut self, stmts: &[Stmt]) -> Result<EvalResult, TsumugiError> {
+    /// 独立スコープブロック（`if` 分岐・`try`/`catch` 本体）の frame を組み立てる。
+    /// スコープを push し §5.1 continuation_frame を課金する（REV-015 Slice 3 PR-b）。
+    fn enter_scoped_block<'p>(
+        &mut self,
+        stmts: &'p [Stmt],
+        line: usize,
+    ) -> Result<Frame<'p>, TsumugiError> {
+        let scope_base = self.env.scope_depth();
         self.env.push_scope();
-        let result = self.exec_block(stmts);
-        self.env.pop_scope();
-        result
+        let charge = crate::budget::heap_size::continuation_frame(0);
+        if let Err(stop) = self.budget.charge_heap(charge, ExecutionPhase::Run) {
+            self.env.truncate_scopes(scope_base);
+            return Err(self.control_stop_to_error(stop, line));
+        }
+        Ok(Frame {
+            stmts,
+            cursor: 0,
+            kind: FrameKind::Scoped,
+            scope_base,
+            heap_charge: charge,
+        })
+    }
+
+    /// `while` の本体 1 反復ぶんのスコープを作り、本体 Block frame と While frame を
+    /// まとめて返す（driver は返された frame を push し、以降 advance_frame が反復を回す）。
+    fn enter_while<'p>(
+        &mut self,
+        condition: &'p Expr,
+        body: &'p [Stmt],
+        line: usize,
+    ) -> Result<Frame<'p>, TsumugiError> {
+        // While frame（反復制御）自身はスコープ・heap を持たない空 stmts の controller。
+        // driver が push した直後に cursor==0>=len==0 で advance_frame へ入り、そこで
+        // condition を評価して反復本体（begin_loop_iteration）を積む。反復ごとのスコープ・
+        // continuation heap は本体 Block frame 側が持つ。
+        Ok(Frame {
+            stmts: &[],
+            cursor: 0,
+            kind: FrameKind::While {
+                condition,
+                body,
+                line,
+                pending_step: false,
+            },
+            scope_base: self.env.scope_depth(),
+            heap_charge: 0,
+        })
+    }
+
+    /// `for` の反復制御 frame を返す（items は materialize 済み）。
+    fn enter_for<'p>(
+        &mut self,
+        var: &'p str,
+        items: Vec<Value>,
+        collection: Value,
+        body: &'p [Stmt],
+        line: usize,
+    ) -> Result<Frame<'p>, TsumugiError> {
+        Ok(Frame {
+            stmts: &[],
+            cursor: 0,
+            kind: FrameKind::For {
+                var,
+                body,
+                line,
+                items,
+                index: 0,
+                pending_step: false,
+                _collection: collection,
+            },
+            scope_base: self.env.scope_depth(),
+            heap_charge: 0,
+        })
+    }
+
+    /// `try` 本体を実行する Try frame を組み立てる。スコープを push し continuation_frame を
+    /// 課金する（catch 側は handle_error が別スコープで用意する）。
+    fn enter_try<'p>(
+        &mut self,
+        try_body: &'p [Stmt],
+        var: &'p str,
+        catch_body: &'p [Stmt],
+        line: usize,
+    ) -> Result<Frame<'p>, TsumugiError> {
+        let scope_base = self.env.scope_depth();
+        self.env.push_scope();
+        let charge = crate::budget::heap_size::continuation_frame(0);
+        if let Err(stop) = self.budget.charge_heap(charge, ExecutionPhase::Run) {
+            self.env.truncate_scopes(scope_base);
+            return Err(self.control_stop_to_error(stop, line));
+        }
+        Ok(Frame {
+            stmts: try_body,
+            cursor: 0,
+            kind: FrameKind::Try {
+                var,
+                catch_body,
+                line,
+            },
+            scope_base,
+            heap_charge: charge,
+        })
     }
 
     /// 式を評価して値を返す（line は文の行番号をエラー表示に使う）
@@ -1050,34 +1597,34 @@ impl Evaluator {
             line,
         });
 
-        // 関数本体を実行
-        let mut result = Value::Null;
-        for stmt in &def.body {
-            match self.exec_stmt(stmt) {
-                Ok(EvalResult::Return(v)) => {
-                    result = v;
-                    break;
-                }
-                Ok(EvalResult::Break) => {
-                    self.call_stack.pop();
-                    self.env.pop_call_frame(saved_scopes);
-                    return Err(TsumugiError::break_outside_loop(line));
-                }
-                Ok(EvalResult::Continue) => {
-                    self.call_stack.pop();
-                    self.env.pop_call_frame(saved_scopes);
-                    return Err(TsumugiError::continue_outside_loop(line));
-                }
-                Ok(EvalResult::Val) => {}
-                Err(e) => {
-                    let mut trace = self.call_stack.clone();
-                    trace.reverse();
-                    self.call_stack.pop();
-                    self.env.pop_call_frame(saved_scopes);
-                    return Err(e.with_trace(trace));
-                }
+        // 関数本体を明示 frame stack で実行する（REV-015 Slice 3 PR-b）。関数呼び出し自体は
+        // 当面 Rust 再帰のまま（PR-c で明示 call frame 化する）だが、本体内のブロック・ループ
+        // 制御は drive_body へ委譲し、EvalResult の巻き戻しを frame stack 上で処理する。
+        let result = match self.drive_body(&def.body) {
+            Ok(EvalResult::Return(v)) => v,
+            Ok(EvalResult::Val) => Value::Null,
+            // ループ外 break/continue は offending 文の行番号でエラー化する。これは VM
+            // （compile 時に break/continue 文の行で検出）と一致する。従来の tree は
+            // 呼び出し位置の行を使い VM と食い違っていたが、frame stack 化に伴い両 engine を
+            // 文の行へ揃える（tree/VM parity の改善。roadmap の差異縮小方針に沿う）。
+            Ok(EvalResult::Break(err_line)) => {
+                self.call_stack.pop();
+                self.env.pop_call_frame(saved_scopes);
+                return Err(TsumugiError::break_outside_loop(err_line));
             }
-        }
+            Ok(EvalResult::Continue(err_line)) => {
+                self.call_stack.pop();
+                self.env.pop_call_frame(saved_scopes);
+                return Err(TsumugiError::continue_outside_loop(err_line));
+            }
+            Err(e) => {
+                let mut trace = self.call_stack.clone();
+                trace.reverse();
+                self.call_stack.pop();
+                self.env.pop_call_frame(saved_scopes);
+                return Err(e.with_trace(trace));
+            }
+        };
 
         self.call_stack.pop();
         self.env.pop_call_frame(saved_scopes);

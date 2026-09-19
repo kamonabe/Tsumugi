@@ -53,4 +53,15 @@ catch e
     print("7: " + e)
 end
 
-print("8: プログラム正常終了")
+# ループの反復進行中（2 回目の while 条件評価）で起きるエラーも catch できる
+# （Slice 3 PR-b: 明示 frame stack でも advance 経路のエラーが try へ届く）
+let n = 2
+try
+    while (10 / (n - 1)) > 0
+        n = n - 1
+    end
+catch e
+    print("8: " + e)
+end
+
+print("9: プログラム正常終了")
