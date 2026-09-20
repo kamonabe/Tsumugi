@@ -333,10 +333,10 @@ impl Parser {
 
         let then_body = self.parse_block(&[Token::Else, Token::Elif, Token::End])?;
 
-        let else_body = if self.peek_token() == Token::Elif {
+        let else_body: crate::ast::Block = if self.peek_token() == Token::Elif {
             // elif を再帰的に if 文としてパース（end は最後の1つだけ必要）
             let elif_stmt = self.with_parse_depth(false, |parser| parser.parse_if())?; // elif を if として再帰パース
-            vec![elif_stmt]
+            std::rc::Rc::from(vec![elif_stmt])
         } else if self.peek_token() == Token::Else {
             self.advance(); // consume 'else'
             self.expect_newline()?;
@@ -351,7 +351,7 @@ impl Parser {
                 line,
             });
         } else {
-            Vec::new()
+            std::rc::Rc::from(Vec::new())
         };
 
         if else_body.is_empty() {
@@ -577,7 +577,7 @@ impl Parser {
     }
 
     /// ブロック: 終端トークンのいずれかに到達するまで文をパース
-    fn parse_block(&mut self, terminators: &[Token]) -> Result<Vec<Stmt>, TsumugiError> {
+    fn parse_block(&mut self, terminators: &[Token]) -> Result<crate::ast::Block, TsumugiError> {
         let mut stmts = Vec::new();
 
         while !self.is_at_end() && !terminators.contains(&self.peek_token()) {
@@ -602,7 +602,7 @@ impl Parser {
             self.skip_newlines();
         }
 
-        Ok(stmts)
+        Ok(stmts.into())
     }
 
     // --- 式のパース（優先順位付き再帰下降） ---
@@ -1011,7 +1011,7 @@ impl Parser {
             self.check_expr_depth(
                 Expr::Lambda {
                     params,
-                    body: vec![Stmt::Return { value: expr, line }],
+                    body: std::rc::Rc::from(vec![Stmt::Return { value: expr, line }]),
                 },
                 lambda_line,
             )

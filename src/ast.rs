@@ -3,6 +3,16 @@
 /// プログラム全体 = 文のリスト
 pub type Program = Vec<Stmt>;
 
+/// ブロック本体（文列）。`Rc<[Stmt]>` で共有する（REV-015 Slice 3 PR-d）。
+///
+/// PR-d 以前は各ブロック本体を `Vec<Stmt>` で所有していたが、実行を suspend/resume できる
+/// 永続 continuation では、frame が自分の実行する文列を「所有」して AST の寿命を保つ必要が
+/// ある（呼び出し側の借用 `'p` に依存できない）。関数本体（`FnDef.body`）が既に `Rc<FnDef>`
+/// 経由で共有されているのと同様に、全ブロック本体を `Rc<[Stmt]>` にして cheap に共有・保持
+/// できるようにする。`Deref` で `&[Stmt]` として読めるため、`.iter()` / `.len()` / index など
+/// の読み取り側は不変。定義時の clone は Rc の参照カウント bump のみで、本体 AST は複製しない。
+pub type Block = std::rc::Rc<[Stmt]>;
+
 /// 文（Statement）
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
@@ -37,15 +47,15 @@ pub enum Stmt {
     /// if cond ... else ... end
     If {
         condition: Expr,
-        then_body: Vec<Stmt>,
-        else_body: Vec<Stmt>,
+        then_body: Block,
+        else_body: Block,
         line: usize,
     },
 
     /// while cond ... end
     While {
         condition: Expr,
-        body: Vec<Stmt>,
+        body: Block,
         line: usize,
     },
 
@@ -53,7 +63,7 @@ pub enum Stmt {
     For {
         var: String,
         iter: Expr,
-        body: Vec<Stmt>,
+        body: Block,
         line: usize,
     },
 
@@ -61,7 +71,7 @@ pub enum Stmt {
     FnDef {
         name: String,
         params: Vec<String>,
-        body: Vec<Stmt>,
+        body: Block,
         line: usize,
     },
 
@@ -76,9 +86,9 @@ pub enum Stmt {
 
     /// try ... catch var ... end
     TryCatch {
-        try_body: Vec<Stmt>,
+        try_body: Block,
         var: String,
-        catch_body: Vec<Stmt>,
+        catch_body: Block,
         line: usize,
     },
 
@@ -150,10 +160,7 @@ pub enum Expr {
     Call { callee: Box<Expr>, args: Vec<Expr> },
 
     /// 無名関数（ラムダ）: fn(params) body end
-    Lambda {
-        params: Vec<String>,
-        body: Vec<Stmt>,
-    },
+    Lambda { params: Vec<String>, body: Block },
 
     /// インデックスアクセス: expr[expr]
     Index { object: Box<Expr>, index: Box<Expr> },

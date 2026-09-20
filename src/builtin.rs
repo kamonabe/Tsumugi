@@ -75,7 +75,7 @@ impl Evaluator {
                 // callback 本体も通常の関数呼び出しと同じく明示 Call frame として driver で
                 // 実行する（REV-015 Slice 3 PR-c）。スコープ退避（`saved_scopes`）と call trace
                 // の巻き戻しは全終了経路で Call frame の pop_frame が行い、エラー時のトレース
-                // 付加は driver の unwind_all_with_trace が担うため、ここでは終了後に env /
+                // 付加は driver の attach_trace が担うため、ここでは終了後に env /
                 // trace を触らない。ループ外 break/continue はその文の行番号でエラー化する。
                 match self.drive_call_body(def, saved_scopes) {
                     Ok(super::EvalResult::Return(v)) => Ok(v),

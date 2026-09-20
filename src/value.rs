@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::rc::Rc;
 
-use crate::ast::Stmt;
 use crate::budget::{AllocationId, ControlStop, ExecutionPhase, HeapLedgerWeak, heap_size};
 use crate::chunk::Chunk;
 
@@ -382,7 +381,9 @@ pub struct FnDef {
     /// 関数名（無名関数は `<lambda>`）
     pub name: String,
     pub params: Vec<String>,
-    pub body: Vec<Stmt>,
+    /// 本体。`Block`（= `Rc<[Stmt]>`）で共有し、永続 continuation の call frame が
+    /// 本体 AST の寿命を保てるようにする（REV-015 Slice 3 PR-d）。
+    pub body: crate::ast::Block,
 }
 
 /// Tsumugi の実行時の値
