@@ -72,37 +72,22 @@ impl Evaluator {
                     line,
                 });
 
-                // callback 本体も通常の関数呼び出しと同じく明示 frame stack で実行する
-                // （REV-015 Slice 3 PR-b）。ループ外 break/continue はその文の行番号で
-                // エラー化し、call trace を付ける（従来挙動）。
-                let result = match self.drive_body(&def.body) {
-                    Ok(super::EvalResult::Return(v)) => v,
-                    Ok(super::EvalResult::Val) => Value::Null,
+                // callback 本体も通常の関数呼び出しと同じく明示 Call frame として driver で
+                // 実行する（REV-015 Slice 3 PR-c）。スコープ退避（`saved_scopes`）と call trace
+                // の巻き戻しは全終了経路で Call frame の pop_frame が行い、エラー時のトレース
+                // 付加は driver の unwind_all_with_trace が担うため、ここでは終了後に env /
+                // trace を触らない。ループ外 break/continue はその文の行番号でエラー化する。
+                match self.drive_call_body(def, saved_scopes) {
+                    Ok(super::EvalResult::Return(v)) => Ok(v),
+                    Ok(super::EvalResult::Val) => Ok(Value::Null),
                     Ok(super::EvalResult::Break(err_line)) => {
-                        let mut trace = self.call_stack.clone();
-                        trace.reverse();
-                        self.call_stack.pop();
-                        self.env.pop_call_frame(saved_scopes);
-                        return Err(TsumugiError::break_outside_loop(err_line).with_trace(trace));
+                        Err(TsumugiError::break_outside_loop(err_line))
                     }
                     Ok(super::EvalResult::Continue(err_line)) => {
-                        let mut trace = self.call_stack.clone();
-                        trace.reverse();
-                        self.call_stack.pop();
-                        self.env.pop_call_frame(saved_scopes);
-                        return Err(TsumugiError::continue_outside_loop(err_line).with_trace(trace));
+                        Err(TsumugiError::continue_outside_loop(err_line))
                     }
-                    Err(e) => {
-                        let mut trace = self.call_stack.clone();
-                        trace.reverse();
-                        self.call_stack.pop();
-                        self.env.pop_call_frame(saved_scopes);
-                        return Err(e.with_trace(trace));
-                    }
-                };
-                self.call_stack.pop();
-                self.env.pop_call_frame(saved_scopes);
-                Ok(result)
+                    Err(e) => Err(e),
+                }
             }
             _ => Err(TsumugiError::callback_not_callable(line, builtin, func)),
         }
