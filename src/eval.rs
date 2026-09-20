@@ -21,6 +21,15 @@ enum EvalResult {
     Continue(usize),
 }
 
+/// `run_driver` が 1 slice 回した結果（REV-015 Slice 3 PR-d-2）。
+enum DriveOutcome {
+    /// この活性の本体を最後まで（または return/break/continue まで）実行し切った。
+    Done(EvalResult),
+    /// slice fuel を使い切って文/反復境界で協調停止した。`self.frames` に continuation が
+    /// 残っており、次の `run_slice` が続きから再開する（§4.2 `Yielded(SliceFuelExhausted)`）。
+    Yielded,
+}
+
 /// 明示 frame stack 上で 1 文を実行した結果、driver がどう遷移するか（REV-015 Slice 3 PR-b）。
 ///
 /// 従来は `exec_block` / ループ本体が Rust 再帰でブロックへ降り、`EvalResult` を
@@ -238,6 +247,30 @@ pub struct Evaluator {
     /// suspend / resume できる（PR-d-2）。関数呼び出しの再入（`drive_call_body`）はこの共有
     /// スタックへ Call frame を積み、`run_driver(stop_depth)` が自分より上だけを回す。
     frames: Vec<Frame>,
+    /// この slice（1 回の `poll`）で消費した fuel（REV-015 Slice 3 PR-d-2、§4.2）。
+    /// `count_step` が加算し、slice 開始時に 0 へ戻す。
+    slice_fuel_used: u64,
+    /// この slice で消費を許す fuel 上限（§4.2）。`None` は slice 制限なし（同期 `run` /
+    /// テスト経路）で、この場合 yield しない。`Some(limit)` は `poll` が 1 slice ぶんを設定。
+    slice_fuel_limit: Option<u64>,
+    /// suspend / resume する実行セッション（REV-015 Slice 3 PR-d-2）。`begin_execution` で
+    /// 張り、terminal で畳む。yield を跨いで module の解決マーカーと transaction 境界を保つ。
+    session: Option<RunSession>,
+}
+
+/// suspend / resume できる 1 回の実行セッション（REV-015 Slice 3 PR-d-2）。
+///
+/// `begin_execution`（初回 poll 相当）で link と root frame push を済ませ、`run_slice` が
+/// `self.frames` を 1 slice ぶん進める。yield すると `self.frames` と本 session が残り、次の
+/// `run_slice` が続きから再開する。terminal（完了・エラー）で finalize する。
+struct RunSession {
+    /// この実行が回すべき frame stack の下限深度（root frame を積む前の `frames.len()`）。
+    /// `run_driver` はここまで縮んだら本体完了とみなす。
+    base_depth: usize,
+    /// 実行完了しなかったとき解決マーカーを巻き戻す import module 群（AUD-030）。
+    newly_loaded: Vec<crate::module::LoadedModule>,
+    /// REPL transaction 経路か（未捕捉エラーで language-state を rollback する。AUD-024）。
+    transactional: bool,
 }
 
 impl Evaluator {
@@ -261,6 +294,9 @@ impl Evaluator {
             script_args: Vec::new(),
             ast_token: None,
             frames: Vec::new(),
+            slice_fuel_used: 0,
+            slice_fuel_limit: None,
+            session: None,
         }
     }
 
@@ -294,11 +330,25 @@ impl Evaluator {
 
     /// ステップ（fuel）を 1 課金し、上限チェックする（REV-015 Slice 1）。
     ///
-    /// 既存挙動どおり、上限到達時は `step_limit` エラーを call trace 付きで返す。
+    /// 既存挙動どおり、total fuel 上限到達時は `step_limit` エラーを call trace 付きで返す。
+    /// あわせて slice fuel 使用量（§4.2）を 1 加算する。slice 上限の判定は yield 可能な
+    /// 文/反復境界（driver）で行うため、ここでは加算だけ行い yield はしない（式の途中で
+    /// yield すると Rust 再帰スタックを保存できず resume 不能になるため）。
     fn count_step(&mut self, line: usize) -> Result<(), TsumugiError> {
         self.budget
             .charge_fuel(1, ExecutionPhase::Run)
-            .map_err(|stop| self.control_stop_to_error(stop, line))
+            .map_err(|stop| self.control_stop_to_error(stop, line))?;
+        self.slice_fuel_used = self.slice_fuel_used.saturating_add(1);
+        Ok(())
+    }
+
+    /// この slice の fuel を使い切ったか（§4.2）。slice 上限が設定されていない同期実行
+    /// （`run` / テスト）では常に false で、yield しない。
+    fn slice_exhausted(&self) -> bool {
+        match self.slice_fuel_limit {
+            Some(limit) => self.slice_fuel_used >= limit,
+            None => false,
+        }
     }
 
     /// 変数 cell を作って現在スコープへ束縛する（REV-015 PR-c）。
@@ -512,6 +562,131 @@ impl Evaluator {
         self.budget.usage()
     }
 
+    /// 実行セッションを開始する（REV-015 Slice 3 PR-d-2、poll 経路の初回）。
+    ///
+    /// import を link し、source/import/AST heap を Link フェーズで課金し、REPL transaction を
+    /// 開始し、root 文列を Block frame として共有 frame stack へ積む。まだ 1 文も実行しない。
+    /// 成功後は [`Self::run_slice`] を繰り返し呼んで実行を進める。Link 失敗は
+    /// `Err((RunPhase::Link, _))` を返し、セッションは張らない（language-state 不変）。
+    pub fn begin_execution(
+        &mut self,
+        program: &Program,
+        root_source_bytes: u64,
+        transactional: bool,
+    ) -> Result<(), (RunPhase, TsumugiError)> {
+        if transactional {
+            self.env.begin_submission();
+        }
+        let (linked, newly_loaded) = match self.loader.link(program) {
+            Ok(linked) => linked,
+            Err(e) => {
+                if transactional {
+                    // link はまだ language-state を変えていない。journal を破棄する。
+                    self.env.commit_submission();
+                }
+                return Err((RunPhase::Link, e));
+            }
+        };
+        let target = linked.as_ref().unwrap_or(program);
+        if let Err(e) = self.charge_link(root_source_bytes, &newly_loaded, target) {
+            if transactional {
+                self.env.rollback_submission();
+            }
+            self.loader.forget(&newly_loaded);
+            return Err((RunPhase::Link, e));
+        }
+        if let Err(e) = validate_program_depth(target) {
+            if transactional {
+                self.env.rollback_submission();
+            }
+            self.loader.forget(&newly_loaded);
+            return Err((RunPhase::Run, e));
+        }
+        // root 文列を Block（Rc<[Stmt]>）へ写して frame へ所有させる。frame が Rc を持つので
+        // linked（ローカル Program）は drop してよい。
+        let root: Block = std::rc::Rc::from(target.as_slice());
+        let base_depth = self.frames.len();
+        self.frames.push(Frame {
+            stmts: root,
+            cursor: 0,
+            kind: FrameKind::Block,
+            scope_base: self.env.scope_depth(),
+            heap_charge: 0,
+        });
+        self.session = Some(RunSession {
+            base_depth,
+            newly_loaded,
+            transactional,
+        });
+        Ok(())
+    }
+
+    /// 進行中セッションを 1 slice ぶん進める（REV-015 Slice 3 PR-d-2、§4.2）。
+    ///
+    /// `slice_fuel` はこの slice で消費を許す fuel 上限。総 fuel はセッションを跨いで
+    /// 単調に維持され、slice 上限は補充されない（実際に commit した fuel だけが total へ乗る）。
+    /// 戻り値:
+    /// - `Ok(None)`: slice fuel を使い切って文/反復境界で yield した。frame stack を保持し、
+    ///   次の `run_slice` で続きから再開する。
+    /// - `Ok(Some(Ok(())))`: 実行が正常完了した（terminal）。transaction を commit 済み。
+    /// - `Ok(Some(Err(e)))`: 実行中に未捕捉エラーで終了した（terminal）。transaction を
+    ///   rollback 済み、module 解決マーカーも巻き戻し済み。
+    ///
+    /// セッションが無い状態で呼ぶと `panic`（呼び出し側が begin_execution 済みを保証する）。
+    /// `None` = yield（継続あり）、`Some(result)` = terminal。
+    pub fn run_slice(&mut self, slice_fuel: u64) -> Option<Result<(), TsumugiError>> {
+        let base_depth = self
+            .session
+            .as_ref()
+            .expect("run_slice requires an active session")
+            .base_depth;
+        // この slice の fuel 予算を張り直す（slice ごとに 0 から数える）。
+        self.slice_fuel_used = 0;
+        self.slice_fuel_limit = Some(slice_fuel);
+
+        let outcome = self.run_driver(base_depth, true);
+
+        // slice 中だけ有効な制限を解除する（同期経路が影響を受けないように）。
+        self.slice_fuel_limit = None;
+
+        match outcome {
+            Ok(DriveOutcome::Yielded) => None,
+            Ok(DriveOutcome::Done(result)) => {
+                // 本体完了。EvalResult を terminal 結果へ写し、transaction / module を finalize。
+                let final_result = match result {
+                    EvalResult::Return(_) | EvalResult::Val => Ok(()),
+                    EvalResult::Break(line) => Err(TsumugiError::break_outside_loop(line)),
+                    EvalResult::Continue(line) => Err(TsumugiError::continue_outside_loop(line)),
+                };
+                self.finalize_session(final_result.is_ok());
+                Some(final_result)
+            }
+            Err(e) => {
+                // 未捕捉エラーで terminal。unwind は run_driver 内で stop_depth まで済んでいる。
+                self.finalize_session(false);
+                Some(Err(e))
+            }
+        }
+    }
+
+    /// セッションを畳む（REV-015 Slice 3 PR-d-2）。commit なら transaction を確定、失敗なら
+    /// language-state を rollback し、完了しなかった module の解決マーカーを巻き戻す。
+    fn finalize_session(&mut self, committed: bool) {
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        if committed {
+            if session.transactional {
+                self.env.commit_submission();
+            }
+        } else {
+            if session.transactional {
+                self.env.rollback_submission();
+            }
+            self.loader.forget(&session.newly_loaded);
+        }
+    }
+
     /// [`Self::run`] と同じ実行をしつつ、失敗が Link フェーズか実行フェーズかを返す
     /// （REV-015 Slice 3 PR-a）。
     ///
@@ -548,12 +723,20 @@ impl Evaluator {
         // させる（PR-d）。`Rc::from(&[Stmt])` は要素を 1 度だけ複製し、以降の子 frame は
         // owner Rc を共有する。
         let root: Block = std::rc::Rc::from(program.as_slice());
-        // トップレベルの break/continue は従来どおりその文の行番号でエラー化する
-        // （EvalResult が offending 文の行を保持する）。
-        match self.drive_body(root)? {
-            EvalResult::Return(_) | EvalResult::Val => Ok(()),
-            EvalResult::Break(line) => Err(TsumugiError::break_outside_loop(line)),
-            EvalResult::Continue(line) => Err(TsumugiError::continue_outside_loop(line)),
+        // 同期実行（`run` / `run_phased` / `run_repl_submission`）は 1 回で terminal まで
+        // 回す（`can_yield = false`）。slice fuel での yield は poll 経路（begin_execution /
+        // run_slice）だけで起きる。トップレベルの break/continue はその文の行番号でエラー化。
+        match self.drive_body(root, false)? {
+            DriveOutcome::Done(EvalResult::Return(_) | EvalResult::Val) => Ok(()),
+            DriveOutcome::Done(EvalResult::Break(line)) => {
+                Err(TsumugiError::break_outside_loop(line))
+            }
+            DriveOutcome::Done(EvalResult::Continue(line)) => {
+                Err(TsumugiError::continue_outside_loop(line))
+            }
+            DriveOutcome::Yielded => {
+                unreachable!("exec_program は can_yield=false なので yield しない")
+            }
         }
     }
 
@@ -573,7 +756,7 @@ impl Evaluator {
     ///
     /// エラーは従来どおり `Err` で伝播する。エラー・return / break / continue の全経路で、
     /// push 済み frame のスコープ解放と continuation heap の release を行う。
-    fn drive_body(&mut self, root: Block) -> Result<EvalResult, TsumugiError> {
+    fn drive_body(&mut self, root: Block, can_yield: bool) -> Result<DriveOutcome, TsumugiError> {
         // 共有 frame stack へ root 文列を素の Block frame として積む。root は呼び出し側
         // （exec_program / callback 本体）がスコープを管理するため、ここでは新しいスコープを
         // push しない（scope_base は現在の深さ）。`base` はこの活性が回すべき下限深度で、
@@ -586,7 +769,7 @@ impl Evaluator {
             scope_base: self.env.scope_depth(),
             heap_charge: 0,
         });
-        self.run_driver(base)
+        self.run_driver(base, can_yield)
     }
 
     /// 関数本体を明示 call frame として driver で実行する（REV-015 Slice 3 PR-c）。
@@ -622,7 +805,15 @@ impl Evaluator {
             scope_base: self.env.scope_depth(),
             heap_charge: 0,
         });
-        self.run_driver(base)
+        // 関数呼び出しは式の途中（Rust 再帰）から再入するため、この活性は yield せず
+        // 完了させる（`can_yield = false`）。slice fuel の消費はここでも count_step で
+        // 加算され、呼び出しから戻ったあとトップレベル driver の境界で yield 判定される。
+        match self.run_driver(base, false)? {
+            DriveOutcome::Done(result) => Ok(result),
+            DriveOutcome::Yielded => {
+                unreachable!("drive_call_body は can_yield=false なので yield しない")
+            }
+        }
     }
 
     /// frame stack を回す共通 driver ループ（REV-015 Slice 3 PR-b / PR-c）。
@@ -635,11 +826,24 @@ impl Evaluator {
     /// この活性の本体を（return なしで）実行し切ったとして `Ok(EvalResult::Val)` を返す。
     /// VM の `run_frames(stop_depth)` をミラーする。return / break / continue / エラーの
     /// 巻き戻しはすべて `stop_depth` を下限に行い、外側の活性の frame を侵さない。
-    fn run_driver(&mut self, stop_depth: usize) -> Result<EvalResult, TsumugiError> {
+    fn run_driver(
+        &mut self,
+        stop_depth: usize,
+        can_yield: bool,
+    ) -> Result<DriveOutcome, TsumugiError> {
         loop {
             // frame がこの活性の下限まで縮んだ = 本体を最後まで実行した。
             if self.frames.len() <= stop_depth {
-                return Ok(EvalResult::Val);
+                return Ok(DriveOutcome::Done(EvalResult::Val));
+            }
+
+            // slice fuel を使い切っていれば、文/反復境界で協調停止する（§4.2）。ここは
+            // exec_stmt / advance_frame を呼ぶ前＝Rust 再帰スタックが driver ループまで
+            // 巻き戻った安全な境界なので、`self.frames` を残したまま resume できる。yield
+            // できるのはトップレベル実行の driver だけ（`can_yield`）。関数呼び出しの再入
+            // （`drive_call_body`、式の途中）では yield せず活性を完了させる。
+            if can_yield && self.slice_exhausted() {
+                return Ok(DriveOutcome::Yielded);
             }
 
             let top = self.frames.last_mut().expect("frames.len() > stop_depth");
@@ -680,7 +884,7 @@ impl Evaluator {
                 Ok(StmtStep::Enter(child)) => self.frames.push(child),
                 Ok(StmtStep::Flow(signal)) => {
                     if let Some(result) = self.unwind_flow(signal, stop_depth)? {
-                        return Ok(result);
+                        return Ok(DriveOutcome::Done(result));
                     }
                 }
                 Err(e) => {

@@ -73,6 +73,7 @@ impl Engine {
             state: ExecutionState::Created,
             outcome: None,
             transactional: false,
+            started: false,
             _engine: PhantomData,
             _not_send: PhantomData,
         }
@@ -96,6 +97,7 @@ impl Engine {
             state: ExecutionState::Linked,
             outcome: None,
             transactional: false,
+            started: false,
             _engine: PhantomData,
             _not_send: PhantomData,
         }
@@ -381,6 +383,9 @@ pub struct ExecutionHandle<'engine, 'script, 'context> {
     outcome: Option<ExecutionOutcome>,
     /// REPL 用に transaction 経路（`run_repl_submission`）で実行するか。
     transactional: bool,
+    /// 実行セッションを開始済みか（REV-015 Slice 3 PR-d-2）。初回 poll で `begin_execution`
+    /// を呼んで true にし、以降の poll は `run_slice` で resume する。
+    started: bool,
     _engine: PhantomData<&'engine Engine>,
     /// `!Send + !Sync` を保証する（第9.1節）。別スレッドへ move させない。
     _not_send: PhantomData<*const ()>,
@@ -404,25 +409,39 @@ impl ExecutionHandle<'_, '_, '_> {
 
     /// 実行を 1 slice 進める（第9節 `poll`）。
     ///
-    /// PR-a の実装: `Created` / `Linked` / `Ready` / `Yielded` から呼ぶと、`Running` を
-    /// 経て既存のツリーウォーク評価器を terminal まで一気に回し、[`PollResult::Terminal`]
-    /// を返す。continuation 分割・slice fuel での `Yielded` は後続 PR-b〜d で実装する。
-    /// terminal 後の poll は [`HandleError::Terminal`]。
-    pub fn poll(&mut self, _slice: PollSlice) -> Result<PollResult, HandleError> {
+    /// `Created` / `Linked` / `Ready` / `Yielded` から呼ぶと `Running` を経て、初回は link を
+    /// 済ませてから最大 `slice.max_fuel` の fuel ぶん実行を進める（REV-015 Slice 3 PR-d-2、
+    /// §4.2）。slice fuel を使い切ると [`PollResult::Yielded`]（`SliceFuelExhausted`）を返し、
+    /// 評価器の永続 continuation に状態が残る。次の poll で続きから resume する。terminal に
+    /// 達すると [`PollResult::Terminal`] を返す。terminal 後の poll は [`HandleError::Terminal`]。
+    pub fn poll(&mut self, slice: PollSlice) -> Result<PollResult, HandleError> {
         match self.state {
             ExecutionState::Terminal => Err(HandleError::Terminal),
             ExecutionState::Paused(_) => Err(HandleError::InvalidState {
                 operation: "poll",
                 state: self.state.clone(),
             }),
-            // Created / Linked / Ready / Yielded はいずれも Running を経て terminal まで進む。
+            // Created / Linked / Ready / Yielded はいずれも Running を経て 1 slice 進む。
             _ => {
                 self.state = ExecutionState::Running;
-                let outcome = self.run_to_terminal();
+                let poll = self.drive_one_slice(slice.max_fuel);
                 let usage = self.context.budget_usage();
-                self.state = ExecutionState::Terminal;
-                self.outcome = Some(outcome.clone());
-                Ok(PollResult::Terminal { outcome, usage })
+                match poll {
+                    // slice fuel を使い切って協調停止した（§4.2）。continuation は
+                    // 評価器の永続 frame stack に残り、次 poll で resume する。
+                    SlicePoll::Yielded => {
+                        self.state = ExecutionState::Yielded(YieldReason::SliceFuelExhausted);
+                        Ok(PollResult::Yielded {
+                            reason: YieldReason::SliceFuelExhausted,
+                            usage,
+                        })
+                    }
+                    SlicePoll::Terminal(outcome) => {
+                        self.state = ExecutionState::Terminal;
+                        self.outcome = Some(outcome.clone());
+                        Ok(PollResult::Terminal { outcome, usage })
+                    }
+                }
             }
         }
     }
@@ -449,27 +468,56 @@ impl ExecutionHandle<'_, '_, '_> {
         }
     }
 
-    /// 評価器を terminal まで回し、outcome を作る（PR-a の poll コア）。
-    fn run_to_terminal(&mut self) -> ExecutionOutcome {
-        let program = &self.script.program;
+    /// 実行を 1 slice 進める（REV-015 Slice 3 PR-d-2 の poll コア）。
+    ///
+    /// 初回 poll では `begin_execution` で link と root frame push を済ませ、以降の poll は
+    /// 評価器の永続 continuation を `run_slice` で resume する。slice fuel を使い切ると
+    /// [`SlicePoll::Yielded`] を返し、terminal に達すると [`SlicePoll::Terminal`] を返す。
+    fn drive_one_slice(&mut self, slice_fuel: u64) -> SlicePoll {
         let source_bytes = self.script.source_bytes;
-        if self.transactional {
-            // REPL transaction 経路。commit / rollback は run_repl_submission が行う。
+        let transactional = self.transactional;
+
+        if !self.started {
+            // 初回 poll: link + Link フェーズ課金 + root frame push。まだ 1 文も実行しない。
+            let program = &self.script.program;
             match self
                 .context
                 .evaluator
-                .run_repl_submission(program, source_bytes)
+                .begin_execution(program, source_bytes, transactional)
             {
-                Ok(()) => ExecutionOutcome::Completed,
-                // transaction 経路は Link/Run を区別しないため RuntimeError へ写す。
-                Err(error) => ExecutionOutcome::RuntimeError { error },
-            }
-        } else {
-            match self.context.evaluator.run_phased(program, source_bytes) {
-                Ok(()) => ExecutionOutcome::Completed,
-                Err((RunPhase::Link, error)) => ExecutionOutcome::LinkError { error },
-                Err((RunPhase::Run, error)) => ExecutionOutcome::RuntimeError { error },
+                Ok(()) => {
+                    self.started = true;
+                }
+                Err((phase, error)) => {
+                    // Link 失敗は terminal。transaction 経路は Link/Run を区別せず RuntimeError。
+                    let outcome = if transactional {
+                        ExecutionOutcome::RuntimeError { error }
+                    } else {
+                        match phase {
+                            RunPhase::Link => ExecutionOutcome::LinkError { error },
+                            RunPhase::Run => ExecutionOutcome::RuntimeError { error },
+                        }
+                    };
+                    return SlicePoll::Terminal(outcome);
+                }
             }
         }
+
+        // 1 slice ぶん実行する。None = yield、Some(result) = terminal。
+        match self.context.evaluator.run_slice(slice_fuel) {
+            None => SlicePoll::Yielded,
+            Some(Ok(())) => SlicePoll::Terminal(ExecutionOutcome::Completed),
+            // 実行フェーズの失敗（予算超過を含む）は RuntimeError（transaction は commit/
+            // rollback を run_slice が済ませている）。
+            Some(Err(error)) => SlicePoll::Terminal(ExecutionOutcome::RuntimeError { error }),
+        }
     }
+}
+
+/// [`ExecutionHandle::drive_one_slice`] の結果（REV-015 Slice 3 PR-d-2）。
+enum SlicePoll {
+    /// slice fuel を使い切って協調停止した。continuation は評価器に残る。
+    Yielded,
+    /// terminal に達した。
+    Terminal(ExecutionOutcome),
 }
