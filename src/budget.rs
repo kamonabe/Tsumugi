@@ -3084,7 +3084,7 @@ mod tests {
             def: StdRc::new(crate::value::FnDef {
                 name: "f".to_string(),
                 params: vec![],
-                body: vec![],
+                body: StdRc::from(vec![]),
             }),
             captured: StdRc::new(captured),
             header: Value::fn_header_untracked(),

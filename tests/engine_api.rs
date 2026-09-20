@@ -291,3 +291,161 @@ fn handle_type_exists_and_is_usable() {
         let _ = h.outcome();
     }
 }
+
+// =============================================================================
+// slice fuel + yield（REV-015 Slice 3 PR-d-2、実行制御仕様 §4.2 / 第9節）
+// =============================================================================
+
+use tsumugi::YieldReason;
+
+/// 小さな slice fuel で poll すると、compute の重いスクリプトは複数 slice に分かれて
+/// yield しながら進み、最終的に大きな slice 1 回と同じ terminal（Completed）へ到達する。
+/// slice は公平性の量子であり、total fuel を補充しないので、消費した total fuel は
+/// 分割の有無にかかわらず一致する（§4.2）。
+#[test]
+fn small_slice_yields_and_resumes_to_same_terminal_and_total_fuel() {
+    // ループ + 関数呼び出しで fuel を十分消費するスクリプト。
+    let source = "\
+fn work(n)\n\
+  let acc = 0\n\
+  let i = 0\n\
+  while i < n\n\
+    acc = acc + i\n\
+    i = i + 1\n\
+  end\n\
+  return acc\n\
+end\n\
+let total = 0\n\
+let k = 0\n\
+while k < 50\n\
+  total = total + work(20)\n\
+  k = k + 1\n\
+end\n";
+
+    let engine = Engine::new();
+
+    // (A) 大きな slice 1 回で terminal まで（分割なし）。
+    let script_a = engine.compile(source).unwrap();
+    let mut ctx_a = ExecutionContext::new();
+    let mut handle_a = engine.create_execution(&script_a, &mut ctx_a, ExecutionRequest::new());
+    let big_slice = PollSlice {
+        max_fuel: 10_000_000,
+    };
+    let outcome_a = match handle_a.poll(big_slice).unwrap() {
+        PollResult::Terminal { outcome, .. } => outcome,
+        other => panic!("大きな slice では 1 回で terminal を期待: {other:?}"),
+    };
+    assert_eq!(outcome_a, ExecutionOutcome::Completed);
+    let total_fuel_single = handle_a.usage().committed.fuel;
+    assert!(total_fuel_single > 16, "テストが fuel を十分消費していない");
+
+    // (B) 小さな slice で複数回 poll。少なくとも 1 回は yield し、最後は同じ terminal。
+    let script_b = engine.compile(source).unwrap();
+    let mut ctx_b = ExecutionContext::new();
+    let mut handle_b = engine.create_execution(&script_b, &mut ctx_b, ExecutionRequest::new());
+    let small_slice = PollSlice { max_fuel: 16 };
+
+    let mut yields = 0usize;
+    let mut polls = 0usize;
+    let final_outcome = loop {
+        polls += 1;
+        assert!(
+            polls < 1_000_000,
+            "poll が terminal に到達しない（無限ループ）"
+        );
+        match handle_b.poll(small_slice).unwrap() {
+            PollResult::Yielded { reason, .. } => {
+                assert_eq!(reason, YieldReason::SliceFuelExhausted);
+                assert_eq!(
+                    handle_b.state(),
+                    ExecutionState::Yielded(YieldReason::SliceFuelExhausted)
+                );
+                yields += 1;
+            }
+            PollResult::Terminal { outcome, .. } => break outcome,
+            PollResult::Paused { .. } => panic!("pause は要求していない"),
+        }
+    };
+
+    assert!(
+        yields > 0,
+        "小さな slice なのに一度も yield しなかった（slice fuel が効いていない）"
+    );
+    assert_eq!(final_outcome, ExecutionOutcome::Completed);
+
+    // total fuel は slice 分割の有無で変わらない（§4.2: slice は total を補充しない）。
+    assert_eq!(
+        handle_b.usage().committed.fuel,
+        total_fuel_single,
+        "分割実行の total fuel が単一 slice と一致しない"
+    );
+}
+
+/// yield 後の handle は Yielded 状態で、再 poll で resume し最終的に terminal へ到達する。
+/// terminal 到達後の poll は HandleError::Terminal。
+#[test]
+fn yielded_handle_resumes_then_rejects_poll_after_terminal() {
+    let source = "\
+let i = 0\n\
+while i < 100\n\
+  i = i + 1\n\
+end\n";
+    let engine = Engine::new();
+    let script = engine.compile(source).unwrap();
+    let mut context = ExecutionContext::new();
+    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let small_slice = PollSlice { max_fuel: 16 };
+
+    // 初回 poll は yield する（100 反復は 16 fuel に収まらない）。
+    match handle.poll(small_slice).unwrap() {
+        PollResult::Yielded { reason, .. } => {
+            assert_eq!(reason, YieldReason::SliceFuelExhausted)
+        }
+        other => panic!("初回は yield を期待: {other:?}"),
+    }
+
+    // resume して terminal まで。
+    loop {
+        match handle.poll(small_slice).unwrap() {
+            PollResult::Yielded { .. } => continue,
+            PollResult::Terminal { outcome, .. } => {
+                assert_eq!(outcome, ExecutionOutcome::Completed);
+                break;
+            }
+            PollResult::Paused { .. } => panic!("pause は要求していない"),
+        }
+    }
+
+    // terminal 後の poll は拒否される。
+    assert_eq!(handle.poll(small_slice), Err(HandleError::Terminal));
+}
+
+/// slice 分割で実行しても、未捕捉エラーの terminal（RuntimeError）へ正しく到達する。
+/// yield を跨いだ後にエラーが起きても continuation は破綻しない。
+#[test]
+fn slice_split_reaches_runtime_error_terminal() {
+    // 50 反復ループの後に未定義変数参照で runtime error。
+    let source = "\
+let i = 0\n\
+while i < 50\n\
+  i = i + 1\n\
+end\n\
+let bad = missing_name\n";
+    let engine = Engine::new();
+    let script = engine.compile(source).unwrap();
+    let mut context = ExecutionContext::new();
+    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let small_slice = PollSlice { max_fuel: 16 };
+
+    let outcome = loop {
+        match handle.poll(small_slice).unwrap() {
+            PollResult::Yielded { .. } => continue,
+            PollResult::Terminal { outcome, .. } => break outcome,
+            PollResult::Paused { .. } => panic!("pause は要求していない"),
+        }
+    };
+    assert!(
+        matches!(outcome, ExecutionOutcome::RuntimeError { .. }),
+        "未定義変数参照は RuntimeError を期待: {outcome:?}"
+    );
+}
