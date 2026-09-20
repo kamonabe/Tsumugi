@@ -47,13 +47,20 @@ enum FlowSignal {
 }
 
 /// 明示実行 frame。ヒープ上の frame stack の 1 要素で、Rust 再帰の 1 段に対応する
-/// （REV-015 Slice 3 PR-b、§9.3）。関数呼び出しと式は当面 Rust 再帰のまま（PR-c / 式は浅い）。
+/// （REV-015 Slice 3 PR-b / PR-c、§9.3）。式評価（`eval_expr`）は当面 Rust 再帰のまま
+/// （式は浅く bounded）。関数呼び出しは PR-c で明示 [`FrameKind::Call`] frame へ移した。
+///
+/// 全 frame は `stmts` を `&'p [Stmt]` として借用する。関数本体を実行する `drive_call_body`
+/// は、呼び出す関数の `Rc<FnDef>` をローカルに保持し、その `&def.body` を `'p` として渡す。
+/// これにより関数本体とそこから派生する `if`/ループ/`try` 本体の子 frame は、`drive_call_body`
+/// の実行中ずっと生きる AST を借用でき、frame が自分自身の所有物を借用する自己参照を避ける
+/// （VM が `CallFrame` に `Rc<Chunk>` を持ち ip で index するのに対応する、tree 側の等価物）。
 struct Frame<'p> {
-    /// この frame が順に実行する文列（linked program または関数本体から借用）。
+    /// この frame が順に実行する文列（program 直下・関数本体・`if`/ループ/`try` 本体）。
     stmts: &'p [Stmt],
     /// 次に実行する文の index。
     cursor: usize,
-    /// frame 種別ごとの状態（loop の反復状態・try handler など）。
+    /// frame 種別ごとの状態（loop の反復状態・try handler・call 境界など）。
     kind: FrameKind<'p>,
     /// frame 生成時の `env.scope_depth()`。pop 時にここまでスコープを巻き戻す。
     scope_base: usize,
@@ -66,6 +73,11 @@ impl Frame<'_> {
     /// この frame が `break` / `continue` を捕捉するループ frame か。
     fn is_loop(&self) -> bool {
         matches!(self.kind, FrameKind::While { .. } | FrameKind::For { .. })
+    }
+
+    /// この frame が関数呼び出しの境界（`return` の到達先）か。
+    fn is_call(&self) -> bool {
+        matches!(self.kind, FrameKind::Call { .. })
     }
 }
 
@@ -125,6 +137,15 @@ enum FrameKind<'p> {
         var: &'p str,
         catch_body: &'p [Stmt],
         line: usize,
+    },
+    /// 関数呼び出しの境界（REV-015 Slice 3 PR-c）。VM の `CallFrame` をミラーする。
+    /// この frame の `stmts` は呼び出す関数本体（`drive_call_body` がローカルに保持する
+    /// `Rc<FnDef>` の `&def.body`）で、本体を実行し切るか `return` に達したら、退避した
+    /// 呼び出し元スコープ（`saved_scopes`）と call trace を復元して 1 個の戻り値を produce
+    /// する。`break` / `continue` はこの境界を越えられず、ここで「ループ外」エラーになる。
+    Call {
+        /// 呼び出し時に `env.push_call_frame()` が返した退避情報。pop 時に復元する。
+        saved_scopes: crate::env::CallFrame,
     },
 }
 
@@ -494,17 +515,56 @@ impl Evaluator {
     /// push 済み frame のスコープ解放と continuation heap の release を行う。
     fn drive_body(&mut self, root: &'_ [Stmt]) -> Result<EvalResult, TsumugiError> {
         // frame stack を作り、root 文列を素の Block frame として積む。root は呼び出し側
-        // （exec_program / eval_call / loop 本体）がスコープ・call frame を管理するため、
-        // ここでは新しいスコープを push しない（scope_base は現在の深さ）。
-        let mut frames: Vec<Frame<'_>> = Vec::new();
-        frames.push(Frame {
+        // （exec_program / loop 本体）がスコープを管理するため、ここでは新しいスコープを
+        // push しない（scope_base は現在の深さ）。
+        let frames: Vec<Frame<'_>> = vec![Frame {
             stmts: root,
             cursor: 0,
             kind: FrameKind::Block,
             scope_base: self.env.scope_depth(),
             heap_charge: 0,
-        });
+        }];
+        self.run_driver(frames)
+    }
 
+    /// 関数本体を明示 call frame として driver で実行する（REV-015 Slice 3 PR-c）。
+    ///
+    /// VM の `run_frames` 相当で、呼び出し境界を [`FrameKind::Call`] としてヒープ frame stack
+    /// の root に積む。`def`（`Rc<FnDef>`）はこの関数のローカルとして保持し、その `&def.body`
+    /// を frame の `stmts`（`'p`）として渡す。関数本体とそこから派生する子 frame は
+    /// `drive_call_body` の実行中ずっと生きるこの本体 AST を借用する（VM の `CallFrame` が
+    /// `Rc<Chunk>` を保持するのに対応する、tree 側の等価な寿命管理）。呼び出し元は事前に
+    /// `env.push_call_frame()` でスコープを退避し、その退避情報 `saved_scopes` をこの Call
+    /// frame へ預ける。frame の pop（正常終了・return・エラー unwind）で `env.pop_call_frame`
+    /// と call trace の巻き戻しが行われ、呼び出し元スコープを復元する。
+    ///
+    /// 戻り値は `drive_body` と同じ `EvalResult`。`Return(v)` は Call frame まで unwind して
+    /// `v` を返し、`Break` / `Continue` は Call 境界を越えられずそのまま surface する
+    /// （呼び出し側が「ループ外」エラーへ写す）。
+    fn drive_call_body(
+        &mut self,
+        def: Rc<FnDef>,
+        saved_scopes: crate::env::CallFrame,
+    ) -> Result<EvalResult, TsumugiError> {
+        // 本体 AST の寿命を drive_call_body の実行全体へ固定する。frames が借用する `'p` は
+        // このローカル `def` に紐づく。
+        let frames: Vec<Frame<'_>> = vec![Frame {
+            stmts: &def.body,
+            cursor: 0,
+            kind: FrameKind::Call { saved_scopes },
+            // Call frame 自身は呼び出し元がスコープ管理する（push_call_frame 済み）。関数用
+            // ローカルスコープは push_call_frame が積み、pop_call_frame が畳むため、この frame
+            // 自身は追加スコープを持たない（scope_base は現在の深さ、heap_charge は 0）。
+            scope_base: self.env.scope_depth(),
+            heap_charge: 0,
+        }];
+        self.run_driver(frames)
+    }
+
+    /// frame stack を回す共通 driver ループ（REV-015 Slice 3 PR-b / PR-c）。
+    ///
+    /// root frame は `drive_body`（Block）または `drive_call_body`（Call）が積む。
+    fn run_driver(&mut self, mut frames: Vec<Frame<'_>>) -> Result<EvalResult, TsumugiError> {
         loop {
             // 現在の（最上位）frame を取り出して 1 文進める。
             let Some(frame) = frames.last_mut() else {
@@ -520,21 +580,30 @@ impl Evaluator {
             if frame.cursor >= frame.stmts.len() {
                 match self.advance_frame(&mut frames) {
                     Ok(()) => {}
-                    Err(e) => match self.handle_error(&mut frames, e) {
-                        Ok(()) => {}
-                        Err(e) => {
-                            self.unwind_all(&mut frames);
-                            return Err(e);
+                    Err(e) => {
+                        let e = self.attach_trace(e);
+                        match self.handle_error(&mut frames, e) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                self.unwind_all(&mut frames);
+                                return Err(e);
+                            }
                         }
-                    },
+                    }
                 }
                 continue;
             }
 
-            // 次の文を実行する。
-            let stmt = &frame.stmts[frame.cursor];
+            // 次の文を実行する。`frame.stmts` は `&'p [Stmt]`（Copy）なので、cursor を進めた
+            // あと stmt を取り出せば frames への借用に依存しない（`'p` に紐づく）。関数本体を
+            // 実行する Call frame でも本体は drive_call_body がローカルに保持する Rc<FnDef> の
+            // `&def.body`（= `'p`）なので同様に安全。
+            let stmts = frame.stmts;
+            let cursor = frame.cursor;
             frame.cursor += 1;
-            match self.exec_stmt(stmt) {
+            let stmt = &stmts[cursor];
+            let step = self.exec_stmt(stmt);
+            match step {
                 Ok(StmtStep::Val) => {}
                 Ok(StmtStep::Enter(child)) => frames.push(child),
                 Ok(StmtStep::Flow(signal)) => {
@@ -543,6 +612,12 @@ impl Evaluator {
                     }
                 }
                 Err(e) => {
+                    // エラー発生時点（frame をまだ畳む前）の call_stack をトレースとして付加
+                    // する。この後 handle_error / unwind_all が Call frame を畳んで call_stack
+                    // を巻き戻すため、ここで snapshot しないと最内フレームが欠落する（PR-c）。
+                    // `with_trace` は既にトレースがあれば上書きしないので、外側の再入 driver
+                    // では no-op になり、最深トレースが保たれる。
+                    let e = self.attach_trace(e);
                     // catch 可能なら最も近い try frame の catch へ切り替える。
                     match self.handle_error(&mut frames, e) {
                         Ok(()) => {}
@@ -684,12 +759,20 @@ impl Evaluator {
     ) -> Result<Option<EvalResult>, TsumugiError> {
         match signal {
             FlowSignal::Return(v) => {
-                // root frame（呼び出し側が管理）だけ残して全て畳む。
-                while frames.len() > 1 {
-                    self.pop_frame(frames);
+                // 関数活性境界（Call frame）まで、なければ root まで全て畳む。Call frame の
+                // pop で `env.pop_call_frame` と call trace の巻き戻しが行われる（PR-c）。
+                // program 直下（Call frame の無い drive_body）では root まで畳んで Return を
+                // surface し、exec_program が「関数外 return」ではなく通常完了として扱う。
+                loop {
+                    match frames.last() {
+                        Some(f) if f.is_call() => {
+                            self.pop_frame(frames);
+                            break;
+                        }
+                        Some(_) => self.pop_frame(frames),
+                        None => break,
+                    }
                 }
-                // root frame も畳む（このあと drive_body は Return を返す）。
-                self.unwind_all(frames);
                 Ok(Some(EvalResult::Return(v)))
             }
             FlowSignal::Break(line) => {
@@ -858,10 +941,19 @@ impl Evaluator {
     }
 
     /// 最上位 frame を 1 つ畳み、スコープと continuation heap を解放する（driver 内部用）。
+    ///
+    /// Call frame は呼び出し境界なので、通常のスコープ巻き戻しではなく
+    /// `env.pop_call_frame` で呼び出し元スコープ・`frame_base` を復元し、call trace も畳む。
     fn pop_frame(&mut self, frames: &mut Vec<Frame<'_>>) {
         if let Some(frame) = frames.pop() {
-            self.env.truncate_scopes(frame.scope_base);
             self.budget.release_heap(frame.heap_charge);
+            match frame.kind {
+                FrameKind::Call { saved_scopes, .. } => {
+                    self.call_stack.pop();
+                    self.env.pop_call_frame(saved_scopes);
+                }
+                _ => self.env.truncate_scopes(frame.scope_base),
+            }
         }
     }
 
@@ -870,6 +962,20 @@ impl Evaluator {
         while !frames.is_empty() {
             self.pop_frame(frames);
         }
+    }
+
+    /// エラー発生時点の call trace を error へ付加する（REV-015 Slice 3 PR-c）。
+    ///
+    /// PR-c 以前は各 `eval_call` / `call_fn_value` が自身の `Err` 経路で `with_trace` を
+    /// 呼んでいた。Call frame を明示 frame stack へ移したことで、frame の pop（handle_error /
+    /// unwind_all）で call_stack が巻き戻る。そのため frame を畳む前・エラー発生時点の
+    /// call_stack を snapshot してトレースにする。`with_trace` は既にトレースがある error を
+    /// 上書きしないため、最内の失敗が積んだ最深トレースが保たれ、外側の再入 driver では
+    /// no-op になる（VM の `attach_trace` と同じ意味論）。
+    fn attach_trace(&self, error: TsumugiError) -> TsumugiError {
+        let mut trace = self.call_stack.clone();
+        trace.reverse();
+        error.with_trace(trace)
     }
 
     /// 1 文の「葉」を実行する（REV-015 Slice 3 PR-b で戻り値を [`StmtStep`] 化）。
@@ -1591,44 +1697,28 @@ impl Evaluator {
             }
         }
 
-        // コールスタックに記録
+        // コールスタックに記録（Call frame の pop 時に対で pop される）。
         self.call_stack.push(TraceFrame {
             name: func_name.to_string(),
             line,
         });
 
-        // 関数本体を明示 frame stack で実行する（REV-015 Slice 3 PR-b）。関数呼び出し自体は
-        // 当面 Rust 再帰のまま（PR-c で明示 call frame 化する）だが、本体内のブロック・ループ
-        // 制御は drive_body へ委譲し、EvalResult の巻き戻しを frame stack 上で処理する。
-        let result = match self.drive_body(&def.body) {
-            Ok(EvalResult::Return(v)) => v,
-            Ok(EvalResult::Val) => Value::Null,
-            // ループ外 break/continue は offending 文の行番号でエラー化する。これは VM
-            // （compile 時に break/continue 文の行で検出）と一致する。従来の tree は
-            // 呼び出し位置の行を使い VM と食い違っていたが、frame stack 化に伴い両 engine を
-            // 文の行へ揃える（tree/VM parity の改善。roadmap の差異縮小方針に沿う）。
-            Ok(EvalResult::Break(err_line)) => {
-                self.call_stack.pop();
-                self.env.pop_call_frame(saved_scopes);
-                return Err(TsumugiError::break_outside_loop(err_line));
-            }
+        // 関数本体を明示 Call frame として driver で実行する（REV-015 Slice 3 PR-c）。
+        // 呼び出し境界がヒープ frame stack 上の [`FrameKind::Call`] になり、スコープ退避
+        // （`saved_scopes`）と call trace の巻き戻しは全終了経路で Call frame の pop_frame が
+        // 行う。そのため eval_call 側では drive_call_body 後に env / trace を触らない
+        // （終了経路ごとの手動 pop_call_frame は不要になった）。エラー時のトレース付加は
+        // driver の unwind_all_with_trace が担う。
+        match self.drive_call_body(def, saved_scopes) {
+            Ok(EvalResult::Return(v)) => Ok(v),
+            Ok(EvalResult::Val) => Ok(Value::Null),
+            // ループ外 break/continue は offending 文の行番号でエラー化する（VM と一致）。
+            Ok(EvalResult::Break(err_line)) => Err(TsumugiError::break_outside_loop(err_line)),
             Ok(EvalResult::Continue(err_line)) => {
-                self.call_stack.pop();
-                self.env.pop_call_frame(saved_scopes);
-                return Err(TsumugiError::continue_outside_loop(err_line));
+                Err(TsumugiError::continue_outside_loop(err_line))
             }
-            Err(e) => {
-                let mut trace = self.call_stack.clone();
-                trace.reverse();
-                self.call_stack.pop();
-                self.env.pop_call_frame(saved_scopes);
-                return Err(e.with_trace(trace));
-            }
-        };
-
-        self.call_stack.pop();
-        self.env.pop_call_frame(saved_scopes);
-        Ok(result)
+            Err(e) => Err(e),
+        }
     }
 }
 

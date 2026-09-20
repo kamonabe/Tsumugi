@@ -1,12 +1,12 @@
 # Tsumugi 実行予算・協調実行仕様
 
-最終更新: 2026-09-18
+最終更新: 2026-09-20
 
-設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は完了（string / source / import accounting、heap accounting 基盤（`AllocationLedger`・§5.1 論理サイズ）、collection（`List`/`Dict`）の per-drop release（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、tree/VM 両対応）、および String body の per-drop release（PR-b、`Value::Str` を `Rc<Tracked<RefCell<Value>>>` 化し `Value::Fn`/`VmFn` に header token を持たせる）、および AST / bytecode chunk / imported module record / rollback journal の per-drop 追跡（PR-d、`HeapToken = Tracked<()>` トークンで所有構造側から課金・release。tree は AST、VM は bytecode chunk を課金）、および string リテラル/連結/f-string 経路の課金（生成点で `track_result` を通し cumulative + live heap を課金、tree/VM 両対応）、および I-O accounting（input / output / host call の count + bytes を reserve/commit/refund で課金。stdio は host call として co-charge。host call 対象は filesystem read/write と stdio に限り、その他 host 境界 builtin は Phase 2）を実装済みで、これで Slice 2 は完了。VM の push/pop の full-clone や f-string リテラル部分の個別課金のため configured 上限で tree と live/peak・cumulative が食い違い得るが、charge trace の tree/VM 完全一致は第14節 Slice 6（VM が experimental の間）で解消する。Slice 3（explicit continuation）は blast radius が大きいため PR-a（公開 state-machine surface + poll-to-terminal core）→ PR-b（statement / block / loop の明示 frame）→ PR-c（関数呼び出し・try handler の明示 frame）→ PR-d（slice fuel + yield）へ分割する。PR-a（公開 state-machine surface + poll-to-terminal core）と PR-b（statement / block / loop の明示 frame stack。tree evaluator の `drive_body` driver ループ + `Frame`/cursor で `exec_program`/`exec_block`/ループ再帰を置換し、continuation_frame heap を配線）を実装済み。次は PR-c（関数呼び出し・try handler の明示 frame）。詳細は第14節 Slice 3 を参照）
+設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は完了（string / source / import accounting、heap accounting 基盤（`AllocationLedger`・§5.1 論理サイズ）、collection（`List`/`Dict`）の per-drop release（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、tree/VM 両対応）、および String body の per-drop release（PR-b、`Value::Str` を `Rc<Tracked<RefCell<Value>>>` 化し `Value::Fn`/`VmFn` に header token を持たせる）、および AST / bytecode chunk / imported module record / rollback journal の per-drop 追跡（PR-d、`HeapToken = Tracked<()>` トークンで所有構造側から課金・release。tree は AST、VM は bytecode chunk を課金）、および string リテラル/連結/f-string 経路の課金（生成点で `track_result` を通し cumulative + live heap を課金、tree/VM 両対応）、および I-O accounting（input / output / host call の count + bytes を reserve/commit/refund で課金。stdio は host call として co-charge。host call 対象は filesystem read/write と stdio に限り、その他 host 境界 builtin は Phase 2）を実装済みで、これで Slice 2 は完了。VM の push/pop の full-clone や f-string リテラル部分の個別課金のため configured 上限で tree と live/peak・cumulative が食い違い得るが、charge trace の tree/VM 完全一致は第14節 Slice 6（VM が experimental の間）で解消する。Slice 3（explicit continuation）は blast radius が大きいため PR-a（公開 state-machine surface + poll-to-terminal core）→ PR-b（statement / block / loop の明示 frame）→ PR-c（関数呼び出し・try handler の明示 frame）→ PR-d（slice fuel + yield）へ分割する。PR-a（公開 state-machine surface + poll-to-terminal core）・PR-b（statement / block / loop の明示 frame stack。tree evaluator の `drive_body` driver ループ + `Frame`/cursor で `exec_program`/`exec_block`/ループ再帰を置換し、continuation_frame heap を配線）・PR-c（関数呼び出し・try handler の明示 frame。`eval_call` / callback の `call_fn_value` を `FrameKind::Call` を積む形へ変換し、共通 `run_driver` + `drive_call_body` で本体を駆動。VM の `CallFrame` をミラーし、`try` handler は PR-b の `FrameKind::Try` が VM の `TryHandler` をミラーする）を実装済み。次は PR-d（slice fuel + yield）。詳細は第14節 Slice 3 を参照）
 
 ## 1. 位置づけ
 
-本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleStringBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線し、さらに string リテラル・`+` 連結・f-string の生成点でも `track_result` で課金）と source / import accounting サブスライス（per-item `SingleSourceBytes`・cumulative `SourceCount`/`SourceBytes`・`ImportCount`/`ImportBytes` を Link フェーズで root と import へ tree/VM 共通で課金）、heap accounting 基盤サブスライス（`AllocationId`・`AllocationLedger`・§5.1 論理サイズ関数・`HeapBytes` reserve/超過写像）、collection（`List`/`Dict`）の per-drop release サブスライス（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、COW は delta 課金、tree/VM 両対応）、および String body の per-drop release サブスライス（PR-b、`Value::Str` を `Rc<Tracked<String>>` 化し、builtin 結果を dispatch 境界の `track_result` で live heap 課金・最後の参照 drop で release）、cell と tree/VM 関数 instance の per-drop release サブスライス（PR-c、cell 生成点で captured cell を課金し `Value::Fn`/`VmFn` の header token で function instance header を課金、drop で release）、および AST / bytecode chunk / imported module record / rollback journal の per-drop 追跡サブスライス（PR-d、所有構造側が `HeapToken = Tracked<()>` トークンで §5.1 論理サイズを課金し drop で release。§5.3「AST または bytecode」に従い tree は AST・VM は bytecode chunk を課金、import record は両 engine、rollback journal entry は両 engine で entry の固定 overhead を課金）、および string リテラル/連結/f-string 経路の課金サブスライス（生成点で `track_result` を通し cumulative + live heap を課金、tree/VM 両対応）、および I-O accounting サブスライス（input / output / host call の count + bytes を reserve/commit/refund（§7）で課金し、stdio を host call として co-charge。tree/VM の `print` / `input` / filesystem dispatch 境界へ共通配線）も実装済みで、Slice 2 は完了した。Slice 3 は PR-a（公開 state-machine surface + poll-to-terminal core）と PR-b（tree evaluator の statement / block / loop を明示 frame stack + driver ループへ変換し continuation_frame heap を配線）を実装済みで、PR-c（関数呼び出し・try handler の明示 frame）以降と cancel/pause、scheduler、VM charge parity は未実装である。
+本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleStringBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線し、さらに string リテラル・`+` 連結・f-string の生成点でも `track_result` で課金）と source / import accounting サブスライス（per-item `SingleSourceBytes`・cumulative `SourceCount`/`SourceBytes`・`ImportCount`/`ImportBytes` を Link フェーズで root と import へ tree/VM 共通で課金）、heap accounting 基盤サブスライス（`AllocationId`・`AllocationLedger`・§5.1 論理サイズ関数・`HeapBytes` reserve/超過写像）、collection（`List`/`Dict`）の per-drop release サブスライス（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、COW は delta 課金、tree/VM 両対応）、および String body の per-drop release サブスライス（PR-b、`Value::Str` を `Rc<Tracked<String>>` 化し、builtin 結果を dispatch 境界の `track_result` で live heap 課金・最後の参照 drop で release）、cell と tree/VM 関数 instance の per-drop release サブスライス（PR-c、cell 生成点で captured cell を課金し `Value::Fn`/`VmFn` の header token で function instance header を課金、drop で release）、および AST / bytecode chunk / imported module record / rollback journal の per-drop 追跡サブスライス（PR-d、所有構造側が `HeapToken = Tracked<()>` トークンで §5.1 論理サイズを課金し drop で release。§5.3「AST または bytecode」に従い tree は AST・VM は bytecode chunk を課金、import record は両 engine、rollback journal entry は両 engine で entry の固定 overhead を課金）、および string リテラル/連結/f-string 経路の課金サブスライス（生成点で `track_result` を通し cumulative + live heap を課金、tree/VM 両対応）、および I-O accounting サブスライス（input / output / host call の count + bytes を reserve/commit/refund（§7）で課金し、stdio を host call として co-charge。tree/VM の `print` / `input` / filesystem dispatch 境界へ共通配線）も実装済みで、Slice 2 は完了した。Slice 3 は PR-a（公開 state-machine surface + poll-to-terminal core）と PR-b（tree evaluator の statement / block / loop を明示 frame stack + driver ループへ変換し continuation_frame heap を配線）、PR-c（関数呼び出し・try handler の明示 frame。`eval_call` / `call_fn_value` を `FrameKind::Call` 化し、共通 `run_driver` + `drive_call_body` で本体を駆動。VM の `CallFrame` / `TryHandler` をミラー）を実装済みで、PR-d（slice fuel + yield）以降と cancel/pause、scheduler、VM charge parity は未実装である。
 
 本文書は次の既存仕様と一体で実装する。
 
@@ -958,11 +958,37 @@ Slice 3 には含めない。
     エラーも、従来どおり囲む try/catch が捕捉する（advance 経路のエラーも `handle_error`
     を通す）。`tests/fixtures/try_catch` に 2 回目 condition 評価での除算エラーを catch する
     ケースを追加して両 engine で固定した。
-- **PR-c: 関数呼び出し・try handler の明示 frame（⬜ 未実装）** —
-  `eval_call` を、Tsumugi の関数呼び出しが Rust 再帰ではなくヒープ call frame を push する形へ
-  変換する（VM の `CallFrame` / `push_call_frame` をミラーし、Slice 6 で収束できるよう設計を
-  揃える）。`try` handler stack も明示化する（VM の `TryHandler` をミラー）。これで深い再帰
-  driver が不要になり、`main.rs` の 8 MiB 実行スレッドも不要化できる（縮小は必須ではない）。
+- **PR-c: 関数呼び出し・try handler の明示 frame（✅ 実装済み）** —
+  `eval_call`（`src/eval.rs`）と callback の `call_fn_value`（`src/builtin.rs`）を、Tsumugi の
+  関数呼び出しがヒープ上の明示 call frame を積む形へ変換した。VM の `CallFrame` をミラーする
+  `FrameKind::Call { saved_scopes }` を追加し、PR-b の driver ループを共通 `run_driver(frames)`
+  へ抽出したうえで、関数本体を実行する `drive_call_body(def, saved_scopes)` を新設した。
+  - 実装（`src/eval.rs` / `src/builtin.rs`）: `drive_call_body` は呼び出す関数の
+    `Rc<FnDef>` をローカルに保持し、その `&def.body` を root frame（`FrameKind::Call`）の
+    `stmts` として渡す。これにより関数本体とそこから派生する `if`/ループ/`try` の子 frame は、
+    呼び出しの実行全体を通じて生きるこの本体 AST を借用でき、frame が自分の所有物を借用する
+    自己参照を避ける（VM の `CallFrame` が `Rc<Chunk>` を保持し `ip` で index するのに対応する
+    tree 側の等価な寿命管理）。呼び出し元（`eval_call` / `call_fn_value`）は従来どおり
+    `env.push_call_frame()` でスコープを退避し、captured cell / self-binding / 引数を束縛し、
+    call trace を積んでから、退避情報 `saved_scopes` を Call frame へ預けて `drive_call_body`
+    を呼ぶ。Call frame の `pop_frame` が全終了経路（正常完了・`return` unwind・エラー unwind）で
+    `env.pop_call_frame` と call trace の巻き戻しを一元的に行うため、呼び出し元側の終了経路ごとの
+    手動 `pop_call_frame` を廃止した。`return` は `unwind_flow` が最も近い Call frame まで畳んで
+    値を produce し、`break` / `continue` は Call 境界を越えられずそのまま surface して
+    呼び出し側が「ループ外」エラーへ写す。エラー時の call trace は、frame を畳む前・発生時点の
+    `call_stack` を snapshot する `attach_trace`（VM の `attach_trace` と同じ意味論。`with_trace`
+    は既存トレースを上書きしないため最深トレースが保たれる）で付加する。
+  - `try` handler は PR-b 時点で既に明示 frame stack 上の `FrameKind::Try`（driver の
+    `handle_error` が最も近い Try frame へ unwind）として実装済みであり、これが VM の
+    `TryHandler` stack をミラーする。PR-c の Call frame 化により、呼び出し境界を越えた
+    try/catch の伝播は各呼び出しが独立した frame stack を持つ再入で自然に分離される
+    （callee 内の未捕捉エラーは Call frame まで畳んで `Err` を返し、caller の driver が
+    自分の Try frame で捕捉する）。
+  - 観測挙動は不変（既存の全テストが緑、tree/VM の trace・catch・parity テストを含む）。
+    再入モデルのため呼び出しごとに 1 段の Rust フレームは残り、`main.rs` の 8 MiB 実行
+    スレッドと呼び出し深度上限 128 はそのまま維持する（式評価が Rust 再帰である以上、
+    呼び出しごとの Rust フレーム除去には明示式評価スタックが必要で、それは範囲外。
+    スレッド縮小は必須ではない）。
 - **PR-d: slice fuel + yield（⬜ 未実装）** —
   `budget.remaining_fuel()` の上に slice-fuel accounting 層を足し、driver ループの charge 点で
   `PollSlice::max_fuel` を確認する。total 残量はあるが slice 残量を超える場合は charge せず
