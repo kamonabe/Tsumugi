@@ -491,13 +491,18 @@ struct CompiledScriptInner {
     backend: Backend,
     /// root source に top-level import 文が1件以上あるか（Phase 1 の link 判定に使う）。
     ///
-    /// E2 の [`CompiledScript`] は `Send + Sync` 契約（EMB-AT-02）を満たす必要がある。現行 AST
-    /// は `Block = Rc<[Stmt]>`（REV-015 Slice 3 PR-d）で `!Send`/`!Sync` のため、runnable AST を
-    /// この handle へ保持しない。compile が検証のため一度 parse するが、実行入口（E3）は
-    /// 実行時に再 parse するか AST を `Send + Sync` 化してから駆動する（別スライスで扱う）。
-    /// import の有無だけは link 判定に必要なので `bool` に畳んで持つ。
+    /// [`CompiledScript`] は `Send + Sync` 契約（EMB-AT-02）を満たす必要がある。現行 AST は
+    /// `Block = Rc<[Stmt]>`（REV-015 Slice 3 PR-d）で `!Send`/`!Sync` のため、runnable AST を
+    /// この handle へ保持しない。E3 の実行入口は、実行スレッド上で保持 source を再 parse して
+    /// runnable な `Program` を再構築する（案 A。設計判断の根拠と却下した案 B は
+    /// [組み込みAPI仕様](../docs/embedding-api.md) 第4.1節を正本とする）。import の有無だけは
+    /// link 判定に必要なので `bool` に畳んで持つ。
     has_imports: bool,
     /// `retain_source=true` のとき保持する source 本文。
+    ///
+    /// E3 の実行入口はこの本文を再 parse して実行する。したがって
+    /// [`CompiledScript`] を実行するには `retain_source=true` で compile しておく必要がある
+    /// （案 A の明示契約。原則2「明示 > 暗黙」に沿う）。
     retained_source: Option<String>,
 }
 
@@ -752,6 +757,234 @@ impl Engine {
             import_graph,
             script_hash,
         })))
+    }
+}
+
+// ===========================================================================
+// スライス E3: tree backend adapter（実行入口）
+// ===========================================================================
+
+use crate::budget::BudgetUsage;
+use crate::eval::{Evaluator, RunPhase};
+
+/// 1 回の実行に対する不変の設定（仕様第6節 `ExecutionRequest`）。
+///
+/// E3 では script 引数 snapshot だけを持つ最小の骨格。仕様の `execution_id` /
+/// frozen `CapabilitySet` / 有限 `BudgetConfig` / `CancellationToken` は Phase 2/3（E7・E11）で
+/// 導入する。alpha facade（[`crate::engine::ExecutionRequest`]）とは別型。
+#[derive(Clone, Debug, Default)]
+pub struct ExecutionRequest {
+    /// `args()` が返すスクリプト引数 snapshot（binary 名・script path・CLI flag を含まない）。
+    arguments: Vec<String>,
+}
+
+impl ExecutionRequest {
+    /// 引数なしの実行リクエストを作る。
+    pub fn new() -> Self {
+        Self {
+            arguments: Vec::new(),
+        }
+    }
+
+    /// スクリプト引数 snapshot を設定する（AUD-018、仕様第6節）。
+    pub fn with_arguments(mut self, arguments: Vec<String>) -> Self {
+        self.arguments = arguments;
+        self
+    }
+}
+
+/// 実行間で維持する Tsumugi の状態（仕様第6節 `ExecutionContext`）。
+///
+/// 単一スレッドの評価状態（変数・関数・import 解決）を保持し、`!Send + !Sync`（第9.1節）。
+/// これは stable 契約であり、別スレッドへ move できない。同 engine の実行で再利用すると
+/// binding を保持する。
+///
+/// alpha facade（[`crate::engine::ExecutionContext`]）とは別型で、crate root では
+/// [`crate::EmbeddingContext`] として公開する。
+pub struct ExecutionContext {
+    engine_id: EngineId,
+    evaluator: Evaluator,
+    /// `!Send + !Sync` を保証する（第9.1節）。
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl ExecutionContext {
+    /// 指定した engine 用の実行コンテキストを作る（仕様第6節 `ExecutionContext::new`）。
+    pub fn new(engine: &Engine) -> Self {
+        Self {
+            engine_id: engine.id(),
+            evaluator: Evaluator::new(),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    /// このコンテキストを作った engine の ID。
+    pub fn engine_id(&self) -> EngineId {
+        self.engine_id
+    }
+
+    /// 相対 import 解決・自己再 import 防止に使う script path を設定する。
+    ///
+    /// Phase 1 は import なし root のみ実行するため実効はないが、CLI 同一入口（E8a）で
+    /// 使えるよう用意する。
+    pub fn set_script_path(&mut self, path: impl AsRef<std::path::Path>) {
+        self.evaluator.set_base_dir(path.as_ref());
+    }
+
+    /// 現在の予算使用量 snapshot を返す（仕様第6節 `BudgetUsage`）。
+    pub fn budget_usage(&self) -> BudgetUsage {
+        self.evaluator.budget_usage()
+    }
+}
+
+impl std::fmt::Debug for ExecutionContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 評価状態（binding・値）を Debug へ出さない（secret-free）。
+        f.debug_struct("ExecutionContext")
+            .field("engine_id", &self.engine_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Engine {
+    /// [`LinkedScript`] を実行コンテキスト内で同期実行し、terminal outcome を返す（仕様第2・8節）。
+    ///
+    /// E3（tree backend adapter）の実行入口。caller スレッドを terminal まで占有する
+    /// convenience method で、worker thread を暗黙生成しない（仕様第2節）。tree 評価器の
+    /// 既存意味論をそのまま使い、Phase 1 で到達し得る [`ExecutionOutcome`]
+    /// （`Completed` / `RuntimeError` / `InternalFailure`）を返す。
+    ///
+    /// # 実行用 AST の再構築（案 A）
+    ///
+    /// [`CompiledScript`] は `Send + Sync` 契約のため runnable AST を保持しない。本メソッドは
+    /// 実行スレッド上で `retain_source` の保持 source を再 parse して `Program` を得る。
+    /// したがって **`retain_source=true` で compile した script だけが実行可能**である。
+    /// source を保持していない場合は [`ExecutionOutcome::InternalFailure`] を返す（host の
+    /// 前提条件違反）。設計判断の根拠と却下した案 B は
+    /// [組み込みAPI仕様](../docs/embedding-api.md) 第4.1節を正本とする。
+    ///
+    /// # スレッドとスタック
+    ///
+    /// [`ExecutionContext`] は `!Send` で、caller スレッド上で再帰評価する。埋め込み host は
+    /// 十分なスタックを持つスレッドで context を生成・利用する（CLI は 8 MiB スレッドを使う）。
+    pub fn run(
+        &self,
+        linked: &LinkedScript,
+        context: &mut ExecutionContext,
+        request: ExecutionRequest,
+    ) -> ExecutionOutcome {
+        // engine / context の整合を検証する（別 engine の context は実行しない）。
+        if context.engine_id() != self.id() {
+            return internal_failure("実行コンテキストの engine が一致しません");
+        }
+        let root = linked.root();
+        if root.engine_id() != self.id() {
+            return internal_failure("LinkedScript の engine が一致しません");
+        }
+
+        // 実行用 Program を保持 source から再構築する（案 A）。
+        let Some(source_text) = root.retained_source() else {
+            return internal_failure(
+                "実行には source の保持が必要です: retain_source=true で compile してください",
+            );
+        };
+        let program = match Parser::new(Lexer::new(source_text).tokenize()).parse() {
+            Ok(program) => program,
+            // compile 済みの script を再 parse して失敗するのは内部不整合（決定的なはず）。
+            Err(errors) => {
+                let detail = errors
+                    .first()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "詳細不明".to_string());
+                return internal_failure(format!(
+                    "保持 source の再 parse に失敗しました: {detail}"
+                ));
+            }
+        };
+        let root_source_bytes = source_text.len() as u64;
+
+        // 引数 snapshot を評価器へ注入する（AUD-018）。
+        context.evaluator.set_script_args(request.arguments);
+
+        // begin_execution → run_slice を terminal まで回す（engine.rs の poll と同じ手順）。
+        // Phase 1 は非トランザクション（transaction 全面適用は E4 / REV-008）。
+        if let Err((phase, error)) =
+            context
+                .evaluator
+                .begin_execution(&program, root_source_bytes, false)
+        {
+            // Phase 1 の import なし root では Link 失敗は起きないが、防御的に写像する。
+            // link/control-plane の LinkError terminal は Phase 2（E7）で扱う。
+            return match phase {
+                RunPhase::Link | RunPhase::Run => runtime_error_outcome(error),
+            };
+        }
+        // program は begin_execution が Rc<[Stmt]> フレームへ写して所有するため drop してよい。
+        drop(program);
+
+        loop {
+            // 大きな slice で 1 回ずつ回す（協調 yield の実効化は Phase 4）。同期実行なので
+            // terminal まで回し切る。
+            match context.evaluator.run_slice(u64::MAX) {
+                None => continue, // yield（Phase 1 では slice=u64::MAX のため実質起きない）
+                Some(Ok(())) => return ExecutionOutcome::Completed,
+                Some(Err(error)) => return runtime_error_outcome(error),
+            }
+        }
+    }
+}
+
+/// 内部 [`TsumugiError`] を [`ExecutionOutcome::RuntimeError`] へ写す。
+fn runtime_error_outcome(error: TsumugiError) -> ExecutionOutcome {
+    ExecutionOutcome::RuntimeError {
+        error: execution_error_from(&error),
+    }
+}
+
+/// secret を含まない [`ExecutionOutcome::InternalFailure`] を作る。
+fn internal_failure(safe_message: impl Into<String>) -> ExecutionOutcome {
+    ExecutionOutcome::InternalFailure {
+        fault_id: next_fault_id(),
+        safe_message: safe_message.into(),
+    }
+}
+
+/// 相関用の非ゼロ fault ID を発番する。
+fn next_fault_id() -> u128 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed) as u128
+}
+
+/// 内部 [`TsumugiError`] を公開 [`ExecutionError`] へ写す（仕様第8節）。
+///
+/// `Runtime` は `kind`・`trace` を持つ。`Parse` は実行フェーズでは発生しない想定だが、
+/// 防御的に `Internal` として写す（message は AUD-019 により secret-free）。
+fn execution_error_from(error: &TsumugiError) -> ExecutionError {
+    match error {
+        TsumugiError::Runtime {
+            line,
+            message,
+            kind,
+            trace,
+        } => ExecutionError {
+            code: *kind,
+            safe_message: message.clone(),
+            line: u32::try_from(*line).ok(),
+            trace: trace
+                .iter()
+                .map(|frame| TraceFrame {
+                    function: frame.name.clone(),
+                    line: u32::try_from(frame.line).ok(),
+                })
+                .collect(),
+        },
+        TsumugiError::Parse { line, message } => ExecutionError {
+            code: ErrorKind::Internal,
+            safe_message: message.clone(),
+            line: u32::try_from(*line).ok(),
+            trace: Vec::new(),
+        },
     }
 }
 
@@ -1231,6 +1464,165 @@ mod tests {
             .link(&script, LinkRequest::new())
             .expect_err("foreign engine");
         assert_eq!(err, LinkError::EngineMismatch);
+    }
+
+    // --- E3: tree backend adapter（実行入口）---
+
+    fn retained(id: &str, text: &str) -> Source<'static> {
+        src(id, text)
+    }
+
+    /// compile(retain) → link → run が Completed を返す。
+    #[test]
+    fn run_completes_import_less_script() {
+        let engine = Engine::builder().build().unwrap();
+        let script = engine
+            .compile(
+                retained("m", "let x = 1\nlet y = x + 2\n"),
+                &CompileOptions {
+                    retain_source: true,
+                },
+            )
+            .unwrap();
+        let linked = engine.link(&script, LinkRequest::new()).unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let outcome = engine.run(&linked, &mut ctx, ExecutionRequest::new());
+        assert_eq!(outcome, ExecutionOutcome::Completed);
+    }
+
+    /// 未捕捉 runtime error は RuntimeError outcome へ写り、code / trace が付く。
+    #[test]
+    fn run_surfaces_runtime_error_with_code_and_trace() {
+        let engine = Engine::builder().build().unwrap();
+        // 未定義変数の参照 → Name エラー。
+        let script = engine
+            .compile(
+                retained("m", "let x = undefined_name\n"),
+                &CompileOptions {
+                    retain_source: true,
+                },
+            )
+            .unwrap();
+        let linked = engine.link(&script, LinkRequest::new()).unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+            ExecutionOutcome::RuntimeError { error } => {
+                assert_eq!(error.code, ErrorKind::Name);
+                assert_eq!(error.line, Some(1));
+            }
+            other => panic!("期待: RuntimeError, 実際: {other:?}"),
+        }
+    }
+
+    /// 関数内で発生したエラーは trace に呼び出し経路を持つ。
+    #[test]
+    fn run_runtime_error_includes_call_trace() {
+        let engine = Engine::builder().build().unwrap();
+        let source = "fn boom()\n  return missing\nend\nlet r = boom()\n";
+        let script = engine
+            .compile(
+                retained("m", source),
+                &CompileOptions {
+                    retain_source: true,
+                },
+            )
+            .unwrap();
+        let linked = engine.link(&script, LinkRequest::new()).unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+            ExecutionOutcome::RuntimeError { error } => {
+                assert_eq!(error.code, ErrorKind::Name);
+                assert!(
+                    error.trace.iter().any(|f| f.function == "boom"),
+                    "trace に boom を含むべき: {:?}",
+                    error.trace
+                );
+            }
+            other => panic!("期待: RuntimeError, 実際: {other:?}"),
+        }
+    }
+
+    /// retain_source=false の script を実行すると InternalFailure（host 前提条件違反）。
+    #[test]
+    fn run_without_retained_source_is_internal_failure() {
+        let engine = Engine::builder().build().unwrap();
+        let script = engine
+            .compile(retained("m", "let x = 1\n"), &CompileOptions::default())
+            .unwrap();
+        let linked = engine.link(&script, LinkRequest::new()).unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+            ExecutionOutcome::InternalFailure { fault_id, .. } => {
+                assert_ne!(fault_id, 0);
+            }
+            other => panic!("期待: InternalFailure, 実際: {other:?}"),
+        }
+    }
+
+    /// 別 engine の context で実行すると InternalFailure（engine 不一致）。
+    #[test]
+    fn run_rejects_foreign_context() {
+        let engine_a = Engine::builder().build().unwrap();
+        let engine_b = Engine::builder().build().unwrap();
+        let script = engine_a
+            .compile(
+                retained("m", "let x = 1\n"),
+                &CompileOptions {
+                    retain_source: true,
+                },
+            )
+            .unwrap();
+        let linked = engine_a.link(&script, LinkRequest::new()).unwrap();
+        let mut foreign_ctx = ExecutionContext::new(&engine_b);
+        assert!(matches!(
+            engine_a.run(&linked, &mut foreign_ctx, ExecutionRequest::new()),
+            ExecutionOutcome::InternalFailure { .. }
+        ));
+    }
+
+    /// 同一 context の再利用で binding が保持される。
+    #[test]
+    fn run_reuses_context_bindings() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+
+        let first = engine
+            .compile(
+                retained("m", "let saved = 41\n"),
+                &CompileOptions {
+                    retain_source: true,
+                },
+            )
+            .unwrap();
+        let linked1 = engine.link(&first, LinkRequest::new()).unwrap();
+        assert_eq!(
+            engine.run(&linked1, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::Completed
+        );
+
+        // 直前の実行で定義した saved を参照できる（同一 context）。
+        let second = engine
+            .compile(
+                retained("m", "let doubled = saved + 1\n"),
+                &CompileOptions {
+                    retain_source: true,
+                },
+            )
+            .unwrap();
+        let linked2 = engine.link(&second, LinkRequest::new()).unwrap();
+        assert_eq!(
+            engine.run(&linked2, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::Completed
+        );
+    }
+
+    /// ExecutionContext は !Send / !Sync（stable 契約、第9.1節）であることを型で示す。
+    /// （コンパイルが通ること自体が確認。ここでは Send/Sync を要求しない用途で使う。）
+    #[test]
+    fn execution_context_is_usable_single_threaded() {
+        let engine = Engine::builder().build().unwrap();
+        let ctx = ExecutionContext::new(&engine);
+        assert_eq!(ctx.engine_id(), engine.id());
     }
 
     /// EMB-AT-13: root hash / graph hash の golden 値を固定し、1 byte 変更で差が出る。
