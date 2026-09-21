@@ -36,7 +36,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -63,7 +63,35 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Test
-        run: cargo test
+        run: cargo test --all-features --locked
+
+  # MSRV（検証・リリース・運用設計 §3.2 / Slice 1）。stable job（rolling）とは別に、
+  # 下限 toolchain 1.97.0 を明示 install して検証する。これにより CI が検証に使う
+  # バージョンが固定され、rolling stable 側の新 lint によるすり抜けとは独立に MSRV を担保する。
+  msrv:
+    name: MSRV (1.97.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.0
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-msrv-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-msrv-
+
+      - name: Test (MSRV)
+        run: cargo test --all-features --locked
 
   coverage:
     name: Coverage
