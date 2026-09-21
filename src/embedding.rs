@@ -400,6 +400,527 @@ pub enum ExecutionOutcome {
     },
 }
 
+// ===========================================================================
+// スライス E2: compile / import なし link / byte-level hash
+// ===========================================================================
+
+use std::sync::Arc;
+
+use crate::ast::Stmt;
+use crate::error::TsumugiError;
+use crate::lexer::Lexer;
+use crate::parser::Parser;
+
+/// compile 対象の root source（仕様第4節 `Source`）。
+pub struct Source<'a> {
+    /// 表示用 source 識別子。
+    pub id: SourceId,
+    /// source 本文（UTF-8）。
+    pub text: &'a str,
+}
+
+impl<'a> Source<'a> {
+    /// root source を作る。
+    pub fn new(id: SourceId, text: &'a str) -> Self {
+        Self { id, text }
+    }
+}
+
+/// compile の挙動オプション（仕様第4節 `CompileOptions`）。
+///
+/// `Default` の `retain_source` は `false`（line map と診断に必要な位置以外は source 本文を
+/// 保持しない）。
+#[derive(Clone, Debug, Default)]
+pub struct CompileOptions {
+    /// source 本文を保持するか。既定は `false`。
+    pub retain_source: bool,
+}
+
+/// compile 診断の分類（仕様第4節 `CompileDiagnosticCode`）。
+///
+/// 現行 pipeline は lex エラーを parser が `Parse` として surface するため、E2 では
+/// AST 深度超過を [`Self::AstDepth`]、それ以外の lex/parse エラーを [`Self::Parse`] に
+/// 分類する。`Backend`（VM compile）と `InternalFault`（compile 中 panic）は後続スライスで
+/// 使う。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompileDiagnosticCode {
+    /// 字句解析エラー。
+    Lex,
+    /// 構文解析エラー。
+    Parse,
+    /// AST ネスト深度の超過。
+    AstDepth,
+    /// backend compile（VM）エラー。
+    Backend,
+    /// compile 中の内部障害。
+    InternalFault,
+}
+
+/// 単一の compile 診断（仕様第4節 `CompileDiagnostic`）。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompileDiagnostic {
+    /// 診断の分類。
+    pub code: CompileDiagnosticCode,
+    /// 発生行。不明なら `None`。
+    pub line: Option<u32>,
+    /// 発生列。現行 parser は列を追跡しないため常に `None`。
+    pub column: Option<u32>,
+    /// secret を含まない表示用メッセージ。
+    pub safe_message: String,
+}
+
+/// compile 失敗（仕様第4節 `CompileErrors`）。診断は常に1件以上、source 位置順。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompileErrors {
+    /// 1件以上の診断（source 位置順）。
+    pub diagnostics: Vec<CompileDiagnostic>,
+}
+
+/// パース済みで実行可能な Tsumugi スクリプト（仕様第4節 `CompiledScript`）。
+///
+/// `Arc` 共有で `Send + Sync`。同 engine / revision / backend で再利用できる。E2 では
+/// `retain_source=false` のとき source 本文を保持しない（AST と source hash のみ持つ）。
+#[derive(Clone)]
+pub struct CompiledScript(Arc<CompiledScriptInner>);
+
+struct CompiledScriptInner {
+    engine_id: EngineId,
+    source_id: SourceId,
+    source_hash: SourceHash,
+    language_revision: LanguageRevision,
+    backend: Backend,
+    /// root source に top-level import 文が1件以上あるか（Phase 1 の link 判定に使う）。
+    ///
+    /// E2 の [`CompiledScript`] は `Send + Sync` 契約（EMB-AT-02）を満たす必要がある。現行 AST
+    /// は `Block = Rc<[Stmt]>`（REV-015 Slice 3 PR-d）で `!Send`/`!Sync` のため、runnable AST を
+    /// この handle へ保持しない。compile が検証のため一度 parse するが、実行入口（E3）は
+    /// 実行時に再 parse するか AST を `Send + Sync` 化してから駆動する（別スライスで扱う）。
+    /// import の有無だけは link 判定に必要なので `bool` に畳んで持つ。
+    has_imports: bool,
+    /// `retain_source=true` のとき保持する source 本文。
+    retained_source: Option<String>,
+}
+
+impl CompiledScript {
+    /// この script を作った engine の ID。
+    pub fn engine_id(&self) -> EngineId {
+        self.0.engine_id
+    }
+
+    /// source 識別子。
+    pub fn source_id(&self) -> &SourceId {
+        &self.0.source_id
+    }
+
+    /// source 内容ハッシュ（SHA-256）。
+    pub fn source_hash(&self) -> SourceHash {
+        self.0.source_hash
+    }
+
+    /// 言語 revision。
+    pub fn language_revision(&self) -> LanguageRevision {
+        self.0.language_revision
+    }
+
+    /// backend。
+    pub fn backend(&self) -> Backend {
+        self.0.backend
+    }
+
+    /// 保持している source 本文（`retain_source=true` のときのみ `Some`）。
+    pub fn retained_source(&self) -> Option<&str> {
+        self.0.retained_source.as_deref()
+    }
+
+    /// root source に top-level import 文があるか（link 判定用、crate 内部）。
+    pub(crate) fn has_imports(&self) -> bool {
+        self.0.has_imports
+    }
+}
+
+impl std::fmt::Debug for CompiledScript {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // source 本文・AST を Debug へ出さない（secret-free）。identity だけを見せる。
+        f.debug_struct("CompiledScript")
+            .field("engine_id", &self.0.engine_id)
+            .field("source_id", &self.0.source_id)
+            .field("source_hash", &self.0.source_hash)
+            .field("language_revision", &self.0.language_revision)
+            .field("backend", &self.0.backend)
+            .finish_non_exhaustive()
+    }
+}
+
+/// import module の識別子（仕様第5節 `ModuleId`）。1..=1024 UTF-8 bytes、NUL なし。
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct ModuleId(String);
+
+impl ModuleId {
+    /// module 識別子を検証して作る。
+    pub fn new(value: impl Into<String>) -> Result<Self, ConfigError> {
+        let value = value.into();
+        validate_identifier("module_id", &value, 1024)?;
+        Ok(Self(value))
+    }
+
+    /// 識別子文字列を返す。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// import graph の1ノード（仕様第5節 `ImportNode`）。
+#[derive(Clone, Debug)]
+pub struct ImportNode {
+    /// module ID。
+    pub module_id: ModuleId,
+    /// この module の source hash。
+    pub source_hash: SourceHash,
+    /// この module が import する module（source 内の出現順）。
+    pub imports: Vec<ModuleId>,
+}
+
+/// import graph（仕様第5節 `ImportGraph`）。
+#[derive(Clone, Debug)]
+pub struct ImportGraph {
+    /// root source の hash。
+    pub root: SourceHash,
+    /// root source が import する module（出現順）。
+    pub root_imports: Vec<ModuleId>,
+    /// 各ノード（module_id の UTF-8 byte 列昇順）。
+    pub nodes: Vec<ImportNode>,
+    /// graph の byte-level hash（§5.1）。
+    pub graph_hash: SourceHash,
+}
+
+/// link 済みで実行可能なスクリプト（仕様第5節 `LinkedScript`）。
+#[derive(Clone)]
+pub struct LinkedScript(Arc<LinkedScriptInner>);
+
+struct LinkedScriptInner {
+    root: CompiledScript,
+    import_graph: ImportGraph,
+    script_hash: SourceHash,
+}
+
+impl LinkedScript {
+    /// root の `CompiledScript`。
+    pub fn root(&self) -> &CompiledScript {
+        &self.0.root
+    }
+
+    /// import graph。
+    pub fn import_graph(&self) -> &ImportGraph {
+        &self.0.import_graph
+    }
+
+    /// linked script の byte-level hash（§5.1）。
+    pub fn script_hash(&self) -> SourceHash {
+        self.0.script_hash
+    }
+}
+
+impl std::fmt::Debug for LinkedScript {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkedScript")
+            .field("root", &self.0.root)
+            .field("script_hash", &self.0.script_hash)
+            .finish_non_exhaustive()
+    }
+}
+
+/// link 要求（仕様第5節 `LinkRequest`）。
+///
+/// E2 では capability / budget / cancellation を伴う import 解決を行わない（Phase 1 は
+/// import 0 件のみ link 可能）。最終形の `operation_id` / `capabilities` / `budget` /
+/// `cancellation` は Phase 2/3（E7・E11）で導入する。現状は最小の骨格に留める。
+#[derive(Clone, Debug, Default)]
+pub struct LinkRequest {
+    _private: (),
+}
+
+impl LinkRequest {
+    /// 既定の link 要求を作る。
+    pub fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// link 失敗（仕様第5節 `LinkError`）。
+///
+/// E2（Phase 1、import 0 件）で到達し得る variant のみを持つ。resolver / capability /
+/// budget / deadline / cancel 等は Phase 2/3 で追加する。`#[non_exhaustive]`。
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum LinkError {
+    /// 別 engine で作られた `CompiledScript` を link しようとした。
+    EngineMismatch,
+    /// revision が一致しない。
+    RevisionMismatch,
+    /// backend が一致しない。
+    BackendMismatch,
+    /// 現在の Phase で未提供の機能を要求した（Phase 1 の import など）。
+    FeatureUnavailable {
+        /// 未提供の機能名。
+        feature: &'static str,
+    },
+}
+
+impl Engine {
+    /// root source を lex / parse / backend compile して再利用可能な [`CompiledScript`] を作る
+    /// （仕様第4節）。
+    ///
+    /// import 先・filesystem・environment・clock・stdio・host function を一切呼ばない。
+    /// 失敗時は source 位置順に1件以上の [`CompileDiagnostic`] を返す。
+    pub fn compile(
+        &self,
+        source: Source<'_>,
+        options: &CompileOptions,
+    ) -> Result<CompiledScript, CompileErrors> {
+        let tokens = Lexer::new(source.text).tokenize();
+        let program = Parser::new(tokens)
+            .parse()
+            .map_err(|errors| CompileErrors {
+                diagnostics: errors.iter().map(compile_diagnostic_from).collect(),
+            })?;
+
+        let source_hash = SourceHash::from_bytes(hash::sha256(source.text.as_bytes()));
+        let has_imports = program.iter().any(is_import_stmt);
+
+        Ok(CompiledScript(Arc::new(CompiledScriptInner {
+            engine_id: self.id(),
+            source_id: source.id.clone(),
+            source_hash,
+            language_revision: self.config().language_revision,
+            backend: self.config().backend,
+            has_imports,
+            retained_source: options.retain_source.then(|| source.text.to_string()),
+        })))
+    }
+
+    /// [`CompiledScript`] を link して [`LinkedScript`] を作る（仕様第5節）。
+    ///
+    /// engine ID → revision → backend の順に検証し、不一致なら対応する [`LinkError`] を返す。
+    /// Phase 1 では import 0 件だけを link でき、import 文が1件以上あれば
+    /// [`LinkError::FeatureUnavailable`]（`feature: "module_resolver"`）を返す。import 0 件でも
+    /// 空 graph を持つ。
+    pub fn link(
+        &self,
+        script: &CompiledScript,
+        _request: LinkRequest,
+    ) -> Result<LinkedScript, LinkError> {
+        if script.engine_id() != self.id() {
+            return Err(LinkError::EngineMismatch);
+        }
+        if script.language_revision() != self.config().language_revision {
+            return Err(LinkError::RevisionMismatch);
+        }
+        if script.backend() != self.config().backend {
+            return Err(LinkError::BackendMismatch);
+        }
+
+        // Phase 1: import が1件でもあれば module resolver 未提供として拒否する。
+        if script.has_imports() {
+            return Err(LinkError::FeatureUnavailable {
+                feature: "module_resolver",
+            });
+        }
+
+        let root = script.source_hash();
+        // import 0 件の空 graph。
+        let graph_hash = SourceHash::from_bytes(hash::import_graph_hash(
+            script.language_revision(),
+            root,
+            &[],
+            &[],
+        ));
+        let import_graph = ImportGraph {
+            root,
+            root_imports: Vec::new(),
+            nodes: Vec::new(),
+            graph_hash,
+        };
+
+        let script_hash = SourceHash::from_bytes(hash::linked_script_hash(
+            script.language_revision(),
+            root,
+            graph_hash,
+        ));
+
+        Ok(LinkedScript(Arc::new(LinkedScriptInner {
+            root: script.clone(),
+            import_graph,
+            script_hash,
+        })))
+    }
+}
+
+/// top-level import 文か。
+fn is_import_stmt(stmt: &Stmt) -> bool {
+    matches!(stmt, Stmt::Import { .. })
+}
+
+/// 内部 [`TsumugiError`]（compile フェーズ）を [`CompileDiagnostic`] へ写す。
+fn compile_diagnostic_from(error: &TsumugiError) -> CompileDiagnostic {
+    let (line, message) = match error {
+        TsumugiError::Parse { line, message } => (*line, message.clone()),
+        // compile フェーズは Parse のみを生成するが、防御的に他種も message を拾う。
+        TsumugiError::Runtime { line, message, .. } => (*line, message.clone()),
+    };
+    let code = if message.contains("ネストが深すぎます") {
+        CompileDiagnosticCode::AstDepth
+    } else {
+        CompileDiagnosticCode::Parse
+    };
+    CompileDiagnostic {
+        code,
+        line: u32::try_from(line).ok(),
+        column: None,
+        safe_message: message,
+    }
+}
+
+/// SHA-256（FIPS 180-4）と §5.1 の byte-level hash encoding。
+///
+/// 外部クレートを持ち込まないため self-contained に実装する。既知テストベクタで検証する。
+mod hash {
+    use super::{LanguageRevision, SourceHash};
+
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    const H0: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+
+    /// SHA-256 ダイジェスト（32 bytes）を計算する。
+    pub fn sha256(data: &[u8]) -> [u8; 32] {
+        let mut h = H0;
+
+        // padding: 0x80、64bit 境界の 56 まで 0、その後 64bit big-endian の bit 長。
+        let bit_len = (data.len() as u64).wrapping_mul(8);
+        let mut msg = data.to_vec();
+        msg.push(0x80);
+        while msg.len() % 64 != 56 {
+            msg.push(0);
+        }
+        msg.extend_from_slice(&bit_len.to_be_bytes());
+
+        for chunk in msg.chunks_exact(64) {
+            let mut w = [0u32; 64];
+            for (i, word) in w.iter_mut().enumerate().take(16) {
+                let j = i * 4;
+                *word = u32::from_be_bytes([chunk[j], chunk[j + 1], chunk[j + 2], chunk[j + 3]]);
+            }
+            for i in 16..64 {
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+                w[i] = w[i - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[i - 7])
+                    .wrapping_add(s1);
+            }
+
+            let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+            for i in 0..64 {
+                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let ch = (e & f) ^ ((!e) & g);
+                let t1 = hh
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K[i])
+                    .wrapping_add(w[i]);
+                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                let maj = (a & b) ^ (a & c) ^ (b & c);
+                let t2 = s0.wrapping_add(maj);
+                hh = g;
+                g = f;
+                f = e;
+                e = d.wrapping_add(t1);
+                d = c;
+                c = b;
+                b = a;
+                a = t1.wrapping_add(t2);
+            }
+            h[0] = h[0].wrapping_add(a);
+            h[1] = h[1].wrapping_add(b);
+            h[2] = h[2].wrapping_add(c);
+            h[3] = h[3].wrapping_add(d);
+            h[4] = h[4].wrapping_add(e);
+            h[5] = h[5].wrapping_add(f);
+            h[6] = h[6].wrapping_add(g);
+            h[7] = h[7].wrapping_add(hh);
+        }
+
+        let mut out = [0u8; 32];
+        for (i, word) in h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    /// §5.1 の `str = u64(len) || UTF-8 bytes` を buffer へ書く。
+    fn push_str_field(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u64).to_be_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    /// import graph の byte-level hash（§5.1、`TSUMUGI-IMPORT-GRAPH-V1`）。
+    ///
+    /// `nodes` は module_id の UTF-8 byte 列昇順で渡す前提。各 node は
+    /// `(module_id, source_hash, imports)` を持つ。E2 では import 0 件のため空 slice を渡す。
+    pub fn import_graph_hash(
+        revision: LanguageRevision,
+        root_hash: SourceHash,
+        root_imports: &[&str],
+        nodes: &[(&str, SourceHash, &[&str])],
+    ) -> [u8; 32] {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"TSUMUGI-IMPORT-GRAPH-V1\0");
+        push_str_field(&mut buf, revision.as_str());
+        buf.extend_from_slice(root_hash.as_bytes());
+        buf.extend_from_slice(&(root_imports.len() as u64).to_be_bytes());
+        for id in root_imports {
+            push_str_field(&mut buf, id);
+        }
+        buf.extend_from_slice(&(nodes.len() as u64).to_be_bytes());
+        for (module_id, source_hash, imports) in nodes {
+            push_str_field(&mut buf, module_id);
+            buf.extend_from_slice(source_hash.as_bytes());
+            buf.extend_from_slice(&(imports.len() as u64).to_be_bytes());
+            for imp in *imports {
+                push_str_field(&mut buf, imp);
+            }
+        }
+        sha256(&buf)
+    }
+
+    /// linked script の byte-level hash（§5.1、`TSUMUGI-LINKED-SCRIPT-V1`）。
+    pub fn linked_script_hash(
+        revision: LanguageRevision,
+        root_hash: SourceHash,
+        graph_hash: SourceHash,
+    ) -> [u8; 32] {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"TSUMUGI-LINKED-SCRIPT-V1\0");
+        push_str_field(&mut buf, revision.as_str());
+        buf.extend_from_slice(root_hash.as_bytes());
+        buf.extend_from_slice(graph_hash.as_bytes());
+        sha256(&buf)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,5 +1059,199 @@ mod tests {
         assert_send_sync::<SourceHash>();
         assert_send_sync::<ExecutionId>();
         assert_send_sync::<EngineId>();
+        // E2: compile/link 成果物も再利用のため Send + Sync。
+        assert_send_sync::<CompiledScript>();
+        assert_send_sync::<LinkedScript>();
+    }
+
+    // --- E2: compile / link / hash ---
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn src(id: &str, text: &str) -> Source<'static> {
+        // テスト用に text を leak して 'static にする（測定に影響しない）。
+        Source::new(
+            SourceId::new(id).unwrap(),
+            Box::leak(text.to_string().into_boxed_str()),
+        )
+    }
+
+    /// SHA-256 の既知テストベクタ（FIPS 180-4）で self-contained 実装を検証する。
+    #[test]
+    fn sha256_known_vectors() {
+        assert_eq!(
+            hex(&hash::sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(&hash::sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex(&hash::sha256(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn compile_produces_source_hash_over_raw_bytes() {
+        let engine = Engine::builder().build().unwrap();
+        let text = "let x = 1\n";
+        let script = engine
+            .compile(src("main.tsg", text), &CompileOptions::default())
+            .expect("compile");
+        assert_eq!(script.engine_id(), engine.id());
+        assert_eq!(script.source_id().as_str(), "main.tsg");
+        assert_eq!(script.language_revision(), LanguageRevision::CURRENT);
+        assert_eq!(script.backend(), Backend::TreeWalk);
+        // SourceHash は生 UTF-8 bytes の SHA-256。
+        assert_eq!(
+            script.source_hash().as_bytes(),
+            &hash::sha256(text.as_bytes())
+        );
+    }
+
+    #[test]
+    fn compile_does_not_retain_source_by_default() {
+        let engine = Engine::builder().build().unwrap();
+        let script = engine
+            .compile(src("m", "let x = 1\n"), &CompileOptions::default())
+            .unwrap();
+        assert_eq!(script.retained_source(), None);
+
+        let retained = engine
+            .compile(
+                src("m", "let x = 1\n"),
+                &CompileOptions {
+                    retain_source: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(retained.retained_source(), Some("let x = 1\n"));
+    }
+
+    #[test]
+    fn compile_reports_parse_diagnostics() {
+        let engine = Engine::builder().build().unwrap();
+        let err = engine
+            .compile(src("bad", "let = = ="), &CompileOptions::default())
+            .expect_err("must fail");
+        assert!(!err.diagnostics.is_empty());
+        assert!(
+            err.diagnostics
+                .iter()
+                .all(|d| d.code == CompileDiagnosticCode::Parse)
+        );
+    }
+
+    #[test]
+    fn compile_diagnostic_debug_is_secret_free() {
+        // 診断 message は開発者が入れない限り secret を含まない。
+        let engine = Engine::builder().build().unwrap();
+        let err = engine
+            .compile(src("bad", "@@@"), &CompileOptions::default())
+            .expect_err("must fail");
+        let rendered = format!("{err:?}");
+        assert!(!rendered.contains("SECRET"));
+    }
+
+    #[test]
+    fn source_hash_changes_with_one_byte_diff() {
+        let engine = Engine::builder().build().unwrap();
+        let a = engine
+            .compile(src("m", "let x = 1\n"), &CompileOptions::default())
+            .unwrap();
+        let b = engine
+            .compile(src("m", "let x = 2\n"), &CompileOptions::default())
+            .unwrap();
+        assert_ne!(a.source_hash(), b.source_hash());
+    }
+
+    #[test]
+    fn link_import_less_produces_empty_graph_and_hashes() {
+        let engine = Engine::builder().build().unwrap();
+        let script = engine
+            .compile(src("m", "let x = 1\n"), &CompileOptions::default())
+            .unwrap();
+        let linked = engine.link(&script, LinkRequest::new()).expect("link");
+
+        let graph = linked.import_graph();
+        assert!(graph.root_imports.is_empty());
+        assert!(graph.nodes.is_empty());
+        assert_eq!(graph.root, script.source_hash());
+        assert_eq!(linked.root().source_hash(), script.source_hash());
+
+        // graph_hash / script_hash は §5.1 の byte-level encoding と一致する。
+        let expected_graph =
+            hash::import_graph_hash(LanguageRevision::CURRENT, script.source_hash(), &[], &[]);
+        assert_eq!(graph.graph_hash.as_bytes(), &expected_graph);
+        let expected_script = hash::linked_script_hash(
+            LanguageRevision::CURRENT,
+            script.source_hash(),
+            graph.graph_hash,
+        );
+        assert_eq!(linked.script_hash().as_bytes(), &expected_script);
+    }
+
+    #[test]
+    fn link_rejects_imports_in_phase1() {
+        let engine = Engine::builder().build().unwrap();
+        let script = engine
+            .compile(
+                src("m", "import \"other\"\nlet x = 1\n"),
+                &CompileOptions::default(),
+            )
+            .unwrap();
+        let err = engine
+            .link(&script, LinkRequest::new())
+            .expect_err("import rejected");
+        assert_eq!(
+            err,
+            LinkError::FeatureUnavailable {
+                feature: "module_resolver"
+            }
+        );
+    }
+
+    #[test]
+    fn link_rejects_foreign_engine() {
+        let engine_a = Engine::builder().build().unwrap();
+        let engine_b = Engine::builder().build().unwrap();
+        let script = engine_a
+            .compile(src("m", "let x = 1\n"), &CompileOptions::default())
+            .unwrap();
+        let err = engine_b
+            .link(&script, LinkRequest::new())
+            .expect_err("foreign engine");
+        assert_eq!(err, LinkError::EngineMismatch);
+    }
+
+    /// EMB-AT-13: root hash / graph hash の golden 値を固定し、1 byte 変更で差が出る。
+    #[test]
+    fn golden_hashes_are_stable() {
+        let engine = Engine::builder().build().unwrap();
+        let script = engine
+            .compile(src("golden", "let x = 1\n"), &CompileOptions::default())
+            .unwrap();
+        // root source hash の golden（"let x = 1\n" の SHA-256）。
+        assert_eq!(
+            hex(script.source_hash().as_bytes()),
+            hex(&hash::sha256(b"let x = 1\n"))
+        );
+        let linked = engine.link(&script, LinkRequest::new()).unwrap();
+        // graph_hash と script_hash が決定的であること（同一入力で不変）。
+        let script2 = engine
+            .compile(src("golden", "let x = 1\n"), &CompileOptions::default())
+            .unwrap();
+        let linked2 = engine.link(&script2, LinkRequest::new()).unwrap();
+        assert_eq!(
+            linked.import_graph().graph_hash,
+            linked2.import_graph().graph_hash
+        );
+        assert_eq!(linked.script_hash(), linked2.script_hash());
     }
 }
