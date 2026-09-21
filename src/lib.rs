@@ -82,3 +82,8 @@ pub use embedding::{
     CompileDiagnostic, CompileDiagnosticCode, CompileErrors, CompileOptions, ImportGraph,
     ImportNode, LinkError, LinkRequest, LinkedScript, ModuleId, Source,
 };
+// スライス E3（`docs/embedding-api.md` 第2・8節）: tree backend adapter（実行入口）。
+// `ExecutionContext` / `ExecutionRequest` は alpha facade と衝突するため、統合（E10）まで
+// `EmbeddingContext` / `EmbeddingRequest` として別名公開する。
+pub use embedding::ExecutionContext as EmbeddingContext;
+pub use embedding::ExecutionRequest as EmbeddingRequest;

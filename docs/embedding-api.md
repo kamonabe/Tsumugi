@@ -181,6 +181,27 @@ impl Engine {
 
 `SourceHash`はsourceのUTF-8 bytesそのものに対するSHA-256で、BOM除去、改行変換、Unicode正規化をしない。
 
+### 4.1 実行用 AST の入手方針（案 A採用、案 B却下の記録）
+
+`CompiledScript` と `LinkedScript` は `Send + Sync` 契約（EMB-AT-02）を持つ一方、実行入口（E3 tree backend adapter）は実行スレッド上で runnable な `Program`（AST）を必要とする。現行 AST は `ast::Block = Rc<[Stmt]>`（REV-015 Slice 3 PR-d の永続 continuation）で `!Send`/`!Sync` のため、この 2 つを両立する方針を確定する必要があった。以下は 2026-09-21 の設計判断の記録である。
+
+**採用（案 A）: 実行時に保持 source を再 parse して `Program` を再構築する。**
+
+- `CompiledScript` は identity・`source_hash`・`has_imports`・任意の保持 source だけを持ち、runnable AST を保持しない。実行入口は保持 source を実行スレッド上で `Lexer`→`Parser` で再 parse して `Program` を得る。parse は決定的なので再構築した AST は `source_hash` と必ず一致し、`Evaluator::begin_execution` が root を `Rc<[Stmt]>` フレームへ写した後は `Program` を drop できる。
+- 実行するには `retain_source = true` で compile しておく必要がある（保持していない場合は `InternalFailure`）。これは欠点ではなく、原則2「権限・前提はホストが明示的に付与する（ambient を既定にしない）」に沿う明示契約である。
+- 評価器・AST の中核に一切触れないため、変更が実行入口スライスに閉じる（原則8「小さく理解可能な中核」）。tree 評価器のホットパスの性能特性（AUD-038/040 でチューニング済み）も不変。
+
+**却下（案 B）: `ast::Block` を `Rc<[Stmt]>` から `Arc<[Stmt]>` へ変え、AST を `Send + Sync` 化して handle に保持する。**
+
+- 変更点自体は小さい（型 alias 1 + `Rc::from` 呼び出し 5 箇所）。AST は `String`/`Expr`/`Block`/`Vec` だけで `Value`/`Rc` を含まないため、`Arc` 化で `Program`/`CompiledScript` は真に `Send + Sync` になり、再 parse も source 保持も不要になる。
+- しかし却下した。理由:
+  - 実行そのものは `ExecutionContext` が `!Send + !Sync`（第9.1節の stable 契約）で単一スレッドに固定される。`Send + Sync` が必要なのは handle だけで、**AST を跨スレッド共有する能力は思想（単一スレッド実行）が要求していない**。案 B はその不要な能力を中核へ足す（原則8 に反する方向）。
+  - tree 評価器はフレームごとに `Block` を clone するホットパスで、`Rc`（非アトミック）→`Arc`（アトミック参照カウント）はわずかに実行コストを増やす。速度は非目標だが「わざわざ遅くする」のは別で、根拠のない性能変更を避ける原則9・計測負債の観点で不利。
+  - 「Send な AST が存在する」こと自体が、将来「実行を複数スレッドへ分ければ速い」という原則1（最悪時負荷の制御）・原則5（backend 差を作らない）に反する最適化への誘因・説明負債として中核に residue を残す。
+- 将来性の評価: Phase 5（決定性・record/replay）は source を再現の第一級入力として扱うため、案 A の「実行時に source から再構築」は将来像と同じ方向を向く。逆に案 B の「Send な AST」は、`!Send` 実行という確定契約の下では将来も使い道がない。案 B が正当化されるのは Tsumugi が単一スレッド実行の stable 契約を撤回して真の並行 AST 共有へ舵を切る場合だけで、それはマニフェスト原則1・5・「目指さないもの（最大スループット競争）」に照らして現時点では起きない前提の変更であり、実行入口スライスで先取りする話ではない。
+
+したがって、現状でも将来でも案 A を採る。案 B の再検討は、単一スレッド実行契約そのものを見直す意思決定とセットでのみ行う。
+
 ## 5. Link、Module graph、link request
 
 ```rust
