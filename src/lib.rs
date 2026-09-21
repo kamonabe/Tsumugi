@@ -13,6 +13,7 @@ pub mod ast;
 pub mod budget;
 pub mod builtin_core;
 pub mod builtin_registry;
+pub mod embedding;
 pub mod engine;
 pub mod env;
 pub mod error;
@@ -56,4 +57,20 @@ pub use engine::{
     CompiledScript, Engine, ExecutionContext, ExecutionHandle, ExecutionOutcome, ExecutionRequest,
     ExecutionState, HandleError, PauseReason, PausedState, PollResult, PollSlice, ResumeState,
     YieldReason,
+};
+
+// Phase 1 embedding（スライス E1、`docs/embedding-api.md` 第3・8節）の公開型。
+//
+// 名前が衝突しない型は crate root へそのまま re-export する。alpha facade（`engine`）と
+// 衝突する `Engine` / `ExecutionOutcome` / `TraceFrame` は、統合（E10）まで別名で公開する:
+// - `embedding::Engine`         → [`EmbeddingEngine`]
+// - `embedding::ExecutionOutcome` → [`EmbeddingOutcome`]
+// - `embedding::TraceFrame`     → [`EmbeddingTraceFrame`]
+pub use embedding::{
+    Backend, ConfigError, EngineBuilder, EngineConfig, EngineId, ExecutionError, ExecutionId,
+    HostError, HostErrorCode, LanguageRevision, SourceHash, SourceId,
+};
+pub use embedding::{
+    Engine as EmbeddingEngine, ExecutionOutcome as EmbeddingOutcome,
+    TraceFrame as EmbeddingTraceFrame,
 };
