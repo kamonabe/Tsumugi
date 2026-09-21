@@ -817,7 +817,10 @@ mod hash {
         }
         msg.extend_from_slice(&bit_len.to_be_bytes());
 
-        for chunk in msg.chunks_exact(64) {
+        // padding 後は必ず 64 の倍数長。`as_chunks` で 64 byte 固定長ブロックへ分ける。
+        let (blocks, rest) = msg.as_chunks::<64>();
+        debug_assert!(rest.is_empty());
+        for chunk in blocks {
             let mut w = [0u32; 64];
             for (i, word) in w.iter_mut().enumerate().take(16) {
                 let j = i * 4;
