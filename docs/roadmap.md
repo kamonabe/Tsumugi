@@ -59,7 +59,7 @@
 | P2 | AUD-020 | sandbox TOCTOU/path-handle未実装 | 🟡 | AUD crosswalk |
 | P2 | AUD-022 | fuzz/stress/matrix未実装 | 🟡 | AUD crosswalk |
 | P2 | AUD-036 | lossy数値・OS境界変換の検証（残: `exit`の構造化`Exited`） | 🟡 | AUD crosswalk（§10 設計確定・Float→Int/file_sizeは実装済み） |
-| P2 | AUD-045 | MSRV/release/install/OCI未実装 | 🟡 | AUD crosswalk |
+| P2 | AUD-045 | MSRV固定は完了。release/install/OCI未実装 | 🟡 | AUD crosswalk（toolchain/MSRV は VRO Slice 1 で実装済み） |
 
 ## プロジェクトの方向性
 
@@ -353,7 +353,7 @@ REV 由来項目の実装順は、[次期意味論・実装決定](semantic-deci
 | AUD-024 | 確定済み | `Completed` / `Exited`だけ全language-stateをcommitし、その他terminalはexecution開始時点へrollbackする。catch済みerror後に最終完了した実行はcommitする。stdout/filesystem/network/DB/host function等の完了済み外部効果はrollbackしない | [次期意味論・実装決定](semantic-decisions.md)第7節、[実行予算・協調実行仕様](execution-control.md)第10節、[組み込みAPI仕様](embedding-api.md)第10節 | ✅ 完了（REPL submissionの未捕捉errorで全language-stateをrollback、正常完了・catch済み完了はcommit、外部効果はrollbackしない。first-write undo logで記録量は変更箇所数に比例。deadline/budget/cancel terminalはPhase 3/4で別追跡） |
 | AUD-034 | 確定済み | `path_join`は全argumentをStrとして検査し、非Strを無言で欠落させない | [次期意味論・実装決定](semantic-decisions.md)第9節 | ✅ 完了（`builtin_path_join`で全引数を左から右へStr検査し、最初の非Strで`builtin_type`エラーを返す。tree/VMは共有handlerで一致。error inventoryと`path_join_contract`テストを追加。仕様revision 0.16） |
 | AUD-036 | 確定済み | `exit`、file size、Float→Intのlossy変換を共通checked helperで拒否し、valid `exit`は構造化`Exited`にする | [次期意味論・実装決定](semantic-decisions.md)第10節 | 🟡 部分実装。Float→Intとfile_sizeのchecked変換は完了（仕様revision 0.17）。valid `exit`の構造化`Exited`は`BudgetUsage`/REV-023依存のため未実装 |
-| AUD-045 | 確定済み | MSRVをRust 1.97とし、stable/MSRV CI、install/release、6 platform artifact、署名・SBOM・OCI、参照用Kubernetes Jobの順序とgateを固定 | [検証・リリース・運用設計](verification-release-operations.md)第3〜10・17〜18節 | 未実装。現行はrolling stable、release/install workflow・OCI・manifestなし |
+| AUD-045 | 確定済み | MSRVをRust 1.97とし、stable/MSRV CI、install/release、6 platform artifact、署名・SBOM・OCI、参照用Kubernetes Jobの順序とgateを固定 | [検証・リリース・運用設計](verification-release-operations.md)第3〜10・17〜18節 | 🟡 部分実装（VRO Slice 1）。`Cargo.toml` に `rust-version = "1.97"`、CI に 1.97.0 pin の `msrv` job（`cargo test --all-features --locked`）を追加し、clippy を `--all-targets --all-features`、test を `--all-features --locked` へ。これで CI が検証に使う toolchain が固定され、rolling stable の新 lint による差分すり抜けと独立に MSRV を担保する。install/release workflow・6 platform artifact・署名・SBOM・OCI・Kubernetes manifest と README install 節、coverage fail-under・docs job（VRO Slice 2 以降）は未実装 |
 | AUD-048 | 確定済み | function/lambda式の**動的評価ごと**にfresh `FunctionId`を発行し、clone/captureは同じIDを保持、rollback後もIDを再利用しない | [次期意味論・実装決定](semantic-decisions.md)第12節、[決定性・実行時監査仕様](determinism-and-audit.md)第4.7節 | ✅ 完了。tree/VMとも関数等価性を`FunctionId`比較へ統一。VMはcapture 0件でも`MakeClosure`で実行時発番し、backend別期待ファイルを削除。REPL rollback非再利用・overflow fault injectionのテストを追加 |
 | AUD-049 | 確定済み | 単一`BuiltinSpec` / callable catalogからtree、VM、compiler、arity、context metadata、生成文書を導出。HostFunction registryは別registryだが共通resolverで衝突検査 | [次期意味論・実装決定](semantic-decisions.md)第13節、[Capability Model仕様](capability-model.md)第17節・CAP-AT-20 | ✅ 完了（language core分。`src/builtin_registry.rs`の`PUBLIC_BUILTINS`をtree/VM/compiler/arity/context metadataの正本にし、`CallBuiltin`をBuiltinId化、`__pop_update`を`OpCode::PopUpdate`へ隔離。HostFunction registryとの共通resolver衝突検査はPhase 2で別追跡） |
 | AUD-050 | 確定済み | `MAX_USER_CALL_DEPTH = 128`を`limits.rs`へ集約し、root frameを数えずactive user call数で統一。128個目を許可し129個目の直前で拒否 | [次期意味論・実装決定](semantic-decisions.md)第5節 | ✅ 完了（AUD-017と一体）。`limits.rs`へ集約、VMは`active_user_frame_count()`でroot除外計数。tree/VMとも128 user frameを許可し129個目を同じline/message/traceで拒否。境界値・相互再帰・lambda・callbackの回帰テスト追加 |
