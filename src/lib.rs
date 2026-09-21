@@ -74,3 +74,11 @@ pub use embedding::{
     Engine as EmbeddingEngine, ExecutionOutcome as EmbeddingOutcome,
     TraceFrame as EmbeddingTraceFrame,
 };
+// スライス E2（`docs/embedding-api.md` 第4・5節）: compile / import なし link / hash。
+// `CompiledScript` は alpha facade（`engine`）と衝突するため、統合（E10）まで
+// `embedding::CompiledScript` → [`EmbeddingCompiledScript`] として別名公開する。
+pub use embedding::CompiledScript as EmbeddingCompiledScript;
+pub use embedding::{
+    CompileDiagnostic, CompileDiagnosticCode, CompileErrors, CompileOptions, ImportGraph,
+    ImportNode, LinkError, LinkRequest, LinkedScript, ModuleId, Source,
+};
