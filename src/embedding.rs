@@ -404,6 +404,7 @@ pub enum ExecutionOutcome {
 // スライス E2: compile / import なし link / byte-level hash
 // ===========================================================================
 
+use std::panic::{AssertUnwindSafe, UnwindSafe};
 use std::sync::Arc;
 
 use crate::ast::{Program, Stmt};
@@ -669,6 +670,16 @@ pub enum LinkError {
         /// 未提供の機能名。
         feature: &'static str,
     },
+    /// link 中に host boundary で panic を捕捉した内部障害（第11節）。
+    ///
+    /// panic payload / native backtrace は含まず、相関用の非ゼロ fault ID と secret を
+    /// 含まない表示用メッセージだけを持つ。
+    InternalFailure {
+        /// 相関用の非ゼロ fault ID。
+        fault_id: u128,
+        /// secret を含まない表示用メッセージ。
+        safe_message: String,
+    },
 }
 
 impl Engine {
@@ -678,6 +689,26 @@ impl Engine {
     /// import 先・filesystem・environment・clock・stdio・host function を一切呼ばない。
     /// 失敗時は source 位置順に1件以上の [`CompileDiagnostic`] を返す。
     pub fn compile(
+        &self,
+        source: Source<'_>,
+        options: &CompileOptions,
+    ) -> Result<CompiledScript, CompileErrors> {
+        // lexer / parser / backend の unwind panic を host boundary で捕捉する（第11節 規則1）。
+        // compile 中の panic は `CompileDiagnosticCode::InternalFault` へ写す（規則2）。panic
+        // payload / native backtrace は公開診断へ含めない（規則3）。
+        catch_host_unwind(|| self.compile_inner(source, options)).unwrap_or_else(|fault_id| {
+            Err(CompileErrors {
+                diagnostics: vec![CompileDiagnostic {
+                    code: CompileDiagnosticCode::InternalFault,
+                    line: None,
+                    column: None,
+                    safe_message: internal_fault_message(fault_id),
+                }],
+            })
+        })
+    }
+
+    fn compile_inner(
         &self,
         source: Source<'_>,
         options: &CompileOptions,
@@ -710,6 +741,21 @@ impl Engine {
     /// [`LinkError::FeatureUnavailable`]（`feature: "module_resolver"`）を返す。import 0 件でも
     /// 空 graph を持つ。
     pub fn link(
+        &self,
+        script: &CompiledScript,
+        request: LinkRequest,
+    ) -> Result<LinkedScript, LinkError> {
+        // linker の unwind panic を host boundary で捕捉する（第11節 規則1）。link 中の panic は
+        // `LinkError::InternalFailure` へ写す（規則2）。payload / backtrace は含めない（規則3）。
+        catch_host_unwind(|| self.link_inner(script, request)).unwrap_or_else(|fault_id| {
+            Err(LinkError::InternalFailure {
+                fault_id,
+                safe_message: internal_fault_message(fault_id),
+            })
+        })
+    }
+
+    fn link_inner(
         &self,
         script: &CompiledScript,
         _request: LinkRequest,
@@ -778,6 +824,12 @@ use crate::eval::{Evaluator, RunPhase};
 pub struct ExecutionRequest {
     /// `args()` が返すスクリプト引数 snapshot（binary 名・script path・CLI flag を含まない）。
     arguments: Vec<String>,
+    /// 最初の poll より前に cancel 済みか（Phase 1 の pre-run cancel、EMB-AT-12）。
+    ///
+    /// Phase 3 の `CancellationToken`（実行中 cancel）は E11 で導入する。E5 では実行前に
+    /// 確定した cancel だけを扱い、命令を1つも実行せずに [`ExecutionOutcome::Cancelled`] へ
+    /// 落とす（"pre-cancel は命令0"）。
+    pre_cancelled: bool,
 }
 
 impl ExecutionRequest {
@@ -785,12 +837,23 @@ impl ExecutionRequest {
     pub fn new() -> Self {
         Self {
             arguments: Vec::new(),
+            pre_cancelled: false,
         }
     }
 
     /// スクリプト引数 snapshot を設定する（AUD-018、仕様第6節）。
     pub fn with_arguments(mut self, arguments: Vec<String>) -> Self {
         self.arguments = arguments;
+        self
+    }
+
+    /// 最初の poll より前に cancel 済みとしてこのリクエストを印付ける（EMB-AT-12）。
+    ///
+    /// このリクエストで [`Engine::run`] を呼ぶと、script 命令を1つも実行せずに
+    /// [`ExecutionOutcome::Cancelled`] を返す。language-state は開始時点へ rollback され
+    /// （第10節 規則5）、context は poison されないので再利用できる。
+    pub fn pre_cancelled(mut self) -> Self {
+        self.pre_cancelled = true;
         self
     }
 }
@@ -837,6 +900,9 @@ pub struct ExecutionContext {
     ///
     /// `Engine::run` は入口で立て、terminal で必ず降ろす。再入すると [`ContextError::Busy`]。
     running: bool,
+    /// test 専用: 次の run で評価器境界を panic させる注入フラグ（E6 の panic 隔離検証用）。
+    #[cfg(test)]
+    panic_in_run_for_test: bool,
     /// `!Send + !Sync` を保証する（第9.1節）。
     _not_send: std::marker::PhantomData<*const ()>,
 }
@@ -849,8 +915,16 @@ impl ExecutionContext {
             evaluator: Evaluator::new(),
             poisoned: false,
             running: false,
+            #[cfg(test)]
+            panic_in_run_for_test: false,
             _not_send: std::marker::PhantomData,
         }
+    }
+
+    /// test 専用: 次の [`Engine::run`] で評価器境界を panic させる（E6 の panic 隔離検証用）。
+    #[cfg(test)]
+    fn inject_run_panic_for_test(&mut self) {
+        self.panic_in_run_for_test = true;
     }
 
     /// このコンテキストを作った engine の ID。
@@ -959,11 +1033,24 @@ impl Engine {
         // context を poison する（第10節 規則4）ため、単一の内部関数へ閉じ、その戻り値で
         // poison を一元判定する。
         context.running = true;
-        let outcome = self.run_inner(linked, context, request);
+        // run / poll 中の unwind panic を host boundary で捕捉する（第11節 規則1）。捕捉した
+        // panic は terminal `ExecutionOutcome::InternalFailure` へ写す（規則2）。payload /
+        // backtrace は公開しない（規則3）。`AssertUnwindSafe` は、panic 後に context を
+        // poison して以後の再利用を拒否する（規則4）ことで正当化する。
+        let outcome = match catch_host_unwind(AssertUnwindSafe(|| {
+            self.run_inner(linked, context, request)
+        })) {
+            Ok(outcome) => outcome,
+            Err(fault_id) => ExecutionOutcome::InternalFailure {
+                fault_id,
+                safe_message: internal_fault_message(fault_id),
+            },
+        };
         context.running = false;
 
         // InternalFailure だけ context を poison する（第10節 規則4）。他 terminal は
         // begin_execution / run_slice が commit / rollback 済みで、そのまま再利用できる。
+        // run/poll 中の panic 経路も InternalFailure なのでここで一律に poison される。
         if matches!(outcome, ExecutionOutcome::InternalFailure { .. }) {
             context.poisoned = true;
         }
@@ -1007,6 +1094,21 @@ impl Engine {
             }
         };
         let root_source_bytes = source_text.len() as u64;
+
+        // test 専用: 評価器境界での panic を模擬し、E6 の catch_unwind 隔離を検証する。
+        // この panic は run の catch_host_unwind 内で捕捉され InternalFailure へ写る。
+        #[cfg(test)]
+        if context.panic_in_run_for_test {
+            panic!("injected run-boundary panic (test only)");
+        }
+
+        // pre-run cancel（EMB-AT-12）: 最初の poll より前に cancel 済みなら、script 命令を
+        // 1つも実行せずに Cancelled terminal を返す（"pre-cancel は命令0"）。language-state は
+        // 何も変更していないので rollback は自明に成立し、context は poison されない
+        // （第10節 規則4・5）。
+        if request.pre_cancelled {
+            return ExecutionOutcome::Cancelled;
+        }
 
         // 引数 snapshot を評価器へ注入する（AUD-018）。
         context.evaluator.set_script_args(request.arguments);
@@ -1069,6 +1171,25 @@ fn next_fault_id() -> u128 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     COUNTER.fetch_add(1, Ordering::Relaxed) as u128
+}
+
+/// fault ID を埋め込んだ secret-free な内部障害メッセージ（第11節 規則3）。
+///
+/// panic payload / native backtrace は決して含めない。相関のための fault ID だけを載せる。
+fn internal_fault_message(fault_id: u128) -> String {
+    format!("内部障害が発生しました (fault_id={fault_id})")
+}
+
+/// host boundary の unwind panic を捕捉する（第11節 規則1）。
+///
+/// panic を捕まえたら発番済みの非ゼロ fault ID を `Err` で返す。panic payload / native
+/// backtrace は呼び出し元へ渡さない（規則3）。`std::process::abort`（`panic=abort`）・OOM・
+/// stack overflow abort は捕捉できない（規則4。最終防御は別 process 隔離）。
+fn catch_host_unwind<F, T>(f: F) -> Result<T, u128>
+where
+    F: FnOnce() -> T + UnwindSafe,
+{
+    std::panic::catch_unwind(f).map_err(|_payload| next_fault_id())
 }
 
 /// 内部 [`TsumugiError`] を公開 [`ExecutionError`] へ写す（仕様第8節）。
@@ -1918,5 +2039,147 @@ mod tests {
     fn e4_context_error_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ContextError>();
+    }
+
+    // =======================================================================
+    // スライス E5: terminal channel（pre-run Cancelled、catch 規則）
+    // =======================================================================
+
+    /// EMB-AT-09 / EMB-AT-12: pre-run cancel は命令を1つも実行せず Cancelled を返す。
+    #[test]
+    fn e5_pre_run_cancel_returns_cancelled_without_running() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+
+        // pre-cancel。副作用（binding）が起きれば後段の probe で検出できる。
+        let linked = compile_link(&engine, "m", "let saved = 123\n");
+        let outcome = engine.run(&linked, &mut ctx, ExecutionRequest::new().pre_cancelled());
+        assert_eq!(outcome, ExecutionOutcome::Cancelled);
+
+        // 命令0なので saved は commit されない（見えれば Name エラーで判別できる）。
+        let probe = compile_link(&engine, "m", "let echo = saved\n");
+        match engine.run(&probe, &mut ctx, ExecutionRequest::new()) {
+            ExecutionOutcome::RuntimeError { error } => assert_eq!(error.code, ErrorKind::Name),
+            other => panic!("pre-cancel が副作用を残した: {other:?}"),
+        }
+    }
+
+    /// EMB-AT-07: pre-run cancel は context を poison せず、再利用できる。
+    #[test]
+    fn e5_pre_run_cancel_does_not_poison() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+
+        let linked = compile_link(&engine, "m", "let x = 1\n");
+        assert_eq!(
+            engine.run(&linked, &mut ctx, ExecutionRequest::new().pre_cancelled()),
+            ExecutionOutcome::Cancelled
+        );
+        assert!(!ctx.is_poisoned(), "Cancelled は poison しない");
+
+        // そのまま再利用して正常実行できる。
+        let ok = compile_link(&engine, "m", "let y = 2\n");
+        assert_eq!(
+            engine.run(&ok, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::Completed
+        );
+    }
+
+    /// pre-run cancel は poison 済み context では実行前提条件が優先される（InternalFailure）。
+    #[test]
+    fn e5_pre_run_cancel_respects_poison_precondition() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+
+        // retain_source=false で poison させる。
+        let script = engine
+            .compile(retained("m", "let x = 1\n"), &CompileOptions::default())
+            .unwrap();
+        let linked = engine.link(&script, LinkRequest::new()).unwrap();
+        assert!(matches!(
+            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::InternalFailure { .. }
+        ));
+
+        // poison 後は pre-cancel でも InternalFailure（precondition 優先、第10節 規則4）。
+        let ok = compile_link(&engine, "m", "let y = 1\n");
+        assert!(matches!(
+            engine.run(&ok, &mut ctx, ExecutionRequest::new().pre_cancelled()),
+            ExecutionOutcome::InternalFailure { .. }
+        ));
+    }
+
+    // =======================================================================
+    // スライス E6: compile / link / run panic 隔離（fault ID）
+    // =======================================================================
+
+    /// panic hook を一時的に無音化して panic を誘発するテストを実行する。
+    fn with_silent_panic_hook<T>(f: impl FnOnce() -> T) -> T {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = f();
+        std::panic::set_hook(previous);
+        result
+    }
+
+    /// catch_host_unwind は panic を捕捉し、非ゼロ fault ID を返す（payload を漏らさない）。
+    #[test]
+    fn e6_catch_host_unwind_captures_panic_as_fault_id() {
+        // 正常経路は値をそのまま返す。
+        assert_eq!(catch_host_unwind(|| 7), Ok(7));
+
+        // panic 経路は Err(fault_id)。fault_id は非ゼロ。
+        let fault = with_silent_panic_hook(|| {
+            catch_host_unwind(|| panic!("secret internal detail")).unwrap_err()
+        });
+        assert_ne!(fault, 0);
+    }
+
+    /// internal_fault_message は fault ID を載せるが panic payload は載せない（第11節 規則3）。
+    #[test]
+    fn e6_internal_fault_message_is_secret_free() {
+        let msg = internal_fault_message(42);
+        assert!(msg.contains("42"), "fault ID を相関できること");
+        // panic payload に使った文字列は含まれない。
+        assert!(!msg.contains("secret"));
+    }
+
+    /// run 中に評価器が panic すると terminal InternalFailure（非ゼロ fault ID）で、
+    /// context は poison される（第11節 規則2/4）。
+    #[test]
+    fn e6_run_panic_maps_to_internal_failure_and_poisons() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+
+        // 実行スレッド上で評価器を panic させる注入 hook（test 専用）。
+        ctx.inject_run_panic_for_test();
+        let linked = compile_link(&engine, "m", "let x = 1\n");
+        let outcome =
+            with_silent_panic_hook(|| engine.run(&linked, &mut ctx, ExecutionRequest::new()));
+        match outcome {
+            ExecutionOutcome::InternalFailure {
+                fault_id,
+                safe_message,
+            } => {
+                assert_ne!(fault_id, 0);
+                assert!(!safe_message.contains("injected"));
+            }
+            other => panic!("期待: InternalFailure, 実際: {other:?}"),
+        }
+        // panic 経路も context を poison する。
+        assert!(ctx.is_poisoned(), "run panic は context を poison する");
+        // running フラグは panic 後も解除され、再入検査で誤検出しない。
+        let ok = compile_link(&engine, "m", "let y = 1\n");
+        assert!(matches!(
+            engine.run(&ok, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::InternalFailure { .. }
+        ));
+    }
+
+    /// LinkError::InternalFailure は Send + Sync な診断値として保持できる。
+    #[test]
+    fn e6_link_error_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<LinkError>();
     }
 }
