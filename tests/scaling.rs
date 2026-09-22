@@ -158,6 +158,20 @@ fn execute_bytes(source: &str, use_vm: bool) -> usize {
     }
 }
 
+/// `execute_bytes` を複数回計測し、最小値を返す。
+///
+/// `execute_bytes` はプロセス全体のグローバル確保量を数えるため、他スレッドや
+/// 遅延初期化の確保がタイミング次第で計測区間に漏れ込み、値が上振れすることがある
+/// （とくに Windows ランナーで顕著）。ノイズは常に「余計に足される」方向にしか
+/// 効かないので、複数回のうち最小値を採ると真の実行コストに収束し、比率判定が安定する。
+fn execute_bytes_min(source: &str, use_vm: bool) -> usize {
+    const SAMPLES: usize = 5;
+    (0..SAMPLES)
+        .map(|_| execute_bytes(source, use_vm))
+        .min()
+        .expect("SAMPLES は 1 以上")
+}
+
 /// 到達しない文でbodyだけを膨らませた関数を、指定回数呼び出すスクリプト
 ///
 /// `return` 以降は実行されないため、1回の呼び出しで行う仕事量はbody長に依存しない。
@@ -191,8 +205,8 @@ fn call_allocation_is_independent_of_body_size_in_both_engines() {
 
     for use_vm in [false, true] {
         let mode = if use_vm { "VM" } else { "tree-walk" };
-        let small = execute_bytes(&small_source, use_vm);
-        let large = execute_bytes(&large_source, use_vm);
+        let small = execute_bytes_min(&small_source, use_vm);
+        let large = execute_bytes_min(&large_source, use_vm);
         assert!(small > 0, "{mode}: 確保量が計測できていません");
 
         let ratio = large as f64 / small as f64;
@@ -223,8 +237,8 @@ fn for_loop_allocation_stays_linear_in_both_engines() {
 
     for use_vm in [false, true] {
         let mode = if use_vm { "VM" } else { "tree-walk" };
-        let small = execute_bytes(&small_source, use_vm);
-        let large = execute_bytes(&large_source, use_vm);
+        let small = execute_bytes_min(&small_source, use_vm);
+        let large = execute_bytes_min(&large_source, use_vm);
         assert!(
             small > 0,
             "{mode}: 確保量が計測できていません（アロケータが差し替わっていない可能性）"
@@ -291,8 +305,8 @@ fn closure_definition_allocation_is_independent_of_visible_bindings_in_both_engi
 
     for use_vm in [false, true] {
         let mode = if use_vm { "VM" } else { "tree-walk" };
-        let few = execute_bytes(&few_source, use_vm);
-        let many = execute_bytes(&many_source, use_vm);
+        let few = execute_bytes_min(&few_source, use_vm);
+        let many = execute_bytes_min(&many_source, use_vm);
         assert!(few > 0, "{mode}: 確保量が計測できていません");
 
         let ratio = many as f64 / few as f64;
@@ -324,8 +338,8 @@ fn call_allocation_is_independent_of_global_count_in_both_engines() {
 
     for use_vm in [false, true] {
         let mode = if use_vm { "VM" } else { "tree-walk" };
-        let few = execute_bytes(&few_source, use_vm);
-        let many = execute_bytes(&many_source, use_vm);
+        let few = execute_bytes_min(&few_source, use_vm);
+        let many = execute_bytes_min(&many_source, use_vm);
         assert!(few > 0, "{mode}: 確保量が計測できていません");
 
         let ratio = many as f64 / few as f64;
@@ -384,8 +398,8 @@ fn collection_read_allocation_stays_linear_in_both_engines() {
     {
         for use_vm in [false, true] {
             let mode = if use_vm { "VM" } else { "tree-walk" };
-            let small = execute_bytes(small_source, use_vm);
-            let large = execute_bytes(large_source, use_vm);
+            let small = execute_bytes_min(small_source, use_vm);
+            let large = execute_bytes_min(large_source, use_vm);
             assert!(small > 0, "{mode}/{label}: 確保量が計測できていません");
 
             let ratio = large as f64 / small as f64;
@@ -443,8 +457,8 @@ fn cow_read_allocation_stays_linear_in_both_engines() {
     {
         for use_vm in [false, true] {
             let mode = if use_vm { "VM" } else { "tree-walk" };
-            let small = execute_bytes(small_source, use_vm);
-            let large = execute_bytes(large_source, use_vm);
+            let small = execute_bytes_min(small_source, use_vm);
+            let large = execute_bytes_min(large_source, use_vm);
             assert!(small > 0, "{mode}/{label}: 確保量が計測できていません");
 
             let ratio = large as f64 / small as f64;
