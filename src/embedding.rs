@@ -406,7 +406,7 @@ pub enum ExecutionOutcome {
 
 use std::sync::Arc;
 
-use crate::ast::Stmt;
+use crate::ast::{Program, Stmt};
 use crate::error::TsumugiError;
 use crate::lexer::Lexer;
 use crate::parser::Parser;
@@ -762,6 +762,8 @@ impl Engine {
 
 // ===========================================================================
 // スライス E3: tree backend adapter（実行入口）
+// スライス E4: Context/Handle cleanup と transaction journal の縦切り
+//   （再利用・poison・全 language-state rollback）
 // ===========================================================================
 
 use crate::budget::BudgetUsage;
@@ -793,17 +795,48 @@ impl ExecutionRequest {
     }
 }
 
+/// [`ExecutionContext`] の状態操作エラー（仕様第6節 `ContextError`）。
+///
+/// E4 で到達し得る variant のみを持つ。`Busy` は実行中の context を再入・状態操作した場合、
+/// `Poisoned` は直前の実行が [`ExecutionOutcome::InternalFailure`] で context を poison した
+/// 場合に返す。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContextError {
+    /// context が実行中で、再入または状態操作できない。
+    Busy,
+    /// 直前の実行が InternalFailure で context を poison した。再利用不可。
+    Poisoned,
+}
+
 /// 実行間で維持する Tsumugi の状態（仕様第6節 `ExecutionContext`）。
 ///
 /// 単一スレッドの評価状態（変数・関数・import 解決）を保持し、`!Send + !Sync`（第9.1節）。
 /// これは stable 契約であり、別スレッドへ move できない。同 engine の実行で再利用すると
 /// binding を保持する。
 ///
+/// # transaction と再利用（E4、仕様第10節）
+///
+/// [`Engine::run`] は AUD-024 の transaction を全 execution へ適用する（第10節 規則5）。
+/// `Completed`（将来は `Exited`）だけが変更した全 language-state（binding・cell・List/Dict・
+/// function・module marker）を commit し、それ以外の terminal（`RuntimeError` 等）は execution
+/// 開始時点へ rollback する。したがって未捕捉エラーで終わった execution の副作用は次の実行に
+/// 残らない。
+///
+/// terminal 後の再利用可否は第10節 規則4に従う。`InternalFailure` だけが context を poison し、
+/// 以後の実行・状態操作を [`ContextError::Poisoned`] で拒否する。他の terminal は commit /
+/// rollback 完了後にそのまま再利用できる。
+///
 /// alpha facade（[`crate::engine::ExecutionContext`]）とは別型で、crate root では
 /// [`crate::EmbeddingContext`] として公開する。
 pub struct ExecutionContext {
     engine_id: EngineId,
     evaluator: Evaluator,
+    /// InternalFailure で poison されたか（第10節 規則4）。true の間は実行・状態操作を拒否する。
+    poisoned: bool,
+    /// 実行中フラグ（第10節 規則: 同 context への再入は許さない）。
+    ///
+    /// `Engine::run` は入口で立て、terminal で必ず降ろす。再入すると [`ContextError::Busy`]。
+    running: bool,
     /// `!Send + !Sync` を保証する（第9.1節）。
     _not_send: std::marker::PhantomData<*const ()>,
 }
@@ -814,6 +847,8 @@ impl ExecutionContext {
         Self {
             engine_id: engine.id(),
             evaluator: Evaluator::new(),
+            poisoned: false,
+            running: false,
             _not_send: std::marker::PhantomData,
         }
     }
@@ -821,6 +856,31 @@ impl ExecutionContext {
     /// このコンテキストを作った engine の ID。
     pub fn engine_id(&self) -> EngineId {
         self.engine_id
+    }
+
+    /// InternalFailure により poison されているか（仕様第6節 `is_poisoned`、第10節 規則4）。
+    ///
+    /// poison された context は実行・状態操作を拒否する。新しい context を作り直すこと。
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// script が定義した全 user state（binding・関数・import 解決）を破棄する
+    /// （仕様第6節 `clear_user_state`）。
+    ///
+    /// 実行中は [`ContextError::Busy`]、poison 済みは [`ContextError::Poisoned`] を返し、
+    /// どちらでもなければ評価状態を初期化して `Ok(())` を返す。engine 対応と `!Send` 契約は
+    /// 維持する。
+    pub fn clear_user_state(&mut self) -> Result<(), ContextError> {
+        if self.running {
+            return Err(ContextError::Busy);
+        }
+        if self.poisoned {
+            return Err(ContextError::Poisoned);
+        }
+        // 評価状態を作り直して全 user state を捨てる（budget config は new と同じ既定）。
+        self.evaluator = Evaluator::new();
+        Ok(())
     }
 
     /// 相対 import 解決・自己再 import 防止に使う script path を設定する。
@@ -842,6 +902,7 @@ impl std::fmt::Debug for ExecutionContext {
         // 評価状態（binding・値）を Debug へ出さない（secret-free）。
         f.debug_struct("ExecutionContext")
             .field("engine_id", &self.engine_id)
+            .field("poisoned", &self.poisoned)
             .finish_non_exhaustive()
     }
 }
@@ -867,7 +928,51 @@ impl Engine {
     ///
     /// [`ExecutionContext`] は `!Send` で、caller スレッド上で再帰評価する。埋め込み host は
     /// 十分なスタックを持つスレッドで context を生成・利用する（CLI は 8 MiB スレッドを使う）。
+    ///
+    /// # transaction・poison・再利用（E4、仕様第10節）
+    ///
+    /// 全 execution へ AUD-024 の transaction を適用する（規則5）。`Completed` は変更した全
+    /// language-state を commit し、`RuntimeError` は execution 開始時点へ rollback する。
+    /// `InternalFailure` だけが context を poison し（規則4）、以後の実行・状態操作を
+    /// [`ContextError::Poisoned`] で拒否する。poison 済み context を渡すと本メソッドは
+    /// `InternalFailure` を返す。同 context への再入（`running` 中の呼び出し）も
+    /// `InternalFailure` とする（第9.1節）。
     pub fn run(
+        &self,
+        linked: &LinkedScript,
+        context: &mut ExecutionContext,
+        request: ExecutionRequest,
+    ) -> ExecutionOutcome {
+        // poison 済み context は実行しない（第10節 規則4）。frame は clean のままで、poison は
+        // 解除しない。この経路は poison を「新たに」設定しない（既に true）。
+        if context.poisoned {
+            return internal_failure("poison 済みの実行コンテキストは再利用できません");
+        }
+        // 同 context への再入は許さない（第9.1節）。!Send かつ &mut 借用のため通常は起きないが、
+        // 防御的に検査する。既に別実行が running なので、この失敗では poison を設定しない
+        // （その実行の terminal 側が状態を確定する）。
+        if context.running {
+            return internal_failure("実行コンテキストが実行中です（再入は許可されません）");
+        }
+
+        // ここから先の失敗は「実行の試行」に起因する。InternalFailure を返す経路はすべて
+        // context を poison する（第10節 規則4）ため、単一の内部関数へ閉じ、その戻り値で
+        // poison を一元判定する。
+        context.running = true;
+        let outcome = self.run_inner(linked, context, request);
+        context.running = false;
+
+        // InternalFailure だけ context を poison する（第10節 規則4）。他 terminal は
+        // begin_execution / run_slice が commit / rollback 済みで、そのまま再利用できる。
+        if matches!(outcome, ExecutionOutcome::InternalFailure { .. }) {
+            context.poisoned = true;
+        }
+        outcome
+    }
+
+    /// [`Self::run`] の本体（precondition guard の後）。ここから返る InternalFailure は
+    /// すべて呼び出し元が context を poison する（第10節 規則4）。
+    fn run_inner(
         &self,
         linked: &LinkedScript,
         context: &mut ExecutionContext,
@@ -906,12 +1011,24 @@ impl Engine {
         // 引数 snapshot を評価器へ注入する（AUD-018）。
         context.evaluator.set_script_args(request.arguments);
 
+        Self::run_transactional(context, &program, root_source_bytes)
+    }
+
+    /// begin_execution → run_slice を terminal まで回す（transaction 適用、E4）。
+    ///
+    /// transaction は評価器側で処理する（`transactional=true`）。`Completed` は commit、
+    /// `RuntimeError` は rollback 済みで戻る。poison 判定は呼び出し元 [`Self::run`] が行う。
+    fn run_transactional(
+        context: &mut ExecutionContext,
+        program: &Program,
+        root_source_bytes: u64,
+    ) -> ExecutionOutcome {
         // begin_execution → run_slice を terminal まで回す（engine.rs の poll と同じ手順）。
-        // Phase 1 は非トランザクション（transaction 全面適用は E4 / REV-008）。
+        // E4: transaction を全面適用する（transactional=true。AUD-024 / 仕様第10節 規則5）。
         if let Err((phase, error)) =
             context
                 .evaluator
-                .begin_execution(&program, root_source_bytes, false)
+                .begin_execution(program, root_source_bytes, true)
         {
             // Phase 1 の import なし root では Link 失敗は起きないが、防御的に写像する。
             // link/control-plane の LinkError terminal は Phase 2（E7）で扱う。
@@ -919,8 +1036,6 @@ impl Engine {
                 RunPhase::Link | RunPhase::Run => runtime_error_outcome(error),
             };
         }
-        // program は begin_execution が Rc<[Stmt]> フレームへ写して所有するため drop してよい。
-        drop(program);
 
         loop {
             // 大きな slice で 1 回ずつ回す（協調 yield の実効化は Phase 4）。同期実行なので
@@ -1648,5 +1763,160 @@ mod tests {
             linked2.import_graph().graph_hash
         );
         assert_eq!(linked.script_hash(), linked2.script_hash());
+    }
+
+    // --- E4: Context cleanup / transaction / poison / reuse ---
+
+    /// retain_source=true の linked script を作る小さなヘルパ。
+    fn compile_link(engine: &Engine, id: &str, text: &str) -> LinkedScript {
+        let script = engine
+            .compile(
+                retained(id, text),
+                &CompileOptions {
+                    retain_source: true,
+                },
+            )
+            .unwrap();
+        engine.link(&script, LinkRequest::new()).unwrap()
+    }
+
+    /// EMB-AT-08: 未捕捉 runtime error は execution 開始時点まで全 language-state を rollback し、
+    /// 副作用は次実行へ残らない（AUD-024・第10節 規則5）。
+    #[test]
+    fn e4_runtime_error_rolls_back_language_state() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+
+        // 変数を代入した直後に未定義参照でエラー化する。rollback されれば committed は残らない。
+        let linked = compile_link(&engine, "m", "let saved = 7\nlet boom = undefined_name\n");
+        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+            ExecutionOutcome::RuntimeError { error } => assert_eq!(error.code, ErrorKind::Name),
+            other => panic!("期待: RuntimeError, 実際: {other:?}"),
+        }
+
+        // rollback 済みなので saved は次実行から見えない（見えれば Name エラーで判別できる）。
+        let probe = compile_link(&engine, "m", "let echo = saved\n");
+        match engine.run(&probe, &mut ctx, ExecutionRequest::new()) {
+            ExecutionOutcome::RuntimeError { error } => assert_eq!(error.code, ErrorKind::Name),
+            other => panic!("saved が rollback されず残った: {other:?}"),
+        }
+    }
+
+    /// EMB-AT-08: Completed は全 language-state を commit し、次実行へ binding が残る。
+    #[test]
+    fn e4_completed_commits_language_state() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+
+        let first = compile_link(&engine, "m", "let saved = 41\n");
+        assert_eq!(
+            engine.run(&first, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::Completed
+        );
+        // commit 済みなので次実行から saved を参照できる。
+        let second = compile_link(&engine, "m", "let doubled = saved + 1\n");
+        assert_eq!(
+            engine.run(&second, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::Completed
+        );
+    }
+
+    /// EMB-AT-08: script 内で catch して正常完了したエラーは commit する（rollback しない）。
+    #[test]
+    fn e4_caught_error_then_completed_commits() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+
+        let linked = compile_link(
+            &engine,
+            "m",
+            "let saved = 0\ntry\n  let x = undefined_name\ncatch e\n  saved = 5\nend\n",
+        );
+        assert_eq!(
+            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::Completed
+        );
+        // catch 後に代入した saved=5 は commit され、次実行から見える。
+        let probe = compile_link(&engine, "m", "let echo = saved + 1\n");
+        assert_eq!(
+            engine.run(&probe, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::Completed
+        );
+    }
+
+    /// EMB-AT-07: RuntimeError で終わっても context は poison されず、再利用できる。
+    #[test]
+    fn e4_runtime_error_does_not_poison() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+
+        let bad = compile_link(&engine, "m", "let x = undefined_name\n");
+        assert!(matches!(
+            engine.run(&bad, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::RuntimeError { .. }
+        ));
+        assert!(!ctx.is_poisoned(), "RuntimeError は poison しない");
+
+        // そのまま再利用して正常実行できる。
+        let ok = compile_link(&engine, "m", "let y = 1\n");
+        assert_eq!(
+            engine.run(&ok, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::Completed
+        );
+    }
+
+    /// EMB-AT-07: InternalFailure は context を poison し、以後の実行を拒否する。
+    #[test]
+    fn e4_internal_failure_poisons_and_blocks_reuse() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+
+        // retain_source=false → 実行入口の前提条件違反で InternalFailure（案 A）。
+        let script = engine
+            .compile(retained("m", "let x = 1\n"), &CompileOptions::default())
+            .unwrap();
+        let linked = engine.link(&script, LinkRequest::new()).unwrap();
+        assert!(matches!(
+            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::InternalFailure { .. }
+        ));
+        assert!(ctx.is_poisoned(), "InternalFailure は poison する");
+
+        // poison 済み context は以後 InternalFailure を返す（正しい retained script でも）。
+        let ok = compile_link(&engine, "m", "let y = 1\n");
+        assert!(matches!(
+            engine.run(&ok, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::InternalFailure { .. }
+        ));
+        // 状態操作も Poisoned で拒否する。
+        assert_eq!(ctx.clear_user_state(), Err(ContextError::Poisoned));
+    }
+
+    /// clear_user_state は user state を捨て、以後の binding 参照を消す。
+    #[test]
+    fn e4_clear_user_state_discards_bindings() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+
+        let seed = compile_link(&engine, "m", "let saved = 9\n");
+        assert_eq!(
+            engine.run(&seed, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::Completed
+        );
+        ctx.clear_user_state().expect("clear on idle context");
+
+        // clear 後は saved が見えない（見えれば commit されている）。
+        let probe = compile_link(&engine, "m", "let echo = saved\n");
+        match engine.run(&probe, &mut ctx, ExecutionRequest::new()) {
+            ExecutionOutcome::RuntimeError { error } => assert_eq!(error.code, ErrorKind::Name),
+            other => panic!("clear 後も saved が残った: {other:?}"),
+        }
+    }
+
+    /// ContextError は Send + Sync（診断値として host が保持しやすいように）。
+    #[test]
+    fn e4_context_error_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ContextError>();
     }
 }

@@ -87,3 +87,6 @@ pub use embedding::{
 // `EmbeddingContext` / `EmbeddingRequest` として別名公開する。
 pub use embedding::ExecutionContext as EmbeddingContext;
 pub use embedding::ExecutionRequest as EmbeddingRequest;
+// スライス E4（`docs/embedding-api.md` 第6・9・10節）: Context cleanup と transaction 縦切り。
+// `ContextError` は alpha facade と衝突しないため、そのまま re-export する。
+pub use embedding::ContextError;
