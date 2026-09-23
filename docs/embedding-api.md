@@ -549,7 +549,7 @@ compatibility shimもprocess exitやambient accessを復活させず、script操
 | E5 | 1 | Completed/Runtime/Internal/Cancelled(pre-run) channel | process継続、catch規則 |
 | E6 | 1 | compile/link/run panic隔離 | unwind test、fault ID |
 | E7 | 2 | capability/import graph/Denied/Exited/HostError/host function接続 | capability Phase 2基準 |
-| E8a | 1 | CLIがEngine APIだけを通る入口統合、基本引数転送 | EMB-AT-15/16/17のPhase 1範囲、AUD-018 |
+| E8a | 1 | CLIがEngine APIだけを通る入口統合、基本引数転送（🟡 importなしtree file/stdinはEngine API経由で完了。import・REPLはE7、VMはE9で統合） | EMB-AT-15/16/17のPhase 1範囲、AUD-018 |
 | E8b | 2 | capability profile/options、safe/legacy移行 | EMB-AT-10/11/16、CAP-AT-23〜26、migration warning |
 | E9 | 5/7 | VM experimental adapter/conformance | 同API、差分0でstable化 |
 | E10 | N-1/N | deprecation/migration | compile test |
@@ -590,8 +590,8 @@ E1→E2→E3→E4→E5→E6→E8a、次にE7→E8b。E11以降をPhase 1/2完了
 ## 16. ロードマップ・監査項目との関係
 
 - **Phase 0:** fault非保証、panic/abort責任分界は[脅威モデル](threat-model.md)。
-- **Phase 1:** E1〜E6・E8a、EMB-AT-01〜09・13・15〜17を完了条件とする。E8aでCLIのtree/VM両経路をEngine APIだけへ統合し、基本引数転送を行う。現行tree-only facadeだけでは不足する。
+- **Phase 1:** E1〜E6・E8a、EMB-AT-01〜09・13・15〜17を完了条件とする。E8aでCLIのtree/VM両経路をEngine APIだけへ統合し、基本引数転送を行う。現行tree-only facadeだけでは不足する。E8aの実装は、CLIのtree file/stdin実行のうちimportなしrootをEngine API（`compile`→`link`→`run`）だけへ統合し、`ExecutionRequest.arguments`で引数転送・`ExecutionOutcome`→exit code変換を第12節どおりに行うところまで。importを含むroot（Phase 1 embeddingの`link`が`FeatureUnavailable { feature: "module_resolver" }`で拒否）とREPL（入力間の状態継続とimport解決が必要）は、import resolverが入るE7（Phase 2）でEngine APIへ統合する。VM経路のEngine API統合はE9（Phase 5）。したがってEMB-AT-17は現時点でimportなしtree file/stdin経路について満たし、残り（import・REPL・VM）はE7/E9で満たす。
 - **Phase 2:** E7・E8b、EMB-AT-10/11/16、CAP-AT-23〜26と[capability model](capability-model.md)のPhase 2基準を完了する。E8bでcapability profile/optionsとsafe/legacy移行を接続する。
-- **AUD-018:** process argvをExecutionRequest snapshotへ置換し、複数script引数とCLI syntaxを固定した。
+- **AUD-018:** process argvをExecutionRequest snapshotへ置換し、複数script引数とCLI syntaxを固定した。E8aでimportなしtree file/stdin経路の引数転送を`EmbeddingRequest::with_arguments`→`Engine::run`経由へ載せ替えた（import・REPLはE7で統合するまでalpha facadeの`set_script_args`を使う）。
 - **AUD-020:** Engineでpath文字列checkをせず、path-handle adapterへ委譲する。
 - **AUD-049:** compile/link callable解決は単一catalogを使い、host registryを第4のbuiltin名一覧にしない。

@@ -3,8 +3,10 @@ use std::fs;
 use std::io::{self, Read, Write};
 
 use tsumugi::{
-    Engine, ExecutionContext, compiler::Compiler, error::TsumugiError, lexer::Lexer,
-    module::ModuleLoader, parser::Parser, token::Token, vm::Vm,
+    CompileErrors, EmbeddingContext, EmbeddingEngine, EmbeddingOutcome, EmbeddingRequest,
+    EmbeddingTraceFrame, Engine, ExecutionContext, ExecutionError, LinkError, LinkRequest,
+    Source as EmbeddingSource, SourceId, compiler::Compiler, embedding::CompileOptions,
+    error::TsumugiError, lexer::Lexer, module::ModuleLoader, parser::Parser, token::Token, vm::Vm,
 };
 
 fn main() {
@@ -186,8 +188,68 @@ fn read_stdin_source() -> String {
     source
 }
 
-/// ツリーウォーク版で source を実行する（ファイル / stdin 共通）。
+/// ツリーウォーク版で source を実行する（ファイル / stdin 共通、E8a）。
+///
+/// import なし root は embedding Engine API（[`EmbeddingEngine`]）だけを通す（EMB-AT-17 の
+/// Phase 1 範囲）。Phase 1 の embedding `link` は import 解決を持たず import 文を拒否するため
+/// （import resolver は Phase 2/E7）、import を含む root は現行の alpha facade（`ModuleLoader`
+/// 経由）へフォールバックする。この import ありの Engine API 統合は E7 で行う。
+///
+/// どちらの経路も同じ診断表示・exit code 契約（[組み込みAPI仕様] 第12節）を満たす。
 fn run_source(source: &str, script_path: &str, script_args: Vec<String>) {
+    let engine = EmbeddingEngine::builder()
+        .build()
+        .expect("既定 backend の Engine build は失敗しない");
+
+    // source を保持して compile する。embedding の `run` は実行スレッド上で保持 source を
+    // 再 parse して Program を得る（案 A）ため、`retain_source=true` が実行の前提になる。
+    let source_id = source_id_for(script_path);
+    let options = CompileOptions {
+        retain_source: true,
+    };
+    let script = match engine.compile(EmbeddingSource::new(source_id, source), &options) {
+        Ok(script) => script,
+        Err(errors) => {
+            print_compile_errors(&errors);
+            std::process::exit(1);
+        }
+    };
+
+    let linked = match engine.link(&script, LinkRequest::new()) {
+        Ok(linked) => linked,
+        // import を含む root は Phase 1 embedding では link できない（module resolver は
+        // Phase 2/E7）。この場合だけ alpha facade（`ModuleLoader` 経由）へフォールバックして
+        // 従来どおり解決・実行する。import ありの Engine API 統合は E7 で行う。
+        Err(LinkError::FeatureUnavailable {
+            feature: "module_resolver",
+        }) => {
+            run_source_alpha(source, script_path, script_args);
+            return;
+        }
+        Err(error) => {
+            // import なし root のその他の link 失敗は engine/revision/backend 不一致のみ。
+            // 単一 Engine を使う CLI では実際には到達しないが、防御的に診断して終了する。
+            print_link_error(&error);
+            std::process::exit(1);
+        }
+    };
+
+    let mut context = EmbeddingContext::new(&engine);
+    context.set_script_path(script_path);
+    let request = EmbeddingRequest::new().with_arguments(script_args);
+
+    let exit_code = exit_code_for_outcome(engine.run(&linked, &mut context, request));
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+}
+
+/// import を含む root を alpha facade（`ModuleLoader` 経由）で実行するフォールバック（E8a）。
+///
+/// Phase 1 の embedding `link` は import 解決を持たないため、import ありの tree 実行は現行の
+/// alpha facade を使う。import ありでも Engine API へ統合するのは E7（Phase 2、capability /
+/// import resolver）の作業である。
+fn run_source_alpha(source: &str, script_path: &str, script_args: Vec<String>) {
     let engine = Engine::new();
     let mut context = ExecutionContext::new();
     context.set_script_path(script_path);
@@ -201,7 +263,90 @@ fn run_source(source: &str, script_path: &str, script_args: Vec<String>) {
     }
 }
 
-/// REPL（対話実行モード）
+/// CLI の script 識別子（[`SourceId`]）を作る。表示専用で secret を含めない。
+///
+/// script path は 1..=256 byte・NUL なしの制約に収まらない場合があるため、収まらないときは
+/// 固定の表示名へフォールバックする（識別子は診断の見出しにのみ使う）。
+fn source_id_for(script_path: &str) -> SourceId {
+    SourceId::new(script_path)
+        .unwrap_or_else(|_| SourceId::new("<script>").expect("固定 fallback 識別子は常に妥当"))
+}
+
+/// embedding の terminal outcome を CLI の exit code へ写す（[組み込みAPI仕様] 第12節）。
+///
+/// `Completed` は 0、`RuntimeError` は 1、`Cancelled` は 130、`InternalFailure` は 70。
+/// エラー系はいずれも診断を stderr へ出してから code を返す。
+fn exit_code_for_outcome(outcome: EmbeddingOutcome) -> i32 {
+    match outcome {
+        EmbeddingOutcome::Completed => 0,
+        EmbeddingOutcome::RuntimeError { error } => {
+            eprintln!("{}", format_execution_error(&error));
+            1
+        }
+        EmbeddingOutcome::Cancelled => 130,
+        EmbeddingOutcome::InternalFailure { safe_message, .. } => {
+            eprintln!("{}", safe_message);
+            70
+        }
+        // `EmbeddingOutcome` は `#[non_exhaustive]`。Phase 1 で到達し得るのは上記4種だが、
+        // 将来 variant が増えても未処理を internal failure と同じ扱い（code 70）で拾う。
+        other => {
+            eprintln!("内部エラー: 未対応の実行結果です: {:?}", other);
+            70
+        }
+    }
+}
+
+/// [`ExecutionError`] を現行 CLI の診断形式へ整形する。
+///
+/// 現行の `TsumugiError` Display（`"{line}行目: {message}"` と、trace 各行の
+/// `"\n  in {name}() ({line}行目)"`）と byte 単位で一致させ、ゴールデンエラー fixture を
+/// 維持する。
+fn format_execution_error(error: &ExecutionError) -> String {
+    let mut out = format_line_message(error.line, &error.safe_message);
+    for frame in &error.trace {
+        out.push_str(&format_trace_frame(frame));
+    }
+    out
+}
+
+/// trace の1フレームを `"\n  in {name}() ({line}行目)"` 形式へ整形する。
+fn format_trace_frame(frame: &EmbeddingTraceFrame) -> String {
+    match frame.line {
+        Some(line) => format!("\n  in {}() ({}行目)", frame.function, line),
+        None => format!("\n  in {}()", frame.function),
+    }
+}
+
+/// `"{line}行目: {message}"` を作る。行番号が不明なら message だけを返す。
+fn format_line_message(line: Option<u32>, message: &str) -> String {
+    match line {
+        Some(line) => format!("{}行目: {}", line, message),
+        None => message.to_string(),
+    }
+}
+
+/// compile 診断を stderr へ出す。source 位置順に1件以上あり、各行を現行形式で表示する。
+fn print_compile_errors(errors: &CompileErrors) {
+    for diagnostic in &errors.diagnostics {
+        eprintln!(
+            "{}",
+            format_line_message(diagnostic.line, &diagnostic.safe_message)
+        );
+    }
+}
+
+/// link 失敗を stderr へ出す。import なし root では engine/revision/backend 不一致のみ。
+fn print_link_error(error: &LinkError) {
+    eprintln!("リンクエラー: {:?}", error);
+}
+
+/// REPL（対話実行モード）。
+///
+/// REPL は入力をまたいで language-state を保持し、import も解決する必要があるため、Phase 1
+/// では現行の alpha facade（`ModuleLoader` を持つ評価器）を使う。embedding Engine API は
+/// import なし root の一括実行のみを提供する（状態継続・import 解決は Phase 2/E7）。REPL の
+/// Engine API 統合は E7 で行う（E8a の Phase 1 範囲外）。
 fn run_repl() {
     write_stdout("Tsumugi v0.1.0 — 終了するには Ctrl+D\n");
     let engine = Engine::new();
@@ -542,5 +687,86 @@ mod cli_tests {
         assert_eq!(inv.backend, Backend::Vm);
         assert_eq!(inv.source, Source::File("app.tsg".to_string()));
         assert!(inv.script_args.is_empty());
+    }
+
+    // --- E8a: embedding outcome → CLI 診断・exit code の写像 ---
+
+    use tsumugi::error::ErrorKind;
+
+    fn exec_error(
+        line: Option<u32>,
+        message: &str,
+        trace: Vec<EmbeddingTraceFrame>,
+    ) -> ExecutionError {
+        ExecutionError {
+            code: ErrorKind::Runtime,
+            safe_message: message.to_string(),
+            line,
+            trace,
+        }
+    }
+
+    #[test]
+    fn runtime_error_without_trace_matches_display_format() {
+        // 現行 TsumugiError Display の `"{line}行目: {message}"` と一致する。
+        let error = exec_error(Some(1), "ゼロ除算", Vec::new());
+        assert_eq!(format_execution_error(&error), "1行目: ゼロ除算");
+    }
+
+    #[test]
+    fn runtime_error_with_trace_matches_display_format() {
+        // trace 各行は `"\n  in {name}() ({line}行目)"`。error_stack_trace fixture と同形式。
+        let error = exec_error(
+            Some(2),
+            "ゼロ除算",
+            vec![
+                EmbeddingTraceFrame {
+                    function: "divide".to_string(),
+                    line: Some(6),
+                },
+                EmbeddingTraceFrame {
+                    function: "calc".to_string(),
+                    line: Some(9),
+                },
+            ],
+        );
+        assert_eq!(
+            format_execution_error(&error),
+            "2行目: ゼロ除算\n  in divide() (6行目)\n  in calc() (9行目)"
+        );
+    }
+
+    #[test]
+    fn line_message_falls_back_to_message_when_line_unknown() {
+        assert_eq!(format_line_message(None, "詳細不明"), "詳細不明");
+        assert_eq!(format_line_message(Some(3), "x"), "3行目: x");
+    }
+
+    #[test]
+    fn completed_outcome_maps_to_exit_zero() {
+        assert_eq!(exit_code_for_outcome(EmbeddingOutcome::Completed), 0);
+    }
+
+    #[test]
+    fn runtime_error_outcome_maps_to_exit_one() {
+        let outcome = EmbeddingOutcome::RuntimeError {
+            error: exec_error(Some(1), "ゼロ除算", Vec::new()),
+        };
+        assert_eq!(exit_code_for_outcome(outcome), 1);
+    }
+
+    #[test]
+    fn cancelled_outcome_maps_to_exit_130() {
+        // 第12節: Cancelled は 130（現行 CLI では pre-cancel を発火しないが写像は固定する）。
+        assert_eq!(exit_code_for_outcome(EmbeddingOutcome::Cancelled), 130);
+    }
+
+    #[test]
+    fn internal_failure_outcome_maps_to_exit_70() {
+        let outcome = EmbeddingOutcome::InternalFailure {
+            fault_id: 1,
+            safe_message: "内部障害が発生しました (fault_id=1)".to_string(),
+        };
+        assert_eq!(exit_code_for_outcome(outcome), 70);
     }
 }
