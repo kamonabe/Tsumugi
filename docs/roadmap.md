@@ -675,3 +675,34 @@ HTTPはnetwork access、DNS、TLS、認証、redirect、response size、timeout�
 - **着手禁止（具体ユースケース承認待ち）**。Phase 1〜6の受入gateと[次期意味論・実装決定](semantic-decisions.md)第16.1節の全条件を満たすまで開始しない
 - 承認後もcore builtinではなくhost adapterとして別計画を作る
 - 具体的なRust HTTP clientと認証方式は承認ユースケースとhost責任に合わせて選び、coreへ固定しない
+
+## 検討済み・現時点で見送り: エラーメッセージの多言語化（ロケール別出力）
+
+### 経緯
+
+エラーメッセージは現在すべて日本語で固定している（`src/error.rs` の operation 別 canonical constructor がテンプレートを持ち、`Display` が `N行目: ...` を組み立てて CLI が stderr へ出す）。利用者の環境に合わせて出力言語を切り替えたいという発想から、「実行ホストの timezone を見て JST なら日本語・それ以外は英語で出力し、将来は他ロケールへも拡張する」というアイデアを検討した。
+
+### 結論: 現時点では見送り
+
+技術的には実現可能だが、現在の設計正本と正面から衝突するため、現時点では実装しない。アイデア自体は破棄せず、下記の条件が整った段階で「表示レイヤ限定の i18n」として再検討する。
+
+### 見送りの理由
+
+1. **canonical error 契約（AUD-019 / [次期意味論・実装決定](semantic-decisions.md)第3章）と衝突する。** runtime error は operation ごとの共通 constructor から `kind` / canonical message / line を生成し、その message テンプレートを「完全一致の正本」として扱う。tree/VM 両 backend で stdout・stderr・kind・message・line・trace が完全一致することを `tests/canonical_error_inventory.rs` で検証している。出力言語が環境で変わると、この完全一致 golden test が環境依存になって壊れる。
+2. **「規範出力を locale 差で変えない」という既存の設計判断に反する。** 第3.2節は「OS エラー文字列を canonical message へ埋め込む」案を、OS・locale 差が規範出力になることを理由に却下している。timezone による言語切り替えは、まさにこの却下理由に該当する。
+3. **timezone から言語を推定するのは筋が悪い。** UTC 運用のサーバー上の日本語話者、JST 環境の英語話者など、timezone と希望言語は一致しない。マニフェスト原則2「時刻も含む外部効果は capability として明示的に付与する」の思想とも噛み合わず、環境からの暗黙推定は避けたい方向である。
+4. **今は canonical message 自体がまだ動く時期である。** Phase 3/4 で `capability` / `budget` / `timeout` / `cancelled` / `host` などの kind 追加が控えている（第3.3節）。message の正本が固まる前に翻訳レイヤを作ると二重メンテになる。
+5. **優先度が低い。** i18n は利用者体験の改善であり、マニフェストの中核価値（安定性・予算・capability・監査・予測可能性）のいずれの牽引役でもない。
+
+### 再検討する場合の方向性（メモ）
+
+将来やるなら、素朴な「timezone で自動判定」ではなく次の切り分けにする。
+
+- **canonical message（機械可読・規範）は 1 言語に固定したまま変えない。** テスト・監査・host 側分岐の基盤なので、環境で揺らさない。
+- **人間向けの表示レイヤ（CLI 出力）だけを翻訳可能にする。** `ErrorKind` + placeholder は既に構造化されているので、「kind + パラメータ → ローカライズ文字列」のカタログを表示直前に噛ませる。
+- **言語選択は timezone ではなく明示設定にする。** 環境変数（`LANG` / `LC_MESSAGES` / `TSUMUGI_LANG`）や CLI オプションなど、ホストが明示的に与える形にする。
+- **前提として、監査ログ・canonical message の正本を何語で持つか（日本語のままか英語へ寄せるか）を先に決めておく**と、表示レイヤの議論が単純になる。
+
+### 着手タイミングの目安
+
+canonical error の正本が固まり `language-spec.md` へ統合され、Phase 2 で CLI（`--help` 等を含む）が整備された後の、表示レイヤ改善としての nice-to-have。Phase 7（運用保証・検証）近辺での検討が自然で、それより前に優先しない。
