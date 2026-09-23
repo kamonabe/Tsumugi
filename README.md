@@ -253,6 +253,7 @@ src/
 ├── main.rs       # CLIエントリポイント（REPL / ファイル実行 / --vm 切り替え）
 ├── lib.rs        # library crateのルート（埋め込みAPIと各モジュールを公開）
 ├── engine.rs     # tree-walk向け埋め込み facade（compile / execute / context）
+├── embedding.rs  # Phase 1 埋め込みAPI（Engine / compile / link / run、crate rootへEmbedding*で公開）
 │
 │  --- フロントエンド（両実行系で共有） ---
 ├── token.rs      # トークン型定義（Spanned: Token + 行番号）
@@ -261,7 +262,7 @@ src/
 ├── parser.rs     # パーサー（トークン列 → AST、エラー回復と行番号付与）
 ├── module.rs     # ModuleLoader（import を実行前に解決してリンク）
 ├── value.rs      # 実行時の値型
-├── error.rs      # エラー型（TsumugiError: Parse / Runtime、ErrorKind 18種）
+├── error.rs      # エラー型（TsumugiError: Parse / Runtime、ErrorKind 22種）
 │
 │  --- ツリーウォーク実行（デフォルト） ---
 ├── env.rs        # 環境（変数スコープとcall frame。関数も変数として保持）

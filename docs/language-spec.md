@@ -773,7 +773,9 @@ end
 
 上記は例であり、網羅ではない。`e["type"]` で得られる種別は次のとおり。
 
-`zero_division`, `type`, `index`, `name`, `limit`, `overflow`, `sandbox`, `import`, `argument`, `int_overflow`, `control_flow`, `collection_limit`, `conversion`, `builtin_type`, `iteration`, `io`, `internal`, `runtime`
+`zero_division`, `type`, `index`, `name`, `limit`, `overflow`, `sandbox`, `import`, `argument`, `int_overflow`, `control_flow`, `collection_limit`, `string_limit`, `source_limit`, `heap_limit`, `io_limit`, `conversion`, `builtin_type`, `iteration`, `io`, `internal`, `runtime`
+
+このうち `string_limit` / `source_limit` / `heap_limit` / `io_limit` は包括budget（REV-015 Slice 2）で追加した予算超過の種別である。既定の上限では通常のスクリプトから観測されず、対応するメッセージテンプレートは budget 実装の確定に伴って変わり得るため、下の正本表には載せていない（実装状態は[ロードマップ](roadmap.md)の REV-015 を参照）。
 
 ### エラーの kind とメッセージ（正本）
 
