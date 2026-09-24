@@ -507,6 +507,78 @@ pub fn name_of(id: BuiltinId) -> &'static str {
         .unwrap_or("")
 }
 
+impl Arity {
+    /// 生成 docs 用の人間可読表現（例 `2`、`0 or 1`、`>=0`）。
+    pub fn describe(&self) -> String {
+        match self {
+            Arity::Exact(n) => n.to_string(),
+            Arity::OneOf(a, b) => format!("{a} or {b}"),
+            Arity::Variadic { min } => format!(">={min}"),
+        }
+    }
+}
+
+impl Execution {
+    /// 生成 docs 用の分類ラベル。
+    pub fn label(self) -> &'static str {
+        match self {
+            Execution::PureCore => "pure-core",
+            Execution::Context => "context",
+        }
+    }
+}
+
+/// 生成 docs（[`crate::builtin_registry`] リファレンス）の先頭に置くヘッダ。
+///
+/// 手編集を禁じ、regenerate 手段を明示する（CAP-AT-20）。
+const GENERATED_DOC_HEADER: &str = "\
+<!-- 生成物: このファイルは編集しないこと。 -->
+<!-- src/builtin_registry.rs の PUBLIC_BUILTINS から生成する。 -->
+<!-- 再生成: `cargo run --bin gen_builtins_doc`（または対応する生成コマンド）。 -->
+<!-- 整合性は tests/builtin_registry_contract.rs が検証する（CAP-AT-20 / AUD-049）。 -->
+
+# 組み込み関数リファレンス（生成物）
+
+`src/builtin_registry.rs` の単一 `BuiltinSpec` registry（AUD-049 の正本）から生成した、
+language から呼べる組み込み関数の一覧である。tree / VM / compiler と本ドキュメントは
+同じ registry を source of truth とし、名前・arity・実行分類が一致する（CAP-AT-20）。
+
+- **arity**: 受理する引数個数。`0 or 1` は 0 個または 1 個、`>=0` は可変長（最小 0 個）。
+- **実行分類**: `pure-core` は評価済み引数から純粋に計算する共有実装、
+  `context` は stdio・argv・変数束縛・closure 呼び出しなど実行コンテキストを要する。
+";
+
+/// 単一 registry から生成 docs（markdown）を描画する（CAP-AT-20）。
+///
+/// 出力は `PUBLIC_BUILTINS` の宣言順で決定的であり、contract test がこの描画結果と
+/// commit 済みの生成物（`docs/generated/builtins.md`）の byte 一致を検証する。
+pub fn render_reference() -> String {
+    let mut out = String::from(GENERATED_DOC_HEADER);
+    out.push_str("\n| 名前 | arity | 実行分類 |\n");
+    out.push_str("|---|---|---|\n");
+    for spec in PUBLIC_BUILTINS {
+        out.push_str(&format!(
+            "| `{}` | {} | {} |\n",
+            spec.name,
+            spec.arity.describe(),
+            spec.execution.label(),
+        ));
+    }
+    out.push_str(&format!(
+        "\n合計 {} 個（pure-core {} 個・context {} 個）。\n",
+        PUBLIC_BUILTINS.len(),
+        PUBLIC_BUILTINS
+            .iter()
+            .filter(|s| s.execution == Execution::PureCore)
+            .count(),
+        PUBLIC_BUILTINS
+            .iter()
+            .filter(|s| s.execution == Execution::Context)
+            .count(),
+    ));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

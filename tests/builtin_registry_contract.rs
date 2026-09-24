@@ -132,3 +132,65 @@ fn pop_update_is_unreachable_from_source() {
         err
     );
 }
+
+/// 生成 docs（`docs/generated/builtins.md`）が registry の描画結果と byte 一致する
+/// こと（CAP-AT-20 の「generated docs 完全一致」）。
+///
+/// registry を変更して生成物を更新し忘れると失敗する。修正手順は
+/// `cargo run --bin gen_builtins_doc` で再生成してコミットする。
+#[test]
+fn generated_docs_match_registry() {
+    let expected = builtin_registry::render_reference();
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/generated/builtins.md");
+    let actual = std::fs::read_to_string(path).expect(
+        "docs/generated/builtins.md が存在しない。`cargo run --bin gen_builtins_doc` で生成する",
+    );
+    assert_eq!(
+        actual, expected,
+        "生成 docs が registry とドリフトしている。`cargo run --bin gen_builtins_doc` で再生成すること"
+    );
+}
+
+/// registry に公開名の重複がないこと（重複は build/test error とする契約、AUD-049 §13.5）。
+#[test]
+fn public_names_have_no_duplicates() {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    for spec in builtin_registry::PUBLIC_BUILTINS {
+        assert!(
+            seen.insert(spec.name),
+            "公開名が重複している: {}",
+            spec.name
+        );
+    }
+}
+
+/// registry に BuiltinId の重複がないこと（entry と ID が 1 対 1、AUD-049 §13.5）。
+#[test]
+fn builtin_ids_have_no_duplicates() {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    for spec in builtin_registry::PUBLIC_BUILTINS {
+        assert!(
+            seen.insert(spec.id),
+            "BuiltinId が重複している: {:?}",
+            spec.id
+        );
+    }
+}
+
+/// 生成 docs に registry の全 public 名と arity 記述が現れること（metadata 一致の
+/// 冗長確認。`generated_docs_match_registry` の byte 一致を補強する）。
+#[test]
+fn generated_docs_contain_every_builtin() {
+    let doc = builtin_registry::render_reference();
+    for spec in builtin_registry::PUBLIC_BUILTINS {
+        let row = format!(
+            "| `{}` | {} | {} |",
+            spec.name,
+            spec.arity.describe(),
+            spec.execution.label()
+        );
+        assert!(doc.contains(&row), "生成 docs に行が無い: {row}");
+    }
+}
