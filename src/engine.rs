@@ -213,6 +213,14 @@ impl ExecutionContext {
         self.evaluator.set_script_args(args);
     }
 
+    /// 直前の実行が `exit(code)` で終了していれば、その終了コードを取り出す（C7、REV-023）。
+    ///
+    /// alpha facade は `execute` の `Err` に終了コードを載せられないため、`exit()` terminal の
+    /// あとに本メソッドで code を読む。CLI がこの code で process を終了する。
+    pub fn take_pending_exit(&mut self) -> Option<u8> {
+        self.evaluator.take_pending_exit()
+    }
+
     /// REPL の次の入力を実行する前にステップ予算をリセットする。
     pub fn reset_step_budget(&mut self) {
         self.evaluator.reset_step_budget();

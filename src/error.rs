@@ -71,6 +71,16 @@ pub enum ErrorKind {
     StackOverflow,
     /// サンドボックス違反
     Sandbox,
+    /// capability 拒否（Environment / Clock / Stdin / Stdout / ProcessExit / HostFunction
+    /// が grant されていない。script 実行中は catch 可能、未捕捉時は RuntimeError。
+    /// 仕様第3.4節「host function capability拒否」）。
+    Capability,
+    /// `exit()` による structured terminal 信号（Phase 2 C7、REV-023）。
+    ///
+    /// script からは catch できない terminal で、`ExecutionOutcome::Exited` へ写す。
+    /// canonical error inventory（第3.4節）には属さない内部制御信号であり、
+    /// 終了コードは [`crate::eval::Evaluator`] の pending_exit に載せる。
+    ProcessExit,
     /// import 失敗
     Import,
     /// 引数の数が合わない
@@ -114,6 +124,9 @@ impl ErrorKind {
             Self::StepLimit => "limit",
             Self::StackOverflow => "overflow",
             Self::Sandbox => "sandbox",
+            Self::Capability => "capability",
+            // 内部制御信号（terminal へ写す）。script の `e["type"]` へは出ない。
+            Self::ProcessExit => "process_exit",
             Self::Import => "import",
             Self::Argument => "argument",
             Self::IntOverflow => "int_overflow",
@@ -745,6 +758,44 @@ impl TsumugiError {
             line,
             ErrorKind::ControlFlow,
             "break はループの中でのみ使用できます",
+        )
+    }
+
+    /// `exit` の終了コードが 0..=255 の範囲外（第3.4節「`exit` code範囲外」、catch 可能）。
+    pub fn exit_code_out_of_range(line: usize, code: i64) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::Argument,
+            format!(
+                "exit の終了コードは 0 から 255 の範囲で指定してください: {}",
+                code
+            ),
+        )
+    }
+
+    /// capability 拒否（第3.4節「host function capability拒否」、catch 可能）。
+    ///
+    /// `name` は adapter-backed builtin の公開名（`env`/`now`/`input`/`print`/`exit`）または
+    /// 登録 host function 名。
+    pub fn capability_denied(line: usize, name: &str) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::Capability,
+            format!("host function の実行が許可されていません: {}", name),
+        )
+    }
+
+    /// `exit()` の structured terminal 信号（Phase 2 C7、REV-023）。
+    ///
+    /// script から catch できない内部制御信号として伝播し、`run_slice` が
+    /// `ExecutionOutcome::Exited` へ写す。終了コードは呼び出し側が
+    /// [`crate::eval::Evaluator`] の pending_exit に載せる。
+    pub fn process_exit_signal(line: usize) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::ProcessExit,
+            // catch されないため message は診断専用（terminal 到達で破棄される）。
+            "exit() による終了",
         )
     }
 

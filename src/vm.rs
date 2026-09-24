@@ -128,6 +128,15 @@ pub struct Vm {
     /// `args()` が返すスクリプト引数の snapshot（AUD-018）。
     /// process argv ではなく実行 context に属する。
     script_args: Vec<String>,
+
+    /// この実行に付与された capability 集合（Phase 2 C1〜）。VM 経路の埋め込み統合は
+    /// E9（Phase 5）のため、現状は ambient 互換の既定 set（ProcessExit を grant）を使う。
+    capabilities: crate::capability::CapabilitySet,
+
+    /// `exit()` の terminal 終了コード（Phase 2 C7、REV-023）。granted な `exit(code)` が
+    /// `Some(code)` を載せ catch 不可の `ProcessExit` 信号を伝播する。CLI が terminal で
+    /// 読み取り実際の exit code へ写す。
+    pending_exit: Option<u8>,
 }
 
 impl Vm {
@@ -150,6 +159,8 @@ impl Vm {
             chunk_tokens: Vec::new(),
             next_function_id: 0,
             script_args: Vec::new(),
+            capabilities: crate::capability::CapabilitySet::ambient_compat(),
+            pending_exit: None,
         }
     }
 
@@ -166,12 +177,19 @@ impl Vm {
             chunk_tokens: Vec::new(),
             next_function_id: 0,
             script_args: Vec::new(),
+            capabilities: crate::capability::CapabilitySet::ambient_compat(),
+            pending_exit: None,
         }
     }
 
     /// `args()` が返すスクリプト引数の snapshot を設定する（AUD-018）。
     pub fn set_script_args(&mut self, args: Vec<String>) {
         self.script_args = args;
+    }
+
+    /// terminal で記録済み `exit` コードを取り出す（C7、REV-023）。CLI が実際の exit code へ写す。
+    pub fn take_pending_exit(&mut self) -> Option<u8> {
+        self.pending_exit.take()
     }
 
     /// step（fuel）上限を明示的に設定する。
@@ -491,6 +509,11 @@ impl Vm {
             };
 
             if let Err(e) = result {
+                // exit() の structured terminal 信号（C7、REV-023）は script から catch でき
+                // ない。try handler を探さずそのまま伝播し、CLI が Exited terminal へ写す。
+                if matches!(e.kind(), Some(crate::error::ErrorKind::ProcessExit)) {
+                    return Err(self.attach_trace(e));
+                }
                 if let Some(handler) = self.try_handlers.pop() {
                     // try ハンドラが stop_depth より深い場合のみ処理する
                     // (stop_depth 以下のハンドラは呼び出し元の管轄)
@@ -1817,16 +1840,21 @@ impl Vm {
                         format!("exit() は引数0〜1個ですが、{}個渡されました", args.len()),
                     ));
                 }
+                // C7（REV-023）: プロセスを終了せず structured terminal（Exited）へ写す。
                 let code = match args.first() {
-                    None => 0,
-                    Some(Value::Int(n)) => *n as i32,
+                    None => None,
+                    Some(Value::Int(n)) => Some(*n),
                     Some(other) => {
                         return Err(TsumugiError::builtin_arg_type(
                             line, "exit", 1, "Int", other,
                         ));
                     }
                 };
-                std::process::exit(code);
+                let has_exit = self.capabilities.process_exit().is_some();
+                let code = crate::builtin_core::resolve_exit(code, has_exit, line)?;
+                // pending_exit を載せ、catch 不可の ProcessExit 信号を返す。
+                self.pending_exit = Some(code);
+                Err(TsumugiError::process_exit_signal(line))
             }
             "args" => {
                 crate::builtin_core::check_arity(name, &args, 0, line)?;

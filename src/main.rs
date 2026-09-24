@@ -3,10 +3,11 @@ use std::fs;
 use std::io::{self, Read, Write};
 
 use tsumugi::{
-    CompileErrors, EmbeddingContext, EmbeddingEngine, EmbeddingOutcome, EmbeddingRequest,
-    EmbeddingTraceFrame, Engine, ExecutionContext, ExecutionError, LinkError, LinkRequest,
-    Source as EmbeddingSource, SourceId, compiler::Compiler, embedding::CompileOptions,
-    error::TsumugiError, lexer::Lexer, module::ModuleLoader, parser::Parser, token::Token, vm::Vm,
+    CapabilitySet, CompileErrors, EmbeddingContext, EmbeddingEngine, EmbeddingOutcome,
+    EmbeddingRequest, EmbeddingTraceFrame, Engine, ExecutionContext, ExecutionError, LinkError,
+    LinkRequest, Source as EmbeddingSource, SourceId, compiler::Compiler,
+    embedding::CompileOptions, error::TsumugiError, lexer::Lexer, module::ModuleLoader,
+    parser::Parser, token::Token, vm::Vm,
 };
 
 fn main() {
@@ -236,12 +237,26 @@ fn run_source(source: &str, script_path: &str, script_args: Vec<String>) {
 
     let mut context = EmbeddingContext::new(&engine);
     context.set_script_path(script_path);
-    let request = EmbeddingRequest::new().with_arguments(script_args);
+    // C7（REV-023）: CLI は従来どおり `exit()` を許可する。Phase 2 の CLI safe/legacy profile
+    // （C9）が capability option を導入するまでは、暫定的に ProcessExit だけを明示 grant する
+    // （filesystem・env・stdio は現行の process-global 経路が担う）。
+    let request = EmbeddingRequest::new()
+        .with_arguments(script_args)
+        .with_capabilities(cli_transition_capabilities());
 
     let exit_code = exit_code_for_outcome(engine.run(&linked, &mut context, request));
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
+}
+
+/// Phase 2 移行期の CLI capability 集合（C9 の safe/legacy profile が入るまでの暫定）。
+///
+/// 現状は `exit()` を structured terminal（`Exited`）へ写すために ProcessExit だけを grant する。
+/// その他 authority（filesystem・env・stdio）は C3〜C5/C10 で置換するまで現行の process-global
+/// 経路（sandbox / env allow-list）が担うため、この set には載せない。
+fn cli_transition_capabilities() -> CapabilitySet {
+    CapabilitySet::ambient_compat()
 }
 
 /// import を含む root を alpha facade（`ModuleLoader` 経由）で実行するフォールバック（E8a）。
@@ -256,6 +271,15 @@ fn run_source_alpha(source: &str, script_path: &str, script_args: Vec<String>) {
     context.set_script_args(script_args);
 
     if let Err(errors) = execute(&engine, source, &mut context) {
+        // C7（REV-023）: exit() は structured terminal。error 表示せず、context に記録された
+        // 終了コードで process を終了する。
+        if errors
+            .iter()
+            .any(|e| matches!(e.kind(), Some(tsumugi::error::ErrorKind::ProcessExit)))
+        {
+            let code = context.take_pending_exit().unwrap_or(0);
+            std::process::exit(code as i32);
+        }
         for e in &errors {
             eprintln!("{}", e);
         }
@@ -279,6 +303,8 @@ fn source_id_for(script_path: &str) -> SourceId {
 fn exit_code_for_outcome(outcome: EmbeddingOutcome) -> i32 {
     match outcome {
         EmbeddingOutcome::Completed => 0,
+        // C7（REV-023）: exit(code) は structured terminal。CLI 境界で実際の exit code へ写す。
+        EmbeddingOutcome::Exited { code } => code as i32,
         EmbeddingOutcome::RuntimeError { error } => {
             eprintln!("{}", format_execution_error(&error));
             1
@@ -380,6 +406,14 @@ fn run_repl() {
         // 未捕捉エラーは入力が変更した language-state を巻き戻す（AUD-024）。
         context.reset_step_budget();
         if let Err(errors) = execute_repl(&engine, &input, &mut context) {
+            // C7（REV-023）: REPL 入力の exit() は REPL を終了コード付きで終える。
+            if errors
+                .iter()
+                .any(|e| matches!(e.kind(), Some(tsumugi::error::ErrorKind::ProcessExit)))
+            {
+                let code = context.take_pending_exit().unwrap_or(0);
+                std::process::exit(code as i32);
+            }
             for e in &errors {
                 eprintln!("  エラー: {}", e);
             }
@@ -476,11 +510,16 @@ fn finish_repl_at_eof(buffer: &str) -> ! {
 
 /// VMモードで source を実行する（ファイル / stdin 共通）。
 fn run_source_vm(source: &str, script_path: &str, script_args: Vec<String>) {
-    if let Err(errors) = execute_vm_with_path(source, script_path, script_args) {
-        for e in &errors {
-            eprintln!("{}", e);
+    match execute_vm_with_path(source, script_path, script_args) {
+        Ok(0) => {}
+        // C7（REV-023）: VM の exit() は structured terminal。CLI 境界で実際の exit code へ写す。
+        Ok(code) => std::process::exit(code),
+        Err(errors) => {
+            for e in &errors {
+                eprintln!("{}", e);
+            }
+            std::process::exit(1);
         }
-        std::process::exit(1);
     }
 }
 
@@ -548,6 +587,14 @@ fn run_repl_vm() {
                         match compiler.compile_repl_line(linked_program) {
                             Ok(chunk) => {
                                 if let Err(e) = vm.run_repl_chunk(chunk) {
+                                    // C7（REV-023）: exit() は REPL を終了コード付きで終える。
+                                    if matches!(
+                                        e.kind(),
+                                        Some(tsumugi::error::ErrorKind::ProcessExit)
+                                    ) {
+                                        let code = vm.take_pending_exit().unwrap_or(0);
+                                        std::process::exit(code as i32);
+                                    }
                                     compiler = compiler_checkpoint;
                                     loader = loader_checkpoint;
                                     eprintln!("  エラー: {}", e);
@@ -584,7 +631,7 @@ fn execute_vm_with_path(
     source: &str,
     path: &str,
     script_args: Vec<String>,
-) -> Result<(), Vec<TsumugiError>> {
+) -> Result<i32, Vec<TsumugiError>> {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize();
 
@@ -610,7 +657,17 @@ fn execute_vm_with_path(
     for (path, token) in record_tokens {
         loader.register_record_token(path, token);
     }
-    vm.run().map_err(|e| vec![e])
+    match vm.run() {
+        Ok(()) => Ok(0),
+        Err(error) => {
+            // C7（REV-023）: exit() は structured terminal。error として表示せず exit code へ写す。
+            if matches!(error.kind(), Some(tsumugi::error::ErrorKind::ProcessExit)) {
+                Ok(vm.take_pending_exit().unwrap_or(0) as i32)
+            } else {
+                Err(vec![error])
+            }
+        }
+    }
 }
 
 #[cfg(test)]

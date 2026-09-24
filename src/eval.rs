@@ -256,6 +256,16 @@ pub struct Evaluator {
     /// suspend / resume する実行セッション（REV-015 Slice 3 PR-d-2）。`begin_execution` で
     /// 張り、terminal で畳む。yield を跨いで module の解決マーカーと transaction 境界を保つ。
     session: Option<RunSession>,
+    /// この実行に付与された capability 集合（Phase 2 C1〜、deny-by-default）。
+    ///
+    /// 埋め込み host は実行単位で frozen set を注入する（`set_capabilities`）。alpha facade /
+    /// CLI / REPL 経路は ambient 互換の既定 set（ProcessExit を grant）を使う。実行後に
+    /// clear され、再利用 context に持ち越さない（仕様第15節 規則5・6）。
+    capabilities: crate::capability::CapabilitySet,
+    /// `exit()` の terminal 終了コード（Phase 2 C7、REV-023）。granted な `exit(code)` が
+    /// `Some(code)` を載せ、`ProcessExit` 信号を伝播する。`run_slice` が terminal で読み取り
+    /// `ExecutionOutcome::Exited` へ写す。
+    pending_exit: Option<u8>,
 }
 
 /// suspend / resume できる 1 回の実行セッション（REV-015 Slice 3 PR-d-2）。
@@ -297,12 +307,45 @@ impl Evaluator {
             slice_fuel_used: 0,
             slice_fuel_limit: None,
             session: None,
+            // alpha facade / CLI / REPL / VM 経路の既定は ambient 互換（ProcessExit を grant）。
+            // 埋め込み Engine::run は set_capabilities で deny-by-default の frozen set へ差し替える。
+            capabilities: crate::capability::CapabilitySet::ambient_compat(),
+            pending_exit: None,
         }
     }
 
     /// `args()` が返すスクリプト引数の snapshot を設定する（AUD-018）。
     pub fn set_script_args(&mut self, args: Vec<String>) {
         self.script_args = args;
+    }
+
+    /// この実行の capability 集合を設定する（Phase 2 C1〜）。埋め込み host が実行単位で
+    /// frozen set を注入する。実行後に [`Self::clear_capabilities`] で ambient 既定へ戻す。
+    pub fn set_capabilities(&mut self, capabilities: crate::capability::CapabilitySet) {
+        self.capabilities = capabilities;
+    }
+
+    /// capability 集合を ambient 互換の既定へ戻す（実行後・再利用前）。
+    pub fn clear_capabilities(&mut self) {
+        self.capabilities = crate::capability::CapabilitySet::ambient_compat();
+    }
+
+    /// この実行の capability 集合を参照する（builtin dispatch から consult する）。
+    pub(crate) fn capabilities(&self) -> &crate::capability::CapabilitySet {
+        &self.capabilities
+    }
+
+    /// granted な `exit(code)` の終了コードを記録し、`ProcessExit` 信号を返す（C7）。
+    ///
+    /// 呼び出し側（`exit` builtin）は先に ProcessExit authority と 0..=255 を検証済みである。
+    pub(crate) fn record_exit(&mut self, code: u8, line: usize) -> TsumugiError {
+        self.pending_exit = Some(code);
+        TsumugiError::process_exit_signal(line)
+    }
+
+    /// terminal で記録済み `exit` コードを取り出す（埋め込み層が Exited outcome へ写す）。
+    pub fn take_pending_exit(&mut self) -> Option<u8> {
+        self.pending_exit.take()
     }
 
     /// `args()` が返すスクリプト引数の snapshot を参照する（AUD-018）。
@@ -662,8 +705,12 @@ impl Evaluator {
                 Some(final_result)
             }
             Err(e) => {
-                // 未捕捉エラーで terminal。unwind は run_driver 内で stop_depth まで済んでいる。
-                self.finalize_session(false);
+                // exit() の structured terminal（C7、REV-023）は成功系 terminal として
+                // language-state を commit する（仕様第10節 規則5: Exited は Completed と同じく
+                // commit）。それ以外の未捕捉エラーは従来どおり rollback する。unwind は
+                // run_driver 内で stop_depth まで済んでいる。
+                let is_exit = matches!(e.kind(), Some(crate::error::ErrorKind::ProcessExit));
+                self.finalize_session(is_exit);
                 Some(Err(e))
             }
         }
@@ -1115,6 +1162,13 @@ impl Evaluator {
     /// そのまま返し、呼び出し側で unwind する。従来の `TryCatch` と同じく、fuel/collection/
     /// heap など全種の `Err` を捕捉する（現行挙動を保つ）。
     fn handle_error(&mut self, error: TsumugiError, stop_depth: usize) -> Result<(), TsumugiError> {
+        // exit() の structured terminal 信号（C7、REV-023）は script から catch できない。
+        // try frame を探さずそのまま伝播し、run_slice が Exited terminal へ写す（capability-
+        // model 第2節 原則4: exit は catch 不可 terminal）。budget/deadline/cancel の terminal
+        // 化は Slice 1/2 でまだ catchable な TsumugiError 経由のため、ここでは exit のみ除外する。
+        if matches!(error.kind(), Some(crate::error::ErrorKind::ProcessExit)) {
+            return Err(error);
+        }
         // この活性内（stop_depth より上）で最も近い try frame を探す。stop_depth より下
         // （外側の活性）の try は侵さない。見つからなければエラーを伝播し、呼び出し元の
         // run_driver が自分の frame を巻き戻す。
