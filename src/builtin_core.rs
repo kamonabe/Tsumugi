@@ -111,6 +111,30 @@ pub fn validate_context_builtin_call(
     }
 }
 
+/// `exit(code)` の code を検証する共通ロジック（Phase 2 C7、REV-023）。tree/VM 両 engine が使う。
+///
+/// - arity（0〜1）は呼び出し側が既に検査済みで、ここは評価済み code を受け取る。
+/// - `code` が `0..=255` の範囲外なら catch 可能な `argument` エラー（第3.4節「`exit` code範囲外」）。
+/// - `has_process_exit` が false（ProcessExit 未 grant）なら catch 可能な `capability` エラー
+///   （第3.4節「host function capability拒否」、`{name}` = `exit`）。OS/process へは触れない。
+/// - 両方通れば `Ok(u8)` を返す。呼び出し側が `Evaluator`/`Vm` の `record_exit` で terminal 信号へ写す。
+///
+/// `code` の `None` は引数なし呼び出し（`exit()`）で、終了コード 0 を意味する。
+pub fn resolve_exit(
+    code: Option<i64>,
+    has_process_exit: bool,
+    line: usize,
+) -> Result<u8, TsumugiError> {
+    let code = code.unwrap_or(0);
+    // 範囲検査を capability 検査より先に行う（第3.7節 error precedence: 引数・型を authority
+    // より先に確定する。malformed 引数と authority 不足の channel を混在させない）。
+    let code = u8::try_from(code).map_err(|_| TsumugiError::exit_code_out_of_range(line, code))?;
+    if !has_process_exit {
+        return Err(TsumugiError::capability_denied(line, "exit"));
+    }
+    Ok(code)
+}
+
 /// builtin 引数が Str であることを要求し、そうでなければ canonical な引数型エラーを返す。
 fn require_str<'a>(
     value: &'a Value,

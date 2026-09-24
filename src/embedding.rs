@@ -409,6 +409,15 @@ pub struct HostError {
 pub enum ExecutionOutcome {
     /// スクリプトが最後まで実行された。v1 の返値は常に空（top-level 返値は将来拡張）。
     Completed,
+    /// スクリプトが `exit(code)` で終了した（Phase 2 C7、REV-023）。
+    ///
+    /// ProcessExit capability を grant された実行だけがこの terminal に到達する。`Completed`
+    /// と同じく全 language-state を commit する（仕様第10節 規則5）。script からは catch でき
+    /// ない。`usage: BudgetUsage` field は Phase 3（E11）で追加する。
+    Exited {
+        /// スクリプトが指定した終了コード（0..=255）。
+        code: u8,
+    },
     /// スクリプト実行中に未捕捉 runtime error で終了した。
     RuntimeError {
         /// canonical な runtime error。
@@ -855,20 +864,35 @@ pub struct ExecutionRequest {
     /// 確定した cancel だけを扱い、命令を1つも実行せずに [`ExecutionOutcome::Cancelled`] へ
     /// 落とす（"pre-cancel は命令0"）。
     pre_cancelled: bool,
+    /// この実行に付与する frozen capability 集合（Phase 2 C1〜、deny-by-default）。
+    ///
+    /// 既定は [`CapabilitySet::empty`]（全 authority 拒否）。host が `with_capabilities` で
+    /// 明示 grant した authority だけを許可する。実行後に評価器から clear され、reusable な
+    /// context へ持ち越さない（仕様第15節 規則5・6）。
+    capabilities: crate::capability::CapabilitySet,
 }
 
 impl ExecutionRequest {
-    /// 引数なしの実行リクエストを作る。
+    /// 引数なしの実行リクエストを作る（capability は empty＝deny-by-default）。
     pub fn new() -> Self {
         Self {
             arguments: Vec::new(),
             pre_cancelled: false,
+            capabilities: crate::capability::CapabilitySet::empty(),
         }
     }
 
     /// スクリプト引数 snapshot を設定する（AUD-018、仕様第6節）。
     pub fn with_arguments(mut self, arguments: Vec<String>) -> Self {
         self.arguments = arguments;
+        self
+    }
+
+    /// この実行の frozen capability 集合を設定する（Phase 2、仕様第6節）。
+    ///
+    /// 設定しなければ deny-by-default（[`CapabilitySet::empty`]）。
+    pub fn with_capabilities(mut self, capabilities: crate::capability::CapabilitySet) -> Self {
+        self.capabilities = capabilities;
         self
     }
 
@@ -1135,10 +1159,16 @@ impl Engine {
             return ExecutionOutcome::Cancelled;
         }
 
-        // 引数 snapshot を評価器へ注入する（AUD-018）。
+        // 引数 snapshot と frozen capability 集合を評価器へ注入する（AUD-018 / Phase 2 C1〜）。
         context.evaluator.set_script_args(request.arguments);
+        context.evaluator.set_capabilities(request.capabilities);
 
-        Self::run_transactional(context, &program, root_source_bytes)
+        let outcome = Self::run_transactional(context, &program, root_source_bytes);
+
+        // capability は reusable context に持ち越さない（仕様第15節 規則5・6）。次 request の
+        // empty set か再注入まで、ambient 互換の既定へ戻す。
+        context.evaluator.clear_capabilities();
+        outcome
     }
 
     /// begin_execution → run_slice を terminal まで回す（transaction 適用、E4）。
@@ -1170,7 +1200,16 @@ impl Engine {
             match context.evaluator.run_slice(u64::MAX) {
                 None => continue, // yield（Phase 1 では slice=u64::MAX のため実質起きない）
                 Some(Ok(())) => return ExecutionOutcome::Completed,
-                Some(Err(error)) => return runtime_error_outcome(error),
+                Some(Err(error)) => {
+                    // exit() の structured terminal（C7、REV-023）を Exited outcome へ写す。
+                    // run_slice は既に language-state を commit 済み（Exited は Completed と同じ
+                    // 規則5 commit）。それ以外の未捕捉エラーは RuntimeError（rollback 済み）。
+                    if matches!(error.kind(), Some(crate::error::ErrorKind::ProcessExit)) {
+                        let code = context.evaluator.take_pending_exit().unwrap_or(0);
+                        return ExecutionOutcome::Exited { code };
+                    }
+                    return runtime_error_outcome(error);
+                }
             }
         }
     }
@@ -2209,5 +2248,168 @@ mod tests {
     fn e6_link_error_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<LinkError>();
+    }
+
+    // --- C7: ProcessExit（exit → Exited terminal、REV-023）---
+
+    /// ProcessExit を grant した capability 集合を作る。
+    fn exit_granted() -> crate::capability::CapabilitySet {
+        use std::num::NonZeroU128;
+        crate::capability::CapabilitySet::builder()
+            .process_exit(crate::capability::ProcessExit::new(
+                NonZeroU128::new(1).unwrap(),
+            ))
+            .unwrap()
+            .build()
+    }
+
+    /// granted な exit(code) は Exited terminal になる（CAP-AT-18 / EMB-AT-11）。
+    #[test]
+    fn c7_exit_granted_maps_to_exited() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "exit(7)\n");
+        let outcome = engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_capabilities(exit_granted()),
+        );
+        assert_eq!(outcome, ExecutionOutcome::Exited { code: 7 });
+    }
+
+    /// exit(0) / exit(255) は境界値として Exited（EMB-AT-11）。
+    #[test]
+    fn c7_exit_boundary_codes_are_exited() {
+        let engine = Engine::builder().build().unwrap();
+        for (src_text, code) in [("exit(0)\n", 0u8), ("exit(255)\n", 255u8)] {
+            let mut ctx = ExecutionContext::new(&engine);
+            let linked = compile_link(&engine, "m", src_text);
+            let outcome = engine.run(
+                &linked,
+                &mut ctx,
+                ExecutionRequest::new().with_capabilities(exit_granted()),
+            );
+            assert_eq!(outcome, ExecutionOutcome::Exited { code });
+        }
+    }
+
+    /// Exited は Completed と同じく直前までの language-state を commit する（第10節 規則5）。
+    #[test]
+    fn c7_exit_commits_language_state() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let first = compile_link(&engine, "m", "let saved = 41\nexit(0)\n");
+        assert_eq!(
+            engine.run(
+                &first,
+                &mut ctx,
+                ExecutionRequest::new().with_capabilities(exit_granted())
+            ),
+            ExecutionOutcome::Exited { code: 0 }
+        );
+        // 次の実行で saved が見える（commit されている）。
+        let probe = compile_link(&engine, "m", "let echo = saved\n");
+        assert_eq!(
+            engine.run(
+                &probe,
+                &mut ctx,
+                ExecutionRequest::new().with_capabilities(exit_granted())
+            ),
+            ExecutionOutcome::Completed
+        );
+    }
+
+    /// ProcessExit 未 grant の exit() は catch 可能な capability error（未捕捉→RuntimeError）。
+    /// OS/process は継続する（EMB-AT-11 / CAP-AT-18）。
+    #[test]
+    fn c7_exit_ungranted_is_runtime_error() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        // 既定 request は deny-by-default（capability なし）。
+        let linked = compile_link(&engine, "m", "exit(0)\n");
+        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+            ExecutionOutcome::RuntimeError { error } => {
+                assert_eq!(error.code, crate::error::ErrorKind::Capability);
+            }
+            other => panic!("期待: RuntimeError(capability), 実際: {other:?}"),
+        }
+    }
+
+    /// 未 grant の exit() は script から catch できる（catchable capability error）。
+    #[test]
+    fn c7_exit_ungranted_is_catchable() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(
+            &engine,
+            "m",
+            "try\n  exit(0)\ncatch e\n  let caught = e[\"type\"]\nend\n",
+        );
+        // catch されれば正常完了する。
+        assert_eq!(
+            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::Completed
+        );
+    }
+
+    /// granted でも 0..=255 の範囲外は catch 可能な argument error（EMB-AT-11）。
+    #[test]
+    fn c7_exit_out_of_range_is_runtime_error() {
+        let engine = Engine::builder().build().unwrap();
+        for src_text in ["exit(256)\n", "exit(0 - 1)\n"] {
+            let mut ctx = ExecutionContext::new(&engine);
+            let linked = compile_link(&engine, "m", src_text);
+            match engine.run(
+                &linked,
+                &mut ctx,
+                ExecutionRequest::new().with_capabilities(exit_granted()),
+            ) {
+                ExecutionOutcome::RuntimeError { error } => {
+                    assert_eq!(error.code, crate::error::ErrorKind::Argument);
+                }
+                other => panic!("期待: RuntimeError(argument), 実際: {other:?}"),
+            }
+        }
+    }
+
+    /// granted な exit() は script の try/catch で捕捉できない uncatchable terminal（規則4）。
+    #[test]
+    fn c7_granted_exit_is_uncatchable() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(
+            &engine,
+            "m",
+            "try\n  exit(3)\ncatch e\n  print(\"caught\")\nend\n",
+        );
+        // catch を素通りして Exited terminal になる。
+        assert_eq!(
+            engine.run(
+                &linked,
+                &mut ctx,
+                ExecutionRequest::new().with_capabilities(exit_granted())
+            ),
+            ExecutionOutcome::Exited { code: 3 }
+        );
+    }
+
+    /// exit terminal 後も context は poison されず再利用できる（規則4）。
+    #[test]
+    fn c7_exit_does_not_poison_context() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "exit(2)\n");
+        engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_capabilities(exit_granted()),
+        );
+        assert!(!ctx.is_poisoned());
+        // 再利用できる。
+        let ok = compile_link(&engine, "m", "let x = 1\n");
+        assert_eq!(
+            engine.run(&ok, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::Completed
+        );
     }
 }

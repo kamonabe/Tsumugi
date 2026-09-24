@@ -262,11 +262,14 @@ impl Evaluator {
                         format!("exit() は引数0〜1個ですが、{}個渡されました", args.len()),
                     ));
                 }
+                // C7（REV-023）: プロセスを終了せず structured terminal（Exited）へ写す。
+                // 引数を評価し（型検査は Int 要求）、範囲・ProcessExit authority を共通ロジックで
+                // 検証してから terminal 信号を返す。
                 let code = if args.is_empty() {
-                    0
+                    None
                 } else {
                     match self.eval_expr(&args[0], line)? {
-                        Value::Int(n) => n as i32,
+                        Value::Int(n) => Some(n),
                         other => {
                             return Err(TsumugiError::builtin_arg_type(
                                 line, "exit", 1, "Int", &other,
@@ -274,7 +277,10 @@ impl Evaluator {
                         }
                     }
                 };
-                std::process::exit(code);
+                let has_exit = self.capabilities().process_exit().is_some();
+                let code = crate::builtin_core::resolve_exit(code, has_exit, line)?;
+                // record_exit は pending_exit を載せ、catch 不可の ProcessExit 信号を返す。
+                Err(self.record_exit(code, line))
             }
             _ => Ok(None),
         }

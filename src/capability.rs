@@ -518,6 +518,25 @@ impl CapabilitySet {
         CapabilitySetBuilder::new()
     }
 
+    /// ambient 互換の既定 set（Phase 2 移行用）。
+    ///
+    /// alpha facade / CLI / REPL / VM 経路は Phase 2 の CLI profile（C9）が入るまで、
+    /// 従来どおり `exit()` がプロセス終了相当（C7 後は structured `Exited` terminal）に
+    /// 到達できる必要がある。そのため ProcessExit だけを grant した set を既定にする。
+    /// filesystem・env・stdio 等は従来の process-global 経路（sandbox/env allow-list）が
+    /// 引き続き担うため、この set には載せない（C3〜C5/C10 で置換する）。
+    ///
+    /// deny-by-default の唯一の library 既定値は [`Self::empty`] であり、埋め込み host は
+    /// そちらから明示 grant する。本 set は移行期の内部利用に限る。
+    pub fn ambient_compat() -> Self {
+        // ambient 経路は policy 相関 ID を区別しないため固定の非ゼロ policy_id を使う。
+        let policy_id = NonZeroU128::new(1).expect("non-zero");
+        CapabilitySetBuilder::new()
+            .process_exit(ProcessExit::new(policy_id))
+            .expect("single grant never duplicates")
+            .build()
+    }
+
     /// policy 相関 ID。
     pub fn id(&self) -> CapabilitySetId {
         self.0.id
@@ -558,6 +577,13 @@ impl CapabilitySet {
     #[allow(dead_code)]
     pub(crate) fn process_exit(&self) -> Option<ProcessExit> {
         self.0.process_exit
+    }
+}
+
+impl Default for CapabilitySet {
+    /// deny-by-default（[`CapabilitySet::empty`]）。
+    fn default() -> Self {
+        Self::empty()
     }
 }
 

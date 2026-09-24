@@ -3,6 +3,9 @@ name = "tsumugi"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+# 既定の `cargo run` は CLI（tsumugi）を対象にする。生成ツール gen_builtins_doc を
+# 追加したため、default-run を明示しないと `cargo run` が binary を決められない。
+default-run = "tsumugi"
 # MSRV（検証・リリース・運用設計 §3.2）。CI の msrv job が 1.97.0 を明示 install して
 # 検証する。意図せず MSRV を上げる変更は禁止（詳細は同文書 §3.2 の運用規則）。
 rust-version = "1.97"
