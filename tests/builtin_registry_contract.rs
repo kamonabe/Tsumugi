@@ -145,8 +145,11 @@ fn generated_docs_match_registry() {
     let actual = std::fs::read_to_string(path).expect(
         "docs/generated/builtins.md が存在しない。`cargo run --bin gen_builtins_doc` で生成する",
     );
+    // 改行コードは checkout 設定（Windows の autocrlf 等）で変わり得るため、内容比較の
+    // 前に CRLF を LF へ正規化する。生成物自体は .gitattributes で LF 固定にしている。
     assert_eq!(
-        actual, expected,
+        actual.replace("\r\n", "\n"),
+        expected.replace("\r\n", "\n"),
         "生成 docs が registry とドリフトしている。`cargo run --bin gen_builtins_doc` で再生成すること"
     );
 }

@@ -2,3 +2,7 @@
 tests/fixtures/*.expected text eol=lf
 tests/fixtures/*.expected_err text eol=lf
 tests/fixtures/*.tsg text eol=lf
+
+# 生成物（registry から生成し contract test が byte 一致を検証する）は常に LF。
+# render_reference() の出力は `\n` 固定のため、Windows で CRLF に変換されるとドリフト検出が誤発火する。
+docs/generated/builtins.md text eol=lf
