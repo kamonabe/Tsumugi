@@ -164,9 +164,9 @@ impl Default for EngineConfig {
 
 /// Engine 構築・設定の検証エラー（仕様第3節 `ConfigError`）。
 ///
-/// E1 で到達し得る variant のみを持つ。capability / callable / descriptor /
-/// filesystem policy 関連（`DuplicateCapability` / `DuplicateCallableName` /
-/// `InvalidDescriptor` / `InvalidFilesystemPolicy`）は Phase 2（E7）で追加する。
+/// E1 の variant に加え、Phase 2（E7、slice C1〜）で使う capability / callable /
+/// descriptor / filesystem policy 関連 variant を持つ。C1 では `DuplicateCapability` を
+/// 使い、残る 3 variant は後続 slice（C5/C8）で使う。
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ConfigError {
@@ -189,6 +189,31 @@ pub enum ConfigError {
     },
     /// 実験 backend が許可されていない。
     ExperimentalBackendNotEnabled,
+    /// 同一 [`CapabilityKind`](crate::capability::CapabilityKind) を二重に設定した
+    /// （後勝ちにしない。仕様第3節）。host function grant は別 ID なら複数許可する。
+    DuplicateCapability {
+        /// 重複した authority 種別。
+        kind: crate::capability::CapabilityKind,
+    },
+    /// callable 名が keyword / builtin / 既登録 host function と衝突する（AUD-049）。
+    ///
+    /// C8（`HostFunctionRegistry`）で使う。
+    DuplicateCallableName {
+        /// 衝突した公開名。
+        name: String,
+    },
+    /// descriptor field が不正（arity / audit policy 等）。C8 で使う。
+    InvalidDescriptor {
+        /// 対象 field 名。
+        field: &'static str,
+        /// 機械可読の理由コード。
+        code: &'static str,
+    },
+    /// filesystem policy が不正（mount / operation / symlink policy 等）。C5 で使う。
+    InvalidFilesystemPolicy {
+        /// 機械可読の理由コード。
+        code: &'static str,
+    },
 }
 
 /// 識別子（`SourceId` / `ModuleId` / `HostErrorCode` の共通制約）を検証する。
@@ -1252,7 +1277,10 @@ fn compile_diagnostic_from(error: &TsumugiError) -> CompileDiagnostic {
 /// SHA-256（FIPS 180-4）と §5.1 の byte-level hash encoding。
 ///
 /// 外部クレートを持ち込まないため self-contained に実装する。既知テストベクタで検証する。
-mod hash {
+///
+/// `CapabilitySetId`（[`crate::capability`]）も同じ self-contained SHA-256 を再利用するため
+/// crate 内へ公開する（外部 SHA-256 実装を二重に持ち込まない）。
+pub(crate) mod hash {
     use super::{LanguageRevision, SourceHash};
 
     const K: [u32; 64] = [
