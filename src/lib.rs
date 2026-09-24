@@ -13,6 +13,7 @@ pub mod ast;
 pub mod budget;
 pub mod builtin_core;
 pub mod builtin_registry;
+pub mod capability;
 pub mod embedding;
 pub mod engine;
 pub mod env;
@@ -90,3 +91,12 @@ pub use embedding::ExecutionRequest as EmbeddingRequest;
 // スライス E4（`docs/embedding-api.md` 第6・9・10節）: Context cleanup と transaction 縦切り。
 // `ContextError` は alpha facade と衝突しないため、そのまま re-export する。
 pub use embedding::ContextError;
+
+// Phase 2 capability（スライス C1、`docs/capability-model.md` 第3・8・13節）の公開型。
+// alpha facade と名前衝突しないため、そのまま crate root へ re-export する。
+pub use capability::{
+    CapabilityKind, CapabilitySet, CapabilitySetBuilder, CapabilitySetId, Clock,
+    DataClassification, DirectoryHandle, EnvironmentSnapshot, EnvironmentValue,
+    FilesystemCapability, FilesystemRoot, FsOperation, HostFunctionId, Input, ModuleResolver,
+    MountName, Output, ProcessExit, SymlinkPolicy,
+};
