@@ -23,7 +23,7 @@
 //! 実行中の grant/revoke はない（原則2・3）。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroU128;
+use std::num::{NonZeroU64, NonZeroU128};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -283,16 +283,21 @@ impl Clock for FixedClock {
 
 /// adapter が返すエラー（仕様第4節 `AdapterError`）。
 ///
-/// C4 の最小形は host 起因の失敗（`Host`）だけを持つ。budget/deadline/cancel を運ぶ
-/// `Control` variant と filesystem 用の `SecureResolutionUnsupported` は、それらの
-/// 制御・予約 context を導入する後続スライス（Phase 3/4・C5/C8）で追加する
-/// （C1/C3 が実行時 context を後続へ委ねたのと同じ方針）。
+/// C4 で host 起因の失敗（`Host`）、C5 で filesystem 用の `SecureResolutionUnsupported`
+/// を持つ。budget/deadline/cancel を運ぶ `Control` variant は、その制御・予約 context を
+/// 導入する後続スライス（Phase 3/4）で追加する（C1/C3 が実行時 context を後続へ委ねたのと
+/// 同じ方針）。
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum AdapterError {
     /// host 実装内部で起きた失敗。script 操作中は sanitized な canonical `host` error として
     /// catch 可能にし、`null`/`false` へ潰さない（仕様第4・7節）。
     Host(String),
+    /// platform が root 拘束・symlink policy を保証できない（仕様第8.3節 契約3）。
+    ///
+    /// 文字列 prefix check へ fallback せず fail closed する。script filesystem 操作中は
+    /// code `secure_resolution_unsupported` の canonical `host` error（catch 可能）へ写す。
+    SecureResolutionUnsupported,
 }
 
 /// [`Input::read_line`] の1行読み取り結果（仕様第7節 `InputLine`）。
@@ -499,14 +504,72 @@ impl MountName {
 
 /// portable path-handle（仕様第8.3節 `DirectoryHandle`）。
 ///
-/// C1 は set 格納と検証・ID 計算に必要な [`policy_id`](DirectoryHandle::policy_id) と
-/// [`symlink_policy`](DirectoryHandle::symlink_policy) だけを要求する。open/read/write/list/
-/// remove/rename は C5 で追加する。
+/// C5 の最小形は open/create_dir/metadata/list/remove/rename を `CapabilityCallContext`
+/// なしで提供する（C3/C4 と同じく Phase 3 の制御・予約 context は後続へ委譲する）。有限
+/// budget（`max_bytes`/`max_entries`）は `Option<NonZeroU64>` の器だけ用意し、上限適用は
+/// Phase 3 で adapter へ渡す。
+///
+/// adapter は root 拘束と symlink policy を単一 handle へ bind して保証する（契約1〜7）。
+/// `canonicalize` でチェック後に元 path を `std::fs` へ渡す実装は禁止。platform が保証
+/// できなければ [`AdapterError::SecureResolutionUnsupported`] を返し、文字列 prefix へ
+/// fallback しない。
 pub trait DirectoryHandle: Send + Sync + 'static {
     /// policy 相関 ID。
     fn policy_id(&self) -> NonZeroU128;
     /// この handle の symlink policy。
     fn symlink_policy(&self) -> SymlinkPolicy;
+
+    /// file を open する。root 内へ secure に bind できなければ拒否する。
+    fn open_file(
+        &self,
+        path: &RelativePath,
+        request: OpenFileRequest,
+    ) -> Result<Box<dyn FileHandle>, AdapterError>;
+
+    /// directory を作る（親は既存前提。`Create` operation）。
+    fn create_dir(&self, path: &RelativePath) -> Result<(), AdapterError>;
+
+    /// メタデータを取得する。`follow_final=false` は final symlink entry 自体を対象にする。
+    fn metadata(
+        &self,
+        path: &RelativePath,
+        follow_final: bool,
+    ) -> Result<PublicMetadata, AdapterError>;
+
+    /// directory を列挙する。`max_entries` は Phase 3 の budget 器（C5 では None 相当）。
+    fn list(
+        &self,
+        path: &RelativePath,
+        max_entries: Option<NonZeroU64>,
+    ) -> Result<Vec<DirectoryEntry>, AdapterError>;
+
+    /// entry を削除する（`FileOrSymlink` / `EmptyDirectory`）。
+    fn remove(&self, path: &RelativePath, kind: RemoveKind) -> Result<(), AdapterError>;
+
+    /// entry を rename する。両 handle 認可後に単一 rename call を行う（契約6）。
+    fn rename(
+        &self,
+        from: &RelativePath,
+        to_directory: &dyn DirectoryHandle,
+        to: &RelativePath,
+        replace: bool,
+    ) -> Result<(), AdapterError>;
+}
+
+/// open 済み file への path-handle（仕様第8.3節 `FileHandle`）。
+///
+/// C5 の最小形は read/write/metadata を `CapabilityCallContext` なしで提供する。`max_bytes`
+/// は Phase 3 の budget 器で、C5 では未適用（`None` 相当）。`Send` だが `Sync` は要求しない
+/// （仕様の signature に合わせる）。
+pub trait FileHandle: Send + 'static {
+    /// 全 byte を読み取る。`max_bytes` は Phase 3 の上限器（C5 では None 相当）。
+    fn read_to_end(&mut self, max_bytes: Option<NonZeroU64>) -> Result<Vec<u8>, AdapterError>;
+
+    /// bytes を書き出す。
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), AdapterError>;
+
+    /// メタデータを取得する。
+    fn metadata(&self) -> Result<PublicMetadata, AdapterError>;
 }
 
 /// 1 つの mount root（仕様第8.1節 `FilesystemRoot`）。
@@ -614,6 +677,206 @@ impl std::fmt::Debug for FilesystemCapability {
             .field("roots", &self.roots)
             .finish()
     }
+}
+
+impl FilesystemCapability {
+    /// 指定 mount の root を返す（完全一致。prefix 一致や登録順 fallback はしない、仕様第8.2節）。
+    ///
+    /// C5-a では routing 基盤として用意する。builtin からの consult は C5-c で配線する。
+    #[allow(dead_code)]
+    pub(crate) fn root(&self, mount: &MountName) -> Option<&FilesystemRoot> {
+        self.roots.iter().find(|r| &r.mount == mount)
+    }
+}
+
+/// script が指定する mount 相対 path（仕様第8.2節 `RelativePath`）。
+///
+/// component は UTF-8・1 byte 以上・NUL なし。`.`/`..`/空 component/絶対 path/backslash は
+/// [`FilesystemTarget::parse`] が事前に排除するため、ここへ来る component はすべて検証済み。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelativePath {
+    components: Arc<[String]>,
+}
+
+impl RelativePath {
+    /// 検証済み component を順に返す。
+    pub fn components(&self) -> impl Iterator<Item = &str> {
+        self.components.iter().map(String::as_str)
+    }
+}
+
+/// script path の lexical エラー（仕様第8.2節 `PathError`）。
+///
+/// capability lookup より先に検出し、catch 可能な `argument` error へ写す（authority 不足の
+/// channel とは混在させない、仕様第8.5節）。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PathError {
+    /// path が空。
+    Empty,
+    /// NUL を含む。
+    ContainsNul,
+    /// 絶対 path（先頭 `/` や drive prefix）。
+    Absolute,
+    /// `.` component。
+    DotComponent,
+    /// `..` component。
+    ParentComponent,
+    /// 空 component（`//` 等）。
+    EmptyComponent,
+    /// backslash separator を含む。
+    BackslashSeparator,
+    /// mount 名が不正。
+    InvalidMountName,
+}
+
+/// routing 後の filesystem 操作対象（仕様第8.2節 `FilesystemTarget`）。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FilesystemTarget {
+    /// mount 名。
+    pub mount: MountName,
+    /// mount 相対 path。
+    pub path: RelativePath,
+}
+
+impl FilesystemTarget {
+    /// script path を parse する（規範 syntax `@MOUNT/component/...`、仕様第8.2節）。
+    ///
+    /// unqualified `component/...` は mount 名 `default` へ parse する。mount は完全一致。
+    /// 絶対 path・`.`・`..`・空 component・backslash・drive prefix・UNC・NUL を拒否する
+    /// （host platform path へ変換する前に検証、CAP-AT-10）。
+    pub fn parse(script_path: &str) -> Result<Self, PathError> {
+        if script_path.is_empty() {
+            return Err(PathError::Empty);
+        }
+        if script_path.contains('\0') {
+            return Err(PathError::ContainsNul);
+        }
+        if script_path.contains('\\') {
+            return Err(PathError::BackslashSeparator);
+        }
+
+        // mount と body を分離する。`@MOUNT/...` は qualified、それ以外は `default` mount。
+        let (mount_str, body) = if let Some(rest) = script_path.strip_prefix('@') {
+            match rest.split_once('/') {
+                Some((mount, body)) => (mount, body),
+                // `@MOUNT` だけ（body なし）は空 path とみなす。
+                None => (rest, ""),
+            }
+        } else {
+            ("default", script_path)
+        };
+
+        let mount = MountName::new(mount_str).map_err(|_| PathError::InvalidMountName)?;
+
+        // 絶対 path（先頭 `/`）と Windows drive prefix（`C:`）・UNC（`//` は先頭空 component
+        // として EmptyComponent で捕捉される）を排除する。
+        if body.starts_with('/') {
+            return Err(PathError::Absolute);
+        }
+        if has_drive_prefix(body) {
+            return Err(PathError::Absolute);
+        }
+
+        let mut components = Vec::new();
+        // body が空（`@mount` だけ、または unqualified の空文字は上で Empty 済み）は
+        // root 自身を指す空 component 列とする。それ以外は `/` で分割して各 component を検証。
+        if !body.is_empty() {
+            for component in body.split('/') {
+                match component {
+                    "" => return Err(PathError::EmptyComponent),
+                    "." => return Err(PathError::DotComponent),
+                    ".." => return Err(PathError::ParentComponent),
+                    c => components.push(c.to_string()),
+                }
+            }
+        }
+
+        Ok(Self {
+            mount,
+            path: RelativePath {
+                components: components.into(),
+            },
+        })
+    }
+}
+
+/// Windows drive prefix（`C:` / `C:/...`）か。UNC はここでは判定せず separator で捕捉する。
+fn has_drive_prefix(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+/// file open 時の書き込み mode（仕様第8.3節 `WriteMode`）。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteMode {
+    /// 既存内容を切り詰める。
+    Truncate,
+    /// 末尾へ追記する。
+    Append,
+}
+
+/// file open request（仕様第8.3節 `OpenFileRequest`）。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenFileRequest {
+    /// 既存 file の読み取り。
+    ReadExisting,
+    /// 既存 file への書き込み。
+    WriteExisting {
+        /// 書き込み mode。
+        mode: WriteMode,
+    },
+    /// 新規 file の作成。
+    CreateNew {
+        /// 書き込み mode。
+        mode: WriteMode,
+    },
+    /// 存在を問わず Write+Create を事前要求する（`write_file`/`append_file`）。
+    Upsert {
+        /// 書き込み mode。
+        mode: WriteMode,
+    },
+}
+
+/// entry 種別（仕様第8.3節 `EntryKind`）。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryKind {
+    /// 通常 file。
+    File,
+    /// directory。
+    Directory,
+    /// symlink。
+    Symlink,
+    /// その他。
+    Other,
+}
+
+/// 公開メタデータ（仕様第8.3節 `PublicMetadata`）。時刻・owner・absolute path は含めない。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicMetadata {
+    /// entry 種別。
+    pub kind: EntryKind,
+    /// byte サイズ。
+    pub size_bytes: u64,
+    /// 読み取り専用か。
+    pub readonly: bool,
+}
+
+/// directory entry（仕様第8.3節 `DirectoryEntry`）。`name` は検証済みの単一 component。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryEntry {
+    /// entry 名（path separator を含まない単一 component）。
+    pub name: String,
+    /// entry 種別。
+    pub kind: EntryKind,
+}
+
+/// 削除対象種別（仕様第8.3節 `RemoveKind`）。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoveKind {
+    /// file または symlink。
+    FileOrSymlink,
+    /// 空 directory。
+    EmptyDirectory,
 }
 
 /// `exit()` を structured terminal にする authority（仕様第9節 `ProcessExit`）。
@@ -1098,6 +1361,43 @@ mod tests {
         fn symlink_policy(&self) -> SymlinkPolicy {
             self.1
         }
+        // ID 計算・検証テスト専用の double。実操作は使わない（C5-b の OS adapter が本実装）。
+        fn open_file(
+            &self,
+            _path: &RelativePath,
+            _request: OpenFileRequest,
+        ) -> Result<Box<dyn FileHandle>, AdapterError> {
+            Err(AdapterError::SecureResolutionUnsupported)
+        }
+        fn create_dir(&self, _path: &RelativePath) -> Result<(), AdapterError> {
+            Err(AdapterError::SecureResolutionUnsupported)
+        }
+        fn metadata(
+            &self,
+            _path: &RelativePath,
+            _follow_final: bool,
+        ) -> Result<PublicMetadata, AdapterError> {
+            Err(AdapterError::SecureResolutionUnsupported)
+        }
+        fn list(
+            &self,
+            _path: &RelativePath,
+            _max_entries: Option<NonZeroU64>,
+        ) -> Result<Vec<DirectoryEntry>, AdapterError> {
+            Err(AdapterError::SecureResolutionUnsupported)
+        }
+        fn remove(&self, _path: &RelativePath, _kind: RemoveKind) -> Result<(), AdapterError> {
+            Err(AdapterError::SecureResolutionUnsupported)
+        }
+        fn rename(
+            &self,
+            _from: &RelativePath,
+            _to_directory: &dyn DirectoryHandle,
+            _to: &RelativePath,
+            _replace: bool,
+        ) -> Result<(), AdapterError> {
+            Err(AdapterError::SecureResolutionUnsupported)
+        }
     }
 
     fn all_kinds() -> [CapabilityKind; 8] {
@@ -1375,6 +1675,103 @@ mod tests {
             .build()
             .id();
         assert_eq!(id1, id2, "root order must not affect id");
+    }
+
+    // --- C5-a: FilesystemTarget::parse（mount routing / lexical path、CAP-AT-10/29）---
+
+    #[test]
+    fn fs_target_parse_qualified_mount() {
+        let t = FilesystemTarget::parse("@data/dir/file.txt").expect("parse");
+        assert_eq!(t.mount.as_str(), "data");
+        let comps: Vec<&str> = t.path.components().collect();
+        assert_eq!(comps, vec!["dir", "file.txt"]);
+    }
+
+    #[test]
+    fn fs_target_parse_unqualified_uses_default_mount() {
+        let t = FilesystemTarget::parse("dir/file.txt").expect("parse");
+        assert_eq!(t.mount.as_str(), "default");
+        let comps: Vec<&str> = t.path.components().collect();
+        assert_eq!(comps, vec!["dir", "file.txt"]);
+    }
+
+    #[test]
+    fn fs_target_parse_single_component() {
+        let t = FilesystemTarget::parse("file.txt").expect("parse");
+        assert_eq!(t.mount.as_str(), "default");
+        let comps: Vec<&str> = t.path.components().collect();
+        assert_eq!(comps, vec!["file.txt"]);
+    }
+
+    #[test]
+    fn fs_target_parse_qualified_empty_body_is_empty_path() {
+        // `@mount` だけは body なし → 空 component 列（root 自身）。
+        let t = FilesystemTarget::parse("@data").expect("parse");
+        assert_eq!(t.mount.as_str(), "data");
+        assert_eq!(t.path.components().count(), 0);
+    }
+
+    #[test]
+    fn fs_target_parse_rejects_lexical_errors() {
+        // CAP-AT-10: absolute / dot / dotdot / NUL / empty component / backslash / drive / UNC。
+        assert_eq!(FilesystemTarget::parse(""), Err(PathError::Empty));
+        assert_eq!(
+            FilesystemTarget::parse("dir\0/x"),
+            Err(PathError::ContainsNul)
+        );
+        assert_eq!(
+            FilesystemTarget::parse("/etc/passwd"),
+            Err(PathError::Absolute)
+        );
+        assert_eq!(
+            FilesystemTarget::parse("@data/./x"),
+            Err(PathError::DotComponent)
+        );
+        assert_eq!(
+            FilesystemTarget::parse("@data/../x"),
+            Err(PathError::ParentComponent)
+        );
+        assert_eq!(
+            FilesystemTarget::parse("a//b"),
+            Err(PathError::EmptyComponent)
+        );
+        assert_eq!(
+            FilesystemTarget::parse("dir\\file"),
+            Err(PathError::BackslashSeparator)
+        );
+        // Windows drive prefix と UNC。UNC(`//srv`) は先頭空 component として捕捉する。
+        assert_eq!(FilesystemTarget::parse("C:/x"), Err(PathError::Absolute));
+        assert_eq!(
+            FilesystemTarget::parse("//server/share"),
+            Err(PathError::Absolute)
+        );
+        // 不正な mount 名。
+        assert_eq!(
+            FilesystemTarget::parse("@1bad/x"),
+            Err(PathError::InvalidMountName)
+        );
+    }
+
+    #[test]
+    fn fs_capability_root_lookup_is_exact_match() {
+        // CAP-AT-29: mount は完全一致で引く（prefix 一致や登録順 fallback をしない）。
+        let mut ops = BTreeSet::new();
+        ops.insert(FsOperation::Read);
+        let root = FilesystemRoot::new(
+            MountName::new("data").expect("mount"),
+            pid(1),
+            ops,
+            SymlinkPolicy::DenyAll,
+            Arc::new(FakeDir(pid(1), SymlinkPolicy::DenyAll)),
+        )
+        .expect("root");
+        let fs = FilesystemCapability::new([root]).expect("fs");
+        assert!(fs.root(&MountName::new("data").expect("mount")).is_some());
+        assert!(
+            fs.root(&MountName::new("default").expect("mount"))
+                .is_none()
+        );
+        assert!(fs.root(&MountName::new("dat").expect("mount")).is_none());
     }
 
     #[test]
