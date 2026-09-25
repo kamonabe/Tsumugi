@@ -107,6 +107,9 @@ pub enum ErrorKind {
     Iteration,
     /// 標準出力などのI/O失敗（broken pipe等）
     Io,
+    /// host adapter 失敗（stdio / filesystem / host function 等の host 境界実装内部で発生。
+    /// 仕様第3.4節「host adapter失敗」。script 実行中は catch 可能、`null`/`false` へ潰さない）。
+    Host,
     /// VM 内部エラー（コンパイラバグ等）
     Internal,
     /// 上記に該当しないランタイムエラー
@@ -140,6 +143,7 @@ impl ErrorKind {
             Self::BuiltinType => "builtin_type",
             Self::Iteration => "iteration",
             Self::Io => "io",
+            Self::Host => "host",
             Self::Internal => "internal",
             Self::Runtime => "runtime",
         }
@@ -782,6 +786,21 @@ impl TsumugiError {
             line,
             ErrorKind::Capability,
             format!("host function の実行が許可されていません: {}", name),
+        )
+    }
+
+    /// host adapter 失敗（第3.4節「host adapter失敗」、catch 可能）。
+    ///
+    /// `name` は adapter-backed builtin の公開名（`input`/`print` 等）または登録 host function 名。
+    /// `category` は host の生 message を出さない安全な分類語（例: `stdin`/`stdout`）。
+    pub fn host_adapter_failed(line: usize, name: &str, category: &str) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::Host,
+            format!(
+                "host function の実行に失敗しました: {} ({})",
+                name, category
+            ),
         )
     }
 

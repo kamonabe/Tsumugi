@@ -281,16 +281,130 @@ impl Clock for FixedClock {
     }
 }
 
-/// 標準入力 authority（仕様第7節 `Input`）。C1 は `policy_id` のみ。`read_line` は C4。
+/// adapter が返すエラー（仕様第4節 `AdapterError`）。
+///
+/// C4 の最小形は host 起因の失敗（`Host`）だけを持つ。budget/deadline/cancel を運ぶ
+/// `Control` variant と filesystem 用の `SecureResolutionUnsupported` は、それらの
+/// 制御・予約 context を導入する後続スライス（Phase 3/4・C5/C8）で追加する
+/// （C1/C3 が実行時 context を後続へ委ねたのと同じ方針）。
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum AdapterError {
+    /// host 実装内部で起きた失敗。script 操作中は sanitized な canonical `host` error として
+    /// catch 可能にし、`null`/`false` へ潰さない（仕様第4・7節）。
+    Host(String),
+}
+
+/// [`Input::read_line`] の1行読み取り結果（仕様第7節 `InputLine`）。
+#[derive(Debug)]
+pub enum InputLine {
+    /// 改行を含まない1行分のテキスト（末尾改行は adapter が除去済み）。
+    Line(String),
+    /// 入力終端。script では `null` へ写す。
+    Eof,
+}
+
+/// 標準入力 authority（仕様第7節 `Input`）。
+///
+/// C4 の最小形は `read_line` を context 引数・`ReadLimit` なしで提供する。有限 meter と
+/// N 境界（`ReadLimit`）・`CapabilityCallContext` は Phase 3 で追加する（仕様第7節末尾）。
 pub trait Input: Send + Sync + 'static {
     /// policy 相関 ID。
     fn policy_id(&self) -> NonZeroU128;
+
+    /// 1行読み取る。EOF は [`InputLine::Eof`]、host 起因の失敗は [`AdapterError::Host`]。
+    fn read_line(&self) -> Result<InputLine, AdapterError>;
 }
 
-/// 標準出力 authority（仕様第7節 `Output`）。C1 は `policy_id` のみ。`write_all`/`flush` は C4。
+/// 標準出力 authority（仕様第7節 `Output`）。
+///
+/// C4 の最小形は `write_all`/`flush` を context 引数なしで提供する。残量 N 境界と
+/// `CapabilityCallContext` は Phase 3 で追加する（仕様第7節末尾）。
 pub trait Output: Send + Sync + 'static {
     /// policy 相関 ID。
     fn policy_id(&self) -> NonZeroU128;
+
+    /// UTF-8 bytes を書き出す。host 起因の失敗は [`AdapterError::Host`]。
+    fn write_all(&self, bytes: &[u8]) -> Result<(), AdapterError>;
+
+    /// バッファを flush する。host 起因の失敗は [`AdapterError::Host`]。
+    fn flush(&self) -> Result<(), AdapterError>;
+}
+
+/// OS の標準入力を読む [`Input`]（ambient 互換経路と CLI legacy profile 用）。
+///
+/// [`CapabilitySet::ambient_compat`] が使う既定 stdin。従来 `input()` が直接読んでいた
+/// `std::io::stdin()` をこの adapter 内へ集約する。
+pub struct SystemInput {
+    policy_id: NonZeroU128,
+}
+
+impl SystemInput {
+    /// 指定 policy 相関 ID で作る。
+    pub const fn new(policy_id: NonZeroU128) -> Self {
+        Self { policy_id }
+    }
+}
+
+impl Input for SystemInput {
+    fn policy_id(&self) -> NonZeroU128 {
+        self.policy_id
+    }
+
+    fn read_line(&self) -> Result<InputLine, AdapterError> {
+        use std::io::BufRead;
+        let mut buf = String::new();
+        match std::io::stdin().lock().read_line(&mut buf) {
+            Ok(0) => Ok(InputLine::Eof),
+            Ok(_) => {
+                if buf.ends_with('\n') {
+                    buf.pop();
+                    if buf.ends_with('\r') {
+                        buf.pop();
+                    }
+                }
+                Ok(InputLine::Line(buf))
+            }
+            Err(e) => Err(AdapterError::Host(e.to_string())),
+        }
+    }
+}
+
+/// OS の標準出力へ書き出す [`Output`]（ambient 互換経路と CLI legacy profile 用）。
+///
+/// [`CapabilitySet::ambient_compat`] が使う既定 stdout。broken pipe でも panic せず
+/// [`AdapterError::Host`] へ写す（従来 `write_stdout_line` が持っていた挙動、AUD-035）。
+pub struct SystemOutput {
+    policy_id: NonZeroU128,
+}
+
+impl SystemOutput {
+    /// 指定 policy 相関 ID で作る。
+    pub const fn new(policy_id: NonZeroU128) -> Self {
+        Self { policy_id }
+    }
+}
+
+impl Output for SystemOutput {
+    fn policy_id(&self) -> NonZeroU128 {
+        self.policy_id
+    }
+
+    fn write_all(&self, bytes: &[u8]) -> Result<(), AdapterError> {
+        use std::io::Write;
+        std::io::stdout()
+            .lock()
+            .write_all(bytes)
+            .map_err(|e| AdapterError::Host(e.to_string()))
+    }
+
+    fn flush(&self) -> Result<(), AdapterError> {
+        use std::io::Write;
+        std::io::stdout()
+            .lock()
+            .flush()
+            .map_err(|e| AdapterError::Host(e.to_string()))
+    }
 }
 
 /// import 解決 authority（仕様第10節 `ModuleResolver`）。C1 は `policy_id` のみ。解決は C6。
@@ -594,9 +708,11 @@ impl CapabilitySet {
     ///   ambient 経路の唯一の process env 読み取りをこの構築時点へ集約し、`env()` builtin 側は
     ///   snapshot だけを読む（core builtin の ambient read 0）。
     /// - **Clock**（C3）: OS system clock（[`SystemClock`]）。`now()` が使う。
+    /// - **Stdin**（C4）: OS 標準入力（[`SystemInput`]）。`input()` が使う。
+    /// - **Stdout**（C4）: OS 標準出力（[`SystemOutput`]）。`print` が使う。
     ///
-    /// filesystem・stdio 等は従来の process-global 経路（sandbox）が引き続き担うため、この set
-    /// には載せない（C4/C5/C10 で置換する）。
+    /// filesystem 等は従来の process-global 経路（sandbox）が引き続き担うため、この set
+    /// には載せない（C5/C10 で置換する）。
     ///
     /// deny-by-default の唯一の library 既定値は [`Self::empty`] であり、埋め込み host は
     /// そちらから明示 grant する。本 set は移行期の内部利用に限る。
@@ -609,6 +725,10 @@ impl CapabilitySet {
             .environment(crate::builtin_core::ambient_environment_snapshot())
             .expect("single grant never duplicates")
             .clock(Arc::new(SystemClock::new(policy_id)))
+            .expect("single grant never duplicates")
+            .stdin(Arc::new(SystemInput::new(policy_id)))
+            .expect("single grant never duplicates")
+            .stdout(Arc::new(SystemOutput::new(policy_id)))
             .expect("single grant never duplicates")
             .build()
     }
@@ -645,6 +765,16 @@ impl CapabilitySet {
     /// clock authority（crate 内部限定。C3 で `now()` が使う）。
     pub(crate) fn clock(&self) -> Option<&Arc<dyn Clock>> {
         self.0.clock.as_ref()
+    }
+
+    /// stdin authority（crate 内部限定。C4 で `input()` が使う）。
+    pub(crate) fn stdin(&self) -> Option<&Arc<dyn Input>> {
+        self.0.stdin.as_ref()
+    }
+
+    /// stdout authority（crate 内部限定。C4 で `print` が使う）。
+    pub(crate) fn stdout(&self) -> Option<&Arc<dyn Output>> {
+        self.0.stdout.as_ref()
     }
 
     /// filesystem authority（crate 内部限定。C1 では未配線、C5 で使う）。
@@ -935,12 +1065,21 @@ mod tests {
         fn policy_id(&self) -> NonZeroU128 {
             self.0
         }
+        fn read_line(&self) -> Result<InputLine, AdapterError> {
+            Ok(InputLine::Eof)
+        }
     }
 
     struct FakeOutput(NonZeroU128);
     impl Output for FakeOutput {
         fn policy_id(&self) -> NonZeroU128 {
             self.0
+        }
+        fn write_all(&self, _bytes: &[u8]) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        fn flush(&self) -> Result<(), AdapterError> {
+            Ok(())
         }
     }
 

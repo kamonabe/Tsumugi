@@ -1311,7 +1311,9 @@ impl Vm {
                 self.budget
                     .charge_output(payload.len() as u64, ExecutionPhase::Run)
                     .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
-                crate::builtin_core::write_stdout_line(&payload, line)?;
+                // C4（CAP-AT-07）: Stdout authority を consult してから adapter へ write する。
+                // tree engine（builtin.rs の print）と同じ共有ロジックを通す。
+                crate::builtin_core::resolve_print(self.capabilities.stdout(), &payload, line)?;
             }
             OpCode::Pop => {
                 // 単一 pop 時もセルをクリア
@@ -1807,20 +1809,10 @@ impl Vm {
         match name {
             "input" => {
                 crate::builtin_core::check_arity(name, &args, 0, line)?;
-                let mut buf = String::new();
-                let value = match std::io::stdin().read_line(&mut buf) {
-                    Ok(0) => Value::Null,
-                    Ok(_) => {
-                        if buf.ends_with('\n') {
-                            buf.pop();
-                            if buf.ends_with('\r') {
-                                buf.pop();
-                            }
-                        }
-                        Value::str_constant(buf)
-                    }
-                    Err(_) => Value::Null,
-                };
+                // C4（CAP-AT-08）: Stdin authority を consult する。tree engine と同じ共有
+                // ロジック（`resolve_input`）を通す。未 grant は catch 可能な `capability` error、
+                // EOF は null、host 失敗は catch 可能な `host` error。
+                let value = crate::builtin_core::resolve_input(self.capabilities.stdin(), line)?;
                 // input（stdio host call）を課金する（§6.1、REV-015 Slice 2）。tree engine
                 // と同じく受け取った payload の byte 長を count と併せて課金する。
                 let payload_bytes = match &value {
@@ -2354,6 +2346,100 @@ mod tests {
         let error = vm
             .exec_builtin("now", vec![], 1)
             .expect_err("now ungranted");
+        assert_eq!(error.error_type(), "capability");
+    }
+
+    // --- C4: Stdin / Stdout を VM 経路でも consult する（tree と parity）---
+
+    use crate::capability::{AdapterError, Input, InputLine, Output};
+    use std::sync::Mutex;
+
+    struct ScriptedInput(Mutex<std::collections::VecDeque<String>>);
+    impl Input for ScriptedInput {
+        fn policy_id(&self) -> NonZeroU128 {
+            NonZeroU128::new(1).unwrap()
+        }
+        fn read_line(&self) -> Result<InputLine, AdapterError> {
+            match self.0.lock().unwrap().pop_front() {
+                Some(line) => Ok(InputLine::Line(line)),
+                None => Ok(InputLine::Eof),
+            }
+        }
+    }
+
+    struct CapturingOutput(Arc<Mutex<Vec<u8>>>);
+    impl Output for CapturingOutput {
+        fn policy_id(&self) -> NonZeroU128 {
+            NonZeroU128::new(1).unwrap()
+        }
+        fn write_all(&self, bytes: &[u8]) -> Result<(), AdapterError> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(())
+        }
+        fn flush(&self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    fn stdin_set(lines: &[&str]) -> CapabilitySet {
+        let queue = lines.iter().map(|s| (*s).to_string()).collect();
+        CapabilitySet::builder()
+            .stdin(Arc::new(ScriptedInput(Mutex::new(queue))))
+            .unwrap()
+            .build()
+    }
+
+    fn stdout_set(sink: Arc<Mutex<Vec<u8>>>) -> CapabilitySet {
+        CapabilitySet::builder()
+            .stdout(Arc::new(CapturingOutput(sink)))
+            .unwrap()
+            .build()
+    }
+
+    #[test]
+    fn c4_vm_input_granted_reads_from_adapter() {
+        let mut vm = vm_with(stdin_set(&["hi"]));
+        let value = vm.exec_builtin("input", vec![], 1).expect("input granted");
+        assert_eq!(value.to_string(), "hi");
+    }
+
+    #[test]
+    fn c4_vm_input_granted_eof_is_null() {
+        let mut vm = vm_with(stdin_set(&[]));
+        let value = vm.exec_builtin("input", vec![], 1).expect("input granted");
+        assert!(matches!(value, Value::Null));
+    }
+
+    #[test]
+    fn c4_vm_input_ungranted_is_capability_error() {
+        let mut vm = vm_with(CapabilitySet::empty());
+        let error = vm
+            .exec_builtin("input", vec![], 1)
+            .expect_err("input ungranted");
+        assert_eq!(error.error_type(), "capability");
+    }
+
+    #[test]
+    fn c4_vm_print_granted_writes_to_adapter() {
+        // print は OpCode::Print で実行されるため、chunk を組んで interpreter loop を通す。
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let mut chunk = Chunk::new();
+        chunk.emit_constant(Value::str_constant("hi".into()), 1);
+        chunk.emit(OpCode::Print(1), 1);
+        let mut vm = Vm::new(VerifiedChunk::from_trusted(chunk));
+        vm.capabilities = stdout_set(sink.clone());
+        vm.run().expect("print granted");
+        assert_eq!(sink.lock().unwrap().as_slice(), b"hi\n");
+    }
+
+    #[test]
+    fn c4_vm_print_ungranted_is_capability_error() {
+        let mut chunk = Chunk::new();
+        chunk.emit_constant(Value::str_constant("hi".into()), 1);
+        chunk.emit(OpCode::Print(1), 1);
+        let mut vm = Vm::new(VerifiedChunk::from_trusted(chunk));
+        vm.capabilities = CapabilitySet::empty();
+        let error = vm.run().expect_err("print ungranted");
         assert_eq!(error.error_type(), "capability");
     }
 }

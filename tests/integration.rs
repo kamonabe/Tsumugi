@@ -2057,8 +2057,11 @@ fn print_reports_closed_output_without_host_panic() {
             !output.status.success(),
             "{mode}: 出力失敗が成功扱いになっています: {stderr}"
         );
+        // C4（Phase 2）以降、print の broken pipe は Stdout adapter 経由の canonical
+        // `host` error として報告される（従来の Io error message から変更）。panic せず
+        // 構造化エラーになる AUD-035 の意図は不変。
         assert!(
-            stderr.contains("標準出力への書き込みに失敗しました"),
+            stderr.contains("host function の実行に失敗しました: print (stdout)"),
             "{mode}: 構造化された出力エラーが報告されていません: {stderr}"
         );
     }
