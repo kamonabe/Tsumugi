@@ -33,7 +33,7 @@ fn main() {
 /// 標準出力へ書き出す。書き込めない場合は診断を出して終了する（AUD-035）
 ///
 /// CLI自身のbannerとpromptに使う。スクリプトの`print`は構造化エラーを返すため、
-/// この関数ではなく`builtin_core::write_stdout_line`を通る。
+/// この関数ではなくC4の`builtin_core::resolve_print`経由のStdout adapterを通る。
 fn write_stdout(text: &str) {
     let mut out = io::stdout().lock();
     if let Err(error) = out.write_all(text.as_bytes()).and_then(|()| out.flush()) {

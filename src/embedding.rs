@@ -2612,4 +2612,222 @@ mod tests {
             ExecutionOutcome::Completed
         );
     }
+
+    // --- C4: Stdin / Stdout（input / print capability、CAP-AT-07 / CAP-AT-08）---
+
+    use std::sync::Mutex;
+
+    /// 書き込まれた bytes を蓄積する観測用 Output double（FixedClock の stdout 版）。
+    struct CapturingOutput {
+        policy_id: NonZeroU128,
+        sink: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl crate::capability::Output for CapturingOutput {
+        fn policy_id(&self) -> NonZeroU128 {
+            self.policy_id
+        }
+        fn write_all(&self, bytes: &[u8]) -> Result<(), crate::capability::AdapterError> {
+            self.sink.lock().unwrap().extend_from_slice(bytes);
+            Ok(())
+        }
+        fn flush(&self) -> Result<(), crate::capability::AdapterError> {
+            Ok(())
+        }
+    }
+
+    /// 常に host 失敗を返す Output double（`host` error 経路の観測用）。
+    struct FailingOutput(NonZeroU128);
+    impl crate::capability::Output for FailingOutput {
+        fn policy_id(&self) -> NonZeroU128 {
+            self.0
+        }
+        fn write_all(&self, _bytes: &[u8]) -> Result<(), crate::capability::AdapterError> {
+            Err(crate::capability::AdapterError::Host("boom".into()))
+        }
+        fn flush(&self) -> Result<(), crate::capability::AdapterError> {
+            Ok(())
+        }
+    }
+
+    /// 事前設定した行を順に返す観測用 Input double（決定的、FixedClock の stdin 版）。
+    struct ScriptedInput {
+        policy_id: NonZeroU128,
+        lines: Mutex<std::collections::VecDeque<String>>,
+    }
+
+    impl crate::capability::Input for ScriptedInput {
+        fn policy_id(&self) -> NonZeroU128 {
+            self.policy_id
+        }
+        fn read_line(
+            &self,
+        ) -> Result<crate::capability::InputLine, crate::capability::AdapterError> {
+            match self.lines.lock().unwrap().pop_front() {
+                Some(line) => Ok(crate::capability::InputLine::Line(line)),
+                None => Ok(crate::capability::InputLine::Eof),
+            }
+        }
+    }
+
+    /// 指定 sink の Output（＋結果観測用 ProcessExit）を grant した set。
+    fn stdout_granted(sink: Arc<Mutex<Vec<u8>>>) -> crate::capability::CapabilitySet {
+        crate::capability::CapabilitySet::builder()
+            .stdout(Arc::new(CapturingOutput {
+                policy_id: NonZeroU128::new(1).unwrap(),
+                sink,
+            }))
+            .unwrap()
+            .process_exit(process_exit())
+            .unwrap()
+            .build()
+    }
+
+    /// 指定行を返す Input（＋結果観測用 ProcessExit）を grant した set。
+    fn stdin_granted(lines: &[&str]) -> crate::capability::CapabilitySet {
+        let queue = lines.iter().map(|s| (*s).to_string()).collect();
+        crate::capability::CapabilitySet::builder()
+            .stdin(Arc::new(ScriptedInput {
+                policy_id: NonZeroU128::new(1).unwrap(),
+                lines: Mutex::new(queue),
+            }))
+            .unwrap()
+            .process_exit(process_exit())
+            .unwrap()
+            .build()
+    }
+
+    /// Stdout grant 済みなら print は adapter へ書き出す（CAP-AT-07）。
+    #[test]
+    fn c4_print_granted_writes_to_adapter() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let linked = compile_link(&engine, "m", "print(\"hello\")\n");
+        let outcome = engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_capabilities(stdout_granted(sink.clone())),
+        );
+        assert_eq!(outcome, ExecutionOutcome::Completed);
+        assert_eq!(sink.lock().unwrap().as_slice(), b"hello\n");
+    }
+
+    /// Stdout 未 grant の print は catch 可能な capability error（未捕捉→RuntimeError、CAP-AT-07）。
+    #[test]
+    fn c4_print_ungranted_is_runtime_error() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        // 既定 request は deny-by-default（Stdout なし）。
+        let linked = compile_link(&engine, "m", "print(\"x\")\n");
+        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+            ExecutionOutcome::RuntimeError { error } => {
+                assert_eq!(error.code, crate::error::ErrorKind::Capability);
+            }
+            other => panic!("期待: RuntimeError(capability), 実際: {other:?}"),
+        }
+    }
+
+    /// 未 grant の print は script から catch できる（catchable capability error）。
+    #[test]
+    fn c4_print_ungranted_is_catchable() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(
+            &engine,
+            "m",
+            "try\n  print(\"x\")\ncatch e\n  let caught = e[\"type\"]\nend\n",
+        );
+        assert_eq!(
+            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::Completed
+        );
+    }
+
+    /// print の host adapter 失敗は catch 可能な `host` error で、null へ潰さない（CAP-AT-07）。
+    #[test]
+    fn c4_print_host_failure_is_host_error() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let set = crate::capability::CapabilitySet::builder()
+            .stdout(Arc::new(FailingOutput(NonZeroU128::new(1).unwrap())))
+            .unwrap()
+            .process_exit(process_exit())
+            .unwrap()
+            .build();
+        let linked = compile_link(&engine, "m", "print(\"x\")\n");
+        match engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_capabilities(set),
+        ) {
+            ExecutionOutcome::RuntimeError { error } => {
+                assert_eq!(error.code, crate::error::ErrorKind::Host);
+            }
+            other => panic!("期待: RuntimeError(host), 実際: {other:?}"),
+        }
+    }
+
+    /// Stdin grant 済みなら input は adapter の行を返す（CAP-AT-08）。値 "8" を exit code へ写す。
+    #[test]
+    fn c4_input_granted_reads_from_adapter() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "exit(to_int(input()))\n");
+        let outcome = engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_capabilities(stdin_granted(&["8"])),
+        );
+        assert_eq!(outcome, ExecutionOutcome::Exited { code: 8 });
+    }
+
+    /// Stdin grant 済みで入力が尽きたら input は null（EOF、CAP-AT-08）。
+    #[test]
+    fn c4_input_granted_eof_is_null() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        // 入力なし（空 queue）→ EOF → null → exit(3)。
+        let linked = compile_link(
+            &engine,
+            "m",
+            "if input() == null\n  exit(3)\nelse\n  exit(9)\nend\n",
+        );
+        let outcome = engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_capabilities(stdin_granted(&[])),
+        );
+        assert_eq!(outcome, ExecutionOutcome::Exited { code: 3 });
+    }
+
+    /// Stdin 未 grant の input は catch 可能な capability error（未捕捉→RuntimeError、CAP-AT-08）。
+    #[test]
+    fn c4_input_ungranted_is_runtime_error() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "let x = input()\n");
+        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+            ExecutionOutcome::RuntimeError { error } => {
+                assert_eq!(error.code, crate::error::ErrorKind::Capability);
+            }
+            other => panic!("期待: RuntimeError(capability), 実際: {other:?}"),
+        }
+    }
+
+    /// 未 grant の input は script から catch できる（catchable capability error）。
+    #[test]
+    fn c4_input_ungranted_is_catchable() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(
+            &engine,
+            "m",
+            "try\n  let x = input()\ncatch e\n  let caught = e[\"type\"]\nend\n",
+        );
+        assert_eq!(
+            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::Completed
+        );
+    }
 }

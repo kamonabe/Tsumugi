@@ -9,8 +9,6 @@ use crate::budget::ExecutionPhase;
 use crate::error::TsumugiError;
 use crate::value::Value;
 
-use std::io::{self, BufRead};
-
 use super::Evaluator;
 
 impl Evaluator {
@@ -208,30 +206,20 @@ impl Evaluator {
                 self.budget
                     .charge_output(payload.len() as u64, ExecutionPhase::Run)
                     .map_err(|stop| self.control_stop_to_error(stop, line))?;
-                crate::builtin_core::write_stdout_line(&payload, line)?;
+                // C4（CAP-AT-07）: Stdout authority を consult してから adapter へ write する。
+                // 未 grant は adapter call 0 の catch 可能な `capability` error。
+                crate::builtin_core::resolve_print(self.capabilities().stdout(), &payload, line)?;
                 Ok(Some(Value::Null))
             }
             "input" => {
                 if !args.is_empty() {
                     return Err(TsumugiError::builtin_arity(line, "input", 0, args.len()));
                 }
-                let stdin = io::stdin();
-                let mut line_buf = String::new();
-                let value = match stdin.lock().read_line(&mut line_buf) {
-                    Ok(0) => Value::Null,
-                    Ok(_) => {
-                        if line_buf.ends_with('\n') {
-                            line_buf.pop();
-                            if line_buf.ends_with('\r') {
-                                line_buf.pop();
-                            }
-                        }
-                        Value::str_constant(line_buf)
-                    }
-                    Err(_) => Value::Null,
-                };
+                // C4（CAP-AT-08）: Stdin authority を consult する。未 grant は adapter call 0 の
+                // catch 可能な `capability` error。EOF は null、host 失敗は catch 可能な `host` error。
+                let value = crate::builtin_core::resolve_input(self.capabilities().stdin(), line)?;
                 // input（stdio host call）を課金する（§6.1、REV-015 Slice 2）。受け取った
-                // payload の byte 長を count と併せて課金する（EOF / error 時は 0 byte）。
+                // payload の byte 長を count と併せて課金する（EOF 時は 0 byte）。
                 let payload_bytes = match &value {
                     Value::Str(s) => s.len() as u64,
                     _ => 0,

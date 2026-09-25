@@ -859,22 +859,9 @@ pub fn builtin_format_time(args: &[Value], line: usize) -> Result<Value, Tsumugi
 // 標準出力
 // =============================================================================
 
-/// 標準出力へ1行書き出す。
-///
-/// 失敗をpanicさせず構造化エラーへ変換する（AUD-035）。`println!`はbroken pipeで
-/// panicし、`tsumugi script.tsg | head -1`のような通常の使い方でもホストを落とす。
-pub fn write_stdout_line(text: &str, line: usize) -> Result<(), TsumugiError> {
-    use std::io::Write;
-
-    let mut out = std::io::stdout().lock();
-    writeln!(out, "{}", text).map_err(|_| {
-        TsumugiError::runtime_with_kind(
-            line,
-            crate::error::ErrorKind::Io,
-            "標準出力への書き込みに失敗しました",
-        )
-    })
-}
+// script の `print` による標準出力書き込みは C4（Phase 2）で [`resolve_print`] 経由の
+// Stdout adapter（[`crate::capability::SystemOutput`] 等）へ移した。broken pipe を panic
+// させず構造化エラー化する挙動（AUD-035）は adapter の `write_all` が引き継ぐ。
 
 // =============================================================================
 // ファイルI/O系（サンドボックスチェック付き）
@@ -1188,6 +1175,62 @@ pub fn resolve_now(
         Err(e) => -(e.duration().as_secs() as i64),
     };
     Ok(Value::Int(secs))
+}
+
+/// `input()` を解決する共通ロジック（Phase 2 C4、CAP-AT-08）。tree/VM 両 engine が使う。
+///
+/// - arity（0）は呼び出し側が検査済み。
+/// - `stdin` が `None`（Stdin 未 grant）なら Input adapter call 0 のまま catch 可能な
+///   `capability` エラーを返す（第7節、`{name}` = `input`）。process stdin へは触れない。
+/// - grant 済みなら Input adapter の `read_line` を呼ぶ。EOF は `null` へ写し、
+///   `AdapterError::Host` は catch 可能な canonical `host` エラーへ写す（`null` へ潰さない）。
+pub fn resolve_input(
+    stdin: Option<&std::sync::Arc<dyn crate::capability::Input>>,
+    line: usize,
+) -> Result<Value, TsumugiError> {
+    use crate::capability::{AdapterError, InputLine};
+    // authority 検査を adapter call より先に行う（第3.7節 error precedence）。
+    let Some(stdin) = stdin else {
+        return Err(TsumugiError::capability_denied(line, "input"));
+    };
+    match stdin.read_line() {
+        Ok(InputLine::Line(text)) => Ok(Value::str_constant(text)),
+        Ok(InputLine::Eof) => Ok(Value::Null),
+        // host 起因の失敗は null へ潰さず catch 可能な `host` エラーにする（第7節）。
+        Err(AdapterError::Host(_)) => {
+            Err(TsumugiError::host_adapter_failed(line, "input", "stdin"))
+        }
+    }
+}
+
+/// `print` を解決する共通ロジック（Phase 2 C4、CAP-AT-07）。tree/VM 両 engine が使う。
+///
+/// - 引数の評価・join・budget 課金は呼び出し側が済ませ、logical write 対象の `payload` を渡す。
+/// - `stdout` が `None`（Stdout 未 grant）なら Output adapter call 0 のまま catch 可能な
+///   `capability` エラーを返す（第7節、`{name}` = `print`）。process stdout へは触れない。
+/// - grant 済みなら UTF-8 bytes + 改行を一括 write する。`AdapterError::Host`（broken pipe
+///   等）は catch 可能な canonical `host` エラーへ写す（従来 `write_stdout_line` は `Io` error
+///   にしていたが、C4 では adapter 経由の `host` error に統一する）。
+pub fn resolve_print(
+    stdout: Option<&std::sync::Arc<dyn crate::capability::Output>>,
+    payload: &str,
+    line: usize,
+) -> Result<(), TsumugiError> {
+    use crate::capability::AdapterError;
+    // authority 検査を adapter call より先に行う（第3.7節 error precedence）。
+    let Some(stdout) = stdout else {
+        return Err(TsumugiError::capability_denied(line, "print"));
+    };
+    // UTF-8 bytes + 改行を一括 write する（第7節「logical write 前に一括 charge」に対応する
+    // 単一 write）。改行を含めて 1 回の write_all で渡す。
+    let mut bytes = payload.as_bytes().to_vec();
+    bytes.push(b'\n');
+    match stdout.write_all(&bytes) {
+        Ok(()) => Ok(()),
+        Err(AdapterError::Host(_)) => {
+            Err(TsumugiError::host_adapter_failed(line, "print", "stdout"))
+        }
+    }
 }
 
 // =============================================================================
