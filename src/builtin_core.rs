@@ -1106,6 +1106,11 @@ pub fn ambient_environment_snapshot() -> crate::capability::EnvironmentSnapshot 
         if is_protected_env_key(&key) || !is_env_key_allowed(&key) {
             return None;
         }
+        // Windows の process env lookup は case-insensitive で、legacy の `env()` は
+        // `std::env::var` 経由で `env("PATH")` から OS の `Path` を引けた。exact-match の
+        // snapshot でこの ambient 挙動を保つため、Windows では key を大文字へ正規化する
+        // （script 側の key も後段で同様に正規化する）。他 OS は case-sensitive のまま。
+        let key = normalize_ambient_env_key(&key);
         // key/value 検証（長さ・NUL）を満たさないものは snapshot から落とす。
         if key.is_empty() || key.len() > 256 || key.as_bytes().contains(&0) {
             return None;
@@ -1115,6 +1120,22 @@ pub fn ambient_environment_snapshot() -> crate::capability::EnvironmentSnapshot 
     });
     // from_entries は重複 key で error になるが、process env の key は一意なので握り潰す。
     EnvironmentSnapshot::from_entries(entries).unwrap_or_else(|_| EnvironmentSnapshot::empty())
+}
+
+/// ambient 経路の環境変数 key を OS 規則で正規化する。
+///
+/// Windows の process env lookup は case-insensitive なので、snapshot 構築時・lookup 時とも
+/// key を大文字化してこの ambient 挙動を保つ（legacy の `std::env::var` 相当）。他 OS は
+/// case-sensitive なのでそのまま返す。`is_protected_env_key` の Windows 大文字化と整合する。
+fn normalize_ambient_env_key(key: &str) -> String {
+    #[cfg(windows)]
+    {
+        key.to_uppercase()
+    }
+    #[cfg(not(windows))]
+    {
+        key.to_string()
+    }
 }
 
 /// `env(key)` を解決する共通ロジック（Phase 2 C3、CAP-AT-05）。tree/VM 両 engine が使う。
@@ -1135,7 +1156,10 @@ pub fn resolve_env(
     let Some(snapshot) = environment else {
         return Err(TsumugiError::capability_denied(line, "env"));
     };
-    match snapshot.get(key) {
+    // Windows は case-insensitive な OS env に合わせ key を正規化して引く（ambient 経路の
+    // snapshot も同じ正規化で構築される）。他 OS は case-sensitive の exact match。
+    let lookup_key = normalize_ambient_env_key(key);
+    match snapshot.get(&lookup_key) {
         Some(value) => Ok(Value::str_constant(value.expose_to_script().to_string())),
         None => Ok(Value::Null),
     }
