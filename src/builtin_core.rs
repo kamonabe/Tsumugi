@@ -1188,7 +1188,7 @@ pub fn resolve_input(
     stdin: Option<&std::sync::Arc<dyn crate::capability::Input>>,
     line: usize,
 ) -> Result<Value, TsumugiError> {
-    use crate::capability::{AdapterError, InputLine};
+    use crate::capability::InputLine;
     // authority 検査を adapter call より先に行う（第3.7節 error precedence）。
     let Some(stdin) = stdin else {
         return Err(TsumugiError::capability_denied(line, "input"));
@@ -1197,9 +1197,9 @@ pub fn resolve_input(
         Ok(InputLine::Line(text)) => Ok(Value::str_constant(text)),
         Ok(InputLine::Eof) => Ok(Value::Null),
         // host 起因の失敗は null へ潰さず catch 可能な `host` エラーにする（第7節）。
-        Err(AdapterError::Host(_)) => {
-            Err(TsumugiError::host_adapter_failed(line, "input", "stdin"))
-        }
+        // stdio に secure resolution はないが、`AdapterError` は non_exhaustive のため
+        // 他 variant も host 失敗として安全側に写す。
+        Err(_) => Err(TsumugiError::host_adapter_failed(line, "input", "stdin")),
     }
 }
 
@@ -1216,7 +1216,6 @@ pub fn resolve_print(
     payload: &str,
     line: usize,
 ) -> Result<(), TsumugiError> {
-    use crate::capability::AdapterError;
     // authority 検査を adapter call より先に行う（第3.7節 error precedence）。
     let Some(stdout) = stdout else {
         return Err(TsumugiError::capability_denied(line, "print"));
@@ -1227,9 +1226,9 @@ pub fn resolve_print(
     bytes.push(b'\n');
     match stdout.write_all(&bytes) {
         Ok(()) => Ok(()),
-        Err(AdapterError::Host(_)) => {
-            Err(TsumugiError::host_adapter_failed(line, "print", "stdout"))
-        }
+        // stdio に secure resolution はないが、`AdapterError` は non_exhaustive のため
+        // 他 variant も host 失敗として安全側に写す。
+        Err(_) => Err(TsumugiError::host_adapter_failed(line, "print", "stdout")),
     }
 }
 
