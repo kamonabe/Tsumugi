@@ -110,7 +110,9 @@ impl Evaluator {
 
         match name {
             // --- コンテキスト依存（ツリーウォーク固有の実装が必要） ---
-            "print" | "input" | "args" | "exit" => self.builtin_io(name, args, line),
+            "print" | "input" | "args" | "exit" | "env" | "now" => {
+                self.builtin_io(name, args, line)
+            }
 
             // push/pop はツリーウォークでは変数を直接変更するため固有実装
             "push" | "pop" => self.builtin_collection(name, args, line),
@@ -253,6 +255,37 @@ impl Evaluator {
                 let listed = Value::new_list(argv, &mut self.budget, ExecutionPhase::Run)
                     .map_err(|stop| self.control_stop_to_error(stop, line))?;
                 Ok(Some(listed))
+            }
+            "env" => {
+                // C3（CAP-AT-05）: 引数（arity 1・Str）を評価してから Environment authority を
+                // consult する共通ロジックへ渡す。ambient read はせず snapshot だけを引く。
+                crate::builtin_core::check_arity_count(name, args.len(), 1, line)?;
+                let key = match self.eval_expr(&args[0], line)? {
+                    Value::Str(key) => key,
+                    other => {
+                        return Err(TsumugiError::builtin_arg_type(
+                            line, "env", 1, "Str", &other,
+                        ));
+                    }
+                };
+                let value = crate::builtin_core::resolve_env(
+                    self.capabilities().environment(),
+                    key.as_str(),
+                    line,
+                )?;
+                // env が生成した untracked String body を tracked 化しつつ heap 課金する
+                // （PureCore builtin と同じ dispatch 境界の扱い、REV-015 案A / Slice 2）。
+                let tracked = self
+                    .budget
+                    .track_result(value, ExecutionPhase::Run)
+                    .map_err(|stop| self.control_stop_to_error(stop, line))?;
+                Ok(Some(tracked))
+            }
+            "now" => {
+                // C3（CAP-AT-06）: Clock authority を consult する。system clock へは触れない。
+                crate::builtin_core::check_arity_count(name, args.len(), 0, line)?;
+                let value = crate::builtin_core::resolve_now(self.capabilities().clock(), line)?;
+                Ok(Some(value))
             }
             "exit" => {
                 if args.len() > 1 {

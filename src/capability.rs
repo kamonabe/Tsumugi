@@ -25,6 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU128;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use crate::embedding::ConfigError;
 
@@ -170,8 +171,7 @@ impl EnvironmentSnapshot {
 
     /// key に対応する値を返す（crate 内部限定、仕様第5節の `pub(crate) get`）。
     ///
-    /// C1 では未配線。Environment authority を builtin へ接続する C3 で `env()` が使う。
-    #[allow(dead_code)]
+    /// Environment authority を builtin へ接続する C3 の `env()` が使う。
     pub(crate) fn get(&self, key: &str) -> Option<&EnvironmentValue> {
         self.0.get(key)
     }
@@ -209,11 +209,76 @@ fn validate_env_key(key: &str) -> Result<(), ConfigError> {
 
 /// 時刻 authority（仕様第6節 `Clock`）。
 ///
-/// C1 は set 格納と ID 計算に必要な [`policy_id`](Clock::policy_id) だけを要求する。
-/// `now_utc` は C3 で追加する。
+/// `now()` はこの trait だけを使う。deadline は script 用 Clock ではなく Engine の
+/// monotonic clock を使う（仕様第6節）。
+///
+/// # スライス境界（C3）
+///
+/// 仕様第6節の最終形は `now_utc(&mut CapabilityCallContext) -> Result<SystemTime, AdapterError>`
+/// だが、`CapabilityCallContext` / `AdapterError` は host call 境界を配線する後続スライス
+/// （C4 Stdin/Stdout・C8 HostFunction）で導入する横断型である。C3 はそれらを待たずに
+/// Clock authority を `now()` へ接続するため、context/error を取らない最小形の
+/// [`now_utc`](Clock::now_utc) を提供する。context 引数と `AdapterError` への拡張は、
+/// それらの型を導入するスライスで行う（C1 が実行時メソッドを後続へ委ねたのと同じ方針）。
 pub trait Clock: Send + Sync + 'static {
     /// policy 相関 ID（構成内容ごとに変える非ゼロ値。pointer address 不可）。
     fn policy_id(&self) -> NonZeroU128;
+
+    /// 現在の UTC 時刻を返す。
+    ///
+    /// C3 の最小形。host adapter は自身の時刻源から `SystemTime` を返す。
+    fn now_utc(&self) -> SystemTime;
+}
+
+/// OS の system clock を使う [`Clock`]（ambient 互換経路と CLI legacy profile 用）。
+///
+/// [`CapabilitySet::ambient_compat`] が使う既定 clock。埋め込み host は自前の
+/// [`Clock`] 実装を grant できる。
+pub struct SystemClock {
+    policy_id: NonZeroU128,
+}
+
+impl SystemClock {
+    /// 指定 policy 相関 ID で作る。
+    pub const fn new(policy_id: NonZeroU128) -> Self {
+        Self { policy_id }
+    }
+}
+
+impl Clock for SystemClock {
+    fn policy_id(&self) -> NonZeroU128 {
+        self.policy_id
+    }
+
+    fn now_utc(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
+
+/// 決定的な固定時刻を返す test/host utility の [`Clock`]（仕様第6節 `FixedClock`）。
+///
+/// 同じ設定で常に同じ時刻を返すため、`now()` を含む script の結果を再現できる
+/// （CAP-AT-06）。
+pub struct FixedClock {
+    policy_id: NonZeroU128,
+    instant: SystemTime,
+}
+
+impl FixedClock {
+    /// policy 相関 ID と固定時刻から作る。
+    pub const fn new(policy_id: NonZeroU128, instant: SystemTime) -> Self {
+        Self { policy_id, instant }
+    }
+}
+
+impl Clock for FixedClock {
+    fn policy_id(&self) -> NonZeroU128 {
+        self.policy_id
+    }
+
+    fn now_utc(&self) -> SystemTime {
+        self.instant
+    }
 }
 
 /// 標準入力 authority（仕様第7節 `Input`）。C1 は `policy_id` のみ。`read_line` は C4。
@@ -521,10 +586,17 @@ impl CapabilitySet {
     /// ambient 互換の既定 set（Phase 2 移行用）。
     ///
     /// alpha facade / CLI / REPL / VM 経路は Phase 2 の CLI profile（C9）が入るまで、
-    /// 従来どおり `exit()` がプロセス終了相当（C7 後は structured `Exited` terminal）に
-    /// 到達できる必要がある。そのため ProcessExit だけを grant した set を既定にする。
-    /// filesystem・env・stdio 等は従来の process-global 経路（sandbox/env allow-list）が
-    /// 引き続き担うため、この set には載せない（C3〜C5/C10 で置換する）。
+    /// 従来どおりの挙動へ到達できる必要がある。そのため次を grant した set を既定にする。
+    ///
+    /// - **ProcessExit**（C7）: `exit()` を structured `Exited` terminal にする。
+    /// - **Environment**（C3）: `env()` 用の snapshot。process env を 1 度だけ読み、legacy の
+    ///   allow-list（`TSUMUGI_ENV_ALLOW`）と `TSUMUGI_` 保護を適用した visible key だけを載せる。
+    ///   ambient 経路の唯一の process env 読み取りをこの構築時点へ集約し、`env()` builtin 側は
+    ///   snapshot だけを読む（core builtin の ambient read 0）。
+    /// - **Clock**（C3）: OS system clock（[`SystemClock`]）。`now()` が使う。
+    ///
+    /// filesystem・stdio 等は従来の process-global 経路（sandbox）が引き続き担うため、この set
+    /// には載せない（C4/C5/C10 で置換する）。
     ///
     /// deny-by-default の唯一の library 既定値は [`Self::empty`] であり、埋め込み host は
     /// そちらから明示 grant する。本 set は移行期の内部利用に限る。
@@ -533,6 +605,10 @@ impl CapabilitySet {
         let policy_id = NonZeroU128::new(1).expect("non-zero");
         CapabilitySetBuilder::new()
             .process_exit(ProcessExit::new(policy_id))
+            .expect("single grant never duplicates")
+            .environment(crate::builtin_core::ambient_environment_snapshot())
+            .expect("single grant never duplicates")
+            .clock(Arc::new(SystemClock::new(policy_id)))
             .expect("single grant never duplicates")
             .build()
     }
@@ -561,10 +637,14 @@ impl CapabilitySet {
         self.0.host_functions.contains(&id)
     }
 
-    /// 環境変数 snapshot（crate 内部限定。C1 では未配線、C3 で `env()` が使う）。
-    #[allow(dead_code)]
+    /// 環境変数 snapshot（crate 内部限定。C3 で `env()` が使う）。
     pub(crate) fn environment(&self) -> Option<&EnvironmentSnapshot> {
         self.0.environment.as_ref()
+    }
+
+    /// clock authority（crate 内部限定。C3 で `now()` が使う）。
+    pub(crate) fn clock(&self) -> Option<&Arc<dyn Clock>> {
+        self.0.clock.as_ref()
     }
 
     /// filesystem authority（crate 内部限定。C1 では未配線、C5 で使う）。
@@ -844,6 +924,9 @@ mod tests {
     impl Clock for FakeClock {
         fn policy_id(&self) -> NonZeroU128 {
             self.0
+        }
+        fn now_utc(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH
         }
     }
 

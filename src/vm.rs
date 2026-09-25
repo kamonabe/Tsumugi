@@ -1832,6 +1832,29 @@ impl Vm {
                     .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
                 Ok(value)
             }
+            "env" => {
+                // C3（CAP-AT-05）: arity 1・Str を検査してから Environment authority を
+                // consult する。ambient read はせず snapshot だけを引く。tree engine と同じ
+                // 論理位置・同じ共有ロジック（`resolve_env`）を通す。
+                crate::builtin_core::check_arity(name, &args, 1, line)?;
+                let key = match &args[0] {
+                    Value::Str(key) => key.as_str().to_string(),
+                    other => {
+                        return Err(TsumugiError::builtin_arg_type(line, "env", 1, "Str", other));
+                    }
+                };
+                let value =
+                    crate::builtin_core::resolve_env(self.capabilities.environment(), &key, line)?;
+                // env が生成した untracked String body を tracked 化しつつ heap 課金する。
+                self.budget
+                    .track_result(value, ExecutionPhase::Run)
+                    .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))
+            }
+            "now" => {
+                // C3（CAP-AT-06）: Clock authority を consult する。system clock へは触れない。
+                crate::builtin_core::check_arity(name, &args, 0, line)?;
+                crate::builtin_core::resolve_now(self.capabilities.clock(), line)
+            }
             "exit" => {
                 if args.len() > 1 {
                     return Err(TsumugiError::runtime_with_kind(
@@ -2250,5 +2273,87 @@ mod tests {
             "想定外のメッセージ: {}",
             error.message()
         );
+    }
+
+    // --- C3: Environment / Clock を VM 経路でも consult する（tree と parity）---
+
+    use crate::capability::{
+        CapabilitySet, DataClassification, EnvironmentSnapshot, EnvironmentValue, FixedClock,
+    };
+    use std::num::NonZeroU128;
+    use std::sync::Arc;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    /// 指定 capability を注入した VM を作る（空 chunk。exec_builtin を直接呼ぶ）。
+    fn vm_with(capabilities: CapabilitySet) -> Vm {
+        let mut vm = Vm::new(VerifiedChunk::from_trusted(Chunk::new()));
+        vm.capabilities = capabilities;
+        vm
+    }
+
+    fn env_set(key: &str, value: &str) -> CapabilitySet {
+        let snapshot = EnvironmentSnapshot::from_entries([(
+            key.to_string(),
+            EnvironmentValue::new(value, DataClassification::Public).unwrap(),
+        )])
+        .unwrap();
+        CapabilitySet::builder()
+            .environment(snapshot)
+            .unwrap()
+            .build()
+    }
+
+    fn clock_set(secs: u64) -> CapabilitySet {
+        let instant = UNIX_EPOCH + Duration::from_secs(secs);
+        CapabilitySet::builder()
+            .clock(Arc::new(FixedClock::new(
+                NonZeroU128::new(1).unwrap(),
+                instant,
+            )))
+            .unwrap()
+            .build()
+    }
+
+    #[test]
+    fn c3_vm_env_granted_reads_snapshot() {
+        let mut vm = vm_with(env_set("CODE", "hi"));
+        let value = vm
+            .exec_builtin("env", vec![Value::str_constant("CODE".into())], 1)
+            .expect("env granted");
+        assert_eq!(value.to_string(), "hi");
+    }
+
+    #[test]
+    fn c3_vm_env_granted_missing_key_is_null() {
+        let mut vm = vm_with(env_set("CODE", "hi"));
+        let value = vm
+            .exec_builtin("env", vec![Value::str_constant("MISSING".into())], 1)
+            .expect("env granted");
+        assert!(matches!(value, Value::Null));
+    }
+
+    #[test]
+    fn c3_vm_env_ungranted_is_capability_error() {
+        let mut vm = vm_with(CapabilitySet::empty());
+        let error = vm
+            .exec_builtin("env", vec![Value::str_constant("CODE".into())], 1)
+            .expect_err("env ungranted");
+        assert_eq!(error.error_type(), "capability");
+    }
+
+    #[test]
+    fn c3_vm_now_granted_reads_fixed_clock() {
+        let mut vm = vm_with(clock_set(42));
+        let value = vm.exec_builtin("now", vec![], 1).expect("now granted");
+        assert!(matches!(value, Value::Int(42)));
+    }
+
+    #[test]
+    fn c3_vm_now_ungranted_is_capability_error() {
+        let mut vm = vm_with(CapabilitySet::empty());
+        let error = vm
+            .exec_builtin("now", vec![], 1)
+            .expect_err("now ungranted");
+        assert_eq!(error.error_type(), "capability");
     }
 }

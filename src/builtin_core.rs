@@ -3,15 +3,20 @@
 //! ツリーウォーク評価器 (builtin.rs) と VM (vm.rs) の両方から呼び出される。
 //! 引数は評価済みの `&[Value]` で受け取るため、引数評価の順序と副作用は各engineの責務。
 //!
-//! `builtin_*` は47個ある。うち32個は副作用のない値変換で、残り15個は
-//! filesystem・環境変数・clockに触る（`read_file` / `write_file` / `mkdir` /
-//! `remove` / `rename` / `list_dir` / `env` / `now` など）。これらは
+//! `builtin_*` の多くは副作用のない値変換で、一部は filesystem に触る（`read_file` /
+//! `write_file` / `mkdir` / `remove` / `rename` / `list_dir` など）。これらは
 //! `sandbox` の認可を通すロジックも両engineで共有したいため、ここに置く。
 //!
-//! 各engine側に残すのは、実行コンテキストそのものを必要とするものだけ:
+//! 各engine側に残すのは、実行コンテキスト（capability set・stdio・argv・変数 binding・
+//! closure）そのものを必要とするものだけ:
 //! - `print` / `input` / `exit` / `args` — process の stdio・argv・終了
+//! - `env` / `now` — Environment / Clock capability を consult する（Phase 2 C3）
 //! - `push` / `pop` — 変数bindingへの書き戻し
 //! - `map` / `filter` / `each` — クロージャ呼び出し
+//!
+//! `env` / `now` の型・arity 検査後の解決ロジックは [`resolve_env`] / [`resolve_now`] に
+//! 共有として置き、capability set は各 engine が [`crate::capability::CapabilitySet`] から
+//! 渡す（`exit` の [`resolve_exit`] と同じ形）。
 //!
 //! language-visible builtin 名の正本は [`crate::builtin_registry`] の
 //! `PUBLIC_BUILTINS` 1か所だけである（AUD-049）。本モジュールの `dispatch` は
@@ -835,16 +840,6 @@ pub fn builtin_round(args: &[Value], line: usize) -> Result<Value, TsumugiError>
 // 日時系
 // =============================================================================
 
-pub fn builtin_now(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    check_arity("now", args, 0, line)?;
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    Ok(Value::Int(secs))
-}
-
 pub fn builtin_format_time(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("format_time", args, 2, line)?;
     let Value::Int(ts) = &args[0] else {
@@ -1093,26 +1088,82 @@ fn is_protected_env_key(key: &str) -> bool {
     }
 }
 
-pub fn builtin_env(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    check_arity("env", args, 1, line)?;
-    if let Value::Str(key) = &args[0] {
-        // ランタイム制御用の環境変数はスクリプトからアクセス不可
-        if is_protected_env_key(key) {
-            return Ok(Value::Null);
+/// ambient 互換経路（[`crate::capability::CapabilitySet::ambient_compat`]）用の
+/// 環境変数 snapshot を作る（Phase 2 C3）。
+///
+/// ambient 経路の唯一の process env 読み取りをここへ集約する。process env を 1 度だけ走査し、
+/// legacy の allow-list（`TSUMUGI_ENV_ALLOW`）と `TSUMUGI_` 保護を適用した visible key だけを
+/// [`EnvironmentSnapshot`] に載せる。これにより `env()` builtin 自体は snapshot だけを読み、
+/// core builtin からの ambient read を 0 にする（CAP-AT-27）。
+///
+/// snapshot key は UTF-8・1..=256 bytes・NUL なしが要件のため、これを満たさない key は
+/// 従来の live-read でも `env()` へ渡せない（key は script 由来の Str）ので落として問題ない。
+/// value 側の分類は ambient 互換なので [`DataClassification::Public`] とする。
+pub fn ambient_environment_snapshot() -> crate::capability::EnvironmentSnapshot {
+    use crate::capability::{DataClassification, EnvironmentSnapshot, EnvironmentValue};
+
+    let entries = std::env::vars().filter_map(|(key, value)| {
+        if is_protected_env_key(&key) || !is_env_key_allowed(&key) {
+            return None;
         }
-        if !is_env_key_allowed(key) {
-            // 許可リスト外のキーへのアクセスは null を返す（エラーにはしない）
-            return Ok(Value::Null);
+        // key/value 検証（長さ・NUL）を満たさないものは snapshot から落とす。
+        if key.is_empty() || key.len() > 256 || key.as_bytes().contains(&0) {
+            return None;
         }
-        match std::env::var(key.as_str()) {
-            Ok(val) => Ok(Value::str_constant(val)),
-            Err(_) => Ok(Value::Null),
-        }
-    } else {
-        Err(TsumugiError::builtin_arg_type(
-            line, "env", 1, "Str", &args[0],
-        ))
+        let value = EnvironmentValue::new(value, DataClassification::Public).ok()?;
+        Some((key, value))
+    });
+    // from_entries は重複 key で error になるが、process env の key は一意なので握り潰す。
+    EnvironmentSnapshot::from_entries(entries).unwrap_or_else(|_| EnvironmentSnapshot::empty())
+}
+
+/// `env(key)` を解決する共通ロジック（Phase 2 C3、CAP-AT-05）。tree/VM 両 engine が使う。
+///
+/// - arity（1）と型（Str）は呼び出し側が検査済みで、ここは評価済み key と Environment
+///   snapshot の有無を受け取る。
+/// - `environment` が `None`（Environment 未 grant）なら environment adapter call 0 のまま
+///   catch 可能な `capability` エラーを返す（第5節、`{name}` = `env`）。process env へは触れない。
+/// - grant 済みなら snapshot だけを引く。missing key は `null`（error にしない）。
+///
+/// snapshot は start 前に固定され、実行中に process env を再読しない（CAP-AT-05）。
+pub fn resolve_env(
+    environment: Option<&crate::capability::EnvironmentSnapshot>,
+    key: &str,
+    line: usize,
+) -> Result<Value, TsumugiError> {
+    // authority 検査を snapshot lookup より先に行う（第3.7節 error precedence）。
+    let Some(snapshot) = environment else {
+        return Err(TsumugiError::capability_denied(line, "env"));
+    };
+    match snapshot.get(key) {
+        Some(value) => Ok(Value::str_constant(value.expose_to_script().to_string())),
+        None => Ok(Value::Null),
     }
+}
+
+/// `now()` を解決する共通ロジック（Phase 2 C3、CAP-AT-06）。tree/VM 両 engine が使う。
+///
+/// - arity（0）は呼び出し側が検査済み。
+/// - `clock` が `None`（Clock 未 grant）なら trait call 0 のまま catch 可能な `capability`
+///   エラーを返す（第6節、`{name}` = `now`）。system clock へは触れない。
+/// - grant 済みなら Clock adapter の `now_utc` を Unix 秒（`Int`）へ写す。UNIX epoch より前や
+///   極端な時刻は従来どおり秒へ丸め、負値も許す（AUD-036 の完全な checked 変換は別追跡）。
+pub fn resolve_now(
+    clock: Option<&std::sync::Arc<dyn crate::capability::Clock>>,
+    line: usize,
+) -> Result<Value, TsumugiError> {
+    use std::time::UNIX_EPOCH;
+    let Some(clock) = clock else {
+        return Err(TsumugiError::capability_denied(line, "now"));
+    };
+    let now = clock.now_utc();
+    let secs = match now.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        // epoch より前は負の秒数として表現する（従来の unwrap_or_default は 0 化していたが、
+        // fixed clock で epoch 前を設定できるため符号を保つ）。
+        Err(e) => -(e.duration().as_secs() as i64),
+    };
+    Ok(Value::Int(secs))
 }
 
 // =============================================================================
@@ -1339,13 +1390,11 @@ pub fn dispatch(
         "floor" => builtin_floor(args, line)?,
         "ceil" => builtin_ceil(args, line)?,
         "round" => builtin_round(args, line)?,
-        "now" => builtin_now(args, line)?,
         "format_time" => builtin_format_time(args, line)?,
         "read_file" => builtin_read_file(args, line)?,
         "read_lines" => builtin_read_lines(args, max_collection, line)?,
         "write_file" => builtin_write_file(args, line)?,
         "append_file" => builtin_append_file(args, line)?,
-        "env" => builtin_env(args, line)?,
         "path_exists" => builtin_path_exists(args, line)?,
         "path_join" => builtin_path_join(args, line)?,
         "mkdir" => builtin_mkdir(args, line)?,
