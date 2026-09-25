@@ -2412,4 +2412,204 @@ mod tests {
             ExecutionOutcome::Completed
         );
     }
+
+    // --- C3: Environment / Clock（env / now capability、CAP-AT-05 / CAP-AT-06）---
+
+    use std::num::NonZeroU128;
+    use std::sync::Arc;
+
+    /// 固定 policy_id の ProcessExit を作る（結果観測のため env/clock テストへ相乗り）。
+    fn process_exit() -> crate::capability::ProcessExit {
+        crate::capability::ProcessExit::new(NonZeroU128::new(1).unwrap())
+    }
+
+    /// 指定 env snapshot（＋結果観測用 ProcessExit）を grant した set。
+    fn env_granted(entries: &[(&str, &str)]) -> crate::capability::CapabilitySet {
+        use crate::capability::{DataClassification, EnvironmentSnapshot, EnvironmentValue};
+        let snapshot = EnvironmentSnapshot::from_entries(entries.iter().map(|(k, v)| {
+            (
+                (*k).to_string(),
+                EnvironmentValue::new(*v, DataClassification::Public).unwrap(),
+            )
+        }))
+        .unwrap();
+        crate::capability::CapabilitySet::builder()
+            .environment(snapshot)
+            .unwrap()
+            .process_exit(process_exit())
+            .unwrap()
+            .build()
+    }
+
+    /// 指定 Unix 秒の FixedClock（＋結果観測用 ProcessExit）を grant した set。
+    fn clock_granted(secs: u64) -> crate::capability::CapabilitySet {
+        use crate::capability::FixedClock;
+        use std::time::{Duration, UNIX_EPOCH};
+        let instant = UNIX_EPOCH + Duration::from_secs(secs);
+        crate::capability::CapabilitySet::builder()
+            .clock(Arc::new(FixedClock::new(
+                NonZeroU128::new(1).unwrap(),
+                instant,
+            )))
+            .unwrap()
+            .process_exit(process_exit())
+            .unwrap()
+            .build()
+    }
+
+    /// Environment grant 済みなら env(key) は snapshot の値を返す（CAP-AT-05）。
+    /// 値 "7" を exit code へ写して観測する。
+    #[test]
+    fn c3_env_granted_reads_snapshot() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "exit(to_int(env(\"CODE\")))\n");
+        let outcome = engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_capabilities(env_granted(&[("CODE", "7")])),
+        );
+        assert_eq!(outcome, ExecutionOutcome::Exited { code: 7 });
+    }
+
+    /// Environment grant 済みでも key が snapshot に無ければ null（error にしない、CAP-AT-05）。
+    #[test]
+    fn c3_env_granted_missing_key_is_null() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        // env("MISSING") == null なら exit(5)、そうでなければ exit(9)。
+        let linked = compile_link(
+            &engine,
+            "m",
+            "if env(\"MISSING\") == null\n  exit(5)\nelse\n  exit(9)\nend\n",
+        );
+        let outcome = engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_capabilities(env_granted(&[("CODE", "7")])),
+        );
+        assert_eq!(outcome, ExecutionOutcome::Exited { code: 5 });
+    }
+
+    /// Environment 未 grant の env() は catch 可能な capability error（未捕捉→RuntimeError、
+    /// CAP-AT-05）。process env へは触れない。
+    #[test]
+    fn c3_env_ungranted_is_runtime_error() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        // 既定 request は deny-by-default（Environment なし）。
+        let linked = compile_link(&engine, "m", "let x = env(\"CODE\")\n");
+        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+            ExecutionOutcome::RuntimeError { error } => {
+                assert_eq!(error.code, crate::error::ErrorKind::Capability);
+            }
+            other => panic!("期待: RuntimeError(capability), 実際: {other:?}"),
+        }
+    }
+
+    /// 未 grant の env() は script から catch できる（catchable capability error）。
+    #[test]
+    fn c3_env_ungranted_is_catchable() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(
+            &engine,
+            "m",
+            "try\n  let x = env(\"CODE\")\ncatch e\n  let caught = e[\"type\"]\nend\n",
+        );
+        assert_eq!(
+            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::Completed
+        );
+    }
+
+    /// snapshot は start 前に固定され、実行中に process env を再読しない（CAP-AT-05）。
+    /// grant した snapshot に無い実 process env の key は見えない。
+    #[test]
+    fn c3_env_snapshot_is_fixed_and_isolated_from_process_env() {
+        // 実 process env を汚しても snapshot 経由では見えないことを確認する。
+        // safety: テスト専用の一時 key。
+        unsafe {
+            std::env::set_var("TSG_C3_PROBE", "leak");
+        }
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(
+            &engine,
+            "m",
+            "if env(\"TSG_C3_PROBE\") == null\n  exit(1)\nelse\n  exit(2)\nend\n",
+        );
+        // grant した snapshot は TSG_C3_PROBE を含まない → null → exit(1)。
+        let outcome = engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_capabilities(env_granted(&[("CODE", "7")])),
+        );
+        unsafe {
+            std::env::remove_var("TSG_C3_PROBE");
+        }
+        assert_eq!(outcome, ExecutionOutcome::Exited { code: 1 });
+    }
+
+    /// Clock grant 済みなら now() は FixedClock の時刻を Unix 秒で返す（CAP-AT-06）。
+    #[test]
+    fn c3_now_granted_reads_fixed_clock() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        // now() を exit code へ写す（0..=255 に収まる固定秒）。
+        let linked = compile_link(&engine, "m", "exit(now())\n");
+        let outcome = engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_capabilities(clock_granted(42)),
+        );
+        assert_eq!(outcome, ExecutionOutcome::Exited { code: 42 });
+    }
+
+    /// 同じ FixedClock は同じ結果を返す（決定的、CAP-AT-06）。
+    #[test]
+    fn c3_now_fixed_clock_is_deterministic() {
+        let engine = Engine::builder().build().unwrap();
+        for _ in 0..3 {
+            let mut ctx = ExecutionContext::new(&engine);
+            let linked = compile_link(&engine, "m", "exit(now())\n");
+            let outcome = engine.run(
+                &linked,
+                &mut ctx,
+                ExecutionRequest::new().with_capabilities(clock_granted(100)),
+            );
+            assert_eq!(outcome, ExecutionOutcome::Exited { code: 100 });
+        }
+    }
+
+    /// Clock 未 grant の now() は catch 可能な capability error（未捕捉→RuntimeError、
+    /// CAP-AT-06）。system clock へは触れない。
+    #[test]
+    fn c3_now_ungranted_is_runtime_error() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "let t = now()\n");
+        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+            ExecutionOutcome::RuntimeError { error } => {
+                assert_eq!(error.code, crate::error::ErrorKind::Capability);
+            }
+            other => panic!("期待: RuntimeError(capability), 実際: {other:?}"),
+        }
+    }
+
+    /// 未 grant の now() は script から catch できる（catchable capability error）。
+    #[test]
+    fn c3_now_ungranted_is_catchable() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(
+            &engine,
+            "m",
+            "try\n  let t = now()\ncatch e\n  let caught = e[\"type\"]\nend\n",
+        );
+        assert_eq!(
+            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::Completed
+        );
+    }
 }

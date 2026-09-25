@@ -44,7 +44,7 @@ language から呼べる組み込み関数の一覧である。tree / VM / compi
 | `floor` | 1 | pure-core |
 | `ceil` | 1 | pure-core |
 | `round` | 1 | pure-core |
-| `now` | 0 | pure-core |
+| `now` | 0 | context |
 | `format_time` | 2 | pure-core |
 | `print` | 0 | context |
 | `input` | 0 | context |
@@ -57,7 +57,7 @@ language から呼べる組み込み関数の一覧である。tree / VM / compi
 | `read_lines` | 1 | pure-core |
 | `write_file` | 2 | pure-core |
 | `append_file` | 2 | pure-core |
-| `env` | 1 | pure-core |
+| `env` | 1 | context |
 | `path_exists` | 1 | pure-core |
 | `path_join` | >=0 | pure-core |
 | `mkdir` | 1 | pure-core |
@@ -69,4 +69,4 @@ language から呼べる組み込み関数の一覧である。tree / VM / compi
 | `is_file` | 1 | pure-core |
 | `is_dir` | 1 | pure-core |
 
-合計 53 個（pure-core 44 個・context 9 個）。
+合計 53 個（pure-core 42 個・context 11 個）。

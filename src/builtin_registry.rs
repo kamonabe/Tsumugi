@@ -320,7 +320,8 @@ pub const PUBLIC_BUILTINS: &[BuiltinSpec] = &[
         id: B::Now,
         name: "now",
         arity: Exact(0),
-        execution: PureCore,
+        // Clock capability を consult するため context 実行（Phase 2 C3）。
+        execution: Context,
     },
     BuiltinSpec {
         id: B::FormatTime,
@@ -402,7 +403,8 @@ pub const PUBLIC_BUILTINS: &[BuiltinSpec] = &[
         id: B::Env,
         name: "env",
         arity: Exact(1),
-        execution: PureCore,
+        // Environment capability を consult するため context 実行（Phase 2 C3）。
+        execution: Context,
     },
     // --- パス・ファイルシステム ---
     BuiltinSpec {
@@ -658,7 +660,10 @@ mod tests {
         }
     }
 
-    /// context builtin の集合が期待どおりであること（実行コンテキストを要する 8 個）。
+    /// context builtin の集合が期待どおりであること。
+    ///
+    /// stdio・argv・変数束縛・closure に加え、Environment/Clock capability を consult する
+    /// `env` / `now` も context（Phase 2 C3）。
     #[test]
     fn context_builtins_match_expected_set() {
         let mut ctx: Vec<&str> = PUBLIC_BUILTINS
@@ -670,7 +675,8 @@ mod tests {
         assert_eq!(
             ctx,
             vec![
-                "args", "each", "exit", "filter", "input", "map", "pop", "print", "push"
+                "args", "each", "env", "exit", "filter", "input", "map", "now", "pop", "print",
+                "push"
             ]
         );
     }
