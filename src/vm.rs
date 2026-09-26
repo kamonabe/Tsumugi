@@ -2773,5 +2773,138 @@ mod tests {
             assert!(!root.path.join("link").exists());
             assert!(root.path.join("real").join("keep.txt").exists());
         }
+
+        // --- REV-009: list_dir の部分失敗・非 UTF-8 名（§17.4、capability=safe）---
+
+        #[test]
+        fn list_dir_success_returns_sorted_names() {
+            let root = TempRoot::new();
+            std::fs::write(root.path.join("b.txt"), b"b").unwrap();
+            std::fs::write(root.path.join("a.txt"), b"a").unwrap();
+            let mut vm = vm_with(fs_set(&root, &[FsOperation::List, FsOperation::Metadata]));
+            let listed = vm
+                .exec_builtin("list_dir", vec![Value::str_constant("@default".into())], 1)
+                .expect("list ok");
+            match listed {
+                Value::List(items) => {
+                    let names: Vec<String> = items.iter().map(|v| v.to_string()).collect();
+                    assert_eq!(names, vec!["a.txt".to_string(), "b.txt".to_string()]);
+                }
+                other => panic!("list はリストを返す: {other:?}"),
+            }
+        }
+
+        // 非 UTF-8 entry 名 / entry 取得失敗の error 写像は、OS が実際に不正 byte 名の file を
+        // 作れるかに依存させず、fake DirectoryHandle が該当 `AdapterError` を返すことで検証する
+        // （macOS/APFS は非 UTF-8 名を EILSEQ で拒否するため、実 file 生成に依存しない）。
+        // FilesystemCapability/FilesystemRoot/MountName/SymlinkPolicy/FsOperation/BTreeSet と
+        // AdapterError は本 module（`use super::*` 経由含む）で既に import 済み。ここでは fake
+        // adapter が要する型だけを追加で import する。
+        use crate::capability::{
+            DirectoryEntry, DirectoryHandle, FileHandle, OpenFileRequest, PublicMetadata,
+            RelativePath, RemoveKind,
+        };
+
+        /// `list` が指定 `AdapterError` を返す fake adapter（他操作は使わない）。
+        struct ListErrorDir {
+            policy_id: NonZeroU128,
+            error: fn() -> AdapterError,
+        }
+        impl DirectoryHandle for ListErrorDir {
+            fn policy_id(&self) -> NonZeroU128 {
+                self.policy_id
+            }
+            fn symlink_policy(&self) -> SymlinkPolicy {
+                SymlinkPolicy::DenyAll
+            }
+            fn open_file(
+                &self,
+                _path: &RelativePath,
+                _request: OpenFileRequest,
+            ) -> Result<Box<dyn FileHandle>, AdapterError> {
+                Err(AdapterError::SecureResolutionUnsupported)
+            }
+            fn create_dir(&self, _path: &RelativePath) -> Result<(), AdapterError> {
+                Err(AdapterError::SecureResolutionUnsupported)
+            }
+            fn metadata(
+                &self,
+                _path: &RelativePath,
+                _follow_final: bool,
+            ) -> Result<PublicMetadata, AdapterError> {
+                Err(AdapterError::SecureResolutionUnsupported)
+            }
+            fn list(
+                &self,
+                _path: &RelativePath,
+                _max_entries: Option<std::num::NonZeroU64>,
+            ) -> Result<Vec<DirectoryEntry>, AdapterError> {
+                Err((self.error)())
+            }
+            fn remove(&self, _path: &RelativePath, _kind: RemoveKind) -> Result<(), AdapterError> {
+                Err(AdapterError::SecureResolutionUnsupported)
+            }
+            fn rename(
+                &self,
+                _from: &RelativePath,
+                _to_directory: &dyn DirectoryHandle,
+                _to: &RelativePath,
+                _replace: bool,
+            ) -> Result<(), AdapterError> {
+                Err(AdapterError::SecureResolutionUnsupported)
+            }
+        }
+
+        /// `list` が指定 error を返す adapter を default mount へ grant した set。
+        fn list_error_set(error: fn() -> AdapterError) -> CapabilitySet {
+            let pid = NonZeroU128::new(0x9009).unwrap();
+            let mut ops = BTreeSet::new();
+            ops.insert(FsOperation::List);
+            let root = FilesystemRoot::new(
+                MountName::new("default").unwrap(),
+                pid,
+                ops,
+                SymlinkPolicy::DenyAll,
+                Arc::new(ListErrorDir {
+                    policy_id: pid,
+                    error,
+                }),
+            )
+            .unwrap();
+            let fs = FilesystemCapability::new([root]).unwrap();
+            CapabilitySet::builder().filesystem(fs).unwrap().build()
+        }
+
+        #[test]
+        fn list_dir_non_utf8_name_is_invalid_encoding_host_error() {
+            // safe（capability）経路: 非 UTF-8 の entry 名は lossy 変換で同一視せず、catch 可能な
+            // host error（category invalid_encoding）にする（REV-009 §17.4）。
+            let mut vm = vm_with(list_error_set(|| AdapterError::NonUtf8EntryName));
+            let err = vm
+                .exec_builtin("list_dir", vec![Value::str_constant("@default".into())], 1)
+                .expect_err("non-utf8 name must error");
+            assert_eq!(err.error_type(), "host");
+            assert!(
+                err.message().contains("invalid_encoding"),
+                "category が message に載る: {}",
+                err.message()
+            );
+        }
+
+        #[test]
+        fn list_dir_entry_read_failure_is_directory_read_host_error() {
+            // safe（capability）経路: 個別 entry 取得失敗を黙殺せず directory_read host error に
+            // する（部分結果を成功 List にしない、REV-009 §17.4）。
+            let mut vm = vm_with(list_error_set(|| AdapterError::DirectoryReadFailed));
+            let err = vm
+                .exec_builtin("list_dir", vec![Value::str_constant("@default".into())], 1)
+                .expect_err("entry read failure must error");
+            assert_eq!(err.error_type(), "host");
+            assert!(
+                err.message().contains("directory_read"),
+                "category が message に載る: {}",
+                err.message()
+            );
+        }
     }
 }

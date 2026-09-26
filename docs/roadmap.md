@@ -48,7 +48,7 @@
 | ~~P1~~ | ~~REV-021~~ | ~~`remove_dir`の再帰削除とcapabilityの不整合~~ | ✅ | 完了（§17.6、仕様revision 0.20。`remove_dir`を空のみへ変更し再帰削除を新規`remove_tree`＝`RecursiveDelete`へ分離。budget/cancel/auditはPhase 3/4/6） |
 | P1 | AUD-018 | CLIからscript引数を渡せない（capability profile/optionsはE8bで別追跡） | 🟡 | AUD crosswalk（E8a完了。importなしtree file/stdinは`EmbeddingRequest::with_arguments`→`Engine::run`経由。import・REPLの引数転送はE7で統合するまでalpha facade。E8b残） |
 | P1 | AUD-021 | language-spec/LANG_GUIDE/design drift継続 | 🟡 | AUD P2表（意味論確定後に継続更新） |
-| P2 | REV-009 | `list_dir`の部分失敗黙殺と非UTF-8名衝突 | ⬜ | REV表 P2（§17.4 設計確定） |
+| ~~P2~~ | ~~REV-009~~ | ~~`list_dir`の部分失敗黙殺と非UTF-8名衝突~~ | ✅ | 完了（§17.4。capability経路=safe＝entry失敗→`host` `directory_read`・非UTF-8名→`host` `invalid_encoding`、部分結果を成功Listにしない。ambient経路=legacy互換のまま。budgetはREV-015側） |
 | P2 | REV-010 | 32-bitで`i64 as usize`がwrap | ⬜ | REV表 P2 |
 | P2 | REV-016 | Rc cycleと長寿命contextのheap残留 | ⬜ | REV表 P2 |
 | P2 | REV-017 | 表示・repr・sort orderの結合 | ⬜ | REV表 P2 |
@@ -329,7 +329,7 @@ commit `092da35d0a01c6e3f403123df8416ec0819746d7` を対象に、production sour
 
 | ID | 項目 | 到達範囲 | 設計状態 | 実装状況 |
 |---|---|---|---|---|
-| REV-009 | `list_dir`がentry errorを黙殺し、非UTF-8名をlossy変換して衝突させる。個別entry errorをstructured host errorにし、非UTF-8名を`invalid_encoding`にする | filesystem | ✅ 確定済み（[次期意味論・実装決定](semantic-decisions.md)§17.4、[capability-model](capability-model.md)） | ⬜ 未実装 |
+| REV-009 | `list_dir`がentry errorを黙殺し、非UTF-8名をlossy変換して衝突させる。個別entry errorをstructured host errorにし、非UTF-8名を`invalid_encoding`にする | filesystem | ✅ 確定済み（[次期意味論・実装決定](semantic-decisions.md)§17.4、[capability-model](capability-model.md)） | ✅ 完了（Phase 2最小形＝capability経路=safe / ambient経路=legacy。`AdapterError::DirectoryReadFailed`/`NonUtf8EntryName`を追加し`os_secure::list`のskip/lossyを廃止、capability dispatchが`directory_read`/`invalid_encoding` categoryの`host` errorへ写す。ambientは従来skip/lossy維持。tree/VM共有handler。budget/deadlineはREV-015/execution-control側） |
 | REV-010 | 32-bit targetで`i64 as usize`がwrapし、limit迂回・巨大collectを起こし得る。`try_from`とchecked arithmeticへ置換する | 32-bit target | 設計○（[実行予算・協調実行](execution-control.md) budget受入） | ⬜ 未実装 |
 | REV-016 | scriptからRc cycleを作れ、context再利用で回収不能heapが累積する。baseline heap課金・`clear_user_state()`・tenant跨ぎ再利用禁止で近期対応し、中期はarena+GCを検討する（AUD-042は偶発cycle削減で完了済み） | 長寿命context | 検討◎・設計○（[設計](design.md)、AUD-042） | ⬜ 未実装 |
 | REV-017 | human Displayが非escapeで、sort key・repr・outputが同じ表現へ結合されている。HumanDisplay/CanonicalRepr/TotalOrderを分離する（REV-001と連動） | 通常script | 設計△（sort仕様は記載、分離設計は不足） | ⬜ 未実装 |
