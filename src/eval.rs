@@ -332,6 +332,17 @@ impl Evaluator {
         self.budget.set_clock(clock);
     }
 
+    /// この実行の協調的 cancel token の clone を返す（REV-015 Slice 4）。
+    ///
+    /// host はこの clone を別スレッドで保持し、実行中に
+    /// [`crate::budget::CancellationToken::cancel`] を呼ぶことで協調的 cancel を要求できる。
+    /// cancel は charge 前と文/反復境界で consult され、
+    /// [`crate::error::ErrorKind::Cancelled`] の catch 不能 terminal として停止する。
+    /// 未 cancel の既定経路（alpha / CLI / REPL）は観測挙動不変。
+    pub fn cancellation_token(&self) -> crate::budget::CancellationToken {
+        self.budget.cancellation_token()
+    }
+
     /// `args()` が返すスクリプト引数の snapshot を設定する（AUD-018）。
     pub fn set_script_args(&mut self, args: Vec<String>) {
         self.script_args = args;
@@ -488,13 +499,13 @@ impl Evaluator {
             .map_err(|stop| crate::budget::control_stop_to_error(stop, 0, line))
     }
 
-    /// budget の [`ControlStop`] を既存の [`TsumugiError`] へ写像する（Slice 1/2 互換）。
+    /// budget の [`ControlStop`] を既存の [`TsumugiError`] へ写像する。
     /// resource → error kind/message の対応は tree/VM 共有の
     /// [`crate::budget::control_stop_to_error`] に集約し、trace だけ tree 側で付ける。
     ///
-    /// Slice 1/2 で発生し得るのは fuel（= step）・collection・string 超過。cancel /
-    /// deadline は ledger の charge 経路にまだ配線しておらず（Slice 4）、
-    /// 到達した場合も安全側で step 上限として扱う。
+    /// fuel（= step）・collection・string・source/import・heap・I-O 超過に加え、cancel /
+    /// deadline（REV-015 Slice 4）は catch 不能な `Cancelled` / `DeadlineExceeded` terminal
+    /// 信号へ写す。
     fn control_stop_to_error(&self, stop: ControlStop, line: usize) -> TsumugiError {
         let err =
             crate::budget::control_stop_to_error(stop, self.budget.usage().committed.fuel, line);
@@ -926,11 +937,17 @@ impl Evaluator {
                 return Ok(DriveOutcome::Yielded);
             }
 
-            // deadline checkpoint（REV-015 Slice 4、§8）。charge 経路は charge 前に deadline を
-            // 確認するが、fuel をほとんど消費しない反復では charge 境界に届かないことがある。
-            // 文/反復境界でも確認し、超過なら catch 不能 terminal として直ちに unwind する
-            // （deadline は handle_error が catch しない）。clock 未注入の既定経路では no-op。
-            if let Err(stop) = self.budget.checkpoint_deadline() {
+            // cancel / deadline checkpoint（REV-015 Slice 4、§8）。charge 経路は charge 前に
+            // cancel と deadline を確認するが、fuel をほとんど消費しない反復では charge 境界に
+            // 届かないことがある。文/反復境界でも確認し、要求されていれば catch 不能 terminal
+            // として直ちに unwind する（cancel / deadline は handle_error が catch しない）。
+            // cancel を先に確認する（reserve_all の §7-1 の順序と揃える）。token 未 cancel /
+            // clock 未注入の既定経路では no-op。
+            if let Err(stop) = self
+                .budget
+                .checkpoint_cancel()
+                .and_then(|()| self.budget.checkpoint_deadline())
+            {
                 let e = self.control_stop_to_error(stop, 0);
                 self.unwind_to(stop_depth);
                 return Err(e);
@@ -1210,11 +1227,16 @@ impl Evaluator {
         // - exit() の structured terminal（C7、REV-023 / capability-model 第2節 原則4）
         // - deadline 超過（REV-015 Slice 4 / execution-control §7・§8・§15.1「budget 超過を
         //   try/catch で囲んでも catch body を実行しない」）
-        // それ以外の budget/cancel の terminal 化は Slice 1/2 でまだ catchable な TsumugiError
-        // 経由のため、ここでは exit と deadline のみ除外する。
+        // - 協調的 cancel（REV-015 Slice 4 / execution-control §8）
+        // それ以外の budget の terminal 化は Slice 1/2 でまだ catchable な TsumugiError 経由の
+        // ため、ここでは exit・deadline・cancel のみ除外する。
         if matches!(
             error.kind(),
-            Some(crate::error::ErrorKind::ProcessExit | crate::error::ErrorKind::DeadlineExceeded)
+            Some(
+                crate::error::ErrorKind::ProcessExit
+                    | crate::error::ErrorKind::DeadlineExceeded
+                    | crate::error::ErrorKind::Cancelled
+            )
         ) {
             return Err(error);
         }
@@ -2267,6 +2289,62 @@ mod tests {
             err.kind(),
             Some(crate::error::ErrorKind::DeadlineExceeded),
             "try/catch must not catch deadline terminal: {err:?}"
+        );
+    }
+
+    /// cancel token を実行前に cancel してから input を terminal まで実行する（REV-015 Slice 4）。
+    ///
+    /// `cancel_before` が true なら begin_execution の前に token を cancel する。戻り値は
+    /// terminal 結果。cancel は charge 前・文/反復境界で consult され catch 不能 terminal になる。
+    fn run_with_cancel(input: &str, cancel_before: bool) -> Result<(), TsumugiError> {
+        let program = parse_program(input);
+        let mut eval = Evaluator::new();
+        let token = eval.cancellation_token();
+        if cancel_before {
+            token.cancel();
+        }
+        eval.begin_execution(&program, input.len() as u64, false)
+            .map_err(|(_, e)| e)?;
+        loop {
+            match eval.run_slice(u64::MAX) {
+                None => continue,
+                Some(result) => return result,
+            }
+        }
+    }
+
+    /// cancel 済み token での実行は catch 不能 terminal（Cancelled）で停止する（§8）。
+    #[test]
+    fn cancel_stops_execution_as_terminal() {
+        let result = run_with_cancel("let x = 1 + 2\nlet y = x * 3", true);
+        let err = result.expect_err("cancelled execution should surface as terminal");
+        assert_eq!(
+            err.kind(),
+            Some(crate::error::ErrorKind::Cancelled),
+            "cancel should be a Cancelled terminal: {err:?}"
+        );
+    }
+
+    /// cancel を要求しなければ通常どおり正常完了する（既定経路は観測挙動不変）。
+    #[test]
+    fn no_cancel_completes_normally() {
+        let result = run_with_cancel("let x = 1 + 2\nlet y = x * 3", false);
+        assert!(
+            result.is_ok(),
+            "uncancelled execution should complete: {result:?}"
+        );
+    }
+
+    /// cancel を try/catch で囲んでも catch body を実行しない（catch 不能 terminal、§8）。
+    #[test]
+    fn cancel_is_not_catchable_by_try_catch() {
+        let src = "try\n  let a = 1\ncatch e\n  let x = 99\nend";
+        let result = run_with_cancel(src, true);
+        let err = result.expect_err("cancel should surface as terminal");
+        assert_eq!(
+            err.kind(),
+            Some(crate::error::ErrorKind::Cancelled),
+            "try/catch must not catch cancel terminal: {err:?}"
         );
     }
 

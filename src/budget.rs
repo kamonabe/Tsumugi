@@ -577,8 +577,10 @@ pub enum InternalFailure {
 
 /// 協調的キャンセル token（§8）。
 ///
-/// `cancel()` は idempotent で、最初の `false -> true` を linearization point とする。
-/// Slice 1 では [`BudgetLedger`] の charge 前確認だけで使い、waker 連携は Slice 4。
+/// `cancel()` は idempotent かつ thread-safe で、最初の `false -> true` を linearization
+/// point とする。[`BudgetLedger`] の charge 前確認（§7-1）と driver ループの文/反復境界
+/// checkpoint（REV-015 Slice 4）で consult する。Ready/Yielded/Paused/host call 待ちの
+/// handle を wake する waker 連携は Slice 5（host pending）の範囲。
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken {
     flag: Arc<std::sync::atomic::AtomicBool>,
@@ -589,9 +591,13 @@ impl CancellationToken {
         Self::default()
     }
 
-    /// キャンセルを要求する。既に要求済みなら何もしない。
-    pub fn cancel(&self) {
-        self.flag.store(true, Ordering::SeqCst);
+    /// キャンセルを要求する（§8）。
+    ///
+    /// 最初の `false -> true` を linearization point とし、そのとき `true` を返す。既に
+    /// cancel 済みなら状態を変えず `false` を返す（別スレッドからの呼び出しに対して安全）。
+    pub fn cancel(&self) -> bool {
+        // swap は以前の値を返す。false（未 cancel）だった初回だけ true を返す。
+        !self.flag.swap(true, Ordering::SeqCst)
     }
 
     /// キャンセル済みか。
@@ -901,6 +907,14 @@ impl BudgetLedger {
     /// が execution 作成前に検査する）。
     pub fn set_clock(&mut self, clock: Arc<dyn MonotonicClock>) {
         self.clock = Some(clock);
+    }
+
+    /// この台帳が consult する [`CancellationToken`] の clone を返す（REV-015 Slice 4）。
+    ///
+    /// host はこの clone を別スレッドで保持し、実行中に [`CancellationToken::cancel`] を
+    /// 呼ぶことで協調的 cancel を要求できる（§8）。charge 前と文/反復境界で consult される。
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
 
     /// 現在の使用量 snapshot（§3）。
@@ -1951,6 +1965,16 @@ impl BudgetLedger {
         self.check_deadline()
     }
 
+    /// 文/反復境界の checkpoint 用に cancel を確認する（REV-015 Slice 4、§8）。
+    ///
+    /// charge 経路（[`Self::reserve_all`] ほか）は charge 前に cancel を確認するが、fuel を
+    /// ほとんど消費しない反復では charge 境界に届かないことがある。driver ループの文/反復
+    /// 境界からこれを呼ぶことで、そうした処理でも cancel で協調停止できる。token が未 cancel
+    /// なら no-op。
+    pub fn checkpoint_cancel(&self) -> Result<(), ControlStop> {
+        self.check_cancel()
+    }
+
     /// fuel の残量（total - committed - reserved）。診断・テスト補助。
     pub fn remaining_fuel(&self) -> u64 {
         self.config
@@ -1966,13 +1990,15 @@ impl BudgetLedger {
 /// 1 箇所へ集約して parity を保証する。trace は各 engine が呼び出し側で付ける。
 ///
 /// Slice 1/2 で発生し得るのは fuel（= step）・collection・string・source/import・heap・
-/// I-O（input/output/host call の count/bytes）超過。deadline（Slice 4）は catch 不能な
-/// `DeadlineExceeded` terminal 信号へ写す。cancel は ledger の charge 経路にまだ handle 共有
-/// を配線しておらず（Slice 4 (B)）、到達した場合も安全側で step 上限として扱う。
-/// `committed_fuel` は cancel fallback の上限表示に使う。
+/// I-O（input/output/host call の count/bytes）超過。deadline・cancel（Slice 4）はいずれも
+/// catch 不能な `DeadlineExceeded` / `Cancelled` terminal 信号へ写す。
+///
+/// `_committed_fuel` は以前 cancel/deadline の step 上限 fallback 表示に使っていたが、両者を
+/// 専用 error へ写すようになった現在は未使用（呼び出し側の多い公開シグネチャを保つため引数
+/// だけ残す。budget 超過の上限は各 `BudgetExceeded` の `limit` を使う）。
 pub fn control_stop_to_error(
     stop: ControlStop,
-    committed_fuel: u64,
+    _committed_fuel: u64,
     line: usize,
 ) -> crate::error::TsumugiError {
     use crate::error::TsumugiError;
@@ -2011,7 +2037,7 @@ pub fn control_stop_to_error(
             _ => TsumugiError::step_limit(line, e.limit),
         },
         ControlStop::DeadlineExceeded { .. } => TsumugiError::deadline_exceeded(line),
-        ControlStop::Cancelled => TsumugiError::step_limit(line, committed_fuel),
+        ControlStop::Cancelled => TsumugiError::cancelled(line),
         ControlStop::InternalFailure(InternalFailure::AllocationIdExhausted) => {
             TsumugiError::internal(line, "AllocationId を割り当てできません")
         }
@@ -2167,6 +2193,63 @@ mod tests {
         let err =
             control_stop_to_error(ControlStop::DeadlineExceeded { deadline, observed }, 42, 7);
         assert_eq!(err.kind(), Some(crate::error::ErrorKind::DeadlineExceeded));
+    }
+
+    // -------------------------------------------------------------------------
+    // runtime cancel（§8 / REV-015 Slice 4）
+    // -------------------------------------------------------------------------
+
+    /// cancel() は最初の false→true だけ true を返し、以後は false（§8 linearization point）。
+    #[test]
+    fn cancel_returns_true_only_on_first_transition() {
+        let token = CancellationToken::new();
+        assert!(!token.is_cancelled());
+        assert!(token.cancel(), "初回 cancel は true");
+        assert!(token.is_cancelled());
+        assert!(!token.cancel(), "2 回目以降は false（既に cancel 済み）");
+        assert!(!token.cancel());
+    }
+
+    /// clone した token の cancel は元の token へも観測される（handle 共有経路、§8）。
+    #[test]
+    fn cancel_is_observed_through_clone() {
+        let token = CancellationToken::new();
+        let remote = token.clone();
+        assert!(remote.cancel(), "clone 経由の初回 cancel は true");
+        assert!(token.is_cancelled(), "元の token でも cancel を観測する");
+        // 元 token からの二重 cancel は false（linearization は clone を跨いで 1 回）。
+        assert!(!token.cancel());
+    }
+
+    /// cancel 済み token は charge 前に停止する（token 共有経路）。
+    #[test]
+    fn cancel_stops_charge_via_shared_token() {
+        let mut l = ledger(BudgetConfig::for_legacy(1_000_000, 0));
+        let token = l.cancellation_token();
+        token.cancel();
+        assert_eq!(
+            l.charge_fuel(1, ExecutionPhase::Run),
+            Err(ControlStop::Cancelled)
+        );
+        // charge 前確認なので fuel は 1 も消費しない。
+        assert_eq!(l.usage().committed.fuel, 0);
+    }
+
+    /// 文/反復境界 checkpoint も cancel で停止する。
+    #[test]
+    fn cancel_stops_at_checkpoint() {
+        let l = ledger(BudgetConfig::for_legacy(1_000_000, 0));
+        let token = l.cancellation_token();
+        assert!(l.checkpoint_cancel().is_ok(), "未 cancel は no-op");
+        token.cancel();
+        assert!(matches!(l.checkpoint_cancel(), Err(ControlStop::Cancelled)));
+    }
+
+    /// Cancelled は catch 不能 terminal 信号の error kind へ写る。
+    #[test]
+    fn cancel_maps_to_cancelled_error() {
+        let err = control_stop_to_error(ControlStop::Cancelled, 42, 7);
+        assert_eq!(err.kind(), Some(crate::error::ErrorKind::Cancelled));
     }
 
     // -------------------------------------------------------------------------
