@@ -1787,7 +1787,27 @@ impl Vm {
         }
         // まず共通モジュールで処理を試みる
         let max_collection = self.budget.max_collection_elements();
-        if let Some(result) = crate::builtin_core::dispatch(name, &args, max_collection, line)? {
+        // C5-c（案 B）: filesystem builtin かつ Filesystem authority が grant 済みなら frozen
+        // CapabilitySet 経由で実行する（tree engine と同じ論理位置・同じ共有ロジック）。未 grant
+        // （ambient）は従来の dispatch＝process-global sandbox のまま。
+        let fs_capability_result = if crate::builtin_core::is_filesystem_builtin(name)
+            && let Some(fs) = self.capabilities.filesystem()
+        {
+            Some(crate::builtin_core::dispatch_filesystem_capability(
+                name,
+                &args,
+                fs,
+                max_collection,
+                line,
+            )?)
+        } else {
+            None
+        };
+        let dispatched = match fs_capability_result {
+            Some(value) => Some(value),
+            None => crate::builtin_core::dispatch(name, &args, max_collection, line)?,
+        };
+        if let Some(result) = dispatched {
             // filesystem host call の response bytes（読み込み内容）を、結果が確定した後に
             // 課金する（§6.1）。write 系は response 0 byte。
             if is_host_call {
@@ -2441,5 +2461,226 @@ mod tests {
         vm.capabilities = CapabilitySet::empty();
         let error = vm.run().expect_err("print ungranted");
         assert_eq!(error.error_type(), "capability");
+    }
+
+    // --- C5-c: filesystem builtin を CapabilitySet 経由で実行（CAP-AT-12/13/14）---
+    //
+    // secure OS adapter は Unix 限定のため、grant 経路のテストは #[cfg(unix)]。ambient
+    // 経路（未 grant → sandbox フォールバック）は既存の integration テストが担保する。
+    #[cfg(unix)]
+    mod fs_capability {
+        use super::*;
+        use crate::capability::{
+            FilesystemCapability, FilesystemRoot, FsOperation, MountName, OsDirectoryHandle,
+            SymlinkPolicy,
+        };
+        use std::collections::BTreeSet;
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct TempRoot {
+            path: PathBuf,
+        }
+        impl TempRoot {
+            fn new() -> Self {
+                static COUNTER: AtomicU64 = AtomicU64::new(0);
+                let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+                let mut path = std::env::temp_dir();
+                path.push(format!("tsumugi-c5c-{}-{}", std::process::id(), n));
+                std::fs::create_dir_all(&path).expect("create temp root");
+                Self { path }
+            }
+        }
+        impl Drop for TempRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+
+        /// 指定 operation 集合を grant した default mount の FilesystemCapability を作る。
+        fn fs_set(root: &TempRoot, ops: &[FsOperation]) -> CapabilitySet {
+            let pid = NonZeroU128::new(0xC5C).unwrap();
+            let handle = OsDirectoryHandle::new(root.path.clone(), pid, SymlinkPolicy::DenyAll);
+            let operations: BTreeSet<FsOperation> = ops.iter().copied().collect();
+            let fs_root = FilesystemRoot::new(
+                MountName::new("default").unwrap(),
+                pid,
+                operations,
+                SymlinkPolicy::DenyAll,
+                Arc::new(handle),
+            )
+            .unwrap();
+            let fs = FilesystemCapability::new([fs_root]).unwrap();
+            CapabilitySet::builder().filesystem(fs).unwrap().build()
+        }
+
+        #[test]
+        fn write_then_read_roundtrip() {
+            let root = TempRoot::new();
+            let mut vm = vm_with(fs_set(
+                &root,
+                &[FsOperation::Read, FsOperation::Write, FsOperation::Create],
+            ));
+            let ok = vm
+                .exec_builtin(
+                    "write_file",
+                    vec![
+                        Value::str_constant("a.txt".into()),
+                        Value::str_constant("hello".into()),
+                    ],
+                    1,
+                )
+                .expect("write granted");
+            assert_eq!(ok, Value::Bool(true));
+            let content = vm
+                .exec_builtin("read_file", vec![Value::str_constant("a.txt".into())], 1)
+                .expect("read granted");
+            assert_eq!(content, Value::str_constant("hello".into()));
+        }
+
+        #[test]
+        fn qualified_mount_routing() {
+            let root = TempRoot::new();
+            std::fs::write(root.path.join("m.txt"), b"data").unwrap();
+            let mut vm = vm_with(fs_set(&root, &[FsOperation::Read]));
+            let content = vm
+                .exec_builtin(
+                    "read_file",
+                    vec![Value::str_constant("@default/m.txt".into())],
+                    1,
+                )
+                .expect("qualified read");
+            assert_eq!(content, Value::str_constant("data".into()));
+        }
+
+        #[test]
+        fn operation_not_granted_is_sandbox_denial() {
+            // Read だけ grant。write_file は Write/Create 不足で adapter call 0 の sandbox denial。
+            let root = TempRoot::new();
+            let mut vm = vm_with(fs_set(&root, &[FsOperation::Read]));
+            let err = vm
+                .exec_builtin(
+                    "write_file",
+                    vec![
+                        Value::str_constant("x.txt".into()),
+                        Value::str_constant("y".into()),
+                    ],
+                    1,
+                )
+                .expect_err("write must be denied");
+            assert_eq!(err.error_type(), "sandbox");
+        }
+
+        #[test]
+        fn missing_mount_is_sandbox_denial() {
+            // default mount しか無いので @other は mount 未登録 → sandbox denial。
+            let root = TempRoot::new();
+            let mut vm = vm_with(fs_set(&root, &[FsOperation::Read]));
+            let err = vm
+                .exec_builtin(
+                    "read_file",
+                    vec![Value::str_constant("@other/f.txt".into())],
+                    1,
+                )
+                .expect_err("missing mount denied");
+            assert_eq!(err.error_type(), "sandbox");
+        }
+
+        #[test]
+        fn existence_oracle_denied_and_missing_are_indistinguishable() {
+            // CAP-AT-12: 許可外の存在/不存在を同一 denial にする（null/false へ潰さない）。
+            // Metadata 未 grant の root で、実在ファイルと不存在ファイルの file_size を比べる。
+            let root = TempRoot::new();
+            std::fs::write(root.path.join("real.txt"), b"12345").unwrap();
+            let mut vm = vm_with(fs_set(&root, &[FsOperation::Read])); // Metadata なし
+            let existing = vm
+                .exec_builtin("file_size", vec![Value::str_constant("real.txt".into())], 1)
+                .expect_err("existing but unauthorized");
+            let missing = vm
+                .exec_builtin("file_size", vec![Value::str_constant("nope.txt".into())], 1)
+                .expect_err("missing and unauthorized");
+            // 存在 path と不存在 path で同じ code/message（存在 oracle 防止）。
+            assert_eq!(existing.error_type(), "sandbox");
+            assert_eq!(missing.error_type(), "sandbox");
+            assert_eq!(existing.message(), missing.message());
+        }
+
+        #[test]
+        fn lexical_path_error_is_argument() {
+            // `..` は capability lookup より先に argument error（authority channel と分離）。
+            let root = TempRoot::new();
+            let mut vm = vm_with(fs_set(&root, &[FsOperation::Read]));
+            let err = vm
+                .exec_builtin(
+                    "read_file",
+                    vec![Value::str_constant("../escape.txt".into())],
+                    1,
+                )
+                .expect_err("dotdot rejected");
+            assert_eq!(err.error_type(), "argument");
+        }
+
+        #[test]
+        fn read_missing_file_in_granted_root_is_host_error() {
+            // grant 済み root 内の not-found は null へ潰さず catch 可能な host error。
+            let root = TempRoot::new();
+            let mut vm = vm_with(fs_set(&root, &[FsOperation::Read]));
+            let err = vm
+                .exec_builtin("read_file", vec![Value::str_constant("gone.txt".into())], 1)
+                .expect_err("missing read is host error");
+            assert_eq!(err.error_type(), "host");
+        }
+
+        #[test]
+        fn list_dir_and_metadata() {
+            let root = TempRoot::new();
+            std::fs::write(root.path.join("f1.txt"), b"a").unwrap();
+            std::fs::create_dir(root.path.join("d1")).unwrap();
+            let mut vm = vm_with(fs_set(&root, &[FsOperation::List, FsOperation::Metadata]));
+            // root 自身は `@default`（body なし）で指す（空文字列は PathError::Empty）。
+            let listed = vm
+                .exec_builtin("list_dir", vec![Value::str_constant("@default".into())], 1)
+                .expect("list granted");
+            match listed {
+                Value::List(items) => {
+                    let names: Vec<String> = items.iter().map(|v| v.to_string()).collect();
+                    assert_eq!(names, vec!["d1".to_string(), "f1.txt".to_string()]);
+                }
+                other => panic!("list_dir はリストを返す: {other:?}"),
+            }
+            let is_file = vm
+                .exec_builtin("is_file", vec![Value::str_constant("f1.txt".into())], 1)
+                .expect("is_file");
+            assert_eq!(is_file, Value::Bool(true));
+            let is_dir = vm
+                .exec_builtin("is_dir", vec![Value::str_constant("d1".into())], 1)
+                .expect("is_dir");
+            assert_eq!(is_dir, Value::Bool(true));
+            // 不存在は false（許可 root 内の benign な不存在）。
+            let missing = vm
+                .exec_builtin("path_exists", vec![Value::str_constant("nope".into())], 1)
+                .expect("path_exists");
+            assert_eq!(missing, Value::Bool(false));
+        }
+
+        #[test]
+        fn remove_requires_delete_operation() {
+            let root = TempRoot::new();
+            std::fs::write(root.path.join("del.txt"), b"x").unwrap();
+            // Delete 未 grant → sandbox denial（adapter call 0、ファイルは残る）。
+            let mut vm = vm_with(fs_set(&root, &[FsOperation::Read]));
+            let err = vm
+                .exec_builtin("remove", vec![Value::str_constant("del.txt".into())], 1)
+                .expect_err("delete not granted");
+            assert_eq!(err.error_type(), "sandbox");
+            assert!(root.path.join("del.txt").exists());
+            // Delete grant → 成功。
+            let mut vm = vm_with(fs_set(&root, &[FsOperation::Delete]));
+            let ok = vm
+                .exec_builtin("remove", vec![Value::str_constant("del.txt".into())], 1)
+                .expect("delete granted");
+            assert_eq!(ok, Value::Bool(true));
+            assert!(!root.path.join("del.txt").exists());
+        }
     }
 }

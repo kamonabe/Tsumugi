@@ -1233,6 +1233,319 @@ pub fn resolve_print(
 }
 
 // =============================================================================
+// filesystem capability dispatch（Phase 2 C5-c、CAP-AT-12/13/14）
+// =============================================================================
+
+/// filesystem authority を consult する builtin か（tree/VM が capability 経路へ振り分ける）。
+///
+/// `path_join` は純粋なので含めない。`import` は resolver（C6）が扱うため含めない。
+pub fn is_filesystem_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "read_lines"
+            | "write_file"
+            | "append_file"
+            | "path_exists"
+            | "mkdir"
+            | "remove"
+            | "remove_dir"
+            | "rename"
+            | "list_dir"
+            | "file_size"
+            | "is_file"
+            | "is_dir"
+    )
+}
+
+/// filesystem builtin を frozen [`FilesystemCapability`] 経由で実行する（C5-c、案 B の grant 経路）。
+///
+/// tree/VM 両 engine が、filesystem authority が grant されているときにこの関数へ振り分ける
+/// （未 grant の ambient 経路は従来の [`dispatch`]＝process-global sandbox のまま）。
+///
+/// # error 分離（capability-model 第8.5節）
+///
+/// - 引数の arity/型（`Str`）は adapter/authority 検査より先に検査する。
+/// - script path の lexical 検証（[`crate::capability::FilesystemTarget::parse`]）は
+///   capability lookup より先に行い、[`crate::capability::PathError`] は catch 可能な
+///   `argument` error へ写す（authority channel と混在させない）。
+/// - mount 未登録・operation 未 grant・許可外の存在/不存在は adapter/OS call 0 で単一の
+///   catch 可能な `sandbox` denial（[`TsumugiError::filesystem_denied`]）にする。`null`/`false`
+///   へ潰さない（存在 oracle 防止）。
+/// - adapter 失敗（[`crate::capability::AdapterError`]、`SecureResolutionUnsupported` を含む）は
+///   catch 可能な canonical `host` error（[`TsumugiError::host_adapter_failed`]）へ写す。
+pub fn dispatch_filesystem_capability(
+    name: &str,
+    args: &[Value],
+    filesystem: &crate::capability::FilesystemCapability,
+    max_collection: u64,
+    line: usize,
+) -> Result<Value, TsumugiError> {
+    use crate::capability::{FsOperation, OpenFileRequest, RemoveKind, WriteMode};
+
+    match name {
+        "read_file" => {
+            check_arity(name, args, 1, line)?;
+            let path = require_str(&args[0], name, 1, line)?;
+            let mut file = fs_open(name, filesystem, path, OpenFileRequest::ReadExisting, line)?;
+            let bytes = file
+                .read_to_end(None)
+                .map_err(|_| fs_host_error(name, line))?;
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            Ok(Value::str_constant(text))
+        }
+        "read_lines" => {
+            check_arity(name, args, 1, line)?;
+            let path = require_str(&args[0], name, 1, line)?;
+            let mut file = fs_open(name, filesystem, path, OpenFileRequest::ReadExisting, line)?;
+            let bytes = file
+                .read_to_end(None)
+                .map_err(|_| fs_host_error(name, line))?;
+            let content = String::from_utf8_lossy(&bytes).into_owned();
+            let mut lines = Vec::new();
+            for content_line in content.lines() {
+                check_collection_size(lines.len().saturating_add(1), max_collection, line)?;
+                lines.push(Value::str_constant(content_line.to_string()));
+            }
+            Ok(Value::List(Tracked::constant(lines)))
+        }
+        "write_file" => {
+            check_arity(name, args, 2, line)?;
+            let path = require_str(&args[0], name, 1, line)?;
+            let content = fs_content_arg(&args[1]);
+            let mut file = fs_open(
+                name,
+                filesystem,
+                path,
+                OpenFileRequest::Upsert {
+                    mode: WriteMode::Truncate,
+                },
+                line,
+            )?;
+            file.write_all(content.as_bytes())
+                .map_err(|_| fs_host_error(name, line))?;
+            Ok(Value::Bool(true))
+        }
+        "append_file" => {
+            check_arity(name, args, 2, line)?;
+            let path = require_str(&args[0], name, 1, line)?;
+            let content = fs_content_arg(&args[1]);
+            let mut file = fs_open(
+                name,
+                filesystem,
+                path,
+                OpenFileRequest::Upsert {
+                    mode: WriteMode::Append,
+                },
+                line,
+            )?;
+            file.write_all(content.as_bytes())
+                .map_err(|_| fs_host_error(name, line))?;
+            Ok(Value::Bool(true))
+        }
+        "mkdir" => {
+            check_arity(name, args, 1, line)?;
+            let path = require_str(&args[0], name, 1, line)?;
+            let (root, target) = fs_route(name, filesystem, path, FsOperation::Create, line)?;
+            root.adapter
+                .create_dir(&target.path)
+                .map_err(|_| fs_host_error(name, line))?;
+            Ok(Value::Bool(true))
+        }
+        "remove" => {
+            check_arity(name, args, 1, line)?;
+            let path = require_str(&args[0], name, 1, line)?;
+            let (root, target) = fs_route(name, filesystem, path, FsOperation::Delete, line)?;
+            root.adapter
+                .remove(&target.path, RemoveKind::FileOrSymlink)
+                .map_err(|_| fs_host_error(name, line))?;
+            Ok(Value::Bool(true))
+        }
+        "remove_dir" => {
+            check_arity(name, args, 1, line)?;
+            let path = require_str(&args[0], name, 1, line)?;
+            let (root, target) = fs_route(name, filesystem, path, FsOperation::Delete, line)?;
+            root.adapter
+                .remove(&target.path, RemoveKind::EmptyDirectory)
+                .map_err(|_| fs_host_error(name, line))?;
+            Ok(Value::Bool(true))
+        }
+        "rename" => {
+            check_arity(name, args, 2, line)?;
+            let from = require_str(&args[0], name, 1, line)?;
+            let to = require_str(&args[1], name, 2, line)?;
+            // rename は source `Delete` と destination `Create` を要求する（第8.4節）。
+            let (from_root, from_target) =
+                fs_route(name, filesystem, from, FsOperation::Delete, line)?;
+            let (to_root, to_target) = fs_route(name, filesystem, to, FsOperation::Create, line)?;
+            from_root
+                .adapter
+                .rename(
+                    &from_target.path,
+                    to_root.adapter.as_ref(),
+                    &to_target.path,
+                    true,
+                )
+                .map_err(|_| fs_host_error(name, line))?;
+            Ok(Value::Bool(true))
+        }
+        "list_dir" => {
+            check_arity(name, args, 1, line)?;
+            let path = require_str(&args[0], name, 1, line)?;
+            let (root, target) = fs_route(name, filesystem, path, FsOperation::List, line)?;
+            let entries = root
+                .adapter
+                .list(&target.path, None)
+                .map_err(|_| fs_host_error(name, line))?;
+            let mut names = Vec::new();
+            for entry in entries {
+                check_collection_size(names.len().saturating_add(1), max_collection, line)?;
+                names.push(Value::str_constant(entry.name));
+            }
+            names.sort_by_key(|v| v.to_string());
+            Ok(Value::List(Tracked::constant(names)))
+        }
+        "file_size" => {
+            check_arity(name, args, 1, line)?;
+            let path = require_str(&args[0], name, 1, line)?;
+            let (root, target) = fs_route(name, filesystem, path, FsOperation::Metadata, line)?;
+            let meta = root
+                .adapter
+                .metadata(&target.path, true)
+                .map_err(|_| fs_host_error(name, line))?;
+            Ok(Value::Int(checked_file_size_to_i64(meta.size_bytes, line)?))
+        }
+        "is_file" => {
+            check_arity(name, args, 1, line)?;
+            let path = require_str(&args[0], name, 1, line)?;
+            let kind = fs_metadata_kind(name, filesystem, path, line)?;
+            Ok(Value::Bool(matches!(
+                kind,
+                Some(crate::capability::EntryKind::File)
+            )))
+        }
+        "is_dir" => {
+            check_arity(name, args, 1, line)?;
+            let path = require_str(&args[0], name, 1, line)?;
+            let kind = fs_metadata_kind(name, filesystem, path, line)?;
+            Ok(Value::Bool(matches!(
+                kind,
+                Some(crate::capability::EntryKind::Directory)
+            )))
+        }
+        "path_exists" => {
+            check_arity(name, args, 1, line)?;
+            let path = require_str(&args[0], name, 1, line)?;
+            let kind = fs_metadata_kind(name, filesystem, path, line)?;
+            Ok(Value::Bool(kind.is_some()))
+        }
+        // is_filesystem_builtin と本 match は同じ名前集合を持つ。ここへ来ない。
+        _ => Err(TsumugiError::filesystem_denied(line)),
+    }
+}
+
+/// write/append の content 引数を文字列化する（`Str` はそのまま、他は `to_string`）。
+fn fs_content_arg(value: &Value) -> String {
+    match value {
+        Value::Str(s) => s.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// filesystem 操作失敗を canonical `host` error（category `filesystem`）へ写す。
+fn fs_host_error(name: &str, line: usize) -> TsumugiError {
+    TsumugiError::host_adapter_failed(line, name, "filesystem")
+}
+
+/// script path を parse し、mount routing と operation 認可を行う（第8.2・8.4・8.5節）。
+///
+/// lexical error は `argument`、mount 未登録・operation 未 grant は単一の `sandbox` denial。
+fn fs_route<'a>(
+    name: &str,
+    filesystem: &'a crate::capability::FilesystemCapability,
+    path: &str,
+    operation: crate::capability::FsOperation,
+    line: usize,
+) -> Result<
+    (
+        &'a crate::capability::FilesystemRoot,
+        crate::capability::FilesystemTarget,
+    ),
+    TsumugiError,
+> {
+    let _ = name;
+    // lexical 検証を capability lookup より先に行う（PathError は catch 可能な argument error。
+    // authority channel と分離する、第8.5節）。message に host path を含めない。
+    let target = crate::capability::FilesystemTarget::parse(path).map_err(|_| {
+        TsumugiError::runtime_with_kind(
+            line,
+            crate::error::ErrorKind::Argument,
+            "ファイルパスの形式が不正です",
+        )
+    })?;
+    // mount 完全一致で root を引く。未登録は単一の sandbox denial（存在 oracle 防止）。
+    let Some(root) = filesystem.root(&target.mount) else {
+        return Err(TsumugiError::filesystem_denied(line));
+    };
+    // operation が grant されていなければ adapter call 0 で denial。
+    if !root.operations.contains(&operation) {
+        return Err(TsumugiError::filesystem_denied(line));
+    }
+    Ok((root, target))
+}
+
+/// path を route してから file を open する（read/write 系）。
+fn fs_open(
+    name: &str,
+    filesystem: &crate::capability::FilesystemCapability,
+    path: &str,
+    request: crate::capability::OpenFileRequest,
+    line: usize,
+) -> Result<Box<dyn crate::capability::FileHandle>, TsumugiError> {
+    use crate::capability::{FsOperation, OpenFileRequest};
+    // open request に対応する FsOperation を確定する（第8.4節 operation matrix）。
+    let operation = match request {
+        OpenFileRequest::ReadExisting => FsOperation::Read,
+        OpenFileRequest::WriteExisting { .. } => FsOperation::Write,
+        OpenFileRequest::CreateNew { .. } => FsOperation::Create,
+        // Upsert は Write+Create を事前要求する（第8.4節）。ここでは Write を代表 op として
+        // route し、Create の可否は下で追加検査する。
+        OpenFileRequest::Upsert { .. } => FsOperation::Write,
+    };
+    let (root, target) = fs_route(name, filesystem, path, operation, line)?;
+    // Upsert は Write+Create を事前要求する（第8.4節）。route では Write を検査済みなので、
+    // 追加で Create の grant を確認する（不足なら adapter call 0 の sandbox denial）。
+    if matches!(request, OpenFileRequest::Upsert { .. })
+        && !root.operations.contains(&FsOperation::Create)
+    {
+        return Err(TsumugiError::filesystem_denied(line));
+    }
+    root.adapter
+        .open_file(&target.path, request)
+        .map_err(|_| fs_host_error(name, line))
+}
+
+/// path を route して metadata を取得し、[`EntryKind`] を返す（exists/is_file/is_dir 用）。
+///
+/// not-found は `None`（許可 root 内の benign な不存在。存在 oracle は route/認可で担保済み）。
+/// route 失敗（mount/op 不足）は `sandbox` denial、adapter 失敗は `host` error。
+fn fs_metadata_kind(
+    name: &str,
+    filesystem: &crate::capability::FilesystemCapability,
+    path: &str,
+    line: usize,
+) -> Result<Option<crate::capability::EntryKind>, TsumugiError> {
+    use crate::capability::FsOperation;
+    let (root, target) = fs_route(name, filesystem, path, FsOperation::Metadata, line)?;
+    match root.adapter.metadata(&target.path, true) {
+        Ok(meta) => Ok(Some(meta.kind)),
+        // 許可 root 内の not-found は benign（false へ写す）。それ以外の adapter 失敗も
+        // exists/type 系は従来 bool を返すため、ここでは None（=不存在扱い）に畳む。
+        Err(_) => Ok(None),
+    }
+}
+
+// =============================================================================
 // パス・ファイルシステム系
 // =============================================================================
 
