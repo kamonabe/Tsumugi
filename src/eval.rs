@@ -266,6 +266,11 @@ pub struct Evaluator {
     /// `Some(code)` を載せ、`ProcessExit` 信号を伝播する。`run_slice` が terminal で読み取り
     /// `ExecutionOutcome::Exited` へ写す。
     pending_exit: Option<u8>,
+    /// 登録 host function の registry（Phase 2 C8）。登録と grant は別で、実行可否は
+    /// `capabilities` の `HostFunction` authority が決める。既定は空（host function なし）。
+    /// 埋め込み host が実行単位で注入する（`set_host_registry`）。call site は user binding /
+    /// builtin fallback の後にこの registry を引く。
+    host_registry: std::sync::Arc<crate::host_function::HostFunctionRegistry>,
 }
 
 /// suspend / resume できる 1 回の実行セッション（REV-015 Slice 3 PR-d-2）。
@@ -311,6 +316,8 @@ impl Evaluator {
             // 埋め込み Engine::run は set_capabilities で deny-by-default の frozen set へ差し替える。
             capabilities: crate::capability::CapabilitySet::ambient_compat(),
             pending_exit: None,
+            // 既定は空 registry（host function なし）。埋め込み host が set_host_registry で注入する。
+            host_registry: std::sync::Arc::new(crate::host_function::HostFunctionRegistry::empty()),
         }
     }
 
@@ -333,6 +340,21 @@ impl Evaluator {
     /// この実行の capability 集合を参照する（builtin dispatch から consult する）。
     pub(crate) fn capabilities(&self) -> &crate::capability::CapabilitySet {
         &self.capabilities
+    }
+
+    /// この実行の host function registry を設定する（Phase 2 C8）。埋め込み host が実行単位で
+    /// 注入する。実行後に [`Self::clear_host_registry`] で空へ戻す。
+    pub fn set_host_registry(
+        &mut self,
+        registry: std::sync::Arc<crate::host_function::HostFunctionRegistry>,
+    ) {
+        self.host_registry = registry;
+    }
+
+    /// host function registry を空へ戻す（実行後・再利用前）。
+    pub fn clear_host_registry(&mut self) {
+        self.host_registry =
+            std::sync::Arc::new(crate::host_function::HostFunctionRegistry::empty());
     }
 
     /// granted な `exit(code)` の終了コードを記録し、`ProcessExit` 信号を返す（C7）。
@@ -2006,6 +2028,43 @@ impl Evaluator {
             return Ok(value);
         }
 
+        // Phase 2 C8: user binding も builtin も該当しない識別子 callee が **登録 host function**
+        // なら、それとして解決する（builtin fallback の後、undefined-name の前。第11.1節
+        // 「user binding は builtin/host fallback より優先」）。登録名かどうかを引数評価より前に
+        // 判定し、登録名のときだけ host 経路へ確定する（未登録名は従来の undefined-name 経路へ
+        // 落とし、引数の二重評価・step の二重計上を避ける）。grant 検査・arity・host error 写像は
+        // resolve_host_call が担う。callback panic は host boundary（E6）が隔離する。
+        if let Expr::Ident(name) = callee
+            && self.env.get_cell(name).is_none()
+            && self.host_registry.contains_name(name)
+        {
+            self.count_step(line)?;
+            // 引数を評価してから host function へ渡す（呼び出し側で評価順を確定する）。
+            let mut arg_values = Vec::with_capacity(args.len());
+            for arg in args {
+                arg_values.push(self.eval_expr(arg, line)?);
+            }
+            // registry と capability を分けて借用するため、registry の Arc を clone してから
+            // consult する（`self` の他 field と借用が競合しないようにする）。
+            let registry = std::sync::Arc::clone(&self.host_registry);
+            let value = crate::host_function::resolve_host_call(
+                &registry,
+                &self.capabilities,
+                name,
+                &arg_values,
+                line,
+            )?
+            // contains_name が true のため resolve_host_call は必ず Some（None は未登録名のみ）。
+            .unwrap_or(Value::Null);
+            // host function が生成した untracked な値を tracked 化しつつ heap 課金する
+            // （builtin dispatch 境界と同じ扱い）。
+            let tracked = self
+                .budget
+                .track_result(value, ExecutionPhase::Run)
+                .map_err(|stop| self.control_stop_to_error(stop, line))?;
+            return Ok(tracked);
+        }
+
         // ユーザー定義関数の呼び出し: ステップカウント + 深度チェック
         self.count_step(line)?;
         if self.call_stack.len() >= MAX_USER_CALL_DEPTH {
@@ -2668,6 +2727,187 @@ mod tests {
                 );
             }
             other => panic!("Runtime error を期待したが {other:?}"),
+        }
+    }
+
+    // --- C8: 登録 host function の tree engine 配線（CAP-AT-19/21）---
+    mod host_functions {
+        use super::*;
+        use crate::capability::{CapabilitySet, HostFunctionId};
+        use crate::host_function::{
+            Arity, AuditValuePolicy, HostCallError, HostCost, HostFunction, HostFunctionDescriptor,
+            HostFunctionRegistry,
+        };
+        use std::num::NonZeroU128;
+        use std::sync::{Arc, Mutex};
+
+        /// 呼び出し引数（文字列化）を記録する共有 sink。
+        type CallSink = Arc<Mutex<Vec<Vec<String>>>>;
+
+        fn hid(n: u128) -> HostFunctionId {
+            HostFunctionId::new(NonZeroU128::new(n).unwrap())
+        }
+
+        /// 呼び出し引数を記録し、指定挙動を返す host function。
+        ///
+        /// `Value` は `Rc` を含み `Sync` でないため、sink には引数を文字列化して積む
+        /// （`HostFunction: Send + Sync` 契約を満たすため）。
+        struct Recorder {
+            descriptor: HostFunctionDescriptor,
+            calls: CallSink,
+            fail: bool,
+        }
+        impl HostFunction for Recorder {
+            fn descriptor(&self) -> &HostFunctionDescriptor {
+                &self.descriptor
+            }
+            fn call(&self, arguments: &[Value]) -> Result<Value, HostCallError> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(arguments.iter().map(|v| v.to_string()).collect());
+                if self.fail {
+                    return Err(HostCallError::Host {
+                        category: "lookup".to_string(),
+                    });
+                }
+                Ok(Value::Int(99))
+            }
+        }
+
+        fn descriptor(id: u128, name: &str, arity: Arity) -> HostFunctionDescriptor {
+            HostFunctionDescriptor {
+                id: hid(id),
+                name: name.to_string(),
+                arity,
+                cost: HostCost::default(),
+                argument_audit: Vec::new(),
+                result_audit: AuditValuePolicy::Omit,
+                may_block: false,
+            }
+        }
+
+        /// registry（1 host function "lookup"）と calls sink を作る。
+        fn registry_with(
+            id: u128,
+            arity: Arity,
+            fail: bool,
+        ) -> (Arc<HostFunctionRegistry>, CallSink) {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let recorder = Recorder {
+                descriptor: descriptor(id, "lookup", arity),
+                calls: Arc::clone(&calls),
+                fail,
+            };
+            let registry = HostFunctionRegistry::builder()
+                .register(Arc::new(recorder))
+                .unwrap()
+                .build()
+                .unwrap();
+            (Arc::new(registry), calls)
+        }
+
+        /// script を、指定 registry / capability で実行する。
+        fn run_with(
+            src: &str,
+            registry: Arc<HostFunctionRegistry>,
+            capabilities: CapabilitySet,
+        ) -> Result<(), TsumugiError> {
+            let tokens = Lexer::new(src).tokenize();
+            let program = Parser::new(tokens)
+                .parse()
+                .map_err(|errors| errors.into_iter().next().unwrap())?;
+            let mut eval = Evaluator::new();
+            eval.set_host_registry(registry);
+            eval.set_capabilities(capabilities);
+            eval.run(&program, src.len() as u64)
+        }
+
+        fn granted(id: u128) -> CapabilitySet {
+            CapabilitySet::builder()
+                .grant_host_function(hid(id))
+                .unwrap()
+                .build()
+        }
+
+        #[test]
+        fn granted_call_invokes_callback() {
+            // CAP-AT-19: registered + granted は callback を呼ぶ。
+            let (registry, calls) = registry_with(7, Arity::Exact(1), false);
+            run_with("let r = lookup(42)\n", registry, granted(7)).expect("granted call");
+            let recorded = calls.lock().unwrap();
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(recorded[0], vec!["42".to_string()]);
+        }
+
+        #[test]
+        fn registered_but_ungranted_is_capability_error_callback_zero() {
+            // CAP-AT-19: registered but not granted は callback 0 の catch 可能 capability error。
+            let (registry, calls) = registry_with(7, Arity::Exact(1), false);
+            let err = run_with("lookup(1)\n", registry, CapabilitySet::empty())
+                .expect_err("ungranted must error");
+            assert_eq!(err.error_type(), "capability");
+            assert_eq!(calls.lock().unwrap().len(), 0, "callback は呼ばれない");
+        }
+
+        #[test]
+        fn ungranted_capability_error_is_catchable() {
+            // 未捕捉なら RuntimeError だが、try/catch で捕捉できる（catch 可能）。
+            let (registry, _calls) = registry_with(7, Arity::Exact(1), false);
+            let src = "let ok = false\ntry\n  lookup(1)\ncatch e\n  ok = e[\"type\"] == \"capability\"\nend\n";
+            run_with(src, registry, CapabilitySet::empty())
+                .expect("catch handles capability error");
+        }
+
+        #[test]
+        fn arity_mismatch_is_argument_error_callback_zero() {
+            // CAP-AT-19: arity 不一致は catch 可能な argument error（callback 0）。
+            let (registry, calls) = registry_with(7, Arity::Exact(1), false);
+            let err = run_with("lookup()\n", registry, granted(7)).expect_err("arity mismatch");
+            assert_eq!(err.error_type(), "argument");
+            assert_eq!(calls.lock().unwrap().len(), 0);
+        }
+
+        #[test]
+        fn host_failure_is_catchable_host_error() {
+            // CAP-AT-21: HostCallError::Host は catch 可能な host error（null/false へ潰さない）。
+            let (registry, _calls) = registry_with(7, Arity::Exact(0), true);
+            let err = run_with("lookup()\n", registry, granted(7)).expect_err("host failure");
+            assert_eq!(err.error_type(), "host");
+        }
+
+        #[test]
+        fn unknown_name_is_normal_name_error() {
+            // 未登録名は通常の undefined-name error（host 経路に入らない）。
+            let (registry, _calls) = registry_with(7, Arity::Exact(1), false);
+            let err = run_with("nonexistent(1)\n", registry, granted(7)).expect_err("unknown name");
+            assert_eq!(err.error_type(), "name");
+        }
+
+        #[test]
+        fn user_binding_shadows_host_function() {
+            // 第11.1節: user binding は host fallback より優先する。
+            // 同名の user 関数を定義すると host function は呼ばれない。
+            let (registry, calls) = registry_with(7, Arity::Exact(1), false);
+            let src = "fn lookup(x)\n  return x + 1\nend\nlet r = lookup(10)\n";
+            run_with(src, registry, granted(7)).expect("user fn runs");
+            assert_eq!(
+                calls.lock().unwrap().len(),
+                0,
+                "user binding があると host function は呼ばれない"
+            );
+        }
+
+        #[test]
+        fn empty_registry_leaves_name_error_unchanged() {
+            // registry が空なら従来どおり undefined-name error（観測挙動不変）。
+            let err = run_with(
+                "lookup(1)\n",
+                Arc::new(HostFunctionRegistry::empty()),
+                granted(7),
+            )
+            .expect_err("empty registry");
+            assert_eq!(err.error_type(), "name");
         }
     }
 }

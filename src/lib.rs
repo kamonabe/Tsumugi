@@ -19,6 +19,7 @@ pub mod engine;
 pub mod env;
 pub mod error;
 pub mod eval;
+pub mod host_function;
 pub mod lexer;
 pub(crate) mod limits;
 pub mod module;
