@@ -464,6 +464,18 @@ impl TsumugiError {
         )
     }
 
+    /// 登録 host function の arity 不一致（Phase 2 C8、catch 可能な argument error）。
+    ///
+    /// host function は `Exact`/`Range` のどちらもあり得るため、期待個数ではなく actual だけを
+    /// 載せる（descriptor は公開しない）。
+    pub fn host_function_arity(line: usize, name: &str, actual: usize) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::Argument,
+            format!("{} の引数個数が契約と一致しません: 実際 {}", name, actual),
+        )
+    }
+
     /// builtin argument の型不正
     pub fn builtin_arg_type(
         line: usize,
