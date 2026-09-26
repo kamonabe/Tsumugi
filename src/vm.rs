@@ -2682,5 +2682,96 @@ mod tests {
             assert_eq!(ok, Value::Bool(true));
             assert!(!root.path.join("del.txt").exists());
         }
+
+        // --- REV-021: remove_dir 空のみ / remove_tree 再帰（§17.6）---
+
+        #[test]
+        fn remove_dir_empty_only() {
+            let root = TempRoot::new();
+            std::fs::create_dir(root.path.join("empty")).unwrap();
+            let mut vm = vm_with(fs_set(&root, &[FsOperation::Delete]));
+            let ok = vm
+                .exec_builtin("remove_dir", vec![Value::str_constant("empty".into())], 1)
+                .expect("empty dir removed");
+            assert_eq!(ok, Value::Bool(true));
+            assert!(!root.path.join("empty").exists());
+        }
+
+        #[test]
+        fn remove_dir_non_empty_is_directory_not_empty_host_error() {
+            // 非空 directory への remove_dir は再帰削除せず、host category directory_not_empty。
+            let root = TempRoot::new();
+            std::fs::create_dir(root.path.join("full")).unwrap();
+            std::fs::write(root.path.join("full").join("f.txt"), b"x").unwrap();
+            let mut vm = vm_with(fs_set(&root, &[FsOperation::Delete]));
+            let err = vm
+                .exec_builtin("remove_dir", vec![Value::str_constant("full".into())], 1)
+                .expect_err("non-empty remove_dir must error");
+            assert_eq!(err.error_type(), "host");
+            assert!(
+                err.message().contains("directory_not_empty"),
+                "category が message に載る: {}",
+                err.message()
+            );
+            // ファイルもディレクトリも残る（再帰削除していない）。
+            assert!(root.path.join("full").join("f.txt").exists());
+        }
+
+        #[test]
+        fn remove_tree_deletes_recursively_with_recursive_delete_grant() {
+            let root = TempRoot::new();
+            std::fs::create_dir_all(root.path.join("tree").join("sub")).unwrap();
+            std::fs::write(root.path.join("tree").join("a.txt"), b"a").unwrap();
+            std::fs::write(root.path.join("tree").join("sub").join("b.txt"), b"b").unwrap();
+            let mut vm = vm_with(fs_set(&root, &[FsOperation::RecursiveDelete]));
+            let ok = vm
+                .exec_builtin("remove_tree", vec![Value::str_constant("tree".into())], 1)
+                .expect("recursive delete granted");
+            assert_eq!(ok, Value::Bool(true));
+            assert!(!root.path.join("tree").exists());
+        }
+
+        #[test]
+        fn remove_tree_requires_recursive_delete_not_delete() {
+            // Delete（remove/remove_dir 用）では remove_tree できない（暗黙昇格しない、§17.6）。
+            let root = TempRoot::new();
+            std::fs::create_dir_all(root.path.join("tree").join("sub")).unwrap();
+            let mut vm = vm_with(fs_set(&root, &[FsOperation::Delete]));
+            let err = vm
+                .exec_builtin("remove_tree", vec![Value::str_constant("tree".into())], 1)
+                .expect_err("remove_tree needs RecursiveDelete");
+            assert_eq!(err.error_type(), "sandbox");
+            assert!(root.path.join("tree").exists());
+        }
+
+        #[test]
+        fn remove_dir_requires_delete_not_recursive_delete() {
+            // 逆隣接: RecursiveDelete だけでは remove_dir（Delete 要求）できない。
+            let root = TempRoot::new();
+            std::fs::create_dir(root.path.join("empty")).unwrap();
+            let mut vm = vm_with(fs_set(&root, &[FsOperation::RecursiveDelete]));
+            let err = vm
+                .exec_builtin("remove_dir", vec![Value::str_constant("empty".into())], 1)
+                .expect_err("remove_dir needs Delete");
+            assert_eq!(err.error_type(), "sandbox");
+            assert!(root.path.join("empty").exists());
+        }
+
+        #[test]
+        fn remove_tree_on_symlink_removes_link_not_target() {
+            // final symlink はリンク自体を削除し、リンク先ツリーを辿らない（§17.6）。
+            let root = TempRoot::new();
+            std::fs::create_dir(root.path.join("real")).unwrap();
+            std::fs::write(root.path.join("real").join("keep.txt"), b"keep").unwrap();
+            std::os::unix::fs::symlink(root.path.join("real"), root.path.join("link")).unwrap();
+            let mut vm = vm_with(fs_set(&root, &[FsOperation::RecursiveDelete]));
+            let ok = vm
+                .exec_builtin("remove_tree", vec![Value::str_constant("link".into())], 1)
+                .expect("symlink removed");
+            assert_eq!(ok, Value::Bool(true));
+            // リンクは消え、リンク先ツリーは残る。
+            assert!(!root.path.join("link").exists());
+            assert!(root.path.join("real").join("keep.txt").exists());
+        }
     }
 }

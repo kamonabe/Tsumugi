@@ -435,6 +435,11 @@ pub enum FsOperation {
     List,
     /// import（runtime Read と独立）。
     Import,
+    /// 再帰削除（`remove_tree`。`Delete`/`EmptyDirectory` から暗黙昇格させない、REV-021 §17.6）。
+    ///
+    /// `Ord` の導出は宣言順に従うため、`BTreeSet<FsOperation>` の走査順（§8.6 encoding）と
+    /// tag 昇順を一致させるべく、本 variant は必ず末尾（最大 tag）へ置く。
+    RecursiveDelete,
 }
 
 impl FsOperation {
@@ -448,6 +453,7 @@ impl FsOperation {
             Self::Metadata => 0x05,
             Self::List => 0x06,
             Self::Import => 0x07,
+            Self::RecursiveDelete => 0x08,
         }
     }
 }
@@ -876,6 +882,9 @@ pub enum RemoveKind {
     FileOrSymlink,
     /// 空 directory。
     EmptyDirectory,
+    /// directory を再帰削除する（`remove_tree`、REV-021 §17.6）。中間・final symlink は
+    /// リンクを辿らずリンク自体を削除する。専用 capability `RecursiveDelete` を要求する。
+    Tree,
 }
 
 /// `exit()` を structured terminal にする authority（仕様第9節 `ProcessExit`）。
@@ -1607,7 +1616,8 @@ mod os_secure {
         fs::create_dir(&resolved.path).map_err(|_| host_err("create_dir failed"))
     }
 
-    /// entry を削除する。`FileOrSymlink` は file/symlink、`EmptyDirectory` は空 dir。
+    /// entry を削除する。`FileOrSymlink` は file/symlink、`EmptyDirectory` は空 dir、
+    /// `Tree` は directory の再帰削除（REV-021 §17.6）。
     pub(super) fn remove(
         handle: &OsDirectoryHandle,
         rel: &RelativePath,
@@ -1622,7 +1632,19 @@ mod os_secure {
                 fs::remove_file(&path).map_err(|_| host_err("remove failed"))
             }
             super::RemoveKind::EmptyDirectory => {
+                // 空 directory のみ削除する（非空は OS error → host error）。
                 fs::remove_dir(&path).map_err(|_| host_err("remove_dir failed"))
+            }
+            super::RemoveKind::Tree => {
+                // 再帰削除（REV-021）。final entry が symlink なら追従せずリンク自体を消す。
+                // `remove_dir_all` は directory 内の symlink もリンクとして扱い、リンク先を
+                // 辿って削除しない。
+                let lmeta = fs::symlink_metadata(&path)
+                    .map_err(|_| host_err("remove_tree target not accessible"))?;
+                if lmeta.file_type().is_symlink() {
+                    return fs::remove_file(&path).map_err(|_| host_err("remove_tree failed"));
+                }
+                fs::remove_dir_all(&path).map_err(|_| host_err("remove_tree failed"))
             }
         }
     }

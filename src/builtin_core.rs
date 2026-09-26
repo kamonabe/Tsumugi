@@ -1250,6 +1250,7 @@ pub fn is_filesystem_builtin(name: &str) -> bool {
             | "mkdir"
             | "remove"
             | "remove_dir"
+            | "remove_tree"
             | "rename"
             | "list_dir"
             | "file_size"
@@ -1364,9 +1365,26 @@ pub fn dispatch_filesystem_capability(
         "remove_dir" => {
             check_arity(name, args, 1, line)?;
             let path = require_str(&args[0], name, 1, line)?;
+            // remove_dir は空 directory のみ（`EmptyDirectory`）。非空は最も一般的な失敗要因の
+            // ため、capability 経路の失敗を `directory_not_empty` category の host error へ写す
+            // （REV-021 §17.6.5）。再帰削除は remove_tree（`RecursiveDelete`）を使う。
             let (root, target) = fs_route(name, filesystem, path, FsOperation::Delete, line)?;
             root.adapter
                 .remove(&target.path, RemoveKind::EmptyDirectory)
+                .map_err(|_| {
+                    TsumugiError::host_adapter_failed(line, name, "directory_not_empty")
+                })?;
+            Ok(Value::Bool(true))
+        }
+        "remove_tree" => {
+            check_arity(name, args, 1, line)?;
+            let path = require_str(&args[0], name, 1, line)?;
+            // 再帰削除は専用 capability `RecursiveDelete` を要求する（`EmptyDirectory` から
+            // 暗黙昇格させない、REV-021 §17.6）。symlink は adapter がリンク自体を削除する。
+            let (root, target) =
+                fs_route(name, filesystem, path, FsOperation::RecursiveDelete, line)?;
+            root.adapter
+                .remove(&target.path, RemoveKind::Tree)
                 .map_err(|_| fs_host_error(name, line))?;
             Ok(Value::Bool(true))
         }
@@ -1623,11 +1641,41 @@ pub fn builtin_remove(args: &[Value], line: usize) -> Result<Value, TsumugiError
     }
 }
 
+/// `remove_dir(path)`: **空 directory のみ**を削除する（REV-021 §17.6）。
+///
+/// 非空 directory は削除しない（従来の再帰削除は `remove_tree` へ分離した）。symlink の削除は
+/// `remove`（`FileOrSymlink`）の責務で、`remove_dir` は扱わない。ambient（legacy）経路では
+/// 従来どおり成否を `Bool` で返す（非空・不存在は `false`）。capability 経路は
+/// `EmptyDirectory` を要求し、非空は catch 可能な `host` error（category `directory_not_empty`）
+/// へ写す（[`dispatch_filesystem_capability`]）。
 pub fn builtin_remove_dir(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("remove_dir", args, 1, line)?;
     if let Value::Str(path) = &args[0] {
         let safe_path = crate::sandbox::check_entry_path(path, line)?;
+        // 空 directory のみ削除する（非空は OS error → false）。
+        Ok(Value::Bool(std::fs::remove_dir(&safe_path).is_ok()))
+    } else {
+        Err(TsumugiError::builtin_arg_type(
+            line,
+            "remove_dir",
+            1,
+            "Str",
+            &args[0],
+        ))
+    }
+}
+
+/// `remove_tree(path)`: directory を**再帰削除**する（REV-021 §17.6 で `remove_dir` から分離）。
+///
+/// final entry が symlink ならリンク自体を削除し、リンク先を辿って再帰削除しない。ambient
+/// （legacy）経路では成否を `Bool` で返す。capability 経路は専用 capability `RecursiveDelete`
+/// を要求する（`EmptyDirectory` から暗黙昇格させない）。budget / cancel / audit は Phase 3/4/6。
+pub fn builtin_remove_tree(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
+    check_arity("remove_tree", args, 1, line)?;
+    if let Value::Str(path) = &args[0] {
+        let safe_path = crate::sandbox::check_entry_path(path, line)?;
         let result = match std::fs::symlink_metadata(&safe_path) {
+            // final symlink はリンク自体を削除する（リンク先を辿らない）。
             Ok(metadata) if metadata.file_type().is_symlink() => remove_symlink_entry(&safe_path),
             _ => std::fs::remove_dir_all(&safe_path),
         };
@@ -1635,7 +1683,7 @@ pub fn builtin_remove_dir(args: &[Value], line: usize) -> Result<Value, TsumugiE
     } else {
         Err(TsumugiError::builtin_arg_type(
             line,
-            "remove_dir",
+            "remove_tree",
             1,
             "Str",
             &args[0],
@@ -1779,6 +1827,7 @@ pub fn dispatch(
         "mkdir" => builtin_mkdir(args, line)?,
         "remove" => builtin_remove(args, line)?,
         "remove_dir" => builtin_remove_dir(args, line)?,
+        "remove_tree" => builtin_remove_tree(args, line)?,
         "rename" => builtin_rename(args, line)?,
         "list_dir" => builtin_list_dir(args, max_collection, line)?,
         "file_size" => builtin_file_size(args, line)?,

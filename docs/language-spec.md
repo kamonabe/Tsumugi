@@ -1,8 +1,8 @@
 # Tsumugi 言語仕様
 
-バージョン: 0.19
+バージョン: 0.20
 
-最終更新: 2026-09-10
+最終更新: 2026-09-26
 
 この番号は言語仕様のrevisionであり、Cargo package / REPLの実装バージョン `0.1.0` とは独立して管理する。
 
@@ -854,7 +854,8 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 | `path_join(parts...)` | パーツを結合してパス文字列を返す。全引数はStrである必要があり、非Strは左から順に検査して最初の1つで `builtin_type` エラー（結合は開始しない）。引数0個は空文字列。正規化・存在確認はせず、separator/absolute component/prefixの扱いは実行OSのRust `PathBuf` と同じ |
 | `mkdir(path)` | ディレクトリを再帰的に作成。成功で true |
 | `remove(path)` | ファイルまたは空ディレクトリを削除。final symlinkはlink自体だけを削除する。成功で true |
-| `remove_dir(path)` | ディレクトリを中身ごと再帰削除。final symlinkはlink自体だけを削除し、targetをたどらない。成功で true |
+| `remove_dir(path)` | **空ディレクトリのみ**を削除する。非空ディレクトリは削除しない（再帰削除は `remove_tree`）。成功で true（revision 0.20 で再帰削除から変更、REV-021） |
+| `remove_tree(path)` | ディレクトリを中身ごと**再帰削除**する。final symlinkはlink自体だけを削除し、targetをたどらない。成功で true（revision 0.20 で追加、REV-021） |
 | `rename(from, to)` | ファイル/ディレクトリを移動・リネーム。from/toのfinal symlinkはtargetでなくdirectory entry自体として扱う。成功で true |
 | `list_dir(path)` | ディレクトリ内のエントリ名をリストで返す。失敗で null |
 | `file_size(path)` | ファイルサイズ（バイト）を整数で返す。失敗で null。サイズが i64 で表現できない（`i64::MAX` 超）場合は wrap・負値を返さず `int_overflow` エラー |
@@ -953,7 +954,7 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 - カンマ区切りで複数パスを許可可能
 - 許可パスのプレフィックスに合致しないアクセスはサンドボックス違反エラー
 - 読み書き・metadataは、解決可能なfinal symlinkではtargetを認可対象とする。importは既存pathをcanonicalizeしてから認可する
-- `remove` / `remove_dir` / `rename`は中間symlinkを解決したうえでfinal directory entryを認可対象とし、final symlinkのtargetは操作しない
+- `remove` / `remove_dir` / `remove_tree` / `rename`は中間symlinkを解決したうえでfinal directory entryを認可対象とし、final symlinkのtargetは操作しない
 - targetが未作成のdangling final symlinkを通じた`write_file` / `append_file`は、targetの場所を認可できない既知の制約がある（AUD-020）
 - 検査と実I/Oの間のsymlink差し替えraceまでは防止しない
 - 未設定時は制限なし（全パス許可）

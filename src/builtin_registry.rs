@@ -78,6 +78,7 @@ pub enum BuiltinId {
     Mkdir,
     Remove,
     RemoveDir,
+    RemoveTree,
     Rename,
     ListDir,
     FileSize,
@@ -434,6 +435,12 @@ pub const PUBLIC_BUILTINS: &[BuiltinSpec] = &[
     BuiltinSpec {
         id: B::RemoveDir,
         name: "remove_dir",
+        arity: Exact(1),
+        execution: PureCore,
+    },
+    BuiltinSpec {
+        id: B::RemoveTree,
+        name: "remove_tree",
         arity: Exact(1),
         execution: PureCore,
     },
