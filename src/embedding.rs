@@ -41,23 +41,27 @@ pub enum Backend {
 
 /// 言語仕様 revision（仕様第3節 `LanguageRevision`）。
 ///
-/// 仕様文書の擬似コードは執筆時点の `V0_11` を例示するが、実装の現行 revision は 0.19 で
-/// あるため、実装は現行の `V0_19` を持つ。番号体系は Cargo package version（0.1.0）とは
+/// 仕様文書の擬似コードは執筆時点の `V0_11` を例示するが、実装の現行 revision は 0.20 で
+/// あるため、実装は現行の `V0_20` を持つ。番号体系は Cargo package version（0.1.0）とは
 /// 独立に管理する（`docs/roadmap.md`「バージョン番号の扱い」）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum LanguageRevision {
-    /// language-spec revision 0.19（現行）。
+    /// language-spec revision 0.19。
     V0_19,
+    /// language-spec revision 0.20（現行）。`remove_dir` を空 directory のみへ変更し、再帰削除を
+    /// 新規 builtin `remove_tree`（capability `RecursiveDelete`）へ分離した破壊的変更（REV-021）。
+    V0_20,
 }
 
 impl LanguageRevision {
     /// 現行の言語 revision。
-    pub const CURRENT: Self = Self::V0_19;
+    pub const CURRENT: Self = Self::V0_20;
 
-    /// revision の文字列表現（例: `"0.19"`）。
+    /// revision の文字列表現（例: `"0.20"`）。
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::V0_19 => "0.19",
+            Self::V0_20 => "0.20",
         }
     }
 }
@@ -1469,7 +1473,7 @@ mod tests {
         let config = EngineConfig::default();
         assert_eq!(config.backend, Backend::TreeWalk);
         assert_eq!(config.language_revision, LanguageRevision::CURRENT);
-        assert_eq!(config.language_revision.as_str(), "0.19");
+        assert_eq!(config.language_revision.as_str(), "0.20");
     }
 
     #[test]

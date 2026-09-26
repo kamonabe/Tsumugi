@@ -90,7 +90,7 @@ IDは認可tokenではなくpolicy相関IDである。SHA-256入力の全整数�
 | CapabilityKind | Environment=`0x01`, Clock=`0x02`, Stdin=`0x03`, Stdout=`0x04`, Filesystem=`0x05`, ProcessExit=`0x06`, ModuleResolver=`0x07`, HostFunction=`0x08` |
 | DataClassification | Public=`0x00`, Sensitive=`0x01`, Secret=`0x02` |
 | SymlinkPolicy | DenyAll=`0x00`, FollowWithinRoot=`0x01`, OperateOnFinalEntry=`0x02` |
-| FsOperation | Read=`0x01`, Write=`0x02`, Create=`0x03`, Delete=`0x04`, Metadata=`0x05`, List=`0x06`, Import=`0x07` |
+| FsOperation | Read=`0x01`, Write=`0x02`, Create=`0x03`, Delete=`0x04`, Metadata=`0x05`, List=`0x06`, Import=`0x07`, RecursiveDelete=`0x08` |
 
 `entry_count`は存在するCapabilityKind group数で、host functionが複数でも1 groupと数える。groupはCapabilityKind tag昇順、environment key/mountはUTF-8 byte列昇順、host function IDは16 byte値昇順。empty setも同じdomainと`entry_count=0`でhashする。
 
@@ -366,7 +366,7 @@ pub struct DirectoryEntry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RemoveKind { FileOrSymlink, EmptyDirectory }
+pub enum RemoveKind { FileOrSymlink, EmptyDirectory, Tree }
 
 pub trait DirectoryHandle: Send + Sync + 'static {
     fn policy_id(&self) -> NonZeroU128;
@@ -441,19 +441,20 @@ adapter契約:
 
 ### 8.4 Operation matrix
 
-| Script operation | Read | Write | Create | Delete | Metadata | List | Import |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| `read_file`, `read_lines` | ✓ |  |  |  |  |  |  |
-| `write_file`, `append_file` |  | ✓ | ✓ |  |  |  |  |
-| `mkdir` |  |  | ✓ |  |  |  |  |
-| `remove`, `remove_dir` |  |  |  | ✓ |  |  |  |
-| exists/type/size |  |  |  |  | ✓ |  |  |
-| `list_dir` |  |  |  |  | ✓ | ✓ |  |
-| `rename` no replace |  |  | ✓(to) | ✓(from) |  |  |  |
-| `rename` replace |  |  | ✓(to) | ✓(from+to) |  |  |  |
-| Tsumugi import |  |  |  |  |  |  | ✓ |
+| Script operation | Read | Write | Create | Delete | Metadata | List | Import | RecursiveDelete |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `read_file`, `read_lines` | ✓ |  |  |  |  |  |  |  |
+| `write_file`, `append_file` |  | ✓ | ✓ |  |  |  |  |  |
+| `mkdir` |  |  | ✓ |  |  |  |  |  |
+| `remove`, `remove_dir` |  |  |  | ✓ |  |  |  |  |
+| `remove_tree` |  |  |  |  |  |  |  | ✓ |
+| exists/type/size |  |  |  |  | ✓ |  |  |  |
+| `list_dir` |  |  |  |  | ✓ | ✓ |  |  |
+| `rename` no replace |  |  | ✓(to) | ✓(from) |  |  |  |  |
+| `rename` replace |  |  | ✓(to) | ✓(from+to) |  |  |  |  |
+| Tsumugi import |  |  |  |  |  |  | ✓ |  |
 
-builtin mappingは固定する。`read_file`/`read_lines`は`ReadExisting`、`write_file`は`Upsert { Truncate }`、`append_file`は`Upsert { Append }`を使う。upsertはfileの存在を調べずWrite+Createを事前要求する。現行言語に`WriteExisting`/`CreateNew`専用builtinはなく、これらは将来またはhost adapter用である。`remove`は`FileOrSymlink`、`remove_dir`は`EmptyDirectory`を使う。`PublicMetadata`は時刻、owner、absolute pathを公開せず、`DirectoryEntry.name`が空、`.`、`..`、separator含有ならadapter contract violationとしてHostErrorにする。
+builtin mappingは固定する。`read_file`/`read_lines`は`ReadExisting`、`write_file`は`Upsert { Truncate }`、`append_file`は`Upsert { Append }`を使う。upsertはfileの存在を調べずWrite+Createを事前要求する。現行言語に`WriteExisting`/`CreateNew`専用builtinはなく、これらは将来またはhost adapter用である。`remove`は`FileOrSymlink`、`remove_dir`は`EmptyDirectory`（空directoryのみ。非空は削除しない）を使う。再帰削除は`remove_tree`が`RemoveKind::Tree`＋専用`RecursiveDelete`権限で行い、`EmptyDirectory`から暗黙昇格しない（REV-021 §17.6）。final/中間symlinkはリンク先を辿らずリンク自体を削除する。`PublicMetadata`は時刻、owner、absolute pathを公開せず、`DirectoryEntry.name`が空、`.`、`..`、separator含有ならadapter contract violationとしてHostErrorにする。
 
 `Import`はruntime `Read`と独立する。filesystem resolverが内部でImport rootを使う。Readだけでimportできず、Importだけで`read_file`できない。
 
@@ -646,7 +647,8 @@ callback unwind panicは`InternalFailure`、context poison。callbackへEngine/E
 | `write_file` upsert | — | — | — | — | Write+Create | — | — | — |
 | metadata | — | — | — | — | Metadata | — | — | — |
 | `list_dir` | — | — | — | — | Metadata+List | — | — | — |
-| remove | — | — | — | — | Delete | — | — | — |
+| `remove`, `remove_dir` | — | — | — | — | Delete | — | — | — |
+| `remove_tree` | — | — | — | — | RecursiveDelete | — | — | — |
 | import | — | — | — | — | optional resolver内部Import | — | ✓ | — |
 | `exit()` | — | — | — | — | — | ✓ | — | — |
 | registered host function | — | — | — | — | — | — | — | ✓ |

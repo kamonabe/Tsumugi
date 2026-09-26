@@ -31,6 +31,9 @@ print(path_exists(moved))
 print(remove(b))
 print(path_exists(b))
 
-# remove_dir（再帰削除）
-print(remove_dir(root))
+# remove_dir は空ディレクトリのみ削除する（REV-021）。非空 sub は false。
+print(remove_dir(sub))
+
+# remove_tree（再帰削除。REV-021 で remove_dir から分離）
+print(remove_tree(root))
 print(path_exists(root))

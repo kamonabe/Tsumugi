@@ -63,10 +63,11 @@ language から呼べる組み込み関数の一覧である。tree / VM / compi
 | `mkdir` | 1 | pure-core |
 | `remove` | 1 | pure-core |
 | `remove_dir` | 1 | pure-core |
+| `remove_tree` | 1 | pure-core |
 | `rename` | 2 | pure-core |
 | `list_dir` | 1 | pure-core |
 | `file_size` | 1 | pure-core |
 | `is_file` | 1 | pure-core |
 | `is_dir` | 1 | pure-core |
 
-合計 53 個（pure-core 42 個・context 11 個）。
+合計 54 個（pure-core 43 個・context 11 個）。
