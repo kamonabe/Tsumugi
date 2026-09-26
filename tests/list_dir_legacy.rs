@@ -34,7 +34,12 @@ fn legacy_list_dir_keeps_non_utf8_name_via_lossy_conversion() {
     let dir = temp_dir("legacy_nonutf8");
     std::fs::write(dir.join("good.txt"), b"g").unwrap();
     let bad = std::ffi::OsStr::from_bytes(b"bad\x80name");
-    std::fs::write(dir.join(bad), b"x").unwrap();
+    // 非 UTF-8 の file 名を許さない filesystem（macOS/APFS 等は EILSEQ で拒否する）では
+    // この legacy lossy ケースを検証できないため、作成に失敗したら skip する。
+    if std::fs::write(dir.join(bad), b"x").is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
 
     let arg = Value::str_constant(dir.to_string_lossy().to_string());
     // max_collection は十分大きく取る（budget 検査は別契約）。
