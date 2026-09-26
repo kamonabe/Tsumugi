@@ -513,13 +513,15 @@ impl Vm {
                 // handler を探さずそのまま伝播する（tree の handle_error と parity）:
                 // - exit() の structured terminal（C7、REV-023）は CLI が Exited terminal へ写す
                 // - deadline 超過（REV-015 Slice 4）は DeadlineExceeded terminal へ写す
-                // VM への deadline clock 注入は Slice 6（VM parity）だが、写像は tree と共有の
-                // control_stop_to_error なので、防御的に catch 除外だけ揃えておく。
+                // - 協調的 cancel（REV-015 Slice 4）は Cancelled terminal へ写す
+                // VM への deadline clock / cancel token 注入は Slice 6（VM parity）だが、写像は
+                // tree と共有の control_stop_to_error なので、防御的に catch 除外だけ揃えておく。
                 if matches!(
                     e.kind(),
                     Some(
                         crate::error::ErrorKind::ProcessExit
                             | crate::error::ErrorKind::DeadlineExceeded
+                            | crate::error::ErrorKind::Cancelled
                     )
                 ) {
                     return Err(self.attach_trace(e));

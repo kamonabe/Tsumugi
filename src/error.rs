@@ -73,6 +73,13 @@ pub enum ErrorKind {
     /// `ExecutionOutcome::DeadlineExceeded` へ写す。canonical error inventory（第3.4節）には
     /// 属さない内部制御信号であり、`e["type"]` としては script へ露出しない。
     DeadlineExceeded,
+    /// 実行の協調的キャンセル（REV-015 Slice 4）。
+    ///
+    /// host が [`crate::budget::CancellationToken`] で要求した cancel。deadline と同じく
+    /// script からは catch できない catch 不能 terminal（仕様 execution-control §8）で、
+    /// `ExecutionOutcome::Cancelled` へ写す。canonical error inventory（第3.4節）には属さない
+    /// 内部制御信号であり、`e["type"]` としては script へ露出しない。
+    Cancelled,
     /// スタックオーバーフロー（再帰深度超過）
     StackOverflow,
     /// サンドボックス違反
@@ -133,6 +140,7 @@ impl ErrorKind {
             Self::StepLimit => "limit",
             // 内部制御信号（terminal へ写す）。script の `e["type"]` へは出ない。
             Self::DeadlineExceeded => "deadline_exceeded",
+            Self::Cancelled => "cancelled",
             Self::StackOverflow => "overflow",
             Self::Sandbox => "sandbox",
             Self::Capability => "capability",
@@ -594,6 +602,16 @@ impl TsumugiError {
             ErrorKind::DeadlineExceeded,
             // catch されないため message は診断専用（terminal 到達で破棄される）。
             "実行 deadline を超過しました",
+        )
+    }
+
+    /// 実行の協調的キャンセル（REV-015 Slice 4）。catch 不能 terminal 信号。
+    pub fn cancelled(line: usize) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::Cancelled,
+            // catch されないため message は診断専用（terminal 到達で破棄される）。
+            "実行がキャンセルされました",
         )
     }
 
