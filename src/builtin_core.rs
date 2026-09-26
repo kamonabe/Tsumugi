@@ -1411,10 +1411,13 @@ pub fn dispatch_filesystem_capability(
             check_arity(name, args, 1, line)?;
             let path = require_str(&args[0], name, 1, line)?;
             let (root, target) = fs_route(name, filesystem, path, FsOperation::List, line)?;
+            // REV-009 §17.4（safe profile）: 個別 entry 取得失敗・非 UTF-8 名を黙殺せず、
+            // それぞれ `directory_read` / `invalid_encoding` category の catch 可能な `host`
+            // error へ写す（部分結果を成功 List として返さない）。
             let entries = root
                 .adapter
                 .list(&target.path, None)
-                .map_err(|_| fs_host_error(name, line))?;
+                .map_err(|e| fs_list_error(name, e, line))?;
             let mut names = Vec::new();
             for entry in entries {
                 check_collection_size(names.len().saturating_add(1), max_collection, line)?;
@@ -1473,6 +1476,19 @@ fn fs_content_arg(value: &Value) -> String {
 /// filesystem 操作失敗を canonical `host` error（category `filesystem`）へ写す。
 fn fs_host_error(name: &str, line: usize) -> TsumugiError {
     TsumugiError::host_adapter_failed(line, name, "filesystem")
+}
+
+/// `list_dir` の adapter 失敗を category 付きの `host` error へ写す（REV-009 §17.4）。
+///
+/// 個別 entry 取得失敗は `directory_read`、非 UTF-8 名は `invalid_encoding`、その他は
+/// 一般の `filesystem` category とする。
+fn fs_list_error(name: &str, error: crate::capability::AdapterError, line: usize) -> TsumugiError {
+    let category = match error {
+        crate::capability::AdapterError::DirectoryReadFailed => "directory_read",
+        crate::capability::AdapterError::NonUtf8EntryName => "invalid_encoding",
+        _ => "filesystem",
+    };
+    TsumugiError::host_adapter_failed(line, name, category)
 }
 
 /// script path を parse し、mount routing と operation 認可を行う（第8.2・8.4・8.5節）。
@@ -1700,6 +1716,13 @@ pub fn builtin_rename(args: &[Value], line: usize) -> Result<Value, TsumugiError
     Ok(Value::Bool(std::fs::rename(&safe_from, &safe_to).is_ok()))
 }
 
+/// `list_dir(path)`: ambient（legacy）経路の directory 列挙。
+///
+/// REV-009 §17.4 の **safe** 挙動（個別 entry 取得失敗→`directory_read` host error、非 UTF-8 名
+/// →`invalid_encoding` host error、部分結果を成功 List にしない）は capability 経路
+/// （[`dispatch_filesystem_capability`]）で提供する。この ambient 経路は legacy 互換のまま——
+/// 個別 entry 失敗は skip（`flatten`）、非 UTF-8 名は lossy 変換、`read_dir` 失敗は `null`。
+/// capability denial は sandbox 側で処理し `null` へ畳まない。
 pub fn builtin_list_dir(
     args: &[Value],
     max_collection: u64,
@@ -1711,6 +1734,7 @@ pub fn builtin_list_dir(
         match std::fs::read_dir(&safe_path) {
             Ok(entries) => {
                 let mut names = Vec::new();
+                // legacy: 個別 entry 失敗は skip（safe 経路は directory_read へ写す、REV-009）。
                 for entry in entries.flatten() {
                     check_collection_size(names.len().saturating_add(1), max_collection, line)?;
                     names.push(Value::str_constant(

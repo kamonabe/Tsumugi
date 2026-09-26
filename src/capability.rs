@@ -298,6 +298,12 @@ pub enum AdapterError {
     /// 文字列 prefix check へ fallback せず fail closed する。script filesystem 操作中は
     /// code `secure_resolution_unsupported` の canonical `host` error（catch 可能）へ写す。
     SecureResolutionUnsupported,
+    /// directory 列挙中の個別 entry 取得失敗（REV-009 §17.4）。safe profile では部分結果を
+    /// 成功として返さず、category `directory_read` の catch 可能な `host` error へ写す。
+    DirectoryReadFailed,
+    /// directory entry 名が非 UTF-8（REV-009 §17.4）。safe profile では lossy 変換で同一視せず、
+    /// category `invalid_encoding` の catch 可能な `host` error へ写す。
+    NonUtf8EntryName,
 }
 
 /// [`Input::read_line`] の1行読み取り結果（仕様第7節 `InputLine`）。
@@ -1584,16 +1590,17 @@ mod os_secure {
         let mut out = Vec::new();
         let iter = fs::read_dir(&path).map_err(|_| host_err("read_dir failed"))?;
         for entry in iter {
-            let entry = entry.map_err(|_| host_err("dir entry not readable"))?;
-            let name = match entry.file_name().into_string() {
-                Ok(n) => n,
-                // 非 UTF-8 名は本 slice では skip する（REV-009 で衝突検査を強化）。
-                Err(_) => continue,
-            };
+            // REV-009: 個別 entry 取得失敗を黙殺しない（safe profile は directory_read へ写す）。
+            let entry = entry.map_err(|_| AdapterError::DirectoryReadFailed)?;
+            // REV-009: 非 UTF-8 名を lossy 変換で同一視しない（safe profile は invalid_encoding）。
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| AdapterError::NonUtf8EntryName)?;
             let meta = entry
                 .path()
                 .symlink_metadata()
-                .map_err(|_| host_err("entry metadata not accessible"))?;
+                .map_err(|_| AdapterError::DirectoryReadFailed)?;
             out.push(super::DirectoryEntry {
                 name,
                 kind: entry_kind_of(&meta),

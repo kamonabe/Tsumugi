@@ -2773,5 +2773,46 @@ mod tests {
             assert!(!root.path.join("link").exists());
             assert!(root.path.join("real").join("keep.txt").exists());
         }
+
+        // --- REV-009: list_dir の部分失敗・非 UTF-8 名（§17.4、capability=safe）---
+
+        #[test]
+        fn list_dir_success_returns_sorted_names() {
+            let root = TempRoot::new();
+            std::fs::write(root.path.join("b.txt"), b"b").unwrap();
+            std::fs::write(root.path.join("a.txt"), b"a").unwrap();
+            let mut vm = vm_with(fs_set(&root, &[FsOperation::List, FsOperation::Metadata]));
+            let listed = vm
+                .exec_builtin("list_dir", vec![Value::str_constant("@default".into())], 1)
+                .expect("list ok");
+            match listed {
+                Value::List(items) => {
+                    let names: Vec<String> = items.iter().map(|v| v.to_string()).collect();
+                    assert_eq!(names, vec!["a.txt".to_string(), "b.txt".to_string()]);
+                }
+                other => panic!("list はリストを返す: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn list_dir_non_utf8_name_is_invalid_encoding_host_error() {
+            // safe（capability）経路: 非 UTF-8 の entry 名を lossy 変換で同一視せず、
+            // catch 可能な host error（category invalid_encoding）にする（REV-009 §17.4）。
+            use std::os::unix::ffi::OsStrExt;
+            let root = TempRoot::new();
+            // 不正 byte 0x80 を含む file 名を root 直下に作る。
+            let bad = std::ffi::OsStr::from_bytes(b"bad\x80name");
+            std::fs::write(root.path.join(bad), b"x").unwrap();
+            let mut vm = vm_with(fs_set(&root, &[FsOperation::List, FsOperation::Metadata]));
+            let err = vm
+                .exec_builtin("list_dir", vec![Value::str_constant("@default".into())], 1)
+                .expect_err("non-utf8 name must error");
+            assert_eq!(err.error_type(), "host");
+            assert!(
+                err.message().contains("invalid_encoding"),
+                "category が message に載る: {}",
+                err.message()
+            );
+        }
     }
 }
