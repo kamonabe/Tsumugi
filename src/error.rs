@@ -67,6 +67,12 @@ pub enum ErrorKind {
     Name,
     /// ステップ上限到達
     StepLimit,
+    /// 実行 deadline 超過（REV-015 Slice 4）。
+    ///
+    /// script からは catch できない catch 不能 terminal（仕様 execution-control §7 / §8）。
+    /// `ExecutionOutcome::DeadlineExceeded` へ写す。canonical error inventory（第3.4節）には
+    /// 属さない内部制御信号であり、`e["type"]` としては script へ露出しない。
+    DeadlineExceeded,
     /// スタックオーバーフロー（再帰深度超過）
     StackOverflow,
     /// サンドボックス違反
@@ -125,6 +131,8 @@ impl ErrorKind {
             Self::Index => "index",
             Self::Name => "name",
             Self::StepLimit => "limit",
+            // 内部制御信号（terminal へ写す）。script の `e["type"]` へは出ない。
+            Self::DeadlineExceeded => "deadline_exceeded",
             Self::StackOverflow => "overflow",
             Self::Sandbox => "sandbox",
             Self::Capability => "capability",
@@ -576,6 +584,16 @@ impl TsumugiError {
             line,
             ErrorKind::StepLimit,
             format!("ステップ上限に達しました (上限: {})", limit),
+        )
+    }
+
+    /// 実行 deadline 超過（REV-015 Slice 4）。catch 不能 terminal 信号。
+    pub fn deadline_exceeded(line: usize) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::DeadlineExceeded,
+            // catch されないため message は診断専用（terminal 到達で破棄される）。
+            "実行 deadline を超過しました",
         )
     }
 

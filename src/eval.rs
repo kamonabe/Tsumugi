@@ -321,6 +321,17 @@ impl Evaluator {
         }
     }
 
+    /// deadline 確認用の clock を注入する（REV-015 Slice 4）。
+    ///
+    /// 注入した clock が `config.deadline` に達すると、charge 前と文/反復境界で
+    /// [`crate::error::ErrorKind::DeadlineExceeded`] の catch 不能 terminal として停止する。
+    /// clock は `config.deadline` と同じ domain を前提とする（埋め込み host は
+    /// [`BudgetConfig::validate`] で作成前に検査する）。未注入の既定経路（alpha / CLI /
+    /// REPL）は deadline を効かせず、観測挙動は不変。
+    pub fn set_deadline_clock(&mut self, clock: std::sync::Arc<dyn crate::budget::MonotonicClock>) {
+        self.budget.set_clock(clock);
+    }
+
     /// `args()` が返すスクリプト引数の snapshot を設定する（AUD-018）。
     pub fn set_script_args(&mut self, args: Vec<String>) {
         self.script_args = args;
@@ -915,6 +926,16 @@ impl Evaluator {
                 return Ok(DriveOutcome::Yielded);
             }
 
+            // deadline checkpoint（REV-015 Slice 4、§8）。charge 経路は charge 前に deadline を
+            // 確認するが、fuel をほとんど消費しない反復では charge 境界に届かないことがある。
+            // 文/反復境界でも確認し、超過なら catch 不能 terminal として直ちに unwind する
+            // （deadline は handle_error が catch しない）。clock 未注入の既定経路では no-op。
+            if let Err(stop) = self.budget.checkpoint_deadline() {
+                let e = self.control_stop_to_error(stop, 0);
+                self.unwind_to(stop_depth);
+                return Err(e);
+            }
+
             let top = self.frames.last_mut().expect("frames.len() > stop_depth");
 
             // ループ frame は cursor が本体末尾に達したら「1 反復完了」として扱い、
@@ -1184,11 +1205,17 @@ impl Evaluator {
     /// そのまま返し、呼び出し側で unwind する。従来の `TryCatch` と同じく、fuel/collection/
     /// heap など全種の `Err` を捕捉する（現行挙動を保つ）。
     fn handle_error(&mut self, error: TsumugiError, stop_depth: usize) -> Result<(), TsumugiError> {
-        // exit() の structured terminal 信号（C7、REV-023）は script から catch できない。
-        // try frame を探さずそのまま伝播し、run_slice が Exited terminal へ写す（capability-
-        // model 第2節 原則4: exit は catch 不可 terminal）。budget/deadline/cancel の terminal
-        // 化は Slice 1/2 でまだ catchable な TsumugiError 経由のため、ここでは exit のみ除外する。
-        if matches!(error.kind(), Some(crate::error::ErrorKind::ProcessExit)) {
+        // catch 不能な terminal 信号（script から try/catch で捕捉できない）は、try frame を
+        // 探さずそのまま伝播し、run_slice が対応する terminal へ写す:
+        // - exit() の structured terminal（C7、REV-023 / capability-model 第2節 原則4）
+        // - deadline 超過（REV-015 Slice 4 / execution-control §7・§8・§15.1「budget 超過を
+        //   try/catch で囲んでも catch body を実行しない」）
+        // それ以外の budget/cancel の terminal 化は Slice 1/2 でまだ catchable な TsumugiError
+        // 経由のため、ここでは exit と deadline のみ除外する。
+        if matches!(
+            error.kind(),
+            Some(crate::error::ErrorKind::ProcessExit | crate::error::ErrorKind::DeadlineExceeded)
+        ) {
             return Err(error);
         }
         // この活性内（stop_depth より上）で最も近い try frame を探す。stop_depth より下
@@ -2170,6 +2197,77 @@ mod tests {
             .map_err(|errors| errors.into_iter().next().unwrap())?;
         let mut eval = Evaluator::new();
         eval.run(&program, input.len() as u64)
+    }
+
+    fn parse_program(input: &str) -> Program {
+        let tokens = Lexer::new(input).tokenize();
+        Parser::new(tokens)
+            .parse()
+            .map_err(|errors| errors.into_iter().next().unwrap())
+            .unwrap()
+    }
+
+    /// deadline clock を注入した Evaluator で input を terminal まで実行する（REV-015 Slice 4）。
+    ///
+    /// `set_now_ns` は最初の poll 前に fake clock を進める絶対時刻。deadline は now+30s。
+    /// 戻り値は terminal 結果（`run_slice` を terminal まで駆動したもの）。
+    fn run_with_deadline_clock(input: &str, set_now_ns: u64) -> Result<(), TsumugiError> {
+        use crate::budget::{BudgetConfig, FakeClock};
+        let program = parse_program(input);
+        let clock = std::sync::Arc::new(FakeClock::new());
+        let config = BudgetConfig::standard(clock.as_ref()).unwrap();
+        let mut eval = Evaluator::with_budget(config);
+        eval.set_deadline_clock(clock.clone());
+        clock.set(set_now_ns);
+        eval.begin_execution(&program, input.len() as u64, false)
+            .map_err(|(_, e)| e)?;
+        loop {
+            match eval.run_slice(u64::MAX) {
+                None => continue,
+                Some(result) => return result,
+            }
+        }
+    }
+
+    /// deadline 未満（1 ns 手前）なら実行は正常完了する（§15.1「deadline 直前は実行できる」）。
+    #[test]
+    fn deadline_allows_execution_just_before_deadline() {
+        // now+30s が deadline。deadline-1 ns まで進めても実行できる。
+        let deadline_ns = 30 * 1_000_000_000;
+        let result = run_with_deadline_clock("let x = 1 + 2\nlet y = x * 3", deadline_ns - 1);
+        assert!(
+            result.is_ok(),
+            "should complete before deadline: {result:?}"
+        );
+    }
+
+    /// fake clock が deadline と等しい時点で停止し、catch 不能 terminal になる（§15.1）。
+    #[test]
+    fn deadline_stops_at_exact_deadline() {
+        let deadline_ns = 30 * 1_000_000_000;
+        let result = run_with_deadline_clock("let x = 1 + 2\nlet y = x * 3", deadline_ns);
+        let err = result.expect_err("should stop at deadline");
+        assert_eq!(
+            err.kind(),
+            Some(crate::error::ErrorKind::DeadlineExceeded),
+            "deadline stop should be DeadlineExceeded terminal: {err:?}"
+        );
+    }
+
+    /// deadline 超過を try/catch で囲んでも catch body を実行しない（§15.1、catch 不能 terminal）。
+    #[test]
+    fn deadline_is_not_catchable_by_try_catch() {
+        // catch body が実行されると x = 99 になるが、deadline は catch されないので
+        // 実行は DeadlineExceeded terminal で終わり、catch body には入らない。
+        let src = "try\n  let a = 1\ncatch e\n  let x = 99\nend";
+        let deadline_ns = 30 * 1_000_000_000;
+        let result = run_with_deadline_clock(src, deadline_ns);
+        let err = result.expect_err("deadline should surface as terminal");
+        assert_eq!(
+            err.kind(),
+            Some(crate::error::ErrorKind::DeadlineExceeded),
+            "try/catch must not catch deadline terminal: {err:?}"
+        );
     }
 
     #[test]

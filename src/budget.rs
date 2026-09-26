@@ -858,6 +858,13 @@ pub struct BudgetLedger {
     reserved: BudgetCounters,
     peaks: BudgetPeaks,
     cancellation: CancellationToken,
+    /// deadline 確認用の clock（REV-015 Slice 4、§7-1 / §8）。
+    ///
+    /// `None` の間は [`Self::check_deadline`] は no-op（Slice 1〜3・alpha / CLI / REPL /
+    /// VM の既定経路は deadline を効かせず観測挙動不変）。埋め込み host が
+    /// [`Self::set_clock`] で `config.deadline` と同じ domain の clock を注入したときだけ、
+    /// charge 前と文/反復境界で deadline を確認する。
+    clock: Option<Arc<dyn MonotonicClock>>,
     /// live heap accounting（§5.2、REV-015 Slice 2）。
     ///
     /// per-drop release（案A）のため `Rc<RefCell<>>` 共有ハンドルにする。tracked
@@ -877,12 +884,23 @@ impl BudgetLedger {
             reserved: BudgetCounters::default(),
             peaks: BudgetPeaks::default(),
             cancellation,
+            clock: None,
         }
     }
 
     /// cancellation token を共有せず、単体で使う台帳を作る（テスト補助）。
     pub fn with_config(config: BudgetConfig) -> Self {
         Self::new(config, CancellationToken::new())
+    }
+
+    /// deadline 確認用の clock を注入する（REV-015 Slice 4）。
+    ///
+    /// 注入後は charge 前（[`Self::reserve_all`]）と文/反復境界（driver ループ）の
+    /// [`Self::check_deadline`] が `clock.now()` と `config.deadline` を比較する。clock は
+    /// `config.deadline` と同じ domain（`clock_id` 一致）を前提とする（[`BudgetConfig::validate`]
+    /// が execution 作成前に検査する）。
+    pub fn set_clock(&mut self, clock: Arc<dyn MonotonicClock>) {
+        self.clock = Some(clock);
     }
 
     /// 現在の使用量 snapshot（§3）。
@@ -1079,9 +1097,23 @@ impl BudgetLedger {
         Ok(())
     }
 
-    /// deadline を確認する（§7-1）。Slice 1 では clock を保持しないため、呼び出し側が
-    /// 確認済みであることを前提に no-op とする。deadline checkpoint の配線は Slice 4。
+    /// deadline を確認する（§7-1 / §8、REV-015 Slice 4）。
+    ///
+    /// clock を注入していない間（Slice 1〜3・既定経路）は no-op。clock 注入済みなら
+    /// `clock.now()` を読み、`config.deadline` **以上**なら [`ControlStop::DeadlineExceeded`]
+    /// を返す（§15.1「fake clock が deadline と等しい時点で停止する」ため境界は `>=`）。
+    /// 別 domain の clock（`clock_id` 不一致）は [`BudgetConfig::validate`] が作成前に弾く
+    /// 前提なので、ここでは observed の ns だけを比較する。
     fn check_deadline(&self) -> Result<(), ControlStop> {
+        if let Some(clock) = &self.clock {
+            let observed = clock.now();
+            if observed.as_nanos() >= self.config.deadline.as_nanos() {
+                return Err(ControlStop::DeadlineExceeded {
+                    deadline: self.config.deadline,
+                    observed,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -1909,6 +1941,16 @@ impl BudgetLedger {
         }
     }
 
+    /// 文/反復境界の checkpoint 用に deadline を確認する（REV-015 Slice 4、§8）。
+    ///
+    /// charge 経路（[`Self::reserve_all`]）は charge 前に deadline を確認するが、fuel を
+    /// 消費しない長い反復では charge 境界に到達しないことがある。driver ループの文/反復
+    /// 境界からこれを呼ぶことで、そうした処理でも deadline で協調停止できる。clock 未注入
+    /// なら no-op。
+    pub fn checkpoint_deadline(&self) -> Result<(), ControlStop> {
+        self.check_deadline()
+    }
+
     /// fuel の残量（total - committed - reserved）。診断・テスト補助。
     pub fn remaining_fuel(&self) -> u64 {
         self.config
@@ -1924,9 +1966,10 @@ impl BudgetLedger {
 /// 1 箇所へ集約して parity を保証する。trace は各 engine が呼び出し側で付ける。
 ///
 /// Slice 1/2 で発生し得るのは fuel（= step）・collection・string・source/import・heap・
-/// I-O（input/output/host call の count/bytes）超過。cancel / deadline は ledger の
-/// charge 経路にまだ配線しておらず（Slice 4）、到達した場合も安全側で step 上限として
-/// 扱う。`committed_fuel` は cancel/deadline fallback の上限表示に使う。
+/// I-O（input/output/host call の count/bytes）超過。deadline（Slice 4）は catch 不能な
+/// `DeadlineExceeded` terminal 信号へ写す。cancel は ledger の charge 経路にまだ handle 共有
+/// を配線しておらず（Slice 4 (B)）、到達した場合も安全側で step 上限として扱う。
+/// `committed_fuel` は cancel fallback の上限表示に使う。
 pub fn control_stop_to_error(
     stop: ControlStop,
     committed_fuel: u64,
@@ -1967,9 +2010,8 @@ pub fn control_stop_to_error(
             BudgetResource::HostCallBytes => TsumugiError::host_call_bytes_limit(line, e.limit),
             _ => TsumugiError::step_limit(line, e.limit),
         },
-        ControlStop::Cancelled | ControlStop::DeadlineExceeded { .. } => {
-            TsumugiError::step_limit(line, committed_fuel)
-        }
+        ControlStop::DeadlineExceeded { .. } => TsumugiError::deadline_exceeded(line),
+        ControlStop::Cancelled => TsumugiError::step_limit(line, committed_fuel),
         ControlStop::InternalFailure(InternalFailure::AllocationIdExhausted) => {
             TsumugiError::internal(line, "AllocationId を割り当てできません")
         }
@@ -2050,6 +2092,81 @@ mod tests {
         let clock = FakeClock::new();
         clock.set(u64::MAX - 1);
         assert_eq!(BudgetConfig::standard(&clock), Err(ConfigError::Overflow));
+    }
+
+    // -------------------------------------------------------------------------
+    // deadline checkpoint（§15.1 / REV-015 Slice 4）
+    // -------------------------------------------------------------------------
+
+    /// clock を注入していない台帳は deadline を効かせない（既定経路は観測挙動不変）。
+    #[test]
+    fn deadline_no_op_without_clock() {
+        let clock = FakeClock::new();
+        let config = BudgetConfig::standard(&clock).unwrap();
+        let mut l = ledger(config);
+        // clock 未注入。deadline を過ぎた時刻でも charge は通る。
+        clock.set(config.deadline.as_nanos() + 1);
+        assert!(l.charge_fuel(1, ExecutionPhase::Run).is_ok());
+        assert!(l.checkpoint_deadline().is_ok());
+    }
+
+    /// fake clock が deadline **未満**の間は charge も checkpoint も成功する（deadline 直前は実行）。
+    #[test]
+    fn deadline_allows_execution_just_before() {
+        let clock = Arc::new(FakeClock::new());
+        let config = BudgetConfig::standard(clock.as_ref()).unwrap();
+        let mut l = ledger(config);
+        l.set_clock(clock.clone());
+        // deadline の 1 ns 手前まで進める。
+        clock.set(config.deadline.as_nanos() - 1);
+        assert!(l.charge_fuel(1, ExecutionPhase::Run).is_ok());
+        assert!(l.checkpoint_deadline().is_ok());
+    }
+
+    /// fake clock が deadline と等しい時点で停止する（境界は `>=`、§15.1）。
+    #[test]
+    fn deadline_stops_at_exact_deadline() {
+        let clock = Arc::new(FakeClock::new());
+        let config = BudgetConfig::standard(clock.as_ref()).unwrap();
+        let mut l = ledger(config);
+        l.set_clock(clock.clone());
+        clock.set(config.deadline.as_nanos());
+        // charge 前確認（reserve_all 経由）で DeadlineExceeded。
+        match l.charge_fuel(1, ExecutionPhase::Run) {
+            Err(ControlStop::DeadlineExceeded { deadline, observed }) => {
+                assert_eq!(deadline.as_nanos(), config.deadline.as_nanos());
+                assert_eq!(observed.as_nanos(), config.deadline.as_nanos());
+            }
+            other => panic!("expected DeadlineExceeded, got {:?}", other),
+        }
+        // 文/反復境界 checkpoint でも同じく停止する。
+        assert!(matches!(
+            l.checkpoint_deadline(),
+            Err(ControlStop::DeadlineExceeded { .. })
+        ));
+    }
+
+    /// deadline は charge 前に確認されるので、上限内でも fuel を 1 も消費せず停止する。
+    #[test]
+    fn deadline_is_checked_before_charge() {
+        let clock = Arc::new(FakeClock::new());
+        let config = BudgetConfig::standard(clock.as_ref()).unwrap();
+        let mut l = ledger(config);
+        l.set_clock(clock.clone());
+        clock.set(config.deadline.as_nanos());
+        let _ = l.charge_fuel(1, ExecutionPhase::Run);
+        assert_eq!(l.usage().committed.fuel, 0);
+    }
+
+    /// DeadlineExceeded は catch 不能 terminal 信号の error kind へ写る。
+    #[test]
+    fn deadline_maps_to_deadline_exceeded_error() {
+        let clock = FakeClock::new();
+        let deadline = clock.instant_at(1_000);
+        let observed = clock.instant_at(1_000);
+        let err =
+            control_stop_to_error(ControlStop::DeadlineExceeded { deadline, observed }, 42, 7);
+        assert_eq!(err.kind(), Some(crate::error::ErrorKind::DeadlineExceeded));
     }
 
     // -------------------------------------------------------------------------

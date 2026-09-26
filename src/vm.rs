@@ -509,9 +509,19 @@ impl Vm {
             };
 
             if let Err(e) = result {
-                // exit() の structured terminal 信号（C7、REV-023）は script から catch でき
-                // ない。try handler を探さずそのまま伝播し、CLI が Exited terminal へ写す。
-                if matches!(e.kind(), Some(crate::error::ErrorKind::ProcessExit)) {
+                // catch 不能な terminal 信号（script から try/catch で捕捉できない）は、try
+                // handler を探さずそのまま伝播する（tree の handle_error と parity）:
+                // - exit() の structured terminal（C7、REV-023）は CLI が Exited terminal へ写す
+                // - deadline 超過（REV-015 Slice 4）は DeadlineExceeded terminal へ写す
+                // VM への deadline clock 注入は Slice 6（VM parity）だが、写像は tree と共有の
+                // control_stop_to_error なので、防御的に catch 除外だけ揃えておく。
+                if matches!(
+                    e.kind(),
+                    Some(
+                        crate::error::ErrorKind::ProcessExit
+                            | crate::error::ErrorKind::DeadlineExceeded
+                    )
+                ) {
                     return Err(self.attach_trace(e));
                 }
                 if let Some(handler) = self.try_handlers.pop() {
