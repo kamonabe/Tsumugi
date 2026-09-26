@@ -1304,6 +1304,513 @@ fn encode_filesystem(buf: &mut Vec<u8>, fs: &FilesystemCapability) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// C5-b: secure OS adapter（仕様第8.3節 契約1〜7）
+// ---------------------------------------------------------------------------
+//
+// OS filesystem を backing にする [`DirectoryHandle`] / [`FileHandle`] 実装。root
+// directory を 1 つの base path へ bind し、script が指定する mount 相対 [`RelativePath`]
+// を **component ごとに** 解決する。各中間 component は `symlink_metadata`（lstat 相当）で
+// 種別を確認してから降り、[`SymlinkPolicy`] に従って symlink を拒否/拘束する。final entry の
+// open は `O_NOFOLLOW` を付けて symlink を追従しない（契約4・5）。
+//
+// # platform サポート（契約2・3）
+//
+// secure な component 解決は Unix でだけ提供する。`O_NOFOLLOW` と lstat による symlink 検出は
+// Unix `std::os::unix` surface（外部 crate 非依存）で表現できる。root 拘束・symlink policy を
+// 同じ保証で満たせない platform（非 Unix）では、文字列 prefix check へ fallback せず
+// [`AdapterError::SecureResolutionUnsupported`] を返して fail closed する（契約3）。これは
+// script filesystem 操作では code `secure_resolution_unsupported` の canonical `host` error
+// （catch 可能）へ写る（C5-c で配線）。
+//
+// # 本スライスの範囲
+//
+// TOCTOU race（component 解決中に symlink が差し替わる）は本 slice の対象外で、AUD-020
+// （path-handle TOCTOU、P2）と CAP-AT-11 の stress gate で扱う。ここでは lstat→種別判定→
+// `O_NOFOLLOW` open という契約1（canonicalize せず handle/path を bind）の形を確立する。
+
+/// OS filesystem を backing にする secure な [`DirectoryHandle`]（仕様第8.3節）。
+///
+/// [`OsDirectoryHandle::new`] で root base path・policy 相関 ID・[`SymlinkPolicy`] を束ね、
+/// 以降の操作は root 相対 [`RelativePath`] だけを受け取る。base path 自体の外へ出る解決は
+/// symlink policy と component 検証で防ぐ。
+pub struct OsDirectoryHandle {
+    /// root directory の絶対 path（host が open 前に確定する）。
+    base: std::path::PathBuf,
+    policy_id: NonZeroU128,
+    symlink_policy: SymlinkPolicy,
+}
+
+impl OsDirectoryHandle {
+    /// root base path・policy 相関 ID・symlink policy から作る。
+    ///
+    /// `base` は host が execution 作成前に用意する root directory の path。adapter は
+    /// この path より外を解決しない。
+    pub fn new(
+        base: impl Into<std::path::PathBuf>,
+        policy_id: NonZeroU128,
+        symlink_policy: SymlinkPolicy,
+    ) -> Self {
+        Self {
+            base: base.into(),
+            policy_id,
+            symlink_policy,
+        }
+    }
+}
+
+impl std::fmt::Debug for OsDirectoryHandle {
+    /// host path を出さない（存在 oracle / 情報漏洩防止、仕様第8.5節）。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OsDirectoryHandle")
+            .field("policy_id", &self.policy_id)
+            .field("symlink_policy", &self.symlink_policy)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `std::fs::Metadata` の種別を公開 [`EntryKind`] へ写す。
+fn entry_kind_of(meta: &std::fs::Metadata) -> EntryKind {
+    let ft = meta.file_type();
+    if ft.is_file() {
+        EntryKind::File
+    } else if ft.is_dir() {
+        EntryKind::Directory
+    } else if ft.is_symlink() {
+        EntryKind::Symlink
+    } else {
+        EntryKind::Other
+    }
+}
+
+/// `std::fs::Metadata` から secret-free な [`PublicMetadata`] を作る（時刻・owner・path 非公開）。
+fn public_metadata_of(meta: &std::fs::Metadata) -> PublicMetadata {
+    PublicMetadata {
+        kind: entry_kind_of(meta),
+        size_bytes: meta.len(),
+        readonly: meta.permissions().readonly(),
+    }
+}
+
+/// host I/O error を [`AdapterError::Host`] へ写す。message は OS 由来の文字列のみで、
+/// absolute host path・symlink・permission の詳細は含めない（呼び出し側が sanitize 済み前提）。
+fn host_err(context: &str) -> AdapterError {
+    AdapterError::Host(context.to_string())
+}
+
+#[cfg(unix)]
+mod os_secure {
+    //! Unix 上の secure component 解決（契約1〜5）。
+    //!
+    //! `symlink_metadata`（lstat）で各 component の種別を確認し、[`SymlinkPolicy`] に従って
+    //! 中間/final symlink を拒否または拘束する。final entry は open 前に lstat して policy を
+    //! 適用する（`O_NOFOLLOW` の flag 値は Linux で arch 依存＝libc 非依存では確定できないため、
+    //! flag ではなく明示 lstat で symlink を検出する。TOCTOU race は AUD-020 / CAP-AT-11 stress
+    //! gate で扱う）。
+
+    use super::{
+        AdapterError, OpenFileRequest, OsDirectoryHandle, RelativePath, SymlinkPolicy, WriteMode,
+        entry_kind_of, host_err,
+    };
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// 解決結果の host path と、その parent directory（rename/remove 等が使う）。
+    pub(super) struct Resolved {
+        /// final entry の host path（base 配下）。
+        pub path: PathBuf,
+    }
+
+    /// root base から `rel` を component ごとに secure に解決する。
+    ///
+    /// - 各 **中間** component を lstat し、directory でなければ拒否。symlink は policy に従う
+    ///   （`DenyAll` は拒否、`FollowWithinRoot`/`OperateOnFinalEntry` は解決先を root 内へ拘束）。
+    /// - final component は lstat せず path を組み立てて返す（open/metadata 側が lstat で
+    ///   symlink を検出し policy を適用する）。空 component 列（root 自身）は base を返す。
+    pub(super) fn resolve(
+        handle: &OsDirectoryHandle,
+        rel: &RelativePath,
+    ) -> Result<Resolved, AdapterError> {
+        let policy = handle.symlink_policy;
+        let mut current = handle.base.clone();
+        let comps: Vec<&str> = rel.components().collect();
+        // 最後の 1 つを除く中間 component を解決する。
+        let intermediate = comps.len().saturating_sub(1);
+        for name in comps.iter().take(intermediate) {
+            current.push(name);
+            let meta = fs::symlink_metadata(&current)
+                .map_err(|_| host_err("intermediate component not accessible"))?;
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                match policy {
+                    SymlinkPolicy::DenyAll => {
+                        return Err(host_err("symlink component denied by policy"));
+                    }
+                    SymlinkPolicy::FollowWithinRoot | SymlinkPolicy::OperateOnFinalEntry => {
+                        // 中間 symlink は解決先を root 内へ拘束する。canonicalize の結果が
+                        // base 配下に収まることだけを確認し（契約4）、収まらなければ拒否。
+                        let resolved = fs::canonicalize(&current)
+                            .map_err(|_| host_err("symlink target not resolvable"))?;
+                        if !within_base(&handle.base, &resolved) {
+                            return Err(host_err("symlink escapes root"));
+                        }
+                        if !resolved.is_dir() {
+                            return Err(host_err("intermediate component is not a directory"));
+                        }
+                        current = resolved;
+                    }
+                }
+            } else if !ft.is_dir() {
+                return Err(host_err("intermediate component is not a directory"));
+            }
+        }
+        if let Some(last) = comps.last() {
+            current.push(last);
+        }
+        Ok(Resolved { path: current })
+    }
+
+    /// `candidate` が `base` 配下（base 自身を含む）か。両者とも canonical 前提。
+    pub(super) fn within_base(base: &Path, candidate: &Path) -> bool {
+        // base を canonicalize してから比較する（base は既存 directory 前提）。
+        let base = match fs::canonicalize(base) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        candidate.starts_with(&base)
+    }
+
+    /// final entry を lstat して symlink policy を適用したうえで open する。
+    ///
+    /// Read/Write/Create は final symlink を拒否する（契約4）。open 前に final entry を lstat
+    /// し、symlink なら追従せず拒否する（契約5、dangling final symlink も追従しない）。
+    pub(super) fn open_file(
+        handle: &OsDirectoryHandle,
+        rel: &RelativePath,
+        request: OpenFileRequest,
+    ) -> Result<fs::File, AdapterError> {
+        let resolved = resolve(handle, rel)?;
+        let path = resolved.path;
+
+        // final entry が既存 symlink なら Read/Write/Create すべて拒否する（契約4・5）。
+        // 存在しない場合（CreateNew/Upsert の新規作成）は symlink 検出不要。
+        if let Ok(lmeta) = fs::symlink_metadata(&path)
+            && lmeta.file_type().is_symlink()
+        {
+            return Err(host_err("final symlink denied by policy"));
+        }
+
+        let mut opts = fs::OpenOptions::new();
+        match request {
+            OpenFileRequest::ReadExisting => {
+                opts.read(true);
+            }
+            OpenFileRequest::WriteExisting { mode } => {
+                apply_write_mode(&mut opts, mode);
+            }
+            OpenFileRequest::CreateNew { mode } => {
+                opts.create_new(true);
+                apply_write_mode(&mut opts, mode);
+            }
+            OpenFileRequest::Upsert { mode } => {
+                opts.create(true);
+                apply_write_mode(&mut opts, mode);
+            }
+        }
+        opts.open(&path).map_err(|_| host_err("open failed"))
+    }
+
+    /// [`WriteMode`] を `OpenOptions` へ適用する。
+    fn apply_write_mode(opts: &mut fs::OpenOptions, mode: WriteMode) {
+        match mode {
+            WriteMode::Truncate => {
+                opts.write(true).truncate(true);
+            }
+            WriteMode::Append => {
+                opts.append(true);
+            }
+        }
+    }
+
+    /// final entry の [`super::PublicMetadata`] を取得する。
+    ///
+    /// `follow_final=false` は lstat（symlink 自体）、`true` は stat（追従）を使う。ただし
+    /// `follow_final=true` で symlink を追従する場合、追従先が root 内に留まることを確認する。
+    pub(super) fn metadata(
+        handle: &OsDirectoryHandle,
+        rel: &RelativePath,
+        follow_final: bool,
+    ) -> Result<super::PublicMetadata, AdapterError> {
+        let resolved = resolve(handle, rel)?;
+        let path = resolved.path;
+        let lmeta =
+            fs::symlink_metadata(&path).map_err(|_| host_err("metadata target not accessible"))?;
+        if follow_final && lmeta.file_type().is_symlink() {
+            // 追従する場合は解決先が root 内であることを確認する（契約4）。
+            let resolved =
+                fs::canonicalize(&path).map_err(|_| host_err("symlink target not resolvable"))?;
+            if !within_base(&handle.base, &resolved) {
+                return Err(host_err("symlink escapes root"));
+            }
+            let meta =
+                fs::metadata(&resolved).map_err(|_| host_err("metadata target not accessible"))?;
+            Ok(super::public_metadata_of(&meta))
+        } else {
+            Ok(super::public_metadata_of(&lmeta))
+        }
+    }
+
+    /// directory を列挙する。各 entry を lstat して [`EntryKind`] を確定する。
+    pub(super) fn list(
+        handle: &OsDirectoryHandle,
+        rel: &RelativePath,
+        max_entries: Option<std::num::NonZeroU64>,
+    ) -> Result<Vec<super::DirectoryEntry>, AdapterError> {
+        let resolved = resolve(handle, rel)?;
+        let path = resolved.path;
+        // final entry が symlink の場合は List が拒否する（契約4）。
+        let lmeta =
+            fs::symlink_metadata(&path).map_err(|_| host_err("list target not accessible"))?;
+        if lmeta.file_type().is_symlink() {
+            return Err(host_err("list on symlink denied by policy"));
+        }
+        let mut out = Vec::new();
+        let iter = fs::read_dir(&path).map_err(|_| host_err("read_dir failed"))?;
+        for entry in iter {
+            let entry = entry.map_err(|_| host_err("dir entry not readable"))?;
+            let name = match entry.file_name().into_string() {
+                Ok(n) => n,
+                // 非 UTF-8 名は本 slice では skip する（REV-009 で衝突検査を強化）。
+                Err(_) => continue,
+            };
+            let meta = entry
+                .path()
+                .symlink_metadata()
+                .map_err(|_| host_err("entry metadata not accessible"))?;
+            out.push(super::DirectoryEntry {
+                name,
+                kind: entry_kind_of(&meta),
+            });
+            if let Some(max) = max_entries
+                && out.len() as u64 >= max.get()
+            {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// directory を作る（親は既存前提、`Create`）。
+    pub(super) fn create_dir(
+        handle: &OsDirectoryHandle,
+        rel: &RelativePath,
+    ) -> Result<(), AdapterError> {
+        let resolved = resolve(handle, rel)?;
+        fs::create_dir(&resolved.path).map_err(|_| host_err("create_dir failed"))
+    }
+
+    /// entry を削除する。`FileOrSymlink` は file/symlink、`EmptyDirectory` は空 dir。
+    pub(super) fn remove(
+        handle: &OsDirectoryHandle,
+        rel: &RelativePath,
+        kind: super::RemoveKind,
+    ) -> Result<(), AdapterError> {
+        let resolved = resolve(handle, rel)?;
+        let path = resolved.path;
+        match kind {
+            super::RemoveKind::FileOrSymlink => {
+                // final symlink 自体を消す（追従しない）。DenyAll でも「entry の削除」は
+                // 対象 file の read/write を伴わないため許可する（契約4 の delete 例外）。
+                fs::remove_file(&path).map_err(|_| host_err("remove failed"))
+            }
+            super::RemoveKind::EmptyDirectory => {
+                fs::remove_dir(&path).map_err(|_| host_err("remove_dir failed"))
+            }
+        }
+    }
+
+    /// entry を rename する。両 handle 認可後の単一 rename call（契約6）。
+    ///
+    /// destination handle も [`OsDirectoryHandle`] であることを要求する（異種 backing 間の
+    /// rename は本 slice では非対応で `SecureResolutionUnsupported`）。
+    pub(super) fn rename(
+        from_handle: &OsDirectoryHandle,
+        from: &RelativePath,
+        to_handle: &OsDirectoryHandle,
+        to: &RelativePath,
+        replace: bool,
+    ) -> Result<(), AdapterError> {
+        let src = resolve(from_handle, from)?.path;
+        let dst = resolve(to_handle, to)?.path;
+        if !replace && dst.exists() {
+            return Err(host_err("destination exists"));
+        }
+        fs::rename(&src, &dst).map_err(|_| host_err("rename failed"))
+    }
+}
+
+impl DirectoryHandle for OsDirectoryHandle {
+    fn policy_id(&self) -> NonZeroU128 {
+        self.policy_id
+    }
+
+    fn symlink_policy(&self) -> SymlinkPolicy {
+        self.symlink_policy
+    }
+
+    #[cfg(unix)]
+    fn open_file(
+        &self,
+        path: &RelativePath,
+        request: OpenFileRequest,
+    ) -> Result<Box<dyn FileHandle>, AdapterError> {
+        let file = os_secure::open_file(self, path, request)?;
+        Ok(Box::new(OsFileHandle { file }))
+    }
+
+    #[cfg(unix)]
+    fn create_dir(&self, path: &RelativePath) -> Result<(), AdapterError> {
+        os_secure::create_dir(self, path)
+    }
+
+    #[cfg(unix)]
+    fn metadata(
+        &self,
+        path: &RelativePath,
+        follow_final: bool,
+    ) -> Result<PublicMetadata, AdapterError> {
+        os_secure::metadata(self, path, follow_final)
+    }
+
+    #[cfg(unix)]
+    fn list(
+        &self,
+        path: &RelativePath,
+        max_entries: Option<NonZeroU64>,
+    ) -> Result<Vec<DirectoryEntry>, AdapterError> {
+        os_secure::list(self, path, max_entries)
+    }
+
+    #[cfg(unix)]
+    fn remove(&self, path: &RelativePath, kind: RemoveKind) -> Result<(), AdapterError> {
+        os_secure::remove(self, path, kind)
+    }
+
+    #[cfg(unix)]
+    fn rename(
+        &self,
+        from: &RelativePath,
+        to_directory: &dyn DirectoryHandle,
+        to: &RelativePath,
+        replace: bool,
+    ) -> Result<(), AdapterError> {
+        // 本 slice では同一 backing root（同 policy 相関 ID）内の rename だけを扱う。trait
+        // object から具象型へ downcast できないため、destination handle が同じ policy ID を
+        // 持つ場合に限り self の base を両 path に使う。mount を越える rename（別 root handle）
+        // は C5-c で mount routing を配線する際に拡張する。それまでは fail closed（契約6）。
+        if to_directory.policy_id() != self.policy_id {
+            return Err(AdapterError::SecureResolutionUnsupported);
+        }
+        os_secure::rename(self, from, self, to, replace)
+    }
+
+    // --- 非 Unix: secure resolution 非対応（fail closed、契約3）---
+
+    #[cfg(not(unix))]
+    fn open_file(
+        &self,
+        _path: &RelativePath,
+        _request: OpenFileRequest,
+    ) -> Result<Box<dyn FileHandle>, AdapterError> {
+        Err(AdapterError::SecureResolutionUnsupported)
+    }
+
+    #[cfg(not(unix))]
+    fn create_dir(&self, _path: &RelativePath) -> Result<(), AdapterError> {
+        Err(AdapterError::SecureResolutionUnsupported)
+    }
+
+    #[cfg(not(unix))]
+    fn metadata(
+        &self,
+        _path: &RelativePath,
+        _follow_final: bool,
+    ) -> Result<PublicMetadata, AdapterError> {
+        Err(AdapterError::SecureResolutionUnsupported)
+    }
+
+    #[cfg(not(unix))]
+    fn list(
+        &self,
+        _path: &RelativePath,
+        _max_entries: Option<NonZeroU64>,
+    ) -> Result<Vec<DirectoryEntry>, AdapterError> {
+        Err(AdapterError::SecureResolutionUnsupported)
+    }
+
+    #[cfg(not(unix))]
+    fn remove(&self, _path: &RelativePath, _kind: RemoveKind) -> Result<(), AdapterError> {
+        Err(AdapterError::SecureResolutionUnsupported)
+    }
+
+    #[cfg(not(unix))]
+    fn rename(
+        &self,
+        _from: &RelativePath,
+        _to_directory: &dyn DirectoryHandle,
+        _to: &RelativePath,
+        _replace: bool,
+    ) -> Result<(), AdapterError> {
+        Err(AdapterError::SecureResolutionUnsupported)
+    }
+}
+
+/// OS file を backing にする [`FileHandle`]（Unix）。open は [`OsDirectoryHandle`] が行う。
+#[cfg(unix)]
+pub struct OsFileHandle {
+    file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl FileHandle for OsFileHandle {
+    fn read_to_end(&mut self, max_bytes: Option<NonZeroU64>) -> Result<Vec<u8>, AdapterError> {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        match max_bytes {
+            // Phase 3 で有限 meter を配線する。C5-b では上限が指定された場合のみ
+            // その byte 数まで読む（超過検出は Phase 3 の budget 経路で行う）。
+            Some(max) => {
+                let limit = max.get();
+                let mut limited = (&self.file).take(limit);
+                limited
+                    .read_to_end(&mut buf)
+                    .map_err(|_| host_err("read failed"))?;
+            }
+            None => {
+                self.file
+                    .read_to_end(&mut buf)
+                    .map_err(|_| host_err("read failed"))?;
+            }
+        }
+        Ok(buf)
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), AdapterError> {
+        use std::io::Write;
+        self.file
+            .write_all(bytes)
+            .map_err(|_| host_err("write failed"))
+    }
+
+    fn metadata(&self) -> Result<PublicMetadata, AdapterError> {
+        let meta = self
+            .file
+            .metadata()
+            .map_err(|_| host_err("metadata not accessible"))?;
+        Ok(public_metadata_of(&meta))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1835,5 +2342,253 @@ mod tests {
         ])
         .expect_err("dup key");
         assert_eq!(err, ConfigError::DuplicateCallableName { name: "K".into() });
+    }
+
+    // --- C5-b: secure OS adapter（契約1〜5、CAP-AT-11/12 の Phase 2 範囲）---
+
+    #[cfg(unix)]
+    mod os_adapter {
+        use super::*;
+        use std::fs;
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        /// テスト用の一意な一時 directory を作る（後始末は best-effort）。
+        struct TempRoot {
+            path: PathBuf,
+        }
+
+        impl TempRoot {
+            fn new() -> Self {
+                static COUNTER: AtomicU64 = AtomicU64::new(0);
+                let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+                let mut path = std::env::temp_dir();
+                path.push(format!("tsumugi-c5b-{}-{}", std::process::id(), n));
+                fs::create_dir_all(&path).expect("create temp root");
+                Self { path }
+            }
+        }
+
+        impl Drop for TempRoot {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+
+        /// component 列から [`RelativePath`] を作る（module 内なので private field へアクセス可）。
+        fn rel(components: &[&str]) -> RelativePath {
+            RelativePath {
+                components: components.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+
+        fn handle(root: &TempRoot, policy: SymlinkPolicy) -> OsDirectoryHandle {
+            OsDirectoryHandle::new(root.path.clone(), pid(100), policy)
+        }
+
+        #[test]
+        fn read_write_roundtrip_within_root() {
+            let root = TempRoot::new();
+            let h = handle(&root, SymlinkPolicy::DenyAll);
+            // 書き込み（Upsert/Truncate）。
+            {
+                let mut f = h
+                    .open_file(
+                        &rel(&["a.txt"]),
+                        OpenFileRequest::Upsert {
+                            mode: WriteMode::Truncate,
+                        },
+                    )
+                    .expect("open write");
+                f.write_all(b"hello").expect("write");
+            }
+            // 読み取り。
+            let mut f = h
+                .open_file(&rel(&["a.txt"]), OpenFileRequest::ReadExisting)
+                .expect("open read");
+            let bytes = f.read_to_end(None).expect("read");
+            assert_eq!(bytes, b"hello");
+            // metadata。
+            let meta = h.metadata(&rel(&["a.txt"]), true).expect("metadata");
+            assert_eq!(meta.kind, EntryKind::File);
+            assert_eq!(meta.size_bytes, 5);
+        }
+
+        #[test]
+        fn create_dir_list_and_remove() {
+            let root = TempRoot::new();
+            let h = handle(&root, SymlinkPolicy::DenyAll);
+            h.create_dir(&rel(&["sub"])).expect("mkdir");
+            {
+                let mut f = h
+                    .open_file(
+                        &rel(&["sub", "x.txt"]),
+                        OpenFileRequest::Upsert {
+                            mode: WriteMode::Truncate,
+                        },
+                    )
+                    .expect("open");
+                f.write_all(b"z").expect("write");
+            }
+            let entries = h.list(&rel(&["sub"]), None).expect("list");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].name, "x.txt");
+            assert_eq!(entries[0].kind, EntryKind::File);
+            // remove file, then empty dir。
+            h.remove(&rel(&["sub", "x.txt"]), RemoveKind::FileOrSymlink)
+                .expect("remove file");
+            h.remove(&rel(&["sub"]), RemoveKind::EmptyDirectory)
+                .expect("remove dir");
+        }
+
+        #[test]
+        fn deny_all_rejects_final_symlink_open() {
+            // 契約4: DenyAll は final symlink の read を拒否する（O_NOFOLLOW）。
+            let root = TempRoot::new();
+            // root 内に実体 file と、それを指す symlink を作る。
+            fs::write(root.path.join("real.txt"), b"data").expect("write real");
+            std::os::unix::fs::symlink(root.path.join("real.txt"), root.path.join("link.txt"))
+                .expect("symlink");
+            let h = handle(&root, SymlinkPolicy::DenyAll);
+            // 実体はそのまま読める。
+            let mut f = h
+                .open_file(&rel(&["real.txt"]), OpenFileRequest::ReadExisting)
+                .expect("open real");
+            assert_eq!(f.read_to_end(None).expect("read"), b"data");
+            // symlink 経由の open は拒否（O_NOFOLLOW により host error）。
+            let res = h.open_file(&rel(&["link.txt"]), OpenFileRequest::ReadExisting);
+            assert!(
+                matches!(res, Err(AdapterError::Host(_))),
+                "symlink open must fail"
+            );
+        }
+
+        #[test]
+        fn intermediate_symlink_denied_under_deny_all() {
+            // 契約4: DenyAll は中間 symlink component を拒否する。
+            let root = TempRoot::new();
+            fs::create_dir(root.path.join("realdir")).expect("mkdir realdir");
+            fs::write(root.path.join("realdir").join("f.txt"), b"x").expect("write");
+            std::os::unix::fs::symlink(root.path.join("realdir"), root.path.join("linkdir"))
+                .expect("symlink dir");
+            let h = handle(&root, SymlinkPolicy::DenyAll);
+            let res = h.open_file(&rel(&["linkdir", "f.txt"]), OpenFileRequest::ReadExisting);
+            assert!(
+                matches!(res, Err(AdapterError::Host(_))),
+                "intermediate symlink must be denied"
+            );
+        }
+
+        #[test]
+        fn intermediate_symlink_within_root_followed() {
+            // 契約4: FollowWithinRoot は root 内へ解決する中間 symlink を許可する。
+            let root = TempRoot::new();
+            fs::create_dir(root.path.join("realdir")).expect("mkdir realdir");
+            fs::write(root.path.join("realdir").join("f.txt"), b"ok").expect("write");
+            std::os::unix::fs::symlink(root.path.join("realdir"), root.path.join("linkdir"))
+                .expect("symlink dir");
+            let h = handle(&root, SymlinkPolicy::FollowWithinRoot);
+            let mut f = h
+                .open_file(&rel(&["linkdir", "f.txt"]), OpenFileRequest::ReadExisting)
+                .expect("within-root symlink allowed");
+            assert_eq!(f.read_to_end(None).expect("read"), b"ok");
+        }
+
+        #[test]
+        fn intermediate_symlink_escaping_root_denied() {
+            // 契約4: FollowWithinRoot でも root 外へ出る symlink は拒否する。
+            let root = TempRoot::new();
+            let outside = TempRoot::new();
+            fs::write(outside.path.join("secret.txt"), b"top-secret").expect("write outside");
+            // root 内から root 外 directory を指す symlink。
+            std::os::unix::fs::symlink(&outside.path, root.path.join("escape"))
+                .expect("symlink escape");
+            let h = handle(&root, SymlinkPolicy::FollowWithinRoot);
+            let res = h.open_file(
+                &rel(&["escape", "secret.txt"]),
+                OpenFileRequest::ReadExisting,
+            );
+            assert!(
+                matches!(res, Err(AdapterError::Host(_))),
+                "escaping symlink must be denied"
+            );
+        }
+
+        #[test]
+        fn create_new_rejects_existing() {
+            let root = TempRoot::new();
+            fs::write(root.path.join("exists.txt"), b"1").expect("write");
+            let h = handle(&root, SymlinkPolicy::DenyAll);
+            let res = h.open_file(
+                &rel(&["exists.txt"]),
+                OpenFileRequest::CreateNew {
+                    mode: WriteMode::Truncate,
+                },
+            );
+            assert!(
+                matches!(res, Err(AdapterError::Host(_))),
+                "create_new on existing must fail"
+            );
+        }
+
+        #[test]
+        fn metadata_follow_final_false_sees_symlink_kind() {
+            // 契約4: OperateOnFinalEntry + follow_final=false は final symlink 自体を対象にできる。
+            let root = TempRoot::new();
+            fs::write(root.path.join("real.txt"), b"d").expect("write");
+            std::os::unix::fs::symlink(root.path.join("real.txt"), root.path.join("link.txt"))
+                .expect("symlink");
+            let h = handle(&root, SymlinkPolicy::OperateOnFinalEntry);
+            let meta = h.metadata(&rel(&["link.txt"]), false).expect("lstat");
+            assert_eq!(meta.kind, EntryKind::Symlink);
+        }
+
+        #[test]
+        fn remove_final_symlink_does_not_touch_target() {
+            // 契約4: final symlink の delete は entry 自体を消し、対象 file を残す。
+            let root = TempRoot::new();
+            fs::write(root.path.join("real.txt"), b"keep").expect("write");
+            std::os::unix::fs::symlink(root.path.join("real.txt"), root.path.join("link.txt"))
+                .expect("symlink");
+            let h = handle(&root, SymlinkPolicy::OperateOnFinalEntry);
+            h.remove(&rel(&["link.txt"]), RemoveKind::FileOrSymlink)
+                .expect("remove symlink");
+            // 対象 file は残る。
+            assert!(root.path.join("real.txt").exists());
+            assert!(!root.path.join("link.txt").exists());
+        }
+
+        #[test]
+        fn empty_relative_path_targets_root_metadata() {
+            // 空 component 列（`@mount` だけ）は root 自身を指す。
+            let root = TempRoot::new();
+            let h = handle(&root, SymlinkPolicy::DenyAll);
+            let meta = h.metadata(&rel(&[]), true).expect("root metadata");
+            assert_eq!(meta.kind, EntryKind::Directory);
+        }
+
+        #[test]
+        fn missing_file_maps_to_host_error() {
+            // grant 済み root 内の not-found は catch 可能な host error（null/false へ潰さない）。
+            let root = TempRoot::new();
+            let h = handle(&root, SymlinkPolicy::DenyAll);
+            let res = h.open_file(&rel(&["nope.txt"]), OpenFileRequest::ReadExisting);
+            assert!(
+                matches!(res, Err(AdapterError::Host(_))),
+                "missing must be host error"
+            );
+        }
+
+        #[test]
+        fn debug_does_not_leak_host_path() {
+            // 存在 oracle 防止: Debug に host path を出さない。
+            let root = TempRoot::new();
+            let h = handle(&root, SymlinkPolicy::DenyAll);
+            let dbg = format!("{h:?}");
+            assert!(
+                !dbg.contains(&root.path.to_string_lossy().to_string()),
+                "host path leaked: {dbg}"
+            );
+        }
     }
 }
