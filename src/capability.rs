@@ -682,8 +682,7 @@ impl std::fmt::Debug for FilesystemCapability {
 impl FilesystemCapability {
     /// 指定 mount の root を返す（完全一致。prefix 一致や登録順 fallback はしない、仕様第8.2節）。
     ///
-    /// C5-a では routing 基盤として用意する。builtin からの consult は C5-c で配線する。
-    #[allow(dead_code)]
+    /// C5-c の fs builtin dispatch が routing に使う。
     pub(crate) fn root(&self, mount: &MountName) -> Option<&FilesystemRoot> {
         self.roots.iter().find(|r| &r.mount == mount)
     }
@@ -1040,8 +1039,7 @@ impl CapabilitySet {
         self.0.stdout.as_ref()
     }
 
-    /// filesystem authority（crate 内部限定。C1 では未配線、C5 で使う）。
-    #[allow(dead_code)]
+    /// filesystem authority（crate 内部限定。C5-c で fs builtin が consult する）。
     pub(crate) fn filesystem(&self) -> Option<&FilesystemCapability> {
         self.0.filesystem.as_ref()
     }

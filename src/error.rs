@@ -804,6 +804,19 @@ impl TsumugiError {
         )
     }
 
+    /// filesystem capability 拒否（capability-model 第8.5節、catch 可能）。
+    ///
+    /// mount 未登録・operation 未 grant・許可外の存在/不存在を単一の denial に集約する
+    /// （存在 oracle 防止、CAP-AT-12/13）。message に host path・symlink・permission を
+    /// 含めない。存在 path と不存在 path で同一の code/message になる。
+    pub fn filesystem_denied(line: usize) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::Sandbox,
+            "ファイルシステム操作が許可されていません",
+        )
+    }
+
     /// `exit()` の structured terminal 信号（Phase 2 C7、REV-023）。
     ///
     /// script から catch できない内部制御信号として伝播し、`run_slice` が

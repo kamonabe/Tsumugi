@@ -155,7 +155,22 @@ impl Evaluator {
                         .map_err(|stop| self.control_stop_to_error(stop, line))?;
                 }
                 let max_collection = self.budget.max_collection_elements();
-                let result = crate::builtin_core::dispatch(name, &evaluated, max_collection, line)?;
+                // C5-c（案 B）: filesystem builtin かつ Filesystem authority が grant 済みなら
+                // frozen CapabilitySet 経由で実行する。未 grant（ambient）は従来の dispatch
+                // ＝process-global sandbox のまま。
+                let result = if crate::builtin_core::is_filesystem_builtin(name)
+                    && let Some(fs) = self.capabilities().filesystem()
+                {
+                    Some(crate::builtin_core::dispatch_filesystem_capability(
+                        name,
+                        &evaluated,
+                        fs,
+                        max_collection,
+                        line,
+                    )?)
+                } else {
+                    crate::builtin_core::dispatch(name, &evaluated, max_collection, line)?
+                };
                 match result {
                     Some(value) => {
                         // filesystem host call の response bytes（読み込み内容）を、結果が
