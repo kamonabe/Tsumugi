@@ -1669,6 +1669,86 @@ impl BudgetLedger {
         Ok(())
     }
 
+    /// 2 つの値を構造的に等価比較し、traversal に fuel を課金する（REV-001）。
+    ///
+    /// `Value` の [`PartialEq`] は `&self` で budget を持てず、共有 backing（同じ `Rc` を
+    /// 複数箇所から参照する DAG）を native 再帰で辿るため、ダイヤモンド構造で指数時間に
+    /// なる。本メソッドは worklist で走査し、(1) 訪問する List/Dict ノードのペアごとに
+    /// `charge_fuel(1)` を課金して指数時間を fuel 上限で有限化し、(2) 既に比較済みの
+    /// `(Rc, Rc)` ペアを visited set で枝刈りして共有 DAG の再訪を防ぐ（指数を多項式へ）。
+    ///
+    /// スカラー（Int/Float/Bool/Null/Str/Fn/VmFn/Error）は既存の [`PartialEq`] へ委ね、
+    /// 数値の跨ぎ比較（Int↔Float、REV-003 の `NumericOrder`）も含めてそのまま使う。
+    /// List/Dict だけを budget 付きで再帰的に辿る。fuel 超過は catch 不能 terminal の
+    /// `ControlStop` として返る（比較の途中で止まる）。等価判定の結果は `Ok(bool)`。
+    pub fn values_equal(
+        &mut self,
+        left: &crate::value::Value,
+        right: &crate::value::Value,
+        phase: ExecutionPhase,
+    ) -> Result<bool, ControlStop> {
+        use crate::value::Value;
+        use std::collections::HashSet;
+
+        // 比較すべきペアの worklist。全ペアが等価なら true、1 つでも不一致なら false。
+        let mut worklist: Vec<(&Value, &Value)> = vec![(left, right)];
+        // 比較済みの List/Dict backing ペア（Rc ポインタ同一性）。共有 DAG の再訪枝刈り用。
+        let mut visited: HashSet<(usize, usize)> = HashSet::new();
+
+        while let Some((a, b)) = worklist.pop() {
+            match (a, b) {
+                (Value::List(la), Value::List(lb)) => {
+                    // 同じ backing なら要素比較を省く（自明に等価）。
+                    if Rc::ptr_eq(la, lb) {
+                        continue;
+                    }
+                    // 既に比較したペアは枝刈りする（DAG の指数訪問を防ぐ）。ここで初めて
+                    // 訪れる複合ノードのペアだけ fuel を課金する。
+                    let key = (Rc::as_ptr(la) as usize, Rc::as_ptr(lb) as usize);
+                    if !visited.insert(key) {
+                        continue;
+                    }
+                    self.charge_fuel(1, phase)?;
+                    if la.len() != lb.len() {
+                        return Ok(false);
+                    }
+                    for (ea, eb) in la.iter().zip(lb.iter()) {
+                        worklist.push((ea, eb));
+                    }
+                }
+                (Value::Dict(da), Value::Dict(db)) => {
+                    if Rc::ptr_eq(da, db) {
+                        continue;
+                    }
+                    let key = (Rc::as_ptr(da) as usize, Rc::as_ptr(db) as usize);
+                    if !visited.insert(key) {
+                        continue;
+                    }
+                    self.charge_fuel(1, phase)?;
+                    if da.len() != db.len() {
+                        return Ok(false);
+                    }
+                    // key 集合が一致し、同じ key の値どうしが等価なら等価（BTreeMap は
+                    // 順序が揃うため key 単位で対応づく）。
+                    for ((ka, va), (kb, vb)) in da.iter().zip(db.iter()) {
+                        if ka != kb {
+                            return Ok(false);
+                        }
+                        worklist.push((va, vb));
+                    }
+                }
+                // スカラーおよび型不一致は既存の等価規則へ委ねる（budget 不要の軽量比較）。
+                // List/Dict と非 List/Dict の組み合わせもここで false になる。
+                (a, b) => {
+                    if a != b {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// 生成・変更された `Value` を走査し、untracked な collection backing を tracked へ
     /// 変換しつつ heap 課金する（REV-015 案A、per-drop release）。
     ///
@@ -2250,6 +2330,134 @@ mod tests {
     fn cancel_maps_to_cancelled_error() {
         let err = control_stop_to_error(ControlStop::Cancelled, 42, 7);
         assert_eq!(err.kind(), Some(crate::error::ErrorKind::Cancelled));
+    }
+
+    // -------------------------------------------------------------------------
+    // budget-aware 構造比較 values_equal（REV-001）
+    // -------------------------------------------------------------------------
+
+    /// スカラーの等価は既存の等価規則どおりで、複合ノードが無いので fuel を消費しない。
+    #[test]
+    fn values_equal_scalars_match_partial_eq() {
+        use crate::value::Value;
+        let mut l = ledger(BudgetConfig::for_legacy(1_000_000, 1_000_000));
+        assert!(
+            l.values_equal(&Value::Int(3), &Value::Int(3), ExecutionPhase::Run)
+                .unwrap()
+        );
+        assert!(
+            !l.values_equal(&Value::Int(3), &Value::Int(4), ExecutionPhase::Run)
+                .unwrap()
+        );
+        // Int↔Float の跨ぎ比較（REV-003 の NumericOrder）も委譲される。
+        assert!(
+            l.values_equal(&Value::Int(1), &Value::Float(1.0), ExecutionPhase::Run)
+                .unwrap()
+        );
+        // 型が違えば不等価。
+        assert!(
+            !l.values_equal(&Value::Int(1), &Value::Bool(true), ExecutionPhase::Run)
+                .unwrap()
+        );
+        // スカラーだけなら複合ノードの fuel 課金は発生しない。
+        assert_eq!(l.usage().committed.fuel, 0);
+    }
+
+    /// List / Dict の構造比較は各複合ノードで fuel を 1 課金する。
+    #[test]
+    fn values_equal_lists_charge_fuel_per_node() {
+        use crate::value::{Tracked, Value};
+        let mut l = ledger(BudgetConfig::for_legacy(1_000_000, 1_000_000));
+        let a = Value::List(Tracked::constant(vec![Value::Int(1), Value::Int(2)]));
+        let b = Value::List(Tracked::constant(vec![Value::Int(1), Value::Int(2)]));
+        assert!(l.values_equal(&a, &b, ExecutionPhase::Run).unwrap());
+        // 外側 List ノード 1 個分の fuel（要素はスカラーなので課金しない）。
+        assert_eq!(l.usage().committed.fuel, 1);
+
+        // 要素が違えば不等価。
+        let mut l2 = ledger(BudgetConfig::for_legacy(1_000_000, 1_000_000));
+        let c = Value::List(Tracked::constant(vec![Value::Int(1), Value::Int(9)]));
+        assert!(!l2.values_equal(&a, &c, ExecutionPhase::Run).unwrap());
+    }
+
+    /// 同じ backing（Rc 共有）どうしは要素比較を省き fuel を消費しない。
+    #[test]
+    fn values_equal_shared_backing_is_free() {
+        use crate::value::{Tracked, Value};
+        use std::rc::Rc as StdRc;
+        let mut l = ledger(BudgetConfig::for_legacy(1_000_000, 1_000_000));
+        let shared = Tracked::constant(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        let a = Value::List(StdRc::clone(&shared));
+        let b = Value::List(StdRc::clone(&shared));
+        assert!(l.values_equal(&a, &b, ExecutionPhase::Run).unwrap());
+        // Rc::ptr_eq で即 true。fuel は課金しない。
+        assert_eq!(l.usage().committed.fuel, 0);
+    }
+
+    /// 共有 DAG（ダイヤモンド）の比較で visited pair 枝刈りが効き、fuel が多項式に収まる。
+    /// visited 管理が無ければ 2^depth ノード訪問になるが、枝刈りで depth に線形になる。
+    #[test]
+    fn values_equal_shared_dag_is_pruned_to_polynomial() {
+        use crate::value::{Tracked, Value};
+        use std::rc::Rc as StdRc;
+
+        // depth 段のダイヤモンド DAG を 2 本作る。各段は「1 つ下の層を 2 回参照する List」。
+        // 素朴な再帰なら 2^depth ノード訪問、visited 枝刈りなら depth に比例。
+        fn diamond(depth: usize) -> Value {
+            let mut node = Value::List(Tracked::constant(vec![Value::Int(0)]));
+            for _ in 0..depth {
+                let backing = match &node {
+                    Value::List(b) => StdRc::clone(b),
+                    _ => unreachable!(),
+                };
+                // 同じ子 backing を 2 箇所から参照する（共有）。
+                node = Value::List(Tracked::constant(vec![
+                    Value::List(StdRc::clone(&backing)),
+                    Value::List(backing),
+                ]));
+            }
+            node
+        }
+
+        let depth = 40; // 素朴なら 2^40 訪問（事実上停止しない）。
+        let a = diamond(depth);
+        let b = diamond(depth);
+        let mut l = ledger(BudgetConfig::for_legacy(1_000_000, 1_000_000));
+        assert!(l.values_equal(&a, &b, ExecutionPhase::Run).unwrap());
+        // 訪問ノードは depth に比例する少数（2^40 ではない）。上限を十分下回る。
+        assert!(
+            l.usage().committed.fuel < 10_000,
+            "visited 枝刈りが効かず fuel が爆発している: {}",
+            l.usage().committed.fuel
+        );
+    }
+
+    /// fuel 上限を超える巨大な比較は catch 不能 terminal（ControlStop）で止まる。
+    #[test]
+    fn values_equal_exhausts_fuel_on_large_comparison() {
+        use crate::value::{Tracked, Value};
+        // fuel 上限を小さくし、多数の複合ノードを持つ List を比較する。
+        let mut l = ledger(BudgetConfig::for_legacy(3, 1_000_000));
+        let make = || {
+            Value::List(Tracked::constant(vec![
+                Value::List(Tracked::constant(vec![Value::Int(1)])),
+                Value::List(Tracked::constant(vec![Value::Int(2)])),
+                Value::List(Tracked::constant(vec![Value::Int(3)])),
+                Value::List(Tracked::constant(vec![Value::Int(4)])),
+                Value::List(Tracked::constant(vec![Value::Int(5)])),
+            ]))
+        };
+        // 外側 + 5 内側 = 6 複合ノード > fuel 上限 3。
+        let stop = l
+            .values_equal(&make(), &make(), ExecutionPhase::Run)
+            .unwrap_err();
+        assert!(matches!(
+            stop,
+            ControlStop::BudgetExceeded(BudgetExceeded {
+                resource: BudgetResource::Fuel,
+                ..
+            })
+        ));
     }
 
     // -------------------------------------------------------------------------

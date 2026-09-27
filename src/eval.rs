@@ -1944,8 +1944,12 @@ impl Evaluator {
     }
 
     /// 二項演算
+    ///
+    /// `&mut self` を取るのは等価比較（`==` / `!=`）で budget を課金するため（REV-001）。
+    /// 構造比較は共有 DAG で指数時間になり得るので、`self.budget.values_equal` が
+    /// traversal に fuel を課金し visited pair で枝刈りする。他の演算は budget 不要。
     fn eval_binop(
-        &self,
+        &mut self,
         left: &Value,
         op: &BinOpKind,
         right: &Value,
@@ -2036,10 +2040,23 @@ impl Evaluator {
                 Ok(Value::Bool(result))
             }
 
-            // 等価比較は全ての型の組み合わせで結果を返す（AUD-014）
-            // 判定は `Value` の等価規則へ集約し、VMと同じ意味論にする
-            (l, BinOpKind::Eq, r) => Ok(Value::Bool(l == r)),
-            (l, BinOpKind::NotEq, r) => Ok(Value::Bool(l != r)),
+            // 等価比較は全ての型の組み合わせで結果を返す（AUD-014）。
+            // 判定は budget-aware な `values_equal` へ集約し、共有 DAG の指数時間を
+            // fuel + visited pair で有限化する（REV-001）。意味論は VM と同じ。
+            (l, BinOpKind::Eq, r) => {
+                let equal = self
+                    .budget
+                    .values_equal(l, r, ExecutionPhase::Run)
+                    .map_err(|stop| self.control_stop_to_error(stop, line))?;
+                Ok(Value::Bool(equal))
+            }
+            (l, BinOpKind::NotEq, r) => {
+                let equal = self
+                    .budget
+                    .values_equal(l, r, ExecutionPhase::Run)
+                    .map_err(|stop| self.control_stop_to_error(stop, line))?;
+                Ok(Value::Bool(!equal))
+            }
 
             // 論理演算は eval_expr 側で短絡評価するため、ここには到達しない
             (_, BinOpKind::And, _) | (_, BinOpKind::Or, _) => unreachable!(),
