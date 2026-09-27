@@ -1840,9 +1840,26 @@ impl Vm {
         } else {
             None
         };
-        let dispatched = match fs_capability_result {
-            Some(value) => Some(value),
-            None => crate::builtin_core::dispatch(name, &args, max_collection, line)?,
+        // REV-001: to_str / join は budget-aware な render_display 経由で有限化する
+        // （tree engine の builtin.rs と同じ論理位置・同じ共有関数）。budget を持てない
+        // builtin_core::dispatch へ入れず、境界で先に intercept する。
+        let dispatched = if name == "to_str" {
+            Some(crate::builtin_core::builtin_to_str_budgeted(
+                &args,
+                &mut self.budget,
+                line,
+            )?)
+        } else if name == "join" {
+            Some(crate::builtin_core::builtin_join_budgeted(
+                &args,
+                &mut self.budget,
+                line,
+            )?)
+        } else {
+            match fs_capability_result {
+                Some(value) => Some(value),
+                None => crate::builtin_core::dispatch(name, &args, max_collection, line)?,
+            }
         };
         if let Some(result) = dispatched {
             // filesystem host call の response bytes（読み込み内容）を、結果が確定した後に

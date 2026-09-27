@@ -155,12 +155,27 @@ impl Evaluator {
                         .map_err(|stop| self.control_stop_to_error(stop, line))?;
                 }
                 let max_collection = self.budget.max_collection_elements();
-                // C5-c（案 B）: filesystem builtin かつ Filesystem authority が grant 済みなら
-                // frozen CapabilitySet 経由で実行する。未 grant（ambient）は従来の dispatch
-                // ＝process-global sandbox のまま。
-                let result = if crate::builtin_core::is_filesystem_builtin(name)
+                // REV-001: to_str / join は値を表示して文字列化するため、budget-aware な
+                // render_display 経由（fuel + per-item byte 上限）で有限化する。budget を
+                // 持てない builtin_core::dispatch へ入れず、境界で先に intercept する。
+                let result = if name == "to_str" {
+                    Some(crate::builtin_core::builtin_to_str_budgeted(
+                        &evaluated,
+                        &mut self.budget,
+                        line,
+                    )?)
+                } else if name == "join" {
+                    Some(crate::builtin_core::builtin_join_budgeted(
+                        &evaluated,
+                        &mut self.budget,
+                        line,
+                    )?)
+                } else if crate::builtin_core::is_filesystem_builtin(name)
                     && let Some(fs) = self.capabilities().filesystem()
                 {
+                    // C5-c（案 B）: filesystem builtin かつ Filesystem authority が grant 済みなら
+                    // frozen CapabilitySet 経由で実行する。未 grant（ambient）は従来の dispatch
+                    // ＝process-global sandbox のまま。
                     Some(crate::builtin_core::dispatch_filesystem_capability(
                         name,
                         &evaluated,
