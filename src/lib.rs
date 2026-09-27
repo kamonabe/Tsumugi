@@ -61,6 +61,10 @@ pub use engine::{
     YieldReason,
 };
 
+// 協調的 cancel token（REV-015 Slice 4、実行制御仕様 §8）。`ExecutionHandle::cancellation_token`
+// の戻り値型として公開する。別スレッドへ渡せる `Send + Sync` な `Arc<AtomicBool>` ハンドル。
+pub use budget::CancellationToken;
+
 // Phase 1 embedding（スライス E1、`docs/embedding-api.md` 第3・8節）の公開型。
 //
 // 名前が衝突しない型は crate root へそのまま re-export する。alpha facade（`engine`）と
