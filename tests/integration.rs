@@ -1677,6 +1677,40 @@ fn shared_dag_equality_is_pruned_and_terminates_in_both_engines() {
 }
 
 #[test]
+fn shared_dag_print_is_bounded_by_single_string_limit_in_both_engines() {
+    // REV-001: 共有 DAG（同じ List を複数箇所から参照する構造）の print は、各出現を
+    // 展開する表示の意味論のため to_string すると指数サイズの文字列を materialize し、
+    // OOM につながる。budget-aware な render_display が per-item byte 上限を超えた時点で
+    // materialize 前に打ち切るため、per-item string 上限で有限停止する。両 engine で検証する。
+    //
+    // `[x, x]` を繰り返してダイヤモンドを深くする（展開すると 2^depth の出力）。
+    let depth = 30;
+    let mut source = String::from("let d0 = [1, 2, 3]\n");
+    for i in 0..depth {
+        source.push_str(&format!("let d{} = [d{}, d{}]\n", i + 1, i, i));
+    }
+    source.push_str(&format!("print(d{depth})\n"));
+
+    for use_vm in [false, true] {
+        // per-item string 上限を小さくして、指数展開の途中で打ち切らせる。
+        let output = run_repl_process(
+            &source,
+            use_vm,
+            &[("TSUMUGI_MAX_SINGLE_STRING_BYTES", "1000")],
+        );
+        let (_stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        // materialize 前に per-item string 上限で打ち切られる（指数サイズを確保しない）。
+        assert!(
+            stderr.contains("文字列の長さが上限を超えました"),
+            "{mode}で共有 DAG の print が string 上限で止まっていない: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn shared_builtin_range_gates_via_ledger_collection_limit_in_both_engines() {
     // REV-015 Slice 1: 共有 builtin（range）の collection 検査も、engine の
     // BudgetLedger が保持する上限（legacy env 由来）を単一の正本として使う。

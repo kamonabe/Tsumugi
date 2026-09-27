@@ -213,7 +213,13 @@ impl Evaluator {
                 let mut parts = Vec::new();
                 for arg in args {
                     let val = self.eval_expr(arg, line)?;
-                    parts.push(val.to_string());
+                    // budget-aware に描画する（REV-001）。共有 DAG を to_string で指数サイズに
+                    // materialize する前に、各複合ノードの fuel と per-item byte 上限で打ち切る。
+                    let rendered = self
+                        .budget
+                        .render_display(&val, ExecutionPhase::Run)
+                        .map_err(|stop| self.control_stop_to_error(stop, line))?;
+                    parts.push(rendered);
                 }
                 let payload = parts.join(" ");
                 // output（stdio host call）を課金する（§6.1、REV-015 Slice 2、I-O accounting）。

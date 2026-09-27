@@ -1325,7 +1325,16 @@ impl Vm {
                     values.push(self.pop(line)?);
                 }
                 values.reverse();
-                let output: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+                // budget-aware に描画する（REV-001）。tree engine（builtin.rs の print）と同じく
+                // 各複合ノードの fuel と per-item byte 上限で共有 DAG の指数を materialize 前に止める。
+                let mut output: Vec<String> = Vec::with_capacity(values.len());
+                for v in &values {
+                    let rendered = self
+                        .budget
+                        .render_display(v, ExecutionPhase::Run)
+                        .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
+                    output.push(rendered);
+                }
                 let payload = output.join(" ");
                 // output（stdio host call）を課金する（§6.1、REV-015 Slice 2、I-O accounting）。
                 // tree engine（builtin.rs の print）と同じ論理位置で payload を host へ渡す
@@ -1532,7 +1541,13 @@ impl Vm {
                 let parts: Vec<Value> = self.stack.drain(start..).collect();
                 let mut result = String::new();
                 for val in parts {
-                    result.push_str(&val.to_string());
+                    // budget-aware に描画する（REV-001）。tree engine（eval.rs の FStr）と同じく
+                    // 共有 DAG の指数を materialize 前に fuel + per-item byte 上限で止める。
+                    let rendered = self
+                        .budget
+                        .render_display(&val, ExecutionPhase::Run)
+                        .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
+                    result.push_str(&rendered);
                 }
                 // f-string の生成 body も dispatch を経由しないため課金する（REV-015 Slice 2）。
                 let value = self

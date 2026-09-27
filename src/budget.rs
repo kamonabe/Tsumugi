@@ -1749,6 +1749,112 @@ impl BudgetLedger {
         Ok(true)
     }
 
+    /// 値を人間可読な文字列へ描画し、指数時間／出力を materialize 前に有限化する（REV-001）。
+    ///
+    /// `Value` の [`Display`](std::fmt::Display) は `&self` で budget を持てず、共有 DAG
+    /// （同じ List/Dict を複数箇所から参照する構造）を native 再帰で辿るため、`to_string()`
+    /// は (1) 各出現を展開して指数時間、(2) 指数サイズの `String` を作り切ってから後追い課金、
+    /// という二重の増幅を起こす。本メソッドは書き出しながら、(a) List/Dict の各複合ノードで
+    /// `charge_fuel(1)` を課金して指数時間を fuel 上限で止め、(b) 累積出力が
+    /// `max_single_string_bytes` を超えた時点で `SingleStringBytes` 超過として打ち切り、
+    /// 指数サイズの `String` を確保する前に停止する（OOM 防止）。
+    ///
+    /// **visited スキップはしない**。`[c, c]` は `[[..], [..]]` と各出現を展開するのが表示の
+    /// 意味論であり、共有 backing でも省略しない。出力の有限化は byte 上限、時間の有限化は
+    /// fuel で達成する（現状 COW により Rc cycle は作れないので循環による無限は起きない）。
+    ///
+    /// `repr` が true なら文字列をクォート付きで描画する（collection の要素表示・`format_value_repr`
+    /// 相当）。false なら人間可読（トップレベルの `print` / f-string 相当）。返す `String` の
+    /// cumulative string / live heap への課金は呼び出し側の既存経路（`track_result` /
+    /// `charge_output`）に委ね、ここでは二重課金しない（fuel と per-item byte 上限だけを見る）。
+    pub fn render_display(
+        &mut self,
+        value: &crate::value::Value,
+        phase: ExecutionPhase,
+    ) -> Result<String, ControlStop> {
+        let mut out = String::new();
+        self.render_into(&mut out, value, false, phase)?;
+        Ok(out)
+    }
+
+    /// [`Self::render_display`] の再帰ヘルパ。`out` へ書き足しながら fuel と per-item byte
+    /// 上限を確認する。深さは既存 Display と同じ native 再帰で、AST 深度制限で bounded。
+    fn render_into(
+        &mut self,
+        out: &mut String,
+        value: &crate::value::Value,
+        repr: bool,
+        phase: ExecutionPhase,
+    ) -> Result<(), ControlStop> {
+        use crate::value::Value;
+
+        // 現在の累積出力が per-item 上限を超えていないか確認する（materialize 前に打ち切る）。
+        let limit = self.config.max_single_string_bytes;
+        if out.len() as u64 > limit {
+            self.check_cancel()?;
+            return Err(ControlStop::BudgetExceeded(BudgetExceeded {
+                resource: BudgetResource::SingleStringBytes,
+                limit,
+                used: 0,
+                reserved: 0,
+                requested: out.len() as u64,
+                unit: BudgetUnit::Bytes,
+                phase,
+            }));
+        }
+
+        match value {
+            Value::Str(s) => {
+                if repr {
+                    out.push('"');
+                    out.push_str(s.as_str());
+                    out.push('"');
+                } else {
+                    out.push_str(s.as_str());
+                }
+            }
+            Value::Int(n) => out.push_str(&n.to_string()),
+            Value::Float(n) => out.push_str(&n.to_string()),
+            Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Value::Null => out.push_str("null"),
+            Value::List(items) => {
+                // 複合ノードの展開ごとに fuel を課金し、共有 DAG の指数時間を止める。
+                self.charge_fuel(1, phase)?;
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    // 要素は repr（Str はクォート付き）で描画する（既存 format_value_repr と一致）。
+                    self.render_into(out, item, true, phase)?;
+                }
+                out.push(']');
+            }
+            Value::Dict(map) => {
+                self.charge_fuel(1, phase)?;
+                out.push('{');
+                for (i, (key, item)) in map.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push('"');
+                    out.push_str(key);
+                    out.push_str("\": ");
+                    self.render_into(out, item, true, phase)?;
+                }
+                out.push('}');
+            }
+            Value::Fn { def, .. } => {
+                out.push_str(&format!("<fn {}({})>", def.name, def.params.join(", ")));
+            }
+            Value::VmFn { name, params, .. } => {
+                out.push_str(&format!("<fn {}({})>", name, params.join(", ")));
+            }
+            Value::Error { message, .. } => out.push_str(message),
+        }
+        Ok(())
+    }
+
     /// 生成・変更された `Value` を走査し、untracked な collection backing を tracked へ
     /// 変換しつつ heap 課金する（REV-015 案A、per-drop release）。
     ///
@@ -2455,6 +2561,96 @@ mod tests {
             stop,
             ControlStop::BudgetExceeded(BudgetExceeded {
                 resource: BudgetResource::Fuel,
+                ..
+            })
+        ));
+    }
+
+    // -------------------------------------------------------------------------
+    // budget-aware 表示 render_display（REV-001）
+    // -------------------------------------------------------------------------
+
+    /// スカラー・List・Dict の描画が既存 Display（human / repr）と一致する。
+    #[test]
+    fn render_display_matches_existing_display() {
+        use crate::value::{Tracked, Value};
+        let mut l = ledger(BudgetConfig::for_legacy(1_000_000, 1_000_000));
+        // トップレベル Str は human（クォートなし）。
+        assert_eq!(
+            l.render_display(&Value::str_constant("hi".to_string()), ExecutionPhase::Run)
+                .unwrap(),
+            "hi"
+        );
+        // List は要素を repr（Str はクォート付き）で描画する（既存 format_value_repr と一致）。
+        let list = Value::List(Tracked::constant(vec![
+            Value::Int(1),
+            Value::str_constant("a".to_string()),
+        ]));
+        assert_eq!(
+            l.render_display(&list, ExecutionPhase::Run).unwrap(),
+            "[1, \"a\"]"
+        );
+        // Dict も key クォート + 値 repr。
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("k".to_string(), Value::Int(7));
+        let dict = Value::Dict(Tracked::constant(map));
+        assert_eq!(
+            l.render_display(&dict, ExecutionPhase::Run).unwrap(),
+            "{\"k\": 7}"
+        );
+        // 既存 Display（to_string）とも一致する。
+        assert_eq!(
+            l.render_display(&list, ExecutionPhase::Run).unwrap(),
+            list.to_string()
+        );
+    }
+
+    /// List/Dict の各複合ノードで fuel を 1 課金する（スカラーは課金しない）。
+    #[test]
+    fn render_display_charges_fuel_per_node() {
+        use crate::value::{Tracked, Value};
+        let mut l = ledger(BudgetConfig::for_legacy(1_000_000, 1_000_000));
+        // 外側 List + 内側 List = 2 複合ノード。
+        let nested = Value::List(Tracked::constant(vec![Value::List(Tracked::constant(
+            vec![Value::Int(1)],
+        ))]));
+        let _ = l.render_display(&nested, ExecutionPhase::Run).unwrap();
+        assert_eq!(l.usage().committed.fuel, 2);
+    }
+
+    /// 共有 DAG（ダイヤモンド）を描画すると各出現を展開する（visited スキップしない）ため、
+    /// 出力が per-item byte 上限を超えた時点で materialize 前に打ち切る。
+    #[test]
+    fn render_display_truncates_shared_dag_at_byte_limit() {
+        use crate::value::{Tracked, Value};
+        use std::rc::Rc as StdRc;
+
+        // depth 段のダイヤモンド。各段が 1 つ下を 2 回参照するので、展開すると 2^depth。
+        fn diamond(depth: usize) -> Value {
+            let mut node = Value::List(Tracked::constant(vec![Value::Int(0)]));
+            for _ in 0..depth {
+                let backing = match &node {
+                    Value::List(b) => StdRc::clone(b),
+                    _ => unreachable!(),
+                };
+                node = Value::List(Tracked::constant(vec![
+                    Value::List(StdRc::clone(&backing)),
+                    Value::List(backing),
+                ]));
+            }
+            node
+        }
+
+        // per-item byte 上限を小さくし、fuel は十分に与える。
+        let mut config = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+        config.max_single_string_bytes = 1_000;
+        let mut l = ledger(config);
+        let dag = diamond(30); // 展開すれば 2^30 byte 超、上限 1000 で打ち切られる。
+        let stop = l.render_display(&dag, ExecutionPhase::Run).unwrap_err();
+        assert!(matches!(
+            stop,
+            ControlStop::BudgetExceeded(BudgetExceeded {
+                resource: BudgetResource::SingleStringBytes,
                 ..
             })
         ));
