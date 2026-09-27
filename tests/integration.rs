@@ -1638,6 +1638,45 @@ fn step_limit_env_still_gates_both_engines_via_budget_ledger() {
 }
 
 #[test]
+fn shared_dag_equality_is_pruned_and_terminates_in_both_engines() {
+    // REV-001: 共有 DAG（同じ List を複数箇所から参照するダイヤモンド構造）の `==` は、
+    // 素朴な再帰なら参照を辿って 2^depth ノード訪問の指数時間になり、ホストを焼き尽くす。
+    // budget-aware な values_equal が visited pair で共有ペアの再訪を枝刈りするため、
+    // 指数が多項式（depth 線形）に落ち、深い DAG でも有限時間で正常完了する。
+    //
+    // `[x, x]` を繰り返してダイヤモンドを深くする（各段が 1 つ下の層を 2 回参照）。
+    // depth = 60 は素朴な再帰なら 2^60 訪問で事実上停止しないが、枝刈りありなら瞬時。
+    // 正常完了して正しい比較結果（等価な 2 本なので true）を出すこと自体が枝刈りの証明。
+    let depth = 60;
+    let mut source = String::from("let d0 = [1, 2, 3]\nlet e0 = [1, 2, 3]\n");
+    for i in 0..depth {
+        source.push_str(&format!("let d{} = [d{}, d{}]\n", i + 1, i, i));
+        source.push_str(&format!("let e{} = [e{}, e{}]\n", i + 1, i, i));
+    }
+    source.push_str(&format!("print(d{depth} == e{depth})\n"));
+    // 不等価な枝も検証: 深い DAG の葉だけ違えても、枝刈りしつつ false を返す。
+    source.push_str("let f = [1, 2, 4]\n");
+    source.push_str("print(d0 == f)\n");
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(&source, use_vm, &[]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        // 指数爆発せず正常完了し、正しい比較結果を出す。
+        assert!(
+            stdout.contains("true"),
+            "{mode}で等価な共有 DAG の比較結果が true でない: stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stdout.contains("false"),
+            "{mode}で不等価な比較結果が false でない: stdout={stdout} stderr={stderr}"
+        );
+    }
+}
+
+#[test]
 fn shared_builtin_range_gates_via_ledger_collection_limit_in_both_engines() {
     // REV-015 Slice 1: 共有 builtin（range）の collection 検査も、engine の
     // BudgetLedger が保持する上限（legacy env 由来）を単一の正本として使う。

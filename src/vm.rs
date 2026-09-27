@@ -1060,12 +1060,22 @@ impl Vm {
             OpCode::Eq => {
                 let right = self.pop(line)?;
                 let left = self.pop(line)?;
-                self.stack.push(Value::Bool(left == right));
+                // budget-aware な構造比較（REV-001）。共有 DAG の指数時間を fuel +
+                // visited pair で有限化する。意味論は tree の values_equal と同一。
+                let equal = self
+                    .budget
+                    .values_equal(&left, &right, ExecutionPhase::Run)
+                    .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
+                self.stack.push(Value::Bool(equal));
             }
             OpCode::NotEq => {
                 let right = self.pop(line)?;
                 let left = self.pop(line)?;
-                self.stack.push(Value::Bool(left != right));
+                let equal = self
+                    .budget
+                    .values_equal(&left, &right, ExecutionPhase::Run)
+                    .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
+                self.stack.push(Value::Bool(!equal));
             }
             OpCode::Lt => {
                 let right = self.pop(line)?;
