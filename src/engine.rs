@@ -290,12 +290,21 @@ pub enum ExecutionState {
     Terminal,
 }
 
-/// yield の理由（第9節 `YieldReason`）。PR-a では返さない骨格。
+/// yield の理由（第9節 `YieldReason`）。
+///
+/// 仕様の 6 種のうち、`SliceFuelExhausted`（REV-015 Slice 3 で実効化）と `ExplicitYield`
+/// だけを持つ。`AdmissionQueued` / `HostCallPending` / `AuditBackpressure` /
+/// `SchedulerPreempted` は scheduler・host pending（Slice 5）で導入する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum YieldReason {
-    /// slice fuel を使い切った（第4.2節）。PR-d で実効化。
+    /// slice fuel を使い切った（第4.2節）。REV-015 Slice 3 PR-d で実効化。
     SliceFuelExhausted,
-    /// script / host による明示 yield。後続 PR で実効化。
+    /// script / host による明示 yield。
+    ///
+    /// pause/resume の状態機械は Slice 4 (D) で実効化済みだが、この `ExplicitYield` を
+    /// 生成する trigger は未配線。script 側に `yield` 構文が無く、surface の追加は言語機能
+    /// 拡張になるため据え置く（enum variant だけ用意する）。host からの協調停止は現状
+    /// [`ExecutionHandle::pause`] で表現する。
     ExplicitYield,
 }
 
@@ -454,25 +463,69 @@ impl ExecutionHandle<'_, '_, '_> {
         }
     }
 
-    /// host 要求による pause（第9節）。PR-a では未対応（Slice 4 で実効化）。
+    /// host 要求による pause（第9節、REV-015 Slice 4）。
+    ///
+    /// `Created` / `Linked` / `Ready` / `Yielded` でだけ成功し、直前の状態を
+    /// [`PausedState::resume_to`] に保存して `Paused` へ遷移する（§9.2）。`Running` は
+    /// poll 中の mutable borrow 内なので到達せず、`Paused` は二重 pause、`Terminal` は
+    /// `HandleError::Terminal` になる。pause 中は評価器の永続 continuation（session /
+    /// frame stack / transaction journal）を yield と同じくそのまま保持し、resume まで
+    /// run-turn へ戻らない（§9.3 / §11）。deadline は pause 中も進む（clock を止めない）。
     pub fn pause(&mut self) -> Result<(), HandleError> {
-        match self.state {
-            ExecutionState::Terminal => Err(HandleError::Terminal),
-            _ => Err(HandleError::InvalidState {
+        if self.state == ExecutionState::Terminal {
+            return Err(HandleError::Terminal);
+        }
+        match Self::resume_target(&self.state) {
+            Some(resume_to) => {
+                self.state = ExecutionState::Paused(PausedState {
+                    reason: PauseReason::HostRequested,
+                    resume_to,
+                });
+                Ok(())
+            }
+            None => Err(HandleError::InvalidState {
                 operation: "pause",
                 state: self.state.clone(),
             }),
         }
     }
 
-    /// pause からの resume（第9節）。PR-a では未対応（Slice 4 で実効化）。
+    /// pause からの resume（第9節、REV-015 Slice 4）。
+    ///
+    /// `Paused` でだけ成功し、pause 前に保存した [`PausedState::resume_to`] の状態
+    /// （`Created` / `Linked` / `Ready` / `Yielded`）へ戻す（§9.2）。その状態から
+    /// 次の `poll` が continuation を resume する。`Terminal` は `HandleError::Terminal`、
+    /// それ以外の非 Paused は `InvalidState`。
     pub fn resume(&mut self) -> Result<(), HandleError> {
-        match self.state {
+        match &self.state {
             ExecutionState::Terminal => Err(HandleError::Terminal),
+            ExecutionState::Paused(paused) => {
+                self.state = match &paused.resume_to {
+                    ResumeState::Created => ExecutionState::Created,
+                    ResumeState::Linked => ExecutionState::Linked,
+                    ResumeState::Ready => ExecutionState::Ready,
+                    ResumeState::Yielded(reason) => ExecutionState::Yielded(reason.clone()),
+                };
+                Ok(())
+            }
             _ => Err(HandleError::InvalidState {
                 operation: "resume",
                 state: self.state.clone(),
             }),
+        }
+    }
+
+    /// pause 可能な状態なら、pause 中に保存する [`ResumeState`] を返す（§9.2）。
+    ///
+    /// `Created` / `Linked` / `Ready` / `Yielded` だけが pause でき、その他（`Running` /
+    /// `Paused` / `Terminal`）は `None`（pause 不可）。
+    fn resume_target(state: &ExecutionState) -> Option<ResumeState> {
+        match state {
+            ExecutionState::Created => Some(ResumeState::Created),
+            ExecutionState::Linked => Some(ResumeState::Linked),
+            ExecutionState::Ready => Some(ResumeState::Ready),
+            ExecutionState::Yielded(reason) => Some(ResumeState::Yielded(reason.clone())),
+            ExecutionState::Running | ExecutionState::Paused(_) | ExecutionState::Terminal => None,
         }
     }
 

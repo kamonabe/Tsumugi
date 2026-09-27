@@ -106,7 +106,8 @@ fn args_is_empty_without_injection() {
 // =============================================================================
 
 use tsumugi::{
-    ExecutionHandle, ExecutionRequest, ExecutionState, HandleError, PollResult, PollSlice,
+    ExecutionHandle, ExecutionRequest, ExecutionState, HandleError, PauseReason, PausedState,
+    PollResult, PollSlice, ResumeState,
 };
 
 /// create_execution は Created から始まり、poll で Terminal(Completed) へ到達する。
@@ -448,4 +449,159 @@ let bad = missing_name\n";
         matches!(outcome, ExecutionOutcome::RuntimeError { .. }),
         "未定義変数参照は RuntimeError を期待: {outcome:?}"
     );
+}
+
+// =============================================================================
+// pause / resume 状態機械（REV-015 Slice 4 (D)、実行制御仕様 §9.1 / §9.2 / §11 / §15.3）
+// =============================================================================
+
+/// Created から pause すると Paused(resume_to: Created) へ遷移し、resume で Created へ戻る。
+/// pause 中の poll は拒否され、resume 後に poll して terminal まで到達できる。
+#[test]
+fn pause_from_created_resumes_to_created_and_completes() {
+    let engine = Engine::new();
+    let script = engine.compile("let x = 1 + 2\n").unwrap();
+    let mut context = ExecutionContext::new();
+    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    assert_eq!(handle.state(), ExecutionState::Created);
+
+    // Created から pause。resume_to は Created。
+    handle.pause().expect("Created からの pause は成功する");
+    assert_eq!(
+        handle.state(),
+        ExecutionState::Paused(PausedState {
+            reason: PauseReason::HostRequested,
+            resume_to: ResumeState::Created,
+        })
+    );
+
+    // pause 中の poll は拒否される（§11: read-only、resume/cancel/drop のみ）。
+    assert_eq!(
+        handle.poll(PollSlice::default()),
+        Err(HandleError::InvalidState {
+            operation: "poll",
+            state: ExecutionState::Paused(PausedState {
+                reason: PauseReason::HostRequested,
+                resume_to: ResumeState::Created,
+            }),
+        })
+    );
+
+    // resume で Created へ戻り、poll で terminal まで到達する。
+    handle.resume().expect("Paused からの resume は成功する");
+    assert_eq!(handle.state(), ExecutionState::Created);
+    match handle.poll(PollSlice::default()).unwrap() {
+        PollResult::Terminal { outcome, .. } => assert_eq!(outcome, ExecutionOutcome::Completed),
+        other => panic!("resume 後は terminal を期待: {other:?}"),
+    }
+}
+
+/// Yielded 状態から pause すると resume_to に YieldReason を保持し、resume で Yielded へ戻る。
+/// pause/resume を挟んでも、挟まない場合と同じ terminal（Completed）へ到達する。
+#[test]
+fn pause_from_yielded_preserves_reason_and_completes() {
+    let source = "\
+let i = 0\n\
+while i < 100\n\
+  i = i + 1\n\
+end\n";
+    let engine = Engine::new();
+    let script = engine.compile(source).unwrap();
+    let mut context = ExecutionContext::new();
+    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let small_slice = PollSlice { max_fuel: 16 };
+
+    // 初回 poll で yield させる。
+    match handle.poll(small_slice).unwrap() {
+        PollResult::Yielded { reason, .. } => {
+            assert_eq!(reason, YieldReason::SliceFuelExhausted)
+        }
+        other => panic!("初回は yield を期待: {other:?}"),
+    }
+    assert_eq!(
+        handle.state(),
+        ExecutionState::Yielded(YieldReason::SliceFuelExhausted)
+    );
+
+    // Yielded から pause。resume_to は Yielded(SliceFuelExhausted)。
+    handle.pause().expect("Yielded からの pause は成功する");
+    assert_eq!(
+        handle.state(),
+        ExecutionState::Paused(PausedState {
+            reason: PauseReason::HostRequested,
+            resume_to: ResumeState::Yielded(YieldReason::SliceFuelExhausted),
+        })
+    );
+
+    // resume で Yielded へ戻る。
+    handle.resume().expect("resume は成功する");
+    assert_eq!(
+        handle.state(),
+        ExecutionState::Yielded(YieldReason::SliceFuelExhausted)
+    );
+
+    // 続けて poll すれば terminal まで到達する（continuation は pause/resume で失われない）。
+    let outcome = loop {
+        match handle.poll(small_slice).unwrap() {
+            PollResult::Yielded { .. } => continue,
+            PollResult::Terminal { outcome, .. } => break outcome,
+            PollResult::Paused { .. } => panic!("pause は要求していない"),
+        }
+    };
+    assert_eq!(outcome, ExecutionOutcome::Completed);
+}
+
+/// 二重 pause は InvalidState（Paused からは pause できない）。
+#[test]
+fn double_pause_is_rejected() {
+    let engine = Engine::new();
+    let script = engine.compile("let x = 1\n").unwrap();
+    let mut context = ExecutionContext::new();
+    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+
+    handle.pause().expect("最初の pause は成功する");
+    // 2 回目の pause は Paused 状態からは不正。
+    assert_eq!(
+        handle.pause(),
+        Err(HandleError::InvalidState {
+            operation: "pause",
+            state: ExecutionState::Paused(PausedState {
+                reason: PauseReason::HostRequested,
+                resume_to: ResumeState::Created,
+            }),
+        })
+    );
+}
+
+/// Paused 以外からの resume は InvalidState（Created からは resume できない）。
+#[test]
+fn resume_without_pause_is_rejected() {
+    let engine = Engine::new();
+    let script = engine.compile("let x = 1\n").unwrap();
+    let mut context = ExecutionContext::new();
+    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+
+    assert_eq!(
+        handle.resume(),
+        Err(HandleError::InvalidState {
+            operation: "resume",
+            state: ExecutionState::Created,
+        })
+    );
+}
+
+/// terminal 到達後の pause / resume は HandleError::Terminal（§15.3）。
+#[test]
+fn pause_and_resume_after_terminal_are_rejected() {
+    let engine = Engine::new();
+    let script = engine.compile("let x = 1\n").unwrap();
+    let mut context = ExecutionContext::new();
+    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+
+    // terminal まで進める。
+    let _ = handle.poll(PollSlice::default()).unwrap();
+    assert_eq!(handle.state(), ExecutionState::Terminal);
+
+    assert_eq!(handle.pause(), Err(HandleError::Terminal));
+    assert_eq!(handle.resume(), Err(HandleError::Terminal));
 }
