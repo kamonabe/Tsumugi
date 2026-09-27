@@ -505,7 +505,14 @@ pub fn builtin_split(
     Ok(Value::List(Tracked::constant(parts)))
 }
 
-pub fn builtin_join(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
+/// `join` の budget-aware 版（REV-001）。要素を `to_string` で materialize する代わりに
+/// `BudgetLedger::render_display` で描画し、共有 DAG の指数時間／出力を fuel + per-item
+/// byte 上限で有限化する。tree/VM の dispatch 境界が budget を渡して呼ぶ。
+pub fn builtin_join_budgeted(
+    args: &[Value],
+    budget: &mut crate::budget::BudgetLedger,
+    line: usize,
+) -> Result<Value, TsumugiError> {
     check_arity("join", args, 2, line)?;
     let Value::List(list) = &args[0] else {
         return Err(TsumugiError::builtin_arg_type(
@@ -513,8 +520,28 @@ pub fn builtin_join(args: &[Value], line: usize) -> Result<Value, TsumugiError> 
         ));
     };
     let sep = require_str(&args[1], "join", 2, line)?;
-    let parts: Vec<String> = list.iter().map(|v| v.to_string()).collect();
+    let mut parts: Vec<String> = Vec::with_capacity(list.len());
+    for v in list.iter() {
+        let rendered = budget
+            .render_display(v, crate::budget::ExecutionPhase::Run)
+            .map_err(|stop| crate::budget::control_stop_to_error(stop, 0, line))?;
+        parts.push(rendered);
+    }
     Ok(Value::str_constant(parts.join(sep)))
+}
+
+/// `to_str` の budget-aware 版（REV-001）。`to_string` の代わりに
+/// `BudgetLedger::render_display` で描画し、共有 DAG の指数時間／出力を有限化する。
+pub fn builtin_to_str_budgeted(
+    args: &[Value],
+    budget: &mut crate::budget::BudgetLedger,
+    line: usize,
+) -> Result<Value, TsumugiError> {
+    check_arity("to_str", args, 1, line)?;
+    let rendered = budget
+        .render_display(&args[0], crate::budget::ExecutionPhase::Run)
+        .map_err(|stop| crate::budget::control_stop_to_error(stop, 0, line))?;
+    Ok(Value::str_constant(rendered))
 }
 
 pub fn builtin_trim(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
@@ -661,11 +688,6 @@ pub fn builtin_to_int(args: &[Value], line: usize) -> Result<Value, TsumugiError
             other,
         )),
     }
-}
-
-pub fn builtin_to_str(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    check_arity("to_str", args, 1, line)?;
-    Ok(Value::str_constant(args[0].to_string()))
 }
 
 pub fn builtin_to_float(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
@@ -1825,7 +1847,9 @@ pub fn dispatch(
         "reverse" => builtin_reverse(args, line)?,
         "range" => builtin_range(args, max_collection, line)?,
         "split" => builtin_split(args, max_collection, line)?,
-        "join" => builtin_join(args, line)?,
+        // join / to_str は REV-001 で budget-aware 版（builtin_join_budgeted /
+        // builtin_to_str_budgeted）へ移し、tree/VM の dispatch 境界が intercept する。
+        // ここへは到達しない（budget を持てない dispatch では指数出力を有限化できない）。
         "trim" => builtin_trim(args, line)?,
         "upper" => builtin_upper(args, line)?,
         "lower" => builtin_lower(args, line)?,
@@ -1833,7 +1857,6 @@ pub fn dispatch(
         "ends_with" => builtin_ends_with(args, line)?,
         "replace" => builtin_replace(args, line)?,
         "to_int" => builtin_to_int(args, line)?,
-        "to_str" => builtin_to_str(args, line)?,
         "to_float" => builtin_to_float(args, line)?,
         "abs" => builtin_abs(args, line)?,
         "min" => builtin_min(args, line)?,

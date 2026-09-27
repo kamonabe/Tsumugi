@@ -1711,6 +1711,41 @@ fn shared_dag_print_is_bounded_by_single_string_limit_in_both_engines() {
 }
 
 #[test]
+fn shared_dag_to_str_and_join_are_bounded_in_both_engines() {
+    // REV-001: to_str / join も値を表示して文字列化するため、共有 DAG を to_string で
+    // 指数サイズに materialize し得る。budget-aware な render_display 経由（fuel + per-item
+    // byte 上限）へ移したので、共有 DAG の to_str / join は per-item string 上限で
+    // materialize 前に打ち切る。両 engine で検証する。
+    let depth = 30;
+    let mut prelude = String::from("let d0 = [1, 2, 3]\n");
+    for i in 0..depth {
+        prelude.push_str(&format!("let d{} = [d{}, d{}]\n", i + 1, i, i));
+    }
+
+    // to_str（単一値の表示）と join（List 要素の表示連結）の両方を検証する。
+    let to_str_src = format!("{prelude}print(to_str(d{depth}))\n");
+    let join_src = format!("{prelude}print(join([d{depth}, d{depth}], \", \"))\n");
+
+    for (label, src) in [("to_str", &to_str_src), ("join", &join_src)] {
+        for use_vm in [false, true] {
+            let output =
+                run_repl_process(src, use_vm, &[("TSUMUGI_MAX_SINGLE_STRING_BYTES", "1000")]);
+            let (_stdout, stderr) = output_text(&output);
+            let mode = if use_vm { "VM" } else { "tree" };
+
+            assert!(
+                output.status.success(),
+                "{mode} {label} REPLが異常終了: {stderr}"
+            );
+            assert!(
+                stderr.contains("文字列の長さが上限を超えました"),
+                "{mode}で共有 DAG の {label} が string 上限で止まっていない: {stderr}"
+            );
+        }
+    }
+}
+
+#[test]
 fn shared_builtin_range_gates_via_ledger_collection_limit_in_both_engines() {
     // REV-015 Slice 1: 共有 builtin（range）の collection 検査も、engine の
     // BudgetLedger が保持する上限（legacy env 由来）を単一の正本として使う。
