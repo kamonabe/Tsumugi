@@ -156,6 +156,14 @@ impl Engine {
                         ExecutionOutcome::Completed => Ok(ExecutionOutcome::Completed),
                         ExecutionOutcome::RuntimeError { error }
                         | ExecutionOutcome::LinkError { error } => Err(error),
+                        // cancel / deadline は既定の同期経路（`execute`）では起きない
+                        // （token 未 cancel・clock 未注入）が、防御的に従来互換の Err へ写す。
+                        // 構造化 terminal は `poll` で `ExecutionOutcome::Cancelled` /
+                        // `DeadlineExceeded` として観測する。
+                        ExecutionOutcome::Cancelled => Err(TsumugiError::cancelled(0)),
+                        ExecutionOutcome::DeadlineExceeded => {
+                            Err(TsumugiError::deadline_exceeded(0))
+                        }
                     };
                 }
                 Ok(PollResult::Yielded { .. }) | Ok(PollResult::Paused { .. }) => continue,
@@ -367,11 +375,14 @@ pub enum HandleError {
 
 /// スクリプト実行の terminal payload（第9節 `ExecutionOutcome`）。
 ///
-/// PR-a で到達し得るのは、正常完了 `Completed`、実行中失敗 `RuntimeError`、Link 中失敗
-/// `LinkError` の 3 種。仕様の他の terminal（`Exited` は REV-023、`Denied` / `HostError` /
-/// `BudgetExceeded` / `DeadlineExceeded` / `Cancelled` などは Slice 4/5・Phase 2）は、
-/// 対応する機構が入る後続 PR で追加する。現状の予算超過はツリーウォーク評価器が
-/// `TsumugiError`（limit 系）として返すため `RuntimeError` に含まれる。
+/// 到達し得るのは、正常完了 `Completed`、実行中失敗 `RuntimeError`、Link 中失敗
+/// `LinkError`、協調停止 `Cancelled`、deadline 超過 `DeadlineExceeded` の 5 種。`Cancelled` /
+/// `DeadlineExceeded` は catch 不能 terminal 信号（REV-015 Slice 4）で、tree evaluator が
+/// [`crate::error::ErrorKind::Cancelled`] / [`crate::error::ErrorKind::DeadlineExceeded`] を
+/// surface したときに [`ExecutionHandle::poll`] がこの専用 variant へ写す（`RuntimeError` に
+/// 埋もれさせない）。仕様の他の terminal（`Exited` は REV-023、`Denied` / `HostError` /
+/// `BudgetExceeded` などは Slice 5・Phase 2）は対応機構が入る後続 PR で追加する。予算超過
+/// （limit 系）は現状 `RuntimeError` に含まれる。
 ///
 /// 最終 `BudgetUsage` は [`PollResult::Terminal`] の `usage` field で観測する。terminal
 /// 理由（outcome）と usage を二重に持たせないため、本 enum の error 変種は `error` だけを
@@ -384,6 +395,12 @@ pub enum ExecutionOutcome {
     RuntimeError { error: TsumugiError },
     /// 最初の文を実行する前の Link フェーズ（import 解決・source/heap 課金）で失敗した。
     LinkError { error: TsumugiError },
+    /// host が [`ExecutionHandle::cancellation_token`] で要求した協調的 cancel で停止した
+    /// （REV-015 Slice 4、§8）。language-state は実行開始時点へ rollback 済み（§10 規則3）。
+    Cancelled,
+    /// 実行 deadline を超過して停止した（REV-015 Slice 4、§7 / §8）。
+    /// language-state は実行開始時点へ rollback 済み（§10 規則3）。
+    DeadlineExceeded,
 }
 
 /// 実行を進める handle（第9節 `ExecutionHandle`）。
@@ -424,6 +441,19 @@ impl ExecutionHandle<'_, '_, '_> {
         self.outcome.as_ref()
     }
 
+    /// この実行の協調的 cancel token の clone を返す（第9.1節、REV-015 Slice 4）。
+    ///
+    /// 返る [`CancellationToken`](crate::budget::CancellationToken) は `Arc<AtomicBool>` の
+    /// clone で `Send + Sync`。host はこれを別スレッドで保持し、`cancel()` を呼ぶことで実行中
+    /// の handle を協調的に停止できる（§8）。cancel は各 fuel charge 前と文/反復境界の
+    /// checkpoint で観測され、次の [`Self::poll`] が [`ExecutionState::Terminal`] へ遷移して
+    /// [`ExecutionOutcome::Cancelled`] を返す。既に terminal へ到達した後の cancel は outcome を
+    /// 変えない（§8「commit 後の cancel は結果を変えない」）。別スレッドへ公開するのはこの
+    /// token と waker だけで、continuation や context への参照は渡さない（§9.1）。
+    pub fn cancellation_token(&self) -> crate::budget::CancellationToken {
+        self.context.evaluator.cancellation_token()
+    }
+
     /// 実行を 1 slice 進める（第9節 `poll`）。
     ///
     /// `Created` / `Linked` / `Ready` / `Yielded` から呼ぶと `Running` を経て、初回は link を
@@ -454,6 +484,14 @@ impl ExecutionHandle<'_, '_, '_> {
                         })
                     }
                     SlicePoll::Terminal(outcome) => {
+                        // terminal は 1 回だけセットする（§8 / §15.3）。handle は !Send + !Sync で
+                        // 単一スレッド運用のため、cancel（別スレッドが token を立てるだけ）と正常
+                        // 完了の決着は必ずこの poll 内で単一スレッド的に行われる。ここで state を
+                        // Terminal にすると、以後の poll / pause / resume は先頭の
+                        // `ExecutionState::Terminal` 分岐で `HandleError::Terminal` になり、後から
+                        // 到達した cancel は outcome を変えない（cancel の linearization point は
+                        // token の compare-and-set＝`CancellationToken::cancel` の false→true だが、
+                        // それが観測されるのは次 checkpoint であり、既に terminal 済みなら無視される）。
                         self.state = ExecutionState::Terminal;
                         self.outcome = Some(outcome.clone());
                         Ok(PollResult::Terminal { outcome, usage })
@@ -550,14 +588,20 @@ impl ExecutionHandle<'_, '_, '_> {
                     self.started = true;
                 }
                 Err((phase, error)) => {
-                    // Link 失敗は terminal。transaction 経路は Link/Run を区別せず RuntimeError。
-                    let outcome = if transactional {
-                        ExecutionOutcome::RuntimeError { error }
-                    } else {
-                        match phase {
+                    // cancel / deadline は catch 不能 terminal 信号。Link フェーズの課金
+                    // checkpoint（charge_link）で観測されても専用 terminal へ写す（§8）。
+                    let outcome = match error.kind() {
+                        Some(crate::error::ErrorKind::Cancelled) => ExecutionOutcome::Cancelled,
+                        Some(crate::error::ErrorKind::DeadlineExceeded) => {
+                            ExecutionOutcome::DeadlineExceeded
+                        }
+                        // それ以外の Link 失敗は terminal。transaction 経路は Link/Run を
+                        // 区別せず RuntimeError。
+                        _ if transactional => ExecutionOutcome::RuntimeError { error },
+                        _ => match phase {
                             RunPhase::Link => ExecutionOutcome::LinkError { error },
                             RunPhase::Run => ExecutionOutcome::RuntimeError { error },
-                        }
+                        },
                     };
                     return SlicePoll::Terminal(outcome);
                 }
@@ -568,9 +612,20 @@ impl ExecutionHandle<'_, '_, '_> {
         match self.context.evaluator.run_slice(slice_fuel) {
             None => SlicePoll::Yielded,
             Some(Ok(())) => SlicePoll::Terminal(ExecutionOutcome::Completed),
-            // 実行フェーズの失敗（予算超過を含む）は RuntimeError（transaction は commit/
-            // rollback を run_slice が済ませている）。
-            Some(Err(error)) => SlicePoll::Terminal(ExecutionOutcome::RuntimeError { error }),
+            // 実行フェーズの失敗（transaction は commit/rollback を run_slice が済ませている）。
+            // cancel / deadline は catch 不能 terminal 信号なので専用 outcome へ写し、
+            // RuntimeError に埋もれさせない（REV-015 Slice 4、§8）。予算超過（limit 系）を
+            // 含む他の未捕捉エラーは RuntimeError。
+            Some(Err(error)) => {
+                let outcome = match error.kind() {
+                    Some(crate::error::ErrorKind::Cancelled) => ExecutionOutcome::Cancelled,
+                    Some(crate::error::ErrorKind::DeadlineExceeded) => {
+                        ExecutionOutcome::DeadlineExceeded
+                    }
+                    _ => ExecutionOutcome::RuntimeError { error },
+                };
+                SlicePoll::Terminal(outcome)
+            }
         }
     }
 }

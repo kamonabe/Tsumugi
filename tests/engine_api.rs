@@ -106,8 +106,8 @@ fn args_is_empty_without_injection() {
 // =============================================================================
 
 use tsumugi::{
-    ExecutionHandle, ExecutionRequest, ExecutionState, HandleError, PauseReason, PausedState,
-    PollResult, PollSlice, ResumeState,
+    CancellationToken, ExecutionHandle, ExecutionRequest, ExecutionState, HandleError, PauseReason,
+    PausedState, PollResult, PollSlice, ResumeState,
 };
 
 /// create_execution は Created から始まり、poll で Terminal(Completed) へ到達する。
@@ -604,4 +604,145 @@ fn pause_and_resume_after_terminal_are_rejected() {
 
     assert_eq!(handle.pause(), Err(HandleError::Terminal));
     assert_eq!(handle.resume(), Err(HandleError::Terminal));
+}
+
+// =============================================================================
+// race linearization / terminal 後拒否（REV-015 Slice 4 (E)、実行制御仕様 §8 / §15.3）
+// =============================================================================
+
+/// handle は cancel token を公開し、実行前に cancel すると最初の poll で Cancelled terminal
+/// になる（§8: cancel が先に観測されれば Cancelled へ遷移）。language-state は rollback される。
+#[test]
+fn cancel_before_poll_reaches_cancelled_terminal() {
+    let source = "\
+let i = 0\n\
+while i < 100\n\
+  i = i + 1\n\
+end\n";
+    let engine = Engine::new();
+    let script = engine.compile(source).unwrap();
+    let mut context = ExecutionContext::new();
+    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+
+    // handle から cancel token を取り、実行前に cancel する（別スレッドの cancel を模す）。
+    let token: CancellationToken = handle.cancellation_token();
+    assert!(
+        token.cancel(),
+        "初回 cancel は true（§8 linearization point）"
+    );
+
+    // 最初の poll は charge 前 checkpoint で cancel を観測し、Cancelled terminal になる。
+    match handle.poll(PollSlice::default()).unwrap() {
+        PollResult::Terminal { outcome, .. } => {
+            assert_eq!(outcome, ExecutionOutcome::Cancelled)
+        }
+        other => panic!("cancel 済みなら Cancelled terminal を期待: {other:?}"),
+    }
+    assert_eq!(handle.state(), ExecutionState::Terminal);
+    assert_eq!(handle.outcome(), Some(&ExecutionOutcome::Cancelled));
+}
+
+/// yield を跨いだ後に cancel しても、次の poll で Cancelled terminal になる（§8 の確認点）。
+#[test]
+fn cancel_across_yield_reaches_cancelled_terminal() {
+    let source = "\
+let i = 0\n\
+while i < 200\n\
+  i = i + 1\n\
+end\n";
+    let engine = Engine::new();
+    let script = engine.compile(source).unwrap();
+    let mut context = ExecutionContext::new();
+    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let token = handle.cancellation_token();
+    let small_slice = PollSlice { max_fuel: 16 };
+
+    // 初回 poll で yield させる。
+    match handle.poll(small_slice).unwrap() {
+        PollResult::Yielded { .. } => {}
+        other => panic!("初回は yield を期待: {other:?}"),
+    }
+
+    // yield 中に cancel。次の poll で checkpoint が観測し Cancelled terminal になる。
+    assert!(token.cancel());
+    let outcome = loop {
+        match handle.poll(small_slice).unwrap() {
+            PollResult::Yielded { .. } => continue,
+            PollResult::Terminal { outcome, .. } => break outcome,
+            PollResult::Paused { .. } => panic!("pause は要求していない"),
+        }
+    };
+    assert_eq!(outcome, ExecutionOutcome::Cancelled);
+}
+
+/// 正常完了後の cancel は outcome を変えない（§8「commit 後の cancel は結果を変えない」）。
+/// terminal event は1回だけで、以後の poll は HandleError::Terminal。
+#[test]
+fn cancel_after_completion_does_not_change_outcome() {
+    let engine = Engine::new();
+    let script = engine.compile("let x = 1 + 2\n").unwrap();
+    let mut context = ExecutionContext::new();
+    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let token = handle.cancellation_token();
+
+    // 正常完了させる。
+    match handle.poll(PollSlice::default()).unwrap() {
+        PollResult::Terminal { outcome, .. } => {
+            assert_eq!(outcome, ExecutionOutcome::Completed)
+        }
+        other => panic!("Completed を期待: {other:?}"),
+    }
+
+    // 完了後に cancel しても outcome は Completed のまま。
+    assert!(token.cancel(), "cancel 自体は成功する（token の状態遷移）");
+    assert_eq!(handle.outcome(), Some(&ExecutionOutcome::Completed));
+    // terminal event は1回だけ: 以後の poll は拒否される。
+    assert_eq!(
+        handle.poll(PollSlice::default()),
+        Err(HandleError::Terminal)
+    );
+}
+
+/// Paused 状態でも cancel でき（§11: pause 中に許可する操作は resume/cancel/drop）、
+/// resume 後の poll で Cancelled terminal になる。
+#[test]
+fn cancel_during_pause_then_resume_reaches_cancelled() {
+    let source = "\
+let i = 0\n\
+while i < 100\n\
+  i = i + 1\n\
+end\n";
+    let engine = Engine::new();
+    let script = engine.compile(source).unwrap();
+    let mut context = ExecutionContext::new();
+    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let token = handle.cancellation_token();
+
+    // Created から pause。
+    handle.pause().expect("pause は成功する");
+    // pause 中に cancel（§11 で許可）。
+    assert!(token.cancel());
+    // resume して poll すると Cancelled terminal。
+    handle.resume().expect("resume は成功する");
+    match handle.poll(PollSlice::default()).unwrap() {
+        PollResult::Terminal { outcome, .. } => {
+            assert_eq!(outcome, ExecutionOutcome::Cancelled)
+        }
+        other => panic!("cancel 済みなら Cancelled terminal を期待: {other:?}"),
+    }
+}
+
+/// cancel は idempotent（clone を跨いで最初の false→true だけ true、§8）。
+#[test]
+fn cancel_token_is_idempotent_across_clones() {
+    let engine = Engine::new();
+    let script = engine.compile("let x = 1\n").unwrap();
+    let mut context = ExecutionContext::new();
+    let handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+
+    let token_a = handle.cancellation_token();
+    let token_b = handle.cancellation_token();
+    assert!(token_a.cancel(), "初回 cancel は true");
+    assert!(!token_b.cancel(), "clone を跨いでも 2 回目は false");
+    assert!(token_a.is_cancelled() && token_b.is_cancelled());
 }
