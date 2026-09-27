@@ -421,17 +421,39 @@ pub fn builtin_contains(args: &[Value], line: usize) -> Result<Value, TsumugiErr
     }
 }
 
-pub fn builtin_sort(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
+/// `sort` の budget-aware 版（REV-001）。ソートキーを `to_string`（Display）で materialize
+/// する代わりに `BudgetLedger::render_display` で描画し、共有 DAG の指数時間／出力を fuel +
+/// per-item byte 上限で有限化する。tree/VM の dispatch 境界が budget を渡して呼ぶ。
+///
+/// 順序は現状どおり **文字列表現比較**（`str` の Unicode コードポイント順）を維持する
+/// （language-spec「文字列表現で比較」・semantic-decisions §17.1.9 で数値順化は別課題）。
+/// キーを先に全要素ぶん生成してから安定ソートするため、`sort_by_key(to_string)` と同一の
+/// 順序・安定性になる（同一キーの要素は元の順序を保つ）。全順序 TotalOrderKey への分離は
+/// REV-017 で扱う。
+pub fn builtin_sort_budgeted(
+    args: &[Value],
+    budget: &mut crate::budget::BudgetLedger,
+    line: usize,
+) -> Result<Value, TsumugiError> {
     check_arity("sort", args, 1, line)?;
-    if let Value::List(list) = &args[0] {
-        let mut sorted = (**list).clone();
-        sorted.sort_by_key(|a| a.to_string());
-        Ok(Value::List(Tracked::constant(sorted)))
-    } else {
-        Err(TsumugiError::builtin_arg_type(
+    let Value::List(list) = &args[0] else {
+        return Err(TsumugiError::builtin_arg_type(
             line, "sort", 1, "List", &args[0],
-        ))
+        ));
+    };
+    // 各要素の描画キーを budget-aware に先に生成する（materialize 前に打ち切る）。
+    let mut keyed: Vec<(String, Value)> = Vec::with_capacity(list.len());
+    for v in list.iter() {
+        let key = budget
+            .render_display(v, crate::budget::ExecutionPhase::Run)
+            .map_err(|stop| crate::budget::control_stop_to_error(stop, 0, line))?;
+        keyed.push((key, v.clone()));
     }
+    // 安定ソート（sort_by は stable）。キーが同じ要素は元の順序を保ち、
+    // sort_by_key(to_string) と完全に同一の並びになる。
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    let sorted: Vec<Value> = keyed.into_iter().map(|(_, v)| v).collect();
+    Ok(Value::List(Tracked::constant(sorted)))
 }
 
 pub fn builtin_reverse(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
@@ -1843,13 +1865,13 @@ pub fn dispatch(
         "type" => builtin_type(args, line)?,
         "slice" => builtin_slice(args, line)?,
         "contains" => builtin_contains(args, line)?,
-        "sort" => builtin_sort(args, line)?,
         "reverse" => builtin_reverse(args, line)?,
         "range" => builtin_range(args, max_collection, line)?,
         "split" => builtin_split(args, max_collection, line)?,
-        // join / to_str は REV-001 で budget-aware 版（builtin_join_budgeted /
-        // builtin_to_str_budgeted）へ移し、tree/VM の dispatch 境界が intercept する。
-        // ここへは到達しない（budget を持てない dispatch では指数出力を有限化できない）。
+        // sort / join / to_str は REV-001 で budget-aware 版（builtin_sort_budgeted /
+        // builtin_join_budgeted / builtin_to_str_budgeted）へ移し、tree/VM の dispatch
+        // 境界が intercept する。ここへは到達しない（budget を持てない dispatch では
+        // 共有 DAG の指数時間／出力を有限化できない）。
         "trim" => builtin_trim(args, line)?,
         "upper" => builtin_upper(args, line)?,
         "lower" => builtin_lower(args, line)?,

@@ -1855,6 +1855,12 @@ impl Vm {
                 &mut self.budget,
                 line,
             )?)
+        } else if name == "sort" {
+            Some(crate::builtin_core::builtin_sort_budgeted(
+                &args,
+                &mut self.budget,
+                line,
+            )?)
         } else {
             match fs_capability_result {
                 Some(value) => Some(value),

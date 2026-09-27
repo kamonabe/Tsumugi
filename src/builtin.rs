@@ -170,6 +170,12 @@ impl Evaluator {
                         &mut self.budget,
                         line,
                     )?)
+                } else if name == "sort" {
+                    Some(crate::builtin_core::builtin_sort_budgeted(
+                        &evaluated,
+                        &mut self.budget,
+                        line,
+                    )?)
                 } else if crate::builtin_core::is_filesystem_builtin(name)
                     && let Some(fs) = self.capabilities().filesystem()
                 {
