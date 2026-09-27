@@ -655,6 +655,12 @@ impl Evaluator {
     /// 開始し、root 文列を Block frame として共有 frame stack へ積む。まだ 1 文も実行しない。
     /// 成功後は [`Self::run_slice`] を繰り返し呼んで実行を進める。Link 失敗は
     /// `Err((RunPhase::Link, _))` を返し、セッションは張らない（language-state 不変）。
+    ///
+    /// `transactional` なら submission journal を execution の **開始時点で 1 回だけ**張る
+    /// （§10 規則7: yield / pause は transaction 境界ではない）。journal は yield を跨いで
+    /// 保持され（[`Self::run_slice`] の yield 分岐は `finalize_session` を呼ばない）、
+    /// terminal に到達したときだけ [`Self::finalize_session`] が commit / rollback する。
+    /// このため slice 分割の有無にかかわらず、execution 全体が 1 つの transaction になる。
     pub fn begin_execution(
         &mut self,
         program: &Program,
@@ -737,6 +743,11 @@ impl Evaluator {
         self.slice_fuel_limit = None;
 
         match outcome {
+            // yield は transaction 境界ではない（§10 規則7）。ここで `finalize_session` を
+            // 呼ばず、session（`RunSession`）・永続 frame stack・`env` の submission journal を
+            // そのまま保持したまま `None` を返す。次の `run_slice`（resume）が同じ session と
+            // journal の上で実行を続けるため、yield を何度挟んでも execution 全体が 1 つの
+            // transaction になり、terminal で初めて commit / rollback される。
             Ok(DriveOutcome::Yielded) => None,
             Ok(DriveOutcome::Done(result)) => {
                 // 本体完了。EvalResult を terminal 結果へ写し、transaction / module を finalize。
@@ -2346,6 +2357,96 @@ mod tests {
             Some(crate::error::ErrorKind::Cancelled),
             "try/catch must not catch cancel terminal: {err:?}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // transaction を yield 跨ぎで保持する（REV-015 Slice 4 (C)、§10 規則7 / §15.3）
+    // -------------------------------------------------------------------------
+
+    /// transactional 実行を `slice_fuel` 刻みで terminal まで駆動し、terminal 結果と、
+    /// 実行後（commit/rollback 済み）の Evaluator を返す。yield を跨いでも session と
+    /// journal は保持され、resume 後も同一 transaction を続ける（§10 規則7）。
+    /// `yields` は途中で観測した yield 回数。
+    fn run_transactional_sliced(
+        input: &str,
+        slice_fuel: u64,
+    ) -> (Result<(), TsumugiError>, Evaluator, usize) {
+        let program = parse_program(input);
+        let mut eval = Evaluator::new();
+        eval.begin_execution(&program, input.len() as u64, true)
+            .expect("begin_execution (transactional) should succeed for import-free root");
+        let mut yields = 0usize;
+        let result = loop {
+            match eval.run_slice(slice_fuel) {
+                None => {
+                    yields += 1;
+                    assert!(yields < 1_000_000, "run_slice が terminal に到達しない");
+                }
+                Some(result) => break result,
+            }
+        };
+        (result, eval, yields)
+    }
+
+    /// 小 slice で確実に複数回 yield させるための、fuel を消費するループ本体。
+    /// ループ反復は `count_step` を呼ぶため、単純な `let` の羅列と違い slice fuel を使う。
+    const YIELDING_LOOP: &str = "let i = 0\nwhile i < 8\n  i = i + 1\nend\n";
+
+    /// yield を跨いで積んだ binding が、正常完了時に commit される（§10 規則1・7）。
+    /// 小 slice で複数回 yield しても、単一 slice の実行と同じ commit 結果になる。
+    #[test]
+    fn transaction_commits_across_yields_on_completion() {
+        // marker を積み → fuel を消費するループで yield を挟み → done を積んで正常完了。
+        let src = format!("let marker = 1\n{YIELDING_LOOP}let done = 2\n");
+        let (result, eval, yields) = run_transactional_sliced(&src, 2);
+        assert!(result.is_ok(), "正常完了を期待: {result:?}");
+        assert!(yields > 0, "小 slice なのに一度も yield しなかった");
+        // yield を跨いだ全 binding が commit されて見える。
+        assert_eq!(eval.env.get("marker"), Some(Value::Int(1)));
+        assert_eq!(eval.env.get("done"), Some(Value::Int(2)));
+    }
+
+    /// yield を跨いだ後の slice で未捕捉エラーになると、yield より前に積んだ binding も
+    /// 含めて実行開始時点へ rollback される（§10 規則3・7）。
+    #[test]
+    fn transaction_rolls_back_across_yields_on_uncaught_error() {
+        // marker を積み → ループで yield を挟み → 未定義参照でエラーにする。
+        let src = format!("let marker = 1\n{YIELDING_LOOP}print(undefined_name)\n");
+        let (result, eval, yields) = run_transactional_sliced(&src, 2);
+        let err = result.expect_err("未捕捉エラーで terminal を期待");
+        assert_eq!(err.kind(), Some(crate::error::ErrorKind::Name));
+        assert!(yields > 0, "小 slice なのに一度も yield しなかった");
+        // yield より前に積んだ binding も rollback で消える（transaction 境界は execution 全体）。
+        assert_eq!(
+            eval.env.get("marker"),
+            None,
+            "rollback されず binding が残った"
+        );
+        assert_eq!(eval.env.get("i"), None, "rollback されず binding が残った");
+    }
+
+    /// yield 分割の有無にかかわらず、commit/rollback の結果（binding の可視性）は一致する
+    /// （§10 規則7「yield は transaction 境界ではない」／§15.3）。
+    #[test]
+    fn transaction_result_is_independent_of_slice_split() {
+        let ok_src = format!("let marker = 1\n{YIELDING_LOOP}");
+        let err_src = format!("let marker = 1\n{YIELDING_LOOP}print(undefined_name)\n");
+
+        // commit: 単一 slice でも小 slice でも marker が見える。
+        let (r_big, e_big, y_big) = run_transactional_sliced(&ok_src, u64::MAX);
+        let (r_small, e_small, y_small) = run_transactional_sliced(&ok_src, 2);
+        assert!(r_big.is_ok() && r_small.is_ok());
+        assert_eq!(y_big, 0, "大 slice は yield しない");
+        assert!(y_small > 0, "小 slice は yield する");
+        assert_eq!(e_big.env.get("marker"), Some(Value::Int(1)));
+        assert_eq!(e_small.env.get("marker"), Some(Value::Int(1)));
+
+        // rollback: 単一 slice でも小 slice でも marker が消える。
+        let (r_big, e_big, _) = run_transactional_sliced(&err_src, u64::MAX);
+        let (r_small, e_small, _) = run_transactional_sliced(&err_src, 2);
+        assert!(r_big.is_err() && r_small.is_err());
+        assert_eq!(e_big.env.get("marker"), None);
+        assert_eq!(e_small.env.get("marker"), None);
     }
 
     #[test]
