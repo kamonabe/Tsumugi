@@ -1874,7 +1874,13 @@ impl Evaluator {
                         FStrExprPart::Literal(s) => result.push_str(s),
                         FStrExprPart::Expr(expr) => {
                             let val = self.eval_expr(expr, line)?;
-                            result.push_str(&val.to_string());
+                            // budget-aware に描画する（REV-001）。共有 DAG の指数を
+                            // materialize 前に fuel + per-item byte 上限で止める。
+                            let rendered = self
+                                .budget
+                                .render_display(&val, ExecutionPhase::Run)
+                                .map_err(|stop| self.control_stop_to_error(stop, line))?;
+                            result.push_str(&rendered);
                         }
                     }
                 }
