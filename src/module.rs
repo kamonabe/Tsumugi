@@ -188,8 +188,12 @@ impl ModuleLoader {
             )
         })?;
 
-        // サンドボックスチェック: import 先が許可範囲内か検証
-        crate::sandbox::check_path(canonical.to_str().unwrap_or(""), line)?;
+        // サンドボックスチェック: import 先が許可範囲内か検証する。
+        // canonical な PathBuf をそのまま渡す（REV-002）。以前は
+        // `canonical.to_str().unwrap_or("")` で `&str` 化していたため、
+        // 非UTF-8な canonical path（Unix）が空文字へ潰れ、認可対象（空文字≒CWD）と
+        // 実際の read 対象（&canonical）が分離していた。
+        crate::sandbox::check_path(&canonical, line)?;
 
         if self.loaded.contains(&canonical) {
             return Ok(None);
