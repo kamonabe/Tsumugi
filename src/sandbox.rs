@@ -48,18 +48,22 @@ fn allowed_paths() -> &'static Option<Vec<PathBuf>> {
 /// 範囲外の場合はランタイムエラーを返す。
 /// 戻り値を実際のファイル操作に使い、検査対象と操作対象を一致させる。
 /// ただし、検査後にsymlinkを差し替えるcheck/use raceまでは防止しない。
-pub fn check_path(path_str: &str, line: usize) -> Result<PathBuf, TsumugiError> {
-    authorize_path(normalize_path(path_str), path_str, line)
+///
+/// path は `&Path` で受け取る（REV-002）。`&str` 経由の lossy 変換を挟まないため、
+/// 非UTF-8なcanonical import path（Unix）でも認可対象と操作対象が分離しない。
+pub fn check_path(path: &Path, line: usize) -> Result<PathBuf, TsumugiError> {
+    authorize_path(normalize_path(path), path, line)
 }
 
 /// directory entry自体を変更する操作向けのサンドボックス検査。
 /// 中間componentは解決するが、final componentはsymlink targetへ展開しない。
-pub fn check_entry_path(path_str: &str, line: usize) -> Result<PathBuf, TsumugiError> {
-    authorize_path(normalize_entry_path(path_str), path_str, line)
+pub fn check_entry_path(path: &Path, line: usize) -> Result<PathBuf, TsumugiError> {
+    authorize_path(normalize_entry_path(path), path, line)
 }
 
 /// 正規化済みpathを許可リストと照合する。
-fn authorize_path(target: PathBuf, original: &str, line: usize) -> Result<PathBuf, TsumugiError> {
+/// `original` は認可対象そのもの（`&Path`）で、違反時のメッセージ表示にだけ使う。
+fn authorize_path(target: PathBuf, original: &Path, line: usize) -> Result<PathBuf, TsumugiError> {
     let Some(allowed) = allowed_paths() else {
         return Ok(target);
     };
@@ -74,7 +78,10 @@ fn authorize_path(target: PathBuf, original: &str, line: usize) -> Result<PathBu
     Err(TsumugiError::runtime_with_kind(
         line,
         crate::error::ErrorKind::Sandbox,
-        format!("サンドボックス違反: パス \"{}\" は許可範囲外です", original),
+        format!(
+            "サンドボックス違反: パス \"{}\" は許可範囲外です",
+            original.display()
+        ),
     ))
 }
 
@@ -90,13 +97,13 @@ fn absolutize_path(path: &Path) -> PathBuf {
 }
 
 /// targetを読み書きする操作向けに、final componentを含むpath全体を正規化する。
-fn normalize_path(path_str: &str) -> PathBuf {
-    normalize_absolute_path(&absolutize_path(Path::new(path_str)))
+fn normalize_path(path: &Path) -> PathBuf {
+    normalize_absolute_path(&absolutize_path(path))
 }
 
 /// unlink/rename対象のdirectory entry向けに、中間componentだけを正規化する。
-fn normalize_entry_path(path_str: &str) -> PathBuf {
-    let absolute = absolutize_path(Path::new(path_str));
+fn normalize_entry_path(path: &Path) -> PathBuf {
+    let absolute = absolutize_path(path);
     let Some(file_name) = absolute.file_name() else {
         return normalize_absolute_path(&absolute);
     };
@@ -164,5 +171,47 @@ mod tests {
         assert_eq!(resolve_dots(Path::new("/a/b/../c")), PathBuf::from("/a/c"));
         assert_eq!(resolve_dots(Path::new("/a/b/./c")), PathBuf::from("/a/b/c"));
         assert_eq!(resolve_dots(Path::new("/a/b/../../c")), PathBuf::from("/c"));
+    }
+
+    /// REV-002: 非UTF-8な path でも、認可対象が実際の path のバイト列を保持することを固定する。
+    /// 旧実装は `check_path(&str)` へ渡す前に `to_str().unwrap_or("")` で非UTF-8 path を
+    /// 空文字（≒CWD）へ潰していたため、認可対象と実際のI/O対象が分離していた。
+    /// `&Path` を起点に正規化することで、非UTF-8 component が失われないことを検証する。
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_path_is_authorized_as_itself() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // 0x80 は単体では valid UTF-8 ではない。存在しない絶対 path を組み立てる。
+        let raw = std::ffi::OsStr::from_bytes(b"/nonexistent-rev002/\x80/x.tsg");
+        let path = Path::new(raw);
+
+        // 前提: この path は UTF-8 化できない（旧経路なら "" へ潰れていた）。
+        assert!(
+            path.to_str().is_none(),
+            "テスト用 path はUTF-8であってはならない"
+        );
+
+        // 正規化しても非UTF-8 component が保持され、空 path には潰れない。
+        let normalized = normalize_path(path);
+        assert!(
+            !normalized.as_os_str().is_empty(),
+            "正規化後の path が空になった（認可対象が実際の path と分離している）"
+        );
+        assert!(
+            normalized.as_os_str().as_bytes().contains(&0x80),
+            "正規化後の path が非UTF-8バイトを失った: {:?}",
+            normalized
+        );
+
+        // check_path は認可した path（=正規化 path）をそのまま返し、I/O対象と一致させる。
+        // sandbox 未設定時は allow-all なので、返り値は normalize_path と一致する。
+        if allowed_paths().is_none() {
+            let authorized = check_path(path, 1).expect("allow-all では認可される");
+            assert_eq!(
+                authorized, normalized,
+                "check_path の返り値が正規化 path と一致しない"
+            );
+        }
     }
 }
