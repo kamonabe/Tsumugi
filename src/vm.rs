@@ -510,20 +510,16 @@ impl Vm {
 
             if let Err(e) = result {
                 // catch 不能な terminal 信号（script から try/catch で捕捉できない）は、try
-                // handler を探さずそのまま伝播する（tree の handle_error と parity）:
+                // handler を探さずそのまま伝播する（tree の handle_error と parity。判定は
+                // 共有の `ErrorKind::is_uncatchable`）:
                 // - exit() の structured terminal（C7、REV-023）は CLI が Exited terminal へ写す
-                // - deadline 超過（REV-015 Slice 4）は DeadlineExceeded terminal へ写す
-                // - 協調的 cancel（REV-015 Slice 4）は Cancelled terminal へ写す
+                // - deadline 超過 / 協調 cancel（REV-015 Slice 4）は DeadlineExceeded / Cancelled へ
+                // - 予算超過（fuel / collection / string / source / heap / I-O。REV-015 E11）は
+                //   BudgetExceeded terminal へ写す。E11 で埋め込み API が BudgetExceeded を公開する
+                //   のに合わせ、budget 超過も catch 不能 terminal 信号として扱う。
                 // VM への deadline clock / cancel token 注入は Slice 6（VM parity）だが、写像は
                 // tree と共有の control_stop_to_error なので、防御的に catch 除外だけ揃えておく。
-                if matches!(
-                    e.kind(),
-                    Some(
-                        crate::error::ErrorKind::ProcessExit
-                            | crate::error::ErrorKind::DeadlineExceeded
-                            | crate::error::ErrorKind::Cancelled
-                    )
-                ) {
+                if crate::error::ErrorKind::is_uncatchable(e.kind()) {
                     return Err(self.attach_trace(e));
                 }
                 if let Some(handler) = self.try_handlers.pop() {

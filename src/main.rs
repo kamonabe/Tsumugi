@@ -309,6 +309,18 @@ fn exit_code_for_outcome(outcome: EmbeddingOutcome) -> i32 {
             eprintln!("{}", format_execution_error(&error));
             1
         }
+        // 予算超過（REV-015 E11）: 診断を出して exit 1（第12節の terminal channel 表）。
+        // 既存 CLI の step 上限メッセージと byte 一致させるため RuntimeError と同じ formatter。
+        EmbeddingOutcome::BudgetExceeded { error } => {
+            eprintln!("{}", format_execution_error(&error));
+            1
+        }
+        // deadline 超過（REV-015 E11）: exit 1（第12節）。CLI は deadline clock を注入しないため
+        // 通常この経路には到達しないが、写像は固定しておく。
+        EmbeddingOutcome::DeadlineExceeded => {
+            eprintln!("実行 deadline を超過しました");
+            1
+        }
         EmbeddingOutcome::Cancelled => 130,
         EmbeddingOutcome::InternalFailure { safe_message, .. } => {
             eprintln!("{}", safe_message);

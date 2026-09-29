@@ -332,6 +332,15 @@ impl Evaluator {
         self.budget.set_clock(clock);
     }
 
+    /// deadline clock を注入する前に、budget config と clock の domain 整合を検証する
+    /// （REV-015 E11）。詳細は [`crate::budget::BudgetLedger::validate_clock_domain`]。
+    pub fn validate_budget_against(
+        &self,
+        clock: &dyn crate::budget::MonotonicClock,
+    ) -> Result<(), crate::budget::ConfigError> {
+        self.budget.validate_clock_domain(clock)
+    }
+
     /// この実行の協調的 cancel token の clone を返す（REV-015 Slice 4）。
     ///
     /// host はこの clone を別スレッドで保持し、実行中に
@@ -1239,16 +1248,11 @@ impl Evaluator {
         // - deadline 超過（REV-015 Slice 4 / execution-control §7・§8・§15.1「budget 超過を
         //   try/catch で囲んでも catch body を実行しない」）
         // - 協調的 cancel（REV-015 Slice 4 / execution-control §8）
-        // それ以外の budget の terminal 化は Slice 1/2 でまだ catchable な TsumugiError 経由の
-        // ため、ここでは exit・deadline・cancel のみ除外する。
-        if matches!(
-            error.kind(),
-            Some(
-                crate::error::ErrorKind::ProcessExit
-                    | crate::error::ErrorKind::DeadlineExceeded
-                    | crate::error::ErrorKind::Cancelled
-            )
-        ) {
+        // - 予算超過（fuel / collection / string / source / heap / I-O。REV-015 E11 /
+        //   execution-control §8・§15.1「budget 超過を try/catch で囲んでも catch body を
+        //   実行しない」）。E11 で埋め込み API が `BudgetExceeded` terminal を公開するのに
+        //   合わせ、budget 超過も catch 不能 terminal 信号として扱う。
+        if crate::error::ErrorKind::is_uncatchable(error.kind()) {
             return Err(error);
         }
         // この活性内（stop_depth より上）で最も近い try frame を探す。stop_depth より下
