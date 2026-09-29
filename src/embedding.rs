@@ -3198,4 +3198,26 @@ mod tests {
         );
         assert!(dbg.contains("argument_count"));
     }
+
+    /// 本番 clock（SystemMonotonicClock）で有限 budget + 未来 deadline を設定した実行が
+    /// 通常どおり Completed する（clock domain 整合・deadline 未達）。実運用の deadline 経路が
+    /// 公開 API だけで組めることを固定する（REV-015 E11）。
+    #[test]
+    fn e11_system_clock_deadline_not_reached_completes() {
+        use crate::budget::{BudgetConfig, SystemMonotonicClock};
+
+        let clock = Arc::new(SystemMonotonicClock::new());
+        // 同じ clock で deadline（now + 30 s）を計算し、同じ clock を実行へ注入する（同一 domain）。
+        let budget = BudgetConfig::standard(clock.as_ref()).unwrap();
+        let engine = engine_with_budget(budget);
+        let mut ctx = ExecutionContext::new(&engine);
+
+        let linked = compile_link(&engine, "m", "let x = 1\nlet y = x + 2\n");
+        let outcome = engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_deadline_clock(clock.clone()),
+        );
+        assert_eq!(outcome, ExecutionOutcome::Completed);
+    }
 }
