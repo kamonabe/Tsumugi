@@ -230,23 +230,24 @@ fixture は `fixture_tests!` へ1行宣言するとツリーウォーク版 / VM
 
 ## CI
 
-`main` への push と PR で GitHub Actions が3つのジョブを並行実行する。設定は `.github/workflows/ci.yml`。
+`main` への push と PR で GitHub Actions が4つのジョブを並行実行する。設定は `.github/workflows/ci.yml`。
 
 | ジョブ | 実行環境 | 内容 |
 |---|---|---|
-| `lint` | ubuntu-latest | `cargo fmt --check` と `cargo clippy -- -D warnings` |
-| `test` | ubuntu-latest / macos-latest / windows-latest | `cargo test`（`fail-fast: false` で全OSの結果を得る） |
+| `lint` | ubuntu-latest | `cargo fmt --check` と `cargo clippy --all-targets --all-features -- -D warnings` |
+| `test` | ubuntu-latest / macos-latest / windows-latest | `cargo test --all-features --locked`（`fail-fast: false` で全OSの結果を得る） |
+| `msrv` | ubuntu-latest | MSRV（Rust 1.97.0）を明示 install して `cargo test --all-features --locked` |
 | `coverage` | ubuntu-latest | `cargo llvm-cov` で `lcov.info` を生成し artifact `lcov-report` として保存 |
 
 ローカルで同じ検査をする場合は次を順に実行する。
 
 ```bash
 cargo fmt --check
-cargo clippy -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
 
-Windows固有の挙動（`TSUMUGI_*` 環境変数のcase-insensitive保護など）は `test` ジョブのwindows-latestでのみ検証される。CIの `clippy` はデフォルトターゲットだけを見るため、テストやベンチも含めて検査する場合は `cargo clippy --all-targets -- -D warnings` をローカルで実行する。
+Windows固有の挙動（`TSUMUGI_*` 環境変数のcase-insensitive保護など）は `test` ジョブのwindows-latestでのみ検証される。CIの `clippy` は `--all-targets --all-features` でテストやベンチも含めて検査するため、ローカルでも同じフラグで実行すると差分が出にくい。`msrv` ジョブは MSRV（`Cargo.toml` の `rust-version`）での退行を検出する。MSRV 検証・release workflow・fuzz/stress など Phase 7 の運用ゲートの全体像は[検証・リリース・運用設計](docs/verification-release-operations.md)を正本とする。
 
 ## プロジェクト構成
 
@@ -318,7 +319,7 @@ examples/
 LANG_GUIDE.md         # AIコード支援向けの言語ガイド（形式文法を含む）
 
 .github/workflows/
-└── ci.yml            # CI 設定（lint / test 3 OS / coverage）
+└── ci.yml            # CI 設定（lint / test 3 OS / msrv / coverage）
 ```
 
 実行予算とcapabilityのガードレールは `limits.rs`（コンパイル時定数）と `sandbox.rs`（環境変数ベースのallow-list）に集約している。コールフレーム深度上限は `limits.rs` の `MAX_USER_CALL_DEPTH` に一本化し、ツリーウォーク版・VM版とも root script frame を数えない active user frame 数で判定する（AUD-050 / AUD-017）。

@@ -330,17 +330,18 @@ operation の網羅に加えて、次の軸を paired で固定する。
 
 ### CI
 
-GitHub Actions (`.github/workflows/ci.yml`) が `main` への push と PR で3つのジョブを実行する。
+GitHub Actions (`.github/workflows/ci.yml`) が `main` への push と PR で4つのジョブを実行する。
 
 | ジョブ | 実行環境 | 内容 |
 |---|---|---|
-| `lint` | ubuntu-latest | `cargo fmt --check`（フォーマット整合性）、`cargo clippy -- -D warnings`（静的解析） |
-| `test` | ubuntu-latest / macos-latest / windows-latest | `cargo test`。`fail-fast: false` で1つのOSが落ちても他の結果を得る |
+| `lint` | ubuntu-latest | `cargo fmt --check`（フォーマット整合性）、`cargo clippy --all-targets --all-features -- -D warnings`（静的解析） |
+| `test` | ubuntu-latest / macos-latest / windows-latest | `cargo test --all-features --locked`。`fail-fast: false` で1つのOSが落ちても他の結果を得る |
+| `msrv` | ubuntu-latest | MSRV（Rust 1.97.0）を明示 install して `cargo test --all-features --locked` |
 | `coverage` | ubuntu-latest | `cargo llvm-cov --all-features --lcov` で `lcov.info` を生成し、artifact `lcov-report` として保存する |
 
 3 OS matrixを持つ理由は、filesystemとsymlinkの意味論、および `TSUMUGI_*` 環境変数のcase-insensitive保護（AUD-031）がOSごとに異なるためである。これらは実OSで動かさないと検証できない。
 
-toolchainは全ジョブで `dtolnay/rust-toolchain@stable` を使う。`Cargo.toml` に `rust-version` がなく `rust-toolchain.toml` も置いていないため、CIはstableに追従し、compiler版の下限は検証していない（AUD-045）。`clippy` はデフォルトターゲットだけを検査するため、テスト・ベンチを含む `--all-targets` はCIの対象外である。
+`lint` / `test` / `coverage` は `dtolnay/rust-toolchain@stable` を使い、rolling stableに追従して将来のcompiler版での退行を検出する。加えて `msrv` ジョブが `Cargo.toml` の `rust-version = "1.97"` に対応するRust 1.97.0を明示 install し、MSRVでの退行を検出する（AUD-045 の先取り実装）。`clippy` は `--all-targets --all-features` を付け、テスト・ベンチを含む全ターゲットを検査する。MSRV gate・clippy強化を含む Phase 7 の運用ゲート全体は[検証・リリース・運用設計](verification-release-operations.md)を正本とする。
 
 ## 文法定義の置き場所
 
