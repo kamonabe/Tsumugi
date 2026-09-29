@@ -1,55 +1,57 @@
-# セキュリティポリシー
+**English** | [日本語](SECURITY.ja.md)
 
-Tsumugi の脆弱性報告と保証境界についてまとめる。報告の前に、まず下記「保証境界」を確認してほしい。
+# Security Policy
 
-## プロジェクトのステータス
+This document covers vulnerability reporting and the assurance boundary of Tsumugi. Before reporting, please read the "Assurance boundary" section below first.
 
-Tsumugi は教育・実験用途の **alpha 版**である。言語仕様・組み込みAPI・CLI の後方互換性は保証していない。脆弱性対応もベストエフォートで行う（個人プロジェクトのため、対応時期を約束するものではない）。
+## Project status
 
-## 保証境界（報告前に必読）
+Tsumugi is an **alpha** release intended for educational and experimental use. Backward compatibility of the language specification, embedding API, and CLI is not guaranteed. Vulnerability handling is best-effort as well (this is a personal project, so no response timeline is promised).
 
-**Tsumugi 単体は security boundary ではない。**
+## Assurance boundary (read before reporting)
 
-Tsumugi のサンドボックス、パス検査、ステップ予算、capability モデルは defense-in-depth（多層防御の一層）であり、非信頼コードを隔離する security sandbox ではない。敵対的なスクリプトを安全に実行するには、別プロセス・非 root・最小 mount・cgroup 等の OS レベルの隔離と組み合わせる必要がある。
+**Tsumugi on its own is not a security boundary.**
 
-何を保証し、何を保証しないか、責任分界はどこにあるかは、脅威モデルを正本とする。
+Tsumugi's sandbox, path checks, step budget, and capability model are defense-in-depth (one layer among several), not a security sandbox that isolates untrusted code. To run adversarial scripts safely, you must combine Tsumugi with OS-level isolation such as a separate process, non-root execution, a minimal mount, and cgroups.
 
-- [脅威モデル](docs/threat-model.md) — 保証する性質 / 保証しない性質 / host・Tsumugi・OS の責任分界
-- [Tsumugi Manifesto](docs/manifesto.md) — 設計原則と非目標
+The threat model is the source of truth for what is guaranteed, what is not, and where responsibility is divided.
 
-次に該当するものは、脆弱性ではなく既知の設計上の非目標である。報告の前に脅威モデルの「8. 保証しない性質」を確認してほしい。
+- [Threat model](docs/threat-model.md) (Japanese) — guaranteed properties / non-guaranteed properties / division of responsibility across host, Tsumugi, and OS
+- [Tsumugi Manifesto](docs/manifesto.md) (Japanese) — design principles and non-goals
 
-- 非信頼スクリプトを Tsumugi 単体で完全隔離できないこと
-- OS レベルの OOM / スタックオーバーフロー / `panic=abort` からの同一プロセス回復
-- スクリプトへ正当に渡した secret を、そのスクリプトが意図的に出力すること
-- 未実装フェーズ（Phase 2 以降）の capability / 実行予算 / 監査に関する挙動。実装状態は[ロードマップ](docs/roadmap.md)を参照
+The following are known design non-goals, not vulnerabilities. Before reporting, please review section 8 "Properties not guaranteed" in the threat model.
 
-## 対象バージョン
+- Fully isolating untrusted scripts with Tsumugi alone
+- Recovery within the same process from OS-level OOM, stack overflow, or `panic=abort`
+- A script intentionally emitting a secret that was legitimately passed to it
+- Behavior of capabilities, execution budgets, or auditing in unimplemented phases (Phase 2 and later). See the [roadmap](docs/roadmap.md) (Japanese) for implementation status.
 
-alpha 版のため、セキュリティ修正は原則として最新の `main` に対してのみ行う。
+## Supported versions
 
-| バージョン | サポート |
+Because this is an alpha release, security fixes are in principle applied only to the latest `main`.
+
+| Version | Supported |
 |---|---|
-| 最新の `main` | ✅ |
-| それ以前 | ❌ |
+| Latest `main` | ✅ |
+| Anything earlier | ❌ |
 
-## 脆弱性の報告方法
+## How to report a vulnerability
 
-**脆弱性は公開 Issue に書かないでほしい。** 修正前に詳細が公開されることを避けるため、GitHub の Private Vulnerability Reporting を使う。
+**Please do not post vulnerabilities in public issues.** To avoid disclosing details before a fix is available, use GitHub's Private Vulnerability Reporting.
 
-1. リポジトリの **Security** タブを開く
-2. **Report a vulnerability** を押す
-3. 影響範囲・再現手順・想定される深刻度を記載する
+1. Open the repository's **Security** tab
+2. Click **Report a vulnerability**
+3. Describe the impact, reproduction steps, and expected severity
 
-報告には可能な範囲で次を含めてもらえると対応が早い。
+Including the following, to the extent possible, helps speed up handling.
 
-- 影響を受ける実行系（tree-walk / VM `--vm` / 埋め込み API のいずれか）
-- 再現用の最小スクリプト（`.tsg`）または手順
-- 期待される挙動と実際の挙動
-- 該当する脅威モデルの TM-ID があれば、その番号
+- The affected engine (tree-walk / VM `--vm` / embedding API)
+- A minimal reproducing script (`.tsg`) or steps
+- Expected behavior versus actual behavior
+- The relevant threat-model TM-ID, if any
 
-## 対応の流れ
+## Handling process
 
-- 報告を受け取ったら、Private Vulnerability Reporting のスレッド上で確認・やり取りを行う
-- 有効な脆弱性と判断した場合、修正と、必要に応じて GitHub Security Advisory の公開を行う
-- 対応時期は保証しない（ベストエフォート）
+- Once a report is received, review and discussion happen in the Private Vulnerability Reporting thread
+- If confirmed as a valid vulnerability, a fix is made and, where appropriate, a GitHub Security Advisory is published
+- No response timeline is guaranteed (best-effort)
