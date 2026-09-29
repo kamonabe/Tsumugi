@@ -230,16 +230,9 @@ fixture は `fixture_tests!` へ1行宣言するとツリーウォーク版 / VM
 
 ## CI
 
-`main` への push と PR で GitHub Actions が4つのジョブを並行実行する。設定は `.github/workflows/ci.yml`。
+`main` への push と PR で GitHub Actions が `lint` / `test`（3 OS）/ `msrv` / `coverage` の4つのジョブを並行実行する。各ジョブの実行環境と正確なコマンドは[設計ドキュメント](docs/design.md)の「CI」節を正本とし、設定の実体は `.github/workflows/ci.yml` にある。
 
-| ジョブ | 実行環境 | 内容 |
-|---|---|---|
-| `lint` | ubuntu-latest | `cargo fmt --check` と `cargo clippy --all-targets --all-features -- -D warnings` |
-| `test` | ubuntu-latest / macos-latest / windows-latest | `cargo test --all-features --locked`（`fail-fast: false` で全OSの結果を得る） |
-| `msrv` | ubuntu-latest | MSRV（Rust 1.97.0）を明示 install して `cargo test --all-features --locked` |
-| `coverage` | ubuntu-latest | `cargo llvm-cov` で `lcov.info` を生成し artifact `lcov-report` として保存 |
-
-ローカルで同じ検査をする場合は次を順に実行する。
+ローカルで主要な検査を再現する場合は次を順に実行する。
 
 ```bash
 cargo fmt --check
@@ -247,7 +240,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
 
-Windows固有の挙動（`TSUMUGI_*` 環境変数のcase-insensitive保護など）は `test` ジョブのwindows-latestでのみ検証される。CIの `clippy` は `--all-targets --all-features` でテストやベンチも含めて検査するため、ローカルでも同じフラグで実行すると差分が出にくい。`msrv` ジョブは MSRV（`Cargo.toml` の `rust-version`）での退行を検出する。MSRV 検証・release workflow・fuzz/stress など Phase 7 の運用ゲートの全体像は[検証・リリース・運用設計](docs/verification-release-operations.md)を正本とする。
+Windows固有の挙動（`TSUMUGI_*` 環境変数のcase-insensitive保護など）は `test` ジョブのwindows-latestでのみ検証される。MSRV 検証・release workflow・fuzz/stress など Phase 7 の運用ゲートの全体像は[検証・リリース・運用設計](docs/verification-release-operations.md)を正本とする。
 
 ## プロジェクト構成
 

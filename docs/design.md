@@ -330,7 +330,7 @@ operation の網羅に加えて、次の軸を paired で固定する。
 
 ### CI
 
-GitHub Actions (`.github/workflows/ci.yml`) が `main` への push と PR で4つのジョブを実行する。
+GitHub Actions (`.github/workflows/ci.yml`) が `main` への push と PR で4つのジョブを実行する。本節を現行CIジョブ構成の正本とし、`README.ja.md` は完全な表を複製せず本節を参照する（更新漏れを防ぐための一本化）。英語版 `README.md` は簡潔版でありCI表を持たない。
 
 | ジョブ | 実行環境 | 内容 |
 |---|---|---|
