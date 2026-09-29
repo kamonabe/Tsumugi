@@ -72,7 +72,7 @@ pub use budget::CancellationToken;
 // test / host utility 向けの clock 実装。
 pub use budget::{
     BudgetConfig, BudgetCounters, BudgetPeaks, BudgetUsage, FakeClock, MonotonicClock,
-    MonotonicInstant,
+    MonotonicInstant, SystemMonotonicClock,
 };
 // `budget::ConfigError` は `embedding::ConfigError` と名前衝突するため、budget 側は
 // `BudgetConfigError` として別名公開する。

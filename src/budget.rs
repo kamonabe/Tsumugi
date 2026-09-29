@@ -128,6 +128,69 @@ impl MonotonicClock for FakeClock {
     }
 }
 
+/// OS の単調増加時計に基づく本番用 [`MonotonicClock`]（REV-015 E11）。
+///
+/// deadline を実運用で効かせるための clock で、埋め込み host が
+/// [`crate::embedding::ExecutionRequest::with_deadline_clock`] へ `Arc` で渡す。
+/// [`std::time::Instant`] を backing にし、生成時点を基準（ns=0）とする 0 始まりの
+/// 単調増加 tick を返す。`Instant` は wall-clock ではなく単調時計なので、system time の
+/// 巻き戻しに影響されない（§3 の「単調増加」契約に一致）。
+///
+/// # 使い方
+///
+/// ```
+/// use std::sync::Arc;
+/// use tsumugi::{BudgetConfig, SystemMonotonicClock};
+///
+/// let clock = Arc::new(SystemMonotonicClock::new());
+/// // 同じ clock で deadline を計算し、実行にも同じ clock を注入する（同一 domain）。
+/// let budget = BudgetConfig::standard(clock.as_ref()).expect("standard budget");
+/// # let _ = budget;
+/// ```
+///
+/// # ns への丸め
+///
+/// `Instant::elapsed()` は [`std::time::Duration`]（`u128` ns）を返すため、u64 ns へ
+/// saturating で丸める。単一 execution の想定寿命（既定 deadline 30 秒）に対し u64 ns
+/// （約 584 年）は十分で、実運用で飽和しない。
+pub struct SystemMonotonicClock {
+    clock_id: u64,
+    base: std::time::Instant,
+}
+
+impl SystemMonotonicClock {
+    /// 現在時刻を基準（ns=0）とする新しい system clock を作る。
+    ///
+    /// 一意な `clock_id` を割り当てるため、別 instance が作った [`MonotonicInstant`] とは
+    /// domain が一致しない（`BudgetConfig` の deadline とこの clock は同一 instance を使う）。
+    pub fn new() -> Self {
+        Self {
+            clock_id: next_clock_id(),
+            base: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Default for SystemMonotonicClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MonotonicClock for SystemMonotonicClock {
+    fn clock_id(&self) -> u64 {
+        self.clock_id
+    }
+    fn now(&self) -> MonotonicInstant {
+        // 基準からの経過を u64 ns へ saturating で丸める（u128 → u64）。
+        let ns = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        MonotonicInstant {
+            clock_id: self.clock_id,
+            ns,
+        }
+    }
+}
+
 // =============================================================================
 // config（§3 / §3.1）
 // =============================================================================
@@ -2318,6 +2381,54 @@ mod tests {
         let clock = FakeClock::new();
         clock.set(u64::MAX - 1);
         assert_eq!(BudgetConfig::standard(&clock), Err(ConfigError::Overflow));
+    }
+
+    // -------------------------------------------------------------------------
+    // SystemMonotonicClock（本番 clock、REV-015 E11）
+    // -------------------------------------------------------------------------
+
+    /// system clock の now は単調非減少（2 回読んで t2 >= t1）。
+    #[test]
+    fn system_clock_now_is_monotonic() {
+        let clock = SystemMonotonicClock::new();
+        let t1 = clock.now();
+        let t2 = clock.now();
+        assert_eq!(t1.clock_id(), clock.clock_id());
+        assert_eq!(t2.clock_id(), clock.clock_id());
+        assert!(
+            t2.as_nanos() >= t1.as_nanos(),
+            "now は単調非減少であるべき: t1={}, t2={}",
+            t1.as_nanos(),
+            t2.as_nanos()
+        );
+    }
+
+    /// 別 instance は別 clock_id を持つ（domain 分離）。
+    #[test]
+    fn system_clock_instances_have_distinct_domains() {
+        let a = SystemMonotonicClock::new();
+        let b = SystemMonotonicClock::new();
+        assert_ne!(a.clock_id(), b.clock_id());
+    }
+
+    /// system clock で BudgetConfig::standard を作り、同 clock で validate できる。
+    #[test]
+    fn system_clock_builds_and_validates_standard_config() {
+        let clock = SystemMonotonicClock::new();
+        let config = BudgetConfig::standard(&clock).expect("standard budget");
+        // deadline は同 domain（clock_id 一致）で未来（now + 30 s）。
+        assert_eq!(config.deadline.clock_id(), clock.clock_id());
+        assert!(config.deadline.as_nanos() > clock.now().as_nanos());
+        assert_eq!(config.validate(&clock), Ok(()));
+    }
+
+    /// 別 instance の system clock で validate すると ForeignClock。
+    #[test]
+    fn system_clock_foreign_domain_is_rejected() {
+        let config_clock = SystemMonotonicClock::new();
+        let config = BudgetConfig::standard(&config_clock).unwrap();
+        let other = SystemMonotonicClock::new();
+        assert_eq!(config.validate(&other), Err(ConfigError::ForeignClock));
     }
 
     // -------------------------------------------------------------------------
