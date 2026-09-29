@@ -66,7 +66,7 @@ The full README and the design documents are maintained in Japanese.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). In short: `main` is protected, so work on a feature branch and open a PR, and pass `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test` before submitting.
+See [CONTRIBUTING.md](CONTRIBUTING.md). In short: `main` is protected, so work on a feature branch and open a PR, and pass `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test` before submitting.
 
 ## License
 

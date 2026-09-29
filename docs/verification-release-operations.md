@@ -7,7 +7,7 @@
 
 本文書は、[ロードマップ](roadmap.md) Phase 7「運用保証と検証」、AUD-022「REPL・differential・limit境界・defensive VMテスト」、AUD-045「配布・実行手順とtoolchainの下限」を完了させるため、検証、配布、supply chain、OCI image、参照用Kubernetes Job、rollback、deprecation、runbookの実装契約を定める。
 
-本文書の作成時点では、現行CIのfmt・Clippy・3 OS test・coverage artifact、golden test、timeout、scaling test、defensive VM testだけが実装済みである。本文書が追加するMSRV gate、release workflow、fuzz/stress、artifact署名、OCI image、Kubernetes manifest、運用SLOは**すべて未実装**であり、現在の保証として扱わない。
+現行CIでは、fmt・Clippy（`--all-targets --all-features`）・3 OS test・MSRV 1.97 test・coverage artifact、golden test、timeout、scaling test、defensive VM testが実装済みである。MSRV gate（`rust-version = "1.97"` 宣言と専用CI job）とall-targets Clippyは、本文書のVRO-AT-01/02受入基準を先取りする形で既に実装した。本文書が追加するrelease workflow、fuzz/stress、coverage 80% gate、docs/manifest drift検査、artifact署名、OCI image、Kubernetes manifest、運用SLOは**未実装**であり、現在の保証として扱わない。
 
 本文書では次を決定済みとし、各実装sliceで再選択しない。
 
@@ -47,11 +47,13 @@
 
 ### 2.2 現行と目標の分離
 
+「現行」は実装済みの状態、「本文書の完了状態」はPhase 7完了時の目標を表す。toolchain・Clippy・testのMSRV/all-targets化はVRO-AT-01/02を先取りして実装済みだが、release artifact smokeやcoverage gateを含む完了状態には未到達である。
+
 | 領域 | 現行 | 本文書の完了状態 |
 |---|---|---|
-| toolchain | rolling stable、`rust-version`なし | stable + Rust 1.97、`rust-version = "1.97"` |
-| Clippy | default target | `--all-targets --all-features -D warnings` |
-| test | stable、3 OS | stable 3 OS + MSRV + release artifact smoke |
+| toolchain | rolling stable + Rust 1.97、`rust-version = "1.97"` | stable + Rust 1.97、`rust-version = "1.97"` |
+| Clippy | `--all-targets --all-features -D warnings` | `--all-targets --all-features -D warnings` |
+| test | stable 3 OS + MSRV 1.97 | stable 3 OS + MSRV + release artifact smoke |
 | coverage | LCOV artifactのみ | line coverage 80%以上をgate化 |
 | fuzz/stress | 未実装 | PR smoke + weekly + release candidate gate |
 | release | workflow・artifactなし | 6 platform artifact、SHA-256、SBOM、provenance、署名 |

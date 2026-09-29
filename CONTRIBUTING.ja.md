@@ -75,14 +75,16 @@ git push -u origin <ブランチ名>
 CI と同じゲートをローカルでも通してから PR を出す。
 
 ```bash
-cargo fmt --check              # フォーマット（ローカル整形は cargo fmt）
-cargo clippy -- -D warnings    # lint。warning もエラー扱い
-cargo test                     # テスト
+cargo fmt --check                              # フォーマット（ローカル整形は cargo fmt）
+cargo clippy --all-targets --all-features -- -D warnings   # lint。warning もエラー扱い
+cargo test                                     # テスト
 ```
 
 補足:
 
-- CI の clippy はデフォルトターゲットだけを見る。テストやベンチも含めて検査するなら、ローカルで `cargo clippy --all-targets -- -D warnings` を実行する
+- CI の clippy は `--all-targets --all-features` を付けてテストやベンチも含めて検査する。上記のとおりローカルでも同じフラグで実行すると CI との差分が出にくい
+- CI の test は `cargo test --all-features --locked` を実行する。`--locked` は `Cargo.lock` の変更を許さないため、依存を更新した場合は lock も併せてコミットする
+- CI には MSRV（`Cargo.toml` の `rust-version`、現状 Rust 1.97）での退行を検出する `msrv` ジョブがある。MSRV を意図せず上げる依存更新は避ける
 - 資源の限られた環境では並列度を抑える: `cargo test -j 1 -- --test-threads=1`
 - カバレッジは CI で `cargo llvm-cov` を実行する（ローカル必須ではない）
 - テストは ubuntu / macos / windows のマトリクスで CI 実行される。パス区切り・改行など OS 依存の挙動に注意する
@@ -110,7 +112,7 @@ Tsumugi は Lexer・Parser・AST を共有し、2つの実行系を持つ。
 
 PR を出す前に次を確認する（PR テンプレートにも同じ項目がある）。
 
-- [ ] `cargo fmt --check` / `cargo clippy -- -D warnings` / `cargo test` が通る
+- [ ] `cargo fmt --check` / `cargo clippy --all-targets --all-features -- -D warnings` / `cargo test` が通る
 - [ ] 言語挙動を変える場合、tree-walk と VM の両方で確認した
 - [ ] 仕様変更を伴う場合、`docs/` の該当ドキュメントを更新した
 - [ ] 新機能・バグ修正にテストを添えた

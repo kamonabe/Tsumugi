@@ -19,7 +19,7 @@
 <!-- CI と同じゲートをローカルで通したか -->
 
 - [ ] `cargo fmt --check` が通る
-- [ ] `cargo clippy -- -D warnings` が通る
+- [ ] `cargo clippy --all-targets --all-features -- -D warnings` が通る
 - [ ] `cargo test` が通る
 
 ## 設計ドキュメント（Tsumugi では docs/ が正本）

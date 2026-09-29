@@ -75,14 +75,16 @@ git push -u origin <branch-name>
 Pass the same gates as CI locally before opening a PR.
 
 ```bash
-cargo fmt --check              # Formatting (use cargo fmt to format locally)
-cargo clippy -- -D warnings    # Lint; warnings are treated as errors
-cargo test                     # Tests
+cargo fmt --check                              # Formatting (use cargo fmt to format locally)
+cargo clippy --all-targets --all-features -- -D warnings   # Lint; warnings are treated as errors
+cargo test                                     # Tests
 ```
 
 Notes:
 
-- CI's clippy looks only at the default target. To also check tests and benches, run `cargo clippy --all-targets -- -D warnings` locally
+- CI's clippy runs with `--all-targets --all-features`, so it also checks tests and benches. Running the same flags locally, as shown above, minimizes differences from CI
+- CI's test runs `cargo test --all-features --locked`. `--locked` forbids changes to `Cargo.lock`, so when you update a dependency, commit the updated lock file as well
+- CI has an `msrv` job that detects regressions against the MSRV (`rust-version` in `Cargo.toml`, currently Rust 1.97). Avoid dependency updates that unintentionally raise the MSRV
 - In resource-constrained environments, reduce parallelism: `cargo test -j 1 -- --test-threads=1`
 - Coverage is run in CI via `cargo llvm-cov` (not required locally)
 - Tests run in CI on an ubuntu / macos / windows matrix. Watch out for OS-dependent behavior such as path separators and line endings
@@ -110,7 +112,7 @@ Report vulnerabilities via Private Vulnerability Reporting, not issues. For deta
 
 Confirm the following before opening a PR (the PR template has the same items).
 
-- [ ] `cargo fmt --check` / `cargo clippy -- -D warnings` / `cargo test` pass
+- [ ] `cargo fmt --check` / `cargo clippy --all-targets --all-features -- -D warnings` / `cargo test` pass
 - [ ] For changes that alter language behavior, verified on both tree-walk and the VM
 - [ ] For changes involving a spec change, updated the relevant document under `docs/`
 - [ ] Added tests for new features and bug fixes
