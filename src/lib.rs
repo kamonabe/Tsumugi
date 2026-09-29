@@ -62,8 +62,21 @@ pub use engine::{
 };
 
 // 協調的 cancel token（REV-015 Slice 4、実行制御仕様 §8）。`ExecutionHandle::cancellation_token`
-// の戻り値型として公開する。別スレッドへ渡せる `Send + Sync` な `Arc<AtomicBool>` ハンドル。
+// / `EmbeddingContext::cancellation_token` の戻り値型として公開する。別スレッドへ渡せる
+// `Send + Sync` な `Arc<AtomicBool>` ハンドル。
 pub use budget::CancellationToken;
+
+// 実行予算・deadline の公開型（REV-015 E11、実行制御仕様 §3 / §7）。埋め込み host が
+// `EngineConfig.budget` に有限 budget を設定し、`EmbeddingRequest::with_deadline_clock` に
+// monotonic clock を渡して deadline を実効化するために使う。`FakeClock` は決定的な
+// test / host utility 向けの clock 実装。
+pub use budget::{
+    BudgetConfig, BudgetCounters, BudgetPeaks, BudgetUsage, FakeClock, MonotonicClock,
+    MonotonicInstant,
+};
+// `budget::ConfigError` は `embedding::ConfigError` と名前衝突するため、budget 側は
+// `BudgetConfigError` として別名公開する。
+pub use budget::ConfigError as BudgetConfigError;
 
 // Phase 1 embedding（スライス E1、`docs/embedding-api.md` 第3・8節）の公開型。
 //

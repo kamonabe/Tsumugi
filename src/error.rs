@@ -130,6 +130,35 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
+    /// script の try/catch で捕捉できない catch 不能 terminal 信号か（REV-015 E11、
+    /// execution-control §8 / §15.1）。
+    ///
+    /// これらは try frame を探さずそのまま伝播し、`run_slice` が対応する terminal outcome
+    /// （`Exited` / `DeadlineExceeded` / `Cancelled` / `BudgetExceeded`）へ写す。tree 評価器の
+    /// `handle_error` と VM の try handler が同じ判定を使い、backend 間で catch 可否を揃える。
+    ///
+    /// - `ProcessExit`: `exit()` の structured terminal（C7、REV-023）。
+    /// - `DeadlineExceeded` / `Cancelled`: deadline 超過・協調 cancel（Slice 4）。
+    /// - 予算超過（`StepLimit` / `CollectionLimit` / `StringLimit` / `SourceLimit` /
+    ///   `HeapLimit` / `IoLimit`）: fuel / collection / string / source / heap / I-O の上限
+    ///   （E11 で `BudgetExceeded` terminal を公開するのに合わせて catch 不能化）。
+    pub fn is_uncatchable(kind: Option<ErrorKind>) -> bool {
+        matches!(
+            kind,
+            Some(
+                ErrorKind::ProcessExit
+                    | ErrorKind::DeadlineExceeded
+                    | ErrorKind::Cancelled
+                    | ErrorKind::StepLimit
+                    | ErrorKind::CollectionLimit
+                    | ErrorKind::StringLimit
+                    | ErrorKind::SourceLimit
+                    | ErrorKind::HeapLimit
+                    | ErrorKind::IoLimit
+            )
+        )
+    }
+
     /// try/catch の `e["type"]` フィールドに使われる文字列を返す
     pub fn as_str(self) -> &'static str {
         match self {

@@ -909,6 +909,20 @@ impl BudgetLedger {
         self.clock = Some(clock);
     }
 
+    /// 注入する deadline clock がこの台帳の deadline と同じ domain（`clock_id` 一致）か検証する
+    /// （REV-015 E11）。
+    ///
+    /// domain が一致しないと deadline 比較が無意味になるため、host の前提条件違反として
+    /// [`ConfigError::ForeignClock`] を返す。deadline が既に過去かどうかは検証しない
+    /// （既に過去なら実行開始直後の checkpoint が [`ControlStop::DeadlineExceeded`] を出す。
+    /// これは `InternalFailure` ではなく通常の deadline terminal として扱う）。
+    pub fn validate_clock_domain(&self, clock: &dyn MonotonicClock) -> Result<(), ConfigError> {
+        if self.config.deadline.clock_id() != clock.clock_id() {
+            return Err(ConfigError::ForeignClock);
+        }
+        Ok(())
+    }
+
     /// この台帳が consult する [`CancellationToken`] の clone を返す（REV-015 Slice 4）。
     ///
     /// host はこの clone を別スレッドで保持し、実行中に [`CancellationToken::cancel`] を

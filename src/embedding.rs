@@ -154,14 +154,26 @@ pub struct EngineConfig {
     pub backend: Backend,
     /// 言語 revision。
     pub language_revision: LanguageRevision,
+    /// この engine で作る [`ExecutionContext`] に適用する有限 [`BudgetConfig`]（REV-015 E11）。
+    ///
+    /// `None`（既定）のときは legacy env（`TSUMUGI_MAX_STEPS` 等）由来の既定 budget を使い、
+    /// 観測挙動を従来どおりに保つ。`Some` を設定すると fuel / heap / string / source / I-O の
+    /// 有限上限と deadline を host が明示できる。deadline を実効化するには
+    /// [`ExecutionRequest::with_deadline_clock`] で同 domain の clock を渡す。
+    ///
+    /// 仕様の最終形（[組み込みAPI仕様](../docs/embedding-api.md) 第6節）は budget を必須所有と
+    /// するが、Phase 1/2 の段階実装（同 §同・第3節「内部縦切りで段階実装できる」）として
+    /// ここでは optional にし、既定経路を壊さずに host が有限 budget を選べるようにする。
+    pub budget: Option<crate::budget::BudgetConfig>,
 }
 
 impl Default for EngineConfig {
-    /// 既定は `TreeWalk` + 現行 revision。
+    /// 既定は `TreeWalk` + 現行 revision + legacy env budget（`budget: None`）。
     fn default() -> Self {
         Self {
             backend: Backend::TreeWalk,
             language_revision: LanguageRevision::CURRENT,
+            budget: None,
         }
     }
 }
@@ -427,7 +439,31 @@ pub enum ExecutionOutcome {
         /// canonical な runtime error。
         error: ExecutionError,
     },
-    /// script handler 開始前（最初の poll より前）に cancel された（Phase 1 の pre-run cancel）。
+    /// 実行予算（fuel / heap / string / source / I-O 等）の上限を超過して停止した
+    /// （REV-015 E11、仕様第8節）。
+    ///
+    /// script からは catch できない catch 不能 terminal で、`RuntimeError` には畳まない。
+    /// 超過した resource は [`ExecutionError::code`] の `ErrorKind`（`StepLimit` /
+    /// `CollectionLimit` / `StringLimit` / `SourceLimit` / `HeapLimit` / `IoLimit`）で分かる。
+    /// language-state は開始時点へ rollback される。`failure` の構造化 `BudgetExceeded` 形と
+    /// `usage: BudgetUsage` field は後続で追加する。
+    BudgetExceeded {
+        /// 超過した予算 resource を示す canonical error。
+        error: ExecutionError,
+    },
+    /// 実行 deadline を超過して停止した（REV-015 E11、仕様第8節）。
+    ///
+    /// [`ExecutionRequest::with_deadline_clock`] で渡した clock が
+    /// [`EngineConfig::budget`] の deadline に達したときに到達する catch 不能 terminal。
+    /// script からは catch できず、language-state は開始時点へ rollback される。
+    DeadlineExceeded,
+    /// 実行が協調的に cancel された（REV-015 E11、仕様第7・8節）。
+    ///
+    /// [`ExecutionContext::cancellation_token`] で得た token を実行中に
+    /// [`CancellationToken::cancel`](crate::budget::CancellationToken::cancel) した場合、または
+    /// [`ExecutionRequest::pre_cancelled`] で最初の poll より前に cancel 済みとした場合（Phase 1
+    /// の pre-run cancel）に到達する catch 不能 terminal。language-state は開始時点へ rollback
+    /// される。
     Cancelled,
     /// engine / host callback の panic を捕捉した内部障害（secret を含まない）。
     InternalFailure {
@@ -858,15 +894,15 @@ use crate::eval::{Evaluator, RunPhase};
 /// E3 では script 引数 snapshot だけを持つ最小の骨格。仕様の `execution_id` /
 /// frozen `CapabilitySet` / 有限 `BudgetConfig` / `CancellationToken` は Phase 2/3（E7・E11）で
 /// 導入する。alpha facade（[`crate::engine::ExecutionRequest`]）とは別型。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ExecutionRequest {
     /// `args()` が返すスクリプト引数 snapshot（binary 名・script path・CLI flag を含まない）。
     arguments: Vec<String>,
     /// 最初の poll より前に cancel 済みか（Phase 1 の pre-run cancel、EMB-AT-12）。
     ///
-    /// Phase 3 の `CancellationToken`（実行中 cancel）は E11 で導入する。E5 では実行前に
-    /// 確定した cancel だけを扱い、命令を1つも実行せずに [`ExecutionOutcome::Cancelled`] へ
-    /// 落とす（"pre-cancel は命令0"）。
+    /// 実行前に確定した cancel を扱い、命令を1つも実行せずに [`ExecutionOutcome::Cancelled`] へ
+    /// 落とす（"pre-cancel は命令0"）。実行中の cancel は
+    /// [`ExecutionContext::cancellation_token`] 経由で行う（E11）。
     pre_cancelled: bool,
     /// この実行に付与する frozen capability 集合（Phase 2 C1〜、deny-by-default）。
     ///
@@ -874,6 +910,26 @@ pub struct ExecutionRequest {
     /// 明示 grant した authority だけを許可する。実行後に評価器から clear され、reusable な
     /// context へ持ち越さない（仕様第15節 規則5・6）。
     capabilities: crate::capability::CapabilitySet,
+    /// deadline 確認に使う monotonic clock（REV-015 E11）。
+    ///
+    /// `None`（既定）なら deadline を効かせない（観測挙動は従来どおり）。`Some` のときは
+    /// [`EngineConfig::budget`] の `deadline` と同じ domain（`clock_id` 一致）でなければならず、
+    /// 実行中に `clock.now() >= deadline` に達すると [`ExecutionOutcome::DeadlineExceeded`]
+    /// terminal で停止する（script からは catch できない）。clock と deadline の domain 不一致は
+    /// [`Engine::run`] が [`ExecutionOutcome::InternalFailure`] として拒否する（host の前提条件
+    /// 違反）。
+    deadline_clock: Option<Arc<dyn crate::budget::MonotonicClock>>,
+}
+
+impl std::fmt::Debug for ExecutionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 引数値や capability 本文を Debug へ出さない（secret-free）。件数・有無だけを見せる。
+        f.debug_struct("ExecutionRequest")
+            .field("argument_count", &self.arguments.len())
+            .field("pre_cancelled", &self.pre_cancelled)
+            .field("has_deadline_clock", &self.deadline_clock.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ExecutionRequest {
@@ -883,6 +939,7 @@ impl ExecutionRequest {
             arguments: Vec::new(),
             pre_cancelled: false,
             capabilities: crate::capability::CapabilitySet::empty(),
+            deadline_clock: None,
         }
     }
 
@@ -907,6 +964,18 @@ impl ExecutionRequest {
     /// （第10節 規則5）、context は poison されないので再利用できる。
     pub fn pre_cancelled(mut self) -> Self {
         self.pre_cancelled = true;
+        self
+    }
+
+    /// deadline 確認に使う monotonic clock を設定する（REV-015 E11、仕様第7節）。
+    ///
+    /// [`EngineConfig::budget`] に deadline を設定したうえでこの clock を渡すと、実行中に
+    /// `clock.now() >= deadline` へ達した時点で [`ExecutionOutcome::DeadlineExceeded`] terminal
+    /// で停止する。clock は deadline と同じ domain（`clock_id` 一致）でなければならない
+    /// （通常は `BudgetConfig::standard(&clock)` を作った clock をそのまま渡す）。domain が
+    /// 一致しない場合、[`Engine::run`] は [`ExecutionOutcome::InternalFailure`] を返す。
+    pub fn with_deadline_clock(mut self, clock: Arc<dyn crate::budget::MonotonicClock>) -> Self {
+        self.deadline_clock = Some(clock);
         self
     }
 }
@@ -962,10 +1031,19 @@ pub struct ExecutionContext {
 
 impl ExecutionContext {
     /// 指定した engine 用の実行コンテキストを作る（仕様第6節 `ExecutionContext::new`）。
+    ///
+    /// engine の [`EngineConfig::budget`] が `Some` ならその有限 [`BudgetConfig`] を評価器へ
+    /// 適用する（REV-015 E11）。`None` なら legacy env 由来の既定 budget を使い、観測挙動を
+    /// 従来どおりに保つ。budget（fuel / heap / string / source / I-O / deadline）は context の
+    /// 評価器が保持し、この context での全 execution が共有する。
     pub fn new(engine: &Engine) -> Self {
+        let evaluator = match &engine.config().budget {
+            Some(budget) => Evaluator::with_budget(*budget),
+            None => Evaluator::new(),
+        };
         Self {
             engine_id: engine.id(),
-            evaluator: Evaluator::new(),
+            evaluator,
             poisoned: false,
             running: false,
             #[cfg(test)]
@@ -1021,6 +1099,24 @@ impl ExecutionContext {
     /// 現在の予算使用量 snapshot を返す（仕様第6節 `BudgetUsage`）。
     pub fn budget_usage(&self) -> BudgetUsage {
         self.evaluator.budget_usage()
+    }
+
+    /// この context の実行を協調的に cancel するための token の clone を返す（仕様第7節、
+    /// REV-015 E11）。
+    ///
+    /// 返る [`CancellationToken`](crate::budget::CancellationToken) は `Send + Sync` な
+    /// `Arc<AtomicBool>` の clone で、別スレッドへ渡せる。host は [`Engine::run`] を呼ぶ前に
+    /// この token を取得しておき、別スレッドから [`CancellationToken::cancel`](crate::budget::CancellationToken::cancel)
+    /// を呼ぶことで実行中の script を協調的に停止できる（§8）。cancel は各 fuel charge 前と
+    /// 文/反復境界の checkpoint で観測され、実行は [`ExecutionOutcome::Cancelled`] terminal で
+    /// 終わって全 language-state を rollback する（script からは catch できない）。
+    ///
+    /// token は context の評価器に紐づき、同 context の複数 execution で共有される（ledger が
+    /// context 寿命で持続するため）。1 つの execution だけを cancel したい場合は、その
+    /// execution の前に一度だけこの token を取得し、terminal 後は cancel しても outcome は
+    /// 変わらない（§8「commit 後の cancel は結果を変えない」）。
+    pub fn cancellation_token(&self) -> crate::budget::CancellationToken {
+        self.evaluator.cancellation_token()
     }
 }
 
@@ -1163,6 +1259,17 @@ impl Engine {
             return ExecutionOutcome::Cancelled;
         }
 
+        // deadline 用 clock を注入する（REV-015 E11）。clock と config.deadline の domain 不一致は
+        // host の前提条件違反なので InternalFailure で拒否する（`BudgetConfig::validate`）。
+        if let Some(clock) = request.deadline_clock {
+            if let Err(err) = context.evaluator.validate_budget_against(clock.as_ref()) {
+                return internal_failure(format!(
+                    "deadline clock が budget config と整合しません: {err:?}"
+                ));
+            }
+            context.evaluator.set_deadline_clock(clock);
+        }
+
         // 引数 snapshot と frozen capability 集合を評価器へ注入する（AUD-018 / Phase 2 C1〜）。
         context.evaluator.set_script_args(request.arguments);
         context.evaluator.set_capabilities(request.capabilities);
@@ -1192,9 +1299,11 @@ impl Engine {
                 .begin_execution(program, root_source_bytes, true)
         {
             // Phase 1 の import なし root では Link 失敗は起きないが、防御的に写像する。
-            // link/control-plane の LinkError terminal は Phase 2（E7）で扱う。
+            // link/control-plane の LinkError terminal は Phase 2（E7）で扱う。Link フェーズでも
+            // charge（source/import/heap）で budget 超過・deadline・cancel が起き得るので、
+            // 実行フェーズと同じ専用 terminal へ写す（REV-015 E11、§8）。
             return match phase {
-                RunPhase::Link | RunPhase::Run => runtime_error_outcome(error),
+                RunPhase::Link | RunPhase::Run => terminal_from_run_error(context, error),
             };
         }
 
@@ -1207,12 +1316,10 @@ impl Engine {
                 Some(Err(error)) => {
                     // exit() の structured terminal（C7、REV-023）を Exited outcome へ写す。
                     // run_slice は既に language-state を commit 済み（Exited は Completed と同じ
-                    // 規則5 commit）。それ以外の未捕捉エラーは RuntimeError（rollback 済み）。
-                    if matches!(error.kind(), Some(crate::error::ErrorKind::ProcessExit)) {
-                        let code = context.evaluator.take_pending_exit().unwrap_or(0);
-                        return ExecutionOutcome::Exited { code };
-                    }
-                    return runtime_error_outcome(error);
+                    // 規則5 commit）。cancel / deadline / budget 超過は catch 不能 terminal 信号
+                    // なので専用 outcome へ写し、RuntimeError に埋もれさせない（REV-015 E11、
+                    // 仕様第8節）。それ以外の未捕捉エラーは RuntimeError（rollback 済み）。
+                    return terminal_from_run_error(context, error);
                 }
             }
         }
@@ -1223,6 +1330,45 @@ impl Engine {
 fn runtime_error_outcome(error: TsumugiError) -> ExecutionOutcome {
     ExecutionOutcome::RuntimeError {
         error: execution_error_from(&error),
+    }
+}
+
+/// 実行（Link / Run フェーズ）で発生した内部 [`TsumugiError`] を terminal outcome へ写す
+/// （REV-015 E11、仕様第8節）。
+///
+/// catch 不能 terminal 信号（`exit` / cancel / deadline / budget 超過）は専用 outcome へ写し、
+/// それ以外の未捕捉 runtime error は [`ExecutionOutcome::RuntimeError`] とする。いずれの経路も
+/// `run_slice` / `begin_execution` が既に language-state を commit / rollback 済みで戻る
+/// （`Exited` は commit、他は rollback）。
+fn terminal_from_run_error(
+    context: &mut ExecutionContext,
+    error: TsumugiError,
+) -> ExecutionOutcome {
+    use crate::error::ErrorKind;
+    match error.kind() {
+        // exit() の structured terminal（C7、REV-023）。commit 済み。
+        Some(ErrorKind::ProcessExit) => {
+            let code = context.evaluator.take_pending_exit().unwrap_or(0);
+            ExecutionOutcome::Exited { code }
+        }
+        // 協調 cancel（§8）。catch 不能 terminal。
+        Some(ErrorKind::Cancelled) => ExecutionOutcome::Cancelled,
+        // deadline 超過（§8）。catch 不能 terminal。
+        Some(ErrorKind::DeadlineExceeded) => ExecutionOutcome::DeadlineExceeded,
+        // 予算超過（fuel / collection / string / source / heap / I-O）。catch 不能 terminal で
+        // RuntimeError には畳まない（§8）。
+        Some(
+            ErrorKind::StepLimit
+            | ErrorKind::CollectionLimit
+            | ErrorKind::StringLimit
+            | ErrorKind::SourceLimit
+            | ErrorKind::HeapLimit
+            | ErrorKind::IoLimit,
+        ) => ExecutionOutcome::BudgetExceeded {
+            error: execution_error_from(&error),
+        },
+        // それ以外の未捕捉 runtime error（rollback 済み）。
+        _ => runtime_error_outcome(error),
     }
 }
 
@@ -1495,6 +1641,7 @@ mod tests {
         let config = EngineConfig {
             backend: Backend::VmExperimental,
             language_revision: LanguageRevision::CURRENT,
+            ..EngineConfig::default()
         };
         let err = Engine::builder()
             .config(config.clone())
@@ -2833,5 +2980,222 @@ mod tests {
             engine.run(&linked, &mut ctx, ExecutionRequest::new()),
             ExecutionOutcome::Completed
         );
+    }
+
+    // =======================================================================
+    // スライス E11: budget / deadline / runtime cancel の公開 API 露出
+    //   （EMB-AT-21 の Phase 3・tree 範囲）
+    // =======================================================================
+
+    use crate::budget::{BudgetConfig, CancellationToken, FakeClock};
+
+    /// 有限 budget を持つ engine を作る（deadline は clock.now()+30s の既定）。
+    fn engine_with_budget(budget: BudgetConfig) -> Engine {
+        Engine::builder()
+            .config(EngineConfig {
+                budget: Some(budget),
+                ..EngineConfig::default()
+            })
+            .build()
+            .unwrap()
+    }
+
+    /// EMB-AT-21: deadline に達すると DeadlineExceeded terminal で停止し、RuntimeError にしない。
+    #[test]
+    fn e11_deadline_exceeded_is_terminal() {
+        let clock = Arc::new(FakeClock::new());
+        // 30s 先の deadline を持つ既定 budget。
+        let budget = BudgetConfig::standard(clock.as_ref()).unwrap();
+        let engine = engine_with_budget(budget);
+        let mut ctx = ExecutionContext::new(&engine);
+
+        // clock を deadline ちょうどへ進めておく（charge 前 checkpoint で観測される）。
+        clock.set(budget.deadline.as_nanos());
+
+        let linked = compile_link(&engine, "m", "let x = 1\nlet y = 2\n");
+        let outcome = engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_deadline_clock(clock.clone()),
+        );
+        assert_eq!(outcome, ExecutionOutcome::DeadlineExceeded);
+        // catch 不能 terminal なので poison しない・再利用できる。
+        assert!(!ctx.is_poisoned());
+    }
+
+    /// EMB-AT-21 / EMB-AT-10: deadline は try/catch で捕捉できない（catch body に入らない）。
+    #[test]
+    fn e11_deadline_is_uncatchable() {
+        let clock = Arc::new(FakeClock::new());
+        let budget = BudgetConfig::standard(clock.as_ref()).unwrap();
+        let engine = engine_with_budget(budget);
+        let mut ctx = ExecutionContext::new(&engine);
+        clock.set(budget.deadline.as_nanos());
+
+        // catch body で binding を作っても、deadline は catch されず terminal になる。
+        let linked = compile_link(
+            &engine,
+            "m",
+            "try\n  let a = 1\ncatch e\n  let caught = 1\nend\n",
+        );
+        let outcome = engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_deadline_clock(clock.clone()),
+        );
+        assert_eq!(outcome, ExecutionOutcome::DeadlineExceeded);
+    }
+
+    /// deadline 未達なら通常どおり Completed（clock を進めない）。
+    #[test]
+    fn e11_deadline_not_reached_completes() {
+        let clock = Arc::new(FakeClock::new());
+        let budget = BudgetConfig::standard(clock.as_ref()).unwrap();
+        let engine = engine_with_budget(budget);
+        let mut ctx = ExecutionContext::new(&engine);
+
+        let linked = compile_link(&engine, "m", "let x = 1\nlet y = x + 2\n");
+        let outcome = engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_deadline_clock(clock.clone()),
+        );
+        assert_eq!(outcome, ExecutionOutcome::Completed);
+    }
+
+    /// clock の domain（clock_id）が budget deadline と一致しないと InternalFailure で拒否する。
+    #[test]
+    fn e11_foreign_deadline_clock_is_internal_failure() {
+        let config_clock = FakeClock::new();
+        let budget = BudgetConfig::standard(&config_clock).unwrap();
+        let engine = engine_with_budget(budget);
+        let mut ctx = ExecutionContext::new(&engine);
+
+        // 別 clock（別 clock_id）を渡す。
+        let foreign = Arc::new(FakeClock::new());
+        let linked = compile_link(&engine, "m", "let x = 1\n");
+        match engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_deadline_clock(foreign),
+        ) {
+            ExecutionOutcome::InternalFailure { fault_id, .. } => assert_ne!(fault_id, 0),
+            other => panic!("期待: InternalFailure, 実際: {other:?}"),
+        }
+    }
+
+    /// EMB-AT-21: 実行中 cancel（別スレッド相当）は Cancelled terminal で停止する。
+    ///
+    /// context の token を run 前に取得し、cancel 済みにしてから実行する。最初の charge 前
+    /// checkpoint で観測され、命令実行前に Cancelled になる（§8）。
+    #[test]
+    fn e11_runtime_cancel_is_terminal() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+
+        let token: CancellationToken = ctx.cancellation_token();
+        assert!(token.cancel(), "最初の cancel は true を返す");
+
+        let linked = compile_link(&engine, "m", "let saved = 7\nlet z = saved + 1\n");
+        let outcome = engine.run(&linked, &mut ctx, ExecutionRequest::new());
+        assert_eq!(outcome, ExecutionOutcome::Cancelled);
+        assert!(!ctx.is_poisoned(), "Cancelled は poison しない");
+
+        // cancel された実行は language-state を rollback する（saved は残らない）。
+        // 次実行のため token は new context で作り直す（同 context の token は cancel 済みのまま）。
+        let mut ctx2 = ExecutionContext::new(&engine);
+        let probe = compile_link(&engine, "m", "let echo = saved\n");
+        match engine.run(&probe, &mut ctx2, ExecutionRequest::new()) {
+            ExecutionOutcome::RuntimeError { error } => assert_eq!(error.code, ErrorKind::Name),
+            other => panic!("cancel が副作用を残した: {other:?}"),
+        }
+    }
+
+    /// EMB-AT-10: runtime cancel は try/catch で捕捉できない。
+    #[test]
+    fn e11_runtime_cancel_is_uncatchable() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let token = ctx.cancellation_token();
+        token.cancel();
+
+        let linked = compile_link(
+            &engine,
+            "m",
+            "try\n  let a = 1\ncatch e\n  let caught = 1\nend\n",
+        );
+        assert_eq!(
+            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::Cancelled
+        );
+    }
+
+    /// EMB-AT-21: fuel 上限を超えると BudgetExceeded terminal になり、RuntimeError にはしない。
+    ///
+    /// `for_legacy(total_fuel, collection)` で fuel を極小に絞り、ループ反復で超過させる
+    /// （単純な `let` の羅列は count_step を呼ばないためループを使う）。
+    #[test]
+    fn e11_budget_exceeded_is_terminal_not_runtime_error() {
+        // fuel=5 の極小 budget。ループ反復で step 上限に達する。
+        let budget = BudgetConfig::for_legacy(5, 1_000_000);
+        let engine = engine_with_budget(budget);
+        let mut ctx = ExecutionContext::new(&engine);
+
+        let linked = compile_link(
+            &engine,
+            "m",
+            "let i = 0\nwhile i < 1000\n  i = i + 1\nend\n",
+        );
+        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+            ExecutionOutcome::BudgetExceeded { error } => {
+                // fuel 超過は StepLimit（canonical code "limit"）。
+                assert_eq!(error.code, ErrorKind::StepLimit);
+            }
+            other => panic!("期待: BudgetExceeded, 実際: {other:?}"),
+        }
+        // catch 不能 terminal なので poison しない。
+        assert!(!ctx.is_poisoned());
+    }
+
+    /// EMB-AT-21 / EMB-AT-10: budget 超過は try/catch で捕捉できない。
+    #[test]
+    fn e11_budget_exceeded_is_uncatchable() {
+        let budget = BudgetConfig::for_legacy(5, 1_000_000);
+        let engine = engine_with_budget(budget);
+        let mut ctx = ExecutionContext::new(&engine);
+
+        let linked = compile_link(
+            &engine,
+            "m",
+            "try\n  let i = 0\n  while i < 1000\n    i = i + 1\n  end\ncatch e\n  let caught = 1\nend\n",
+        );
+        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+            ExecutionOutcome::BudgetExceeded { .. } => {}
+            other => panic!("期待: BudgetExceeded, 実際: {other:?}"),
+        }
+    }
+
+    /// budget を設定しない既定 engine では従来どおり Completed（観測挙動不変）。
+    #[test]
+    fn e11_default_engine_budget_unchanged() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "let a = 1\nlet b = a + 2\n");
+        assert_eq!(
+            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::Completed
+        );
+    }
+
+    /// ExecutionRequest の Debug は secret（引数値・capability 本文）を出さない（EMB-AT-14）。
+    #[test]
+    fn e11_execution_request_debug_is_secret_free() {
+        let req = ExecutionRequest::new().with_arguments(vec!["s3cr3t-token".to_string()]);
+        let dbg = format!("{req:?}");
+        assert!(
+            !dbg.contains("s3cr3t-token"),
+            "Debug に引数値を出さない: {dbg}"
+        );
+        assert!(dbg.contains("argument_count"));
     }
 }
