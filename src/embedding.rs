@@ -413,10 +413,15 @@ pub struct HostError {
 
 /// スクリプト実行の terminal outcome（仕様第8節 `ExecutionOutcome`）。
 ///
-/// E1（Phase 1）で構造化できる variant のみを持つ。仕様の他 terminal（`Exited` /
-/// `Denied` / `HostError` / `BudgetExceeded` / `DeadlineExceeded` / `AuditFailure` /
-/// `RecordFailure` / `ReplayMismatch` と、`usage: BudgetUsage` field）は、対応する機構が
-/// 入る後続 Phase で追加する。`#[non_exhaustive]` により variant 追加を breaking にしない。
+/// Phase 1〜Phase 3（E11）で到達し得る variant を持つ。各 variant は仕様第6・12節どおり
+/// `usage: BudgetUsage` を同梱し、terminal 時点の予算使用量 snapshot を公開する。仕様の他
+/// terminal（`Denied` / `HostError` / `AuditFailure` / `RecordFailure` / `ReplayMismatch` /
+/// `LinkError`）は、対応する機構が入る後続 Phase で追加する。`#[non_exhaustive]` により
+/// variant 追加を breaking にしない。
+///
+/// `usage` はいずれの経路でも commit / rollback 後の値を載せる（total budget は単調で、
+/// live heap だけ解放で減少し得る。仕様第2節 不変条件）。実行を1命令も試みない terminal
+/// （precondition 違反による `InternalFailure` や pre-run cancel）は既定の空 usage を持つ。
 ///
 /// 現行 alpha facade の [`crate::engine::ExecutionOutcome`] とは別型で、crate root では
 /// [`crate::EmbeddingOutcome`] として公開する。
@@ -424,20 +429,27 @@ pub struct HostError {
 #[non_exhaustive]
 pub enum ExecutionOutcome {
     /// スクリプトが最後まで実行された。v1 の返値は常に空（top-level 返値は将来拡張）。
-    Completed,
+    Completed {
+        /// terminal 時点の予算使用量 snapshot（仕様第6・12節）。
+        usage: BudgetUsage,
+    },
     /// スクリプトが `exit(code)` で終了した（Phase 2 C7、REV-023）。
     ///
     /// ProcessExit capability を grant された実行だけがこの terminal に到達する。`Completed`
     /// と同じく全 language-state を commit する（仕様第10節 規則5）。script からは catch でき
-    /// ない。`usage: BudgetUsage` field は Phase 3（E11）で追加する。
+    /// ない。
     Exited {
         /// スクリプトが指定した終了コード（0..=255）。
         code: u8,
+        /// terminal 時点の予算使用量 snapshot（仕様第6・12節）。
+        usage: BudgetUsage,
     },
     /// スクリプト実行中に未捕捉 runtime error で終了した。
     RuntimeError {
         /// canonical な runtime error。
         error: ExecutionError,
+        /// terminal 時点の予算使用量 snapshot（仕様第6・12節）。
+        usage: BudgetUsage,
     },
     /// 実行予算（fuel / heap / string / source / I-O 等）の上限を超過して停止した
     /// （REV-015 E11、仕様第8節）。
@@ -445,18 +457,23 @@ pub enum ExecutionOutcome {
     /// script からは catch できない catch 不能 terminal で、`RuntimeError` には畳まない。
     /// 超過した resource は [`ExecutionError::code`] の `ErrorKind`（`StepLimit` /
     /// `CollectionLimit` / `StringLimit` / `SourceLimit` / `HeapLimit` / `IoLimit`）で分かる。
-    /// language-state は開始時点へ rollback される。`failure` の構造化 `BudgetExceeded` 形と
-    /// `usage: BudgetUsage` field は後続で追加する。
+    /// language-state は開始時点へ rollback される。`failure` の構造化 `BudgetExceeded` 形は
+    /// 後続で追加する。
     BudgetExceeded {
         /// 超過した予算 resource を示す canonical error。
         error: ExecutionError,
+        /// terminal 時点の予算使用量 snapshot（仕様第6・12節）。
+        usage: BudgetUsage,
     },
     /// 実行 deadline を超過して停止した（REV-015 E11、仕様第8節）。
     ///
     /// [`ExecutionRequest::with_deadline_clock`] で渡した clock が
     /// [`EngineConfig::budget`] の deadline に達したときに到達する catch 不能 terminal。
     /// script からは catch できず、language-state は開始時点へ rollback される。
-    DeadlineExceeded,
+    DeadlineExceeded {
+        /// terminal 時点の予算使用量 snapshot（仕様第6・12節）。
+        usage: BudgetUsage,
+    },
     /// 実行が協調的に cancel された（REV-015 E11、仕様第7・8節）。
     ///
     /// [`ExecutionContext::cancellation_token`] で得た token を実行中に
@@ -464,13 +481,18 @@ pub enum ExecutionOutcome {
     /// [`ExecutionRequest::pre_cancelled`] で最初の poll より前に cancel 済みとした場合（Phase 1
     /// の pre-run cancel）に到達する catch 不能 terminal。language-state は開始時点へ rollback
     /// される。
-    Cancelled,
+    Cancelled {
+        /// terminal 時点の予算使用量 snapshot（仕様第6・12節）。
+        usage: BudgetUsage,
+    },
     /// engine / host callback の panic を捕捉した内部障害（secret を含まない）。
     InternalFailure {
         /// 相関用の非ゼロ fault ID。
         fault_id: u128,
         /// secret を含まない表示用メッセージ。
         safe_message: String,
+        /// terminal 時点の予算使用量 snapshot（仕様第6・12節）。
+        usage: BudgetUsage,
     },
 }
 
@@ -1193,6 +1215,8 @@ impl Engine {
             Err(fault_id) => ExecutionOutcome::InternalFailure {
                 fault_id,
                 safe_message: internal_fault_message(fault_id),
+                // panic 捕捉時点の usage snapshot（counter の read は panic 後も安全）。
+                usage: context.evaluator.budget_usage(),
             },
         };
         context.running = false;
@@ -1256,7 +1280,10 @@ impl Engine {
         // 何も変更していないので rollback は自明に成立し、context は poison されない
         // （第10節 規則4・5）。
         if request.pre_cancelled {
-            return ExecutionOutcome::Cancelled;
+            // 命令0なので usage は空（begin_execution 前）。
+            return ExecutionOutcome::Cancelled {
+                usage: context.evaluator.budget_usage(),
+            };
         }
 
         // deadline 用 clock を注入する（REV-015 E11）。clock と config.deadline の domain 不一致は
@@ -1312,7 +1339,11 @@ impl Engine {
             // terminal まで回し切る。
             match context.evaluator.run_slice(u64::MAX) {
                 None => continue, // yield（Phase 1 では slice=u64::MAX のため実質起きない）
-                Some(Ok(())) => return ExecutionOutcome::Completed,
+                Some(Ok(())) => {
+                    // commit 済みの usage を同梱する（仕様第6・12節）。
+                    let usage = context.evaluator.budget_usage();
+                    return ExecutionOutcome::Completed { usage };
+                }
                 Some(Err(error)) => {
                     // exit() の structured terminal（C7、REV-023）を Exited outcome へ写す。
                     // run_slice は既に language-state を commit 済み（Exited は Completed と同じ
@@ -1327,9 +1358,10 @@ impl Engine {
 }
 
 /// 内部 [`TsumugiError`] を [`ExecutionOutcome::RuntimeError`] へ写す。
-fn runtime_error_outcome(error: TsumugiError) -> ExecutionOutcome {
+fn runtime_error_outcome(error: TsumugiError, usage: BudgetUsage) -> ExecutionOutcome {
     ExecutionOutcome::RuntimeError {
         error: execution_error_from(&error),
+        usage,
     }
 }
 
@@ -1345,16 +1377,18 @@ fn terminal_from_run_error(
     error: TsumugiError,
 ) -> ExecutionOutcome {
     use crate::error::ErrorKind;
+    // usage snapshot は commit / rollback 後（run_slice / begin_execution が確定済み）の値。
+    let usage = context.evaluator.budget_usage();
     match error.kind() {
         // exit() の structured terminal（C7、REV-023）。commit 済み。
         Some(ErrorKind::ProcessExit) => {
             let code = context.evaluator.take_pending_exit().unwrap_or(0);
-            ExecutionOutcome::Exited { code }
+            ExecutionOutcome::Exited { code, usage }
         }
         // 協調 cancel（§8）。catch 不能 terminal。
-        Some(ErrorKind::Cancelled) => ExecutionOutcome::Cancelled,
+        Some(ErrorKind::Cancelled) => ExecutionOutcome::Cancelled { usage },
         // deadline 超過（§8）。catch 不能 terminal。
-        Some(ErrorKind::DeadlineExceeded) => ExecutionOutcome::DeadlineExceeded,
+        Some(ErrorKind::DeadlineExceeded) => ExecutionOutcome::DeadlineExceeded { usage },
         // 予算超過（fuel / collection / string / source / heap / I-O）。catch 不能 terminal で
         // RuntimeError には畳まない（§8）。
         Some(
@@ -1366,17 +1400,21 @@ fn terminal_from_run_error(
             | ErrorKind::IoLimit,
         ) => ExecutionOutcome::BudgetExceeded {
             error: execution_error_from(&error),
+            usage,
         },
         // それ以外の未捕捉 runtime error（rollback 済み）。
-        _ => runtime_error_outcome(error),
+        _ => runtime_error_outcome(error, usage),
     }
 }
 
 /// secret を含まない [`ExecutionOutcome::InternalFailure`] を作る。
+///
+/// 実行を1命令も試みない precondition 違反経路で使うため、`usage` は空（既定）とする。
 fn internal_failure(safe_message: impl Into<String>) -> ExecutionOutcome {
     ExecutionOutcome::InternalFailure {
         fault_id: next_fault_id(),
         safe_message: safe_message.into(),
+        usage: BudgetUsage::default(),
     }
 }
 
@@ -1725,13 +1763,17 @@ mod tests {
                 line: Some(3),
             }],
         };
-        let outcome = ExecutionOutcome::RuntimeError { error: err };
+        let outcome = ExecutionOutcome::RuntimeError {
+            error: err,
+            usage: BudgetUsage::default(),
+        };
         let rendered = format!("{outcome:?}");
         assert!(!rendered.contains(SECRET));
 
         let internal = ExecutionOutcome::InternalFailure {
             fault_id: 12345,
             safe_message: "内部エラー".to_string(),
+            usage: BudgetUsage::default(),
         };
         assert!(!format!("{internal:?}").contains(SECRET));
     }
@@ -1941,7 +1983,7 @@ mod tests {
         let linked = engine.link(&script, LinkRequest::new()).unwrap();
         let mut ctx = ExecutionContext::new(&engine);
         let outcome = engine.run(&linked, &mut ctx, ExecutionRequest::new());
-        assert_eq!(outcome, ExecutionOutcome::Completed);
+        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }));
     }
 
     /// 未捕捉 runtime error は RuntimeError outcome へ写り、code / trace が付く。
@@ -1960,7 +2002,7 @@ mod tests {
         let linked = engine.link(&script, LinkRequest::new()).unwrap();
         let mut ctx = ExecutionContext::new(&engine);
         match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
-            ExecutionOutcome::RuntimeError { error } => {
+            ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, ErrorKind::Name);
                 assert_eq!(error.line, Some(1));
             }
@@ -1984,7 +2026,7 @@ mod tests {
         let linked = engine.link(&script, LinkRequest::new()).unwrap();
         let mut ctx = ExecutionContext::new(&engine);
         match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
-            ExecutionOutcome::RuntimeError { error } => {
+            ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, ErrorKind::Name);
                 assert!(
                     error.trace.iter().any(|f| f.function == "boom"),
@@ -2049,10 +2091,10 @@ mod tests {
             )
             .unwrap();
         let linked1 = engine.link(&first, LinkRequest::new()).unwrap();
-        assert_eq!(
+        assert!(matches!(
             engine.run(&linked1, &mut ctx, ExecutionRequest::new()),
-            ExecutionOutcome::Completed
-        );
+            ExecutionOutcome::Completed { .. }
+        ));
 
         // 直前の実行で定義した saved を参照できる（同一 context）。
         let second = engine
@@ -2064,10 +2106,10 @@ mod tests {
             )
             .unwrap();
         let linked2 = engine.link(&second, LinkRequest::new()).unwrap();
-        assert_eq!(
+        assert!(matches!(
             engine.run(&linked2, &mut ctx, ExecutionRequest::new()),
-            ExecutionOutcome::Completed
-        );
+            ExecutionOutcome::Completed { .. }
+        ));
     }
 
     /// ExecutionContext は !Send / !Sync（stable 契約、第9.1節）であることを型で示す。
@@ -2129,14 +2171,14 @@ mod tests {
         // 変数を代入した直後に未定義参照でエラー化する。rollback されれば committed は残らない。
         let linked = compile_link(&engine, "m", "let saved = 7\nlet boom = undefined_name\n");
         match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
-            ExecutionOutcome::RuntimeError { error } => assert_eq!(error.code, ErrorKind::Name),
+            ExecutionOutcome::RuntimeError { error, .. } => assert_eq!(error.code, ErrorKind::Name),
             other => panic!("期待: RuntimeError, 実際: {other:?}"),
         }
 
         // rollback 済みなので saved は次実行から見えない（見えれば Name エラーで判別できる）。
         let probe = compile_link(&engine, "m", "let echo = saved\n");
         match engine.run(&probe, &mut ctx, ExecutionRequest::new()) {
-            ExecutionOutcome::RuntimeError { error } => assert_eq!(error.code, ErrorKind::Name),
+            ExecutionOutcome::RuntimeError { error, .. } => assert_eq!(error.code, ErrorKind::Name),
             other => panic!("saved が rollback されず残った: {other:?}"),
         }
     }
@@ -2148,16 +2190,16 @@ mod tests {
         let mut ctx = ExecutionContext::new(&engine);
 
         let first = compile_link(&engine, "m", "let saved = 41\n");
-        assert_eq!(
+        assert!(matches!(
             engine.run(&first, &mut ctx, ExecutionRequest::new()),
-            ExecutionOutcome::Completed
-        );
+            ExecutionOutcome::Completed { .. }
+        ));
         // commit 済みなので次実行から saved を参照できる。
         let second = compile_link(&engine, "m", "let doubled = saved + 1\n");
-        assert_eq!(
+        assert!(matches!(
             engine.run(&second, &mut ctx, ExecutionRequest::new()),
-            ExecutionOutcome::Completed
-        );
+            ExecutionOutcome::Completed { .. }
+        ));
     }
 
     /// EMB-AT-08: script 内で catch して正常完了したエラーは commit する（rollback しない）。
@@ -2171,16 +2213,16 @@ mod tests {
             "m",
             "let saved = 0\ntry\n  let x = undefined_name\ncatch e\n  saved = 5\nend\n",
         );
-        assert_eq!(
+        assert!(matches!(
             engine.run(&linked, &mut ctx, ExecutionRequest::new()),
-            ExecutionOutcome::Completed
-        );
+            ExecutionOutcome::Completed { .. }
+        ));
         // catch 後に代入した saved=5 は commit され、次実行から見える。
         let probe = compile_link(&engine, "m", "let echo = saved + 1\n");
-        assert_eq!(
+        assert!(matches!(
             engine.run(&probe, &mut ctx, ExecutionRequest::new()),
-            ExecutionOutcome::Completed
-        );
+            ExecutionOutcome::Completed { .. }
+        ));
     }
 
     /// EMB-AT-07: RuntimeError で終わっても context は poison されず、再利用できる。
@@ -2198,10 +2240,10 @@ mod tests {
 
         // そのまま再利用して正常実行できる。
         let ok = compile_link(&engine, "m", "let y = 1\n");
-        assert_eq!(
+        assert!(matches!(
             engine.run(&ok, &mut ctx, ExecutionRequest::new()),
-            ExecutionOutcome::Completed
-        );
+            ExecutionOutcome::Completed { .. }
+        ));
     }
 
     /// EMB-AT-07: InternalFailure は context を poison し、以後の実行を拒否する。
@@ -2238,16 +2280,16 @@ mod tests {
         let mut ctx = ExecutionContext::new(&engine);
 
         let seed = compile_link(&engine, "m", "let saved = 9\n");
-        assert_eq!(
+        assert!(matches!(
             engine.run(&seed, &mut ctx, ExecutionRequest::new()),
-            ExecutionOutcome::Completed
-        );
+            ExecutionOutcome::Completed { .. }
+        ));
         ctx.clear_user_state().expect("clear on idle context");
 
         // clear 後は saved が見えない（見えれば commit されている）。
         let probe = compile_link(&engine, "m", "let echo = saved\n");
         match engine.run(&probe, &mut ctx, ExecutionRequest::new()) {
-            ExecutionOutcome::RuntimeError { error } => assert_eq!(error.code, ErrorKind::Name),
+            ExecutionOutcome::RuntimeError { error, .. } => assert_eq!(error.code, ErrorKind::Name),
             other => panic!("clear 後も saved が残った: {other:?}"),
         }
     }
@@ -2272,12 +2314,12 @@ mod tests {
         // pre-cancel。副作用（binding）が起きれば後段の probe で検出できる。
         let linked = compile_link(&engine, "m", "let saved = 123\n");
         let outcome = engine.run(&linked, &mut ctx, ExecutionRequest::new().pre_cancelled());
-        assert_eq!(outcome, ExecutionOutcome::Cancelled);
+        assert!(matches!(outcome, ExecutionOutcome::Cancelled { .. }));
 
         // 命令0なので saved は commit されない（見えれば Name エラーで判別できる）。
         let probe = compile_link(&engine, "m", "let echo = saved\n");
         match engine.run(&probe, &mut ctx, ExecutionRequest::new()) {
-            ExecutionOutcome::RuntimeError { error } => assert_eq!(error.code, ErrorKind::Name),
+            ExecutionOutcome::RuntimeError { error, .. } => assert_eq!(error.code, ErrorKind::Name),
             other => panic!("pre-cancel が副作用を残した: {other:?}"),
         }
     }
@@ -2289,18 +2331,18 @@ mod tests {
         let mut ctx = ExecutionContext::new(&engine);
 
         let linked = compile_link(&engine, "m", "let x = 1\n");
-        assert_eq!(
+        assert!(matches!(
             engine.run(&linked, &mut ctx, ExecutionRequest::new().pre_cancelled()),
-            ExecutionOutcome::Cancelled
-        );
+            ExecutionOutcome::Cancelled { .. }
+        ));
         assert!(!ctx.is_poisoned(), "Cancelled は poison しない");
 
         // そのまま再利用して正常実行できる。
         let ok = compile_link(&engine, "m", "let y = 2\n");
-        assert_eq!(
+        assert!(matches!(
             engine.run(&ok, &mut ctx, ExecutionRequest::new()),
-            ExecutionOutcome::Completed
-        );
+            ExecutionOutcome::Completed { .. }
+        ));
     }
 
     /// pre-run cancel は poison 済み context では実行前提条件が優先される（InternalFailure）。
@@ -2378,6 +2420,7 @@ mod tests {
             ExecutionOutcome::InternalFailure {
                 fault_id,
                 safe_message,
+                ..
             } => {
                 assert_ne!(fault_id, 0);
                 assert!(!safe_message.contains("injected"));
@@ -2425,7 +2468,7 @@ mod tests {
             &mut ctx,
             ExecutionRequest::new().with_capabilities(exit_granted()),
         );
-        assert_eq!(outcome, ExecutionOutcome::Exited { code: 7 });
+        assert!(matches!(outcome, ExecutionOutcome::Exited { code: c, .. } if c == (7)));
     }
 
     /// exit(0) / exit(255) は境界値として Exited（EMB-AT-11）。
@@ -2440,7 +2483,7 @@ mod tests {
                 &mut ctx,
                 ExecutionRequest::new().with_capabilities(exit_granted()),
             );
-            assert_eq!(outcome, ExecutionOutcome::Exited { code });
+            assert!(matches!(outcome, ExecutionOutcome::Exited { code: got, .. } if got == code));
         }
     }
 
@@ -2450,24 +2493,24 @@ mod tests {
         let engine = Engine::builder().build().unwrap();
         let mut ctx = ExecutionContext::new(&engine);
         let first = compile_link(&engine, "m", "let saved = 41\nexit(0)\n");
-        assert_eq!(
+        assert!(matches!(
             engine.run(
                 &first,
                 &mut ctx,
                 ExecutionRequest::new().with_capabilities(exit_granted())
             ),
-            ExecutionOutcome::Exited { code: 0 }
-        );
+            ExecutionOutcome::Exited { code: 0, .. }
+        ));
         // 次の実行で saved が見える（commit されている）。
         let probe = compile_link(&engine, "m", "let echo = saved\n");
-        assert_eq!(
+        assert!(matches!(
             engine.run(
                 &probe,
                 &mut ctx,
                 ExecutionRequest::new().with_capabilities(exit_granted())
             ),
-            ExecutionOutcome::Completed
-        );
+            ExecutionOutcome::Completed { .. }
+        ));
     }
 
     /// ProcessExit 未 grant の exit() は catch 可能な capability error（未捕捉→RuntimeError）。
@@ -2479,7 +2522,7 @@ mod tests {
         // 既定 request は deny-by-default（capability なし）。
         let linked = compile_link(&engine, "m", "exit(0)\n");
         match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
-            ExecutionOutcome::RuntimeError { error } => {
+            ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, crate::error::ErrorKind::Capability);
             }
             other => panic!("期待: RuntimeError(capability), 実際: {other:?}"),
@@ -2497,10 +2540,10 @@ mod tests {
             "try\n  exit(0)\ncatch e\n  let caught = e[\"type\"]\nend\n",
         );
         // catch されれば正常完了する。
-        assert_eq!(
+        assert!(matches!(
             engine.run(&linked, &mut ctx, ExecutionRequest::new()),
-            ExecutionOutcome::Completed
-        );
+            ExecutionOutcome::Completed { .. }
+        ));
     }
 
     /// granted でも 0..=255 の範囲外は catch 可能な argument error（EMB-AT-11）。
@@ -2515,7 +2558,7 @@ mod tests {
                 &mut ctx,
                 ExecutionRequest::new().with_capabilities(exit_granted()),
             ) {
-                ExecutionOutcome::RuntimeError { error } => {
+                ExecutionOutcome::RuntimeError { error, .. } => {
                     assert_eq!(error.code, crate::error::ErrorKind::Argument);
                 }
                 other => panic!("期待: RuntimeError(argument), 実際: {other:?}"),
@@ -2534,14 +2577,14 @@ mod tests {
             "try\n  exit(3)\ncatch e\n  print(\"caught\")\nend\n",
         );
         // catch を素通りして Exited terminal になる。
-        assert_eq!(
+        assert!(matches!(
             engine.run(
                 &linked,
                 &mut ctx,
                 ExecutionRequest::new().with_capabilities(exit_granted())
             ),
-            ExecutionOutcome::Exited { code: 3 }
-        );
+            ExecutionOutcome::Exited { code: 3, .. }
+        ));
     }
 
     /// exit terminal 後も context は poison されず再利用できる（規則4）。
@@ -2558,10 +2601,10 @@ mod tests {
         assert!(!ctx.is_poisoned());
         // 再利用できる。
         let ok = compile_link(&engine, "m", "let x = 1\n");
-        assert_eq!(
+        assert!(matches!(
             engine.run(&ok, &mut ctx, ExecutionRequest::new()),
-            ExecutionOutcome::Completed
-        );
+            ExecutionOutcome::Completed { .. }
+        ));
     }
 
     // --- C3: Environment / Clock（env / now capability、CAP-AT-05 / CAP-AT-06）---
@@ -2620,7 +2663,7 @@ mod tests {
             &mut ctx,
             ExecutionRequest::new().with_capabilities(env_granted(&[("CODE", "7")])),
         );
-        assert_eq!(outcome, ExecutionOutcome::Exited { code: 7 });
+        assert!(matches!(outcome, ExecutionOutcome::Exited { code: c, .. } if c == (7)));
     }
 
     /// Environment grant 済みでも key が snapshot に無ければ null（error にしない、CAP-AT-05）。
@@ -2639,7 +2682,7 @@ mod tests {
             &mut ctx,
             ExecutionRequest::new().with_capabilities(env_granted(&[("CODE", "7")])),
         );
-        assert_eq!(outcome, ExecutionOutcome::Exited { code: 5 });
+        assert!(matches!(outcome, ExecutionOutcome::Exited { code: c, .. } if c == (5)));
     }
 
     /// Environment 未 grant の env() は catch 可能な capability error（未捕捉→RuntimeError、
@@ -2651,7 +2694,7 @@ mod tests {
         // 既定 request は deny-by-default（Environment なし）。
         let linked = compile_link(&engine, "m", "let x = env(\"CODE\")\n");
         match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
-            ExecutionOutcome::RuntimeError { error } => {
+            ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, crate::error::ErrorKind::Capability);
             }
             other => panic!("期待: RuntimeError(capability), 実際: {other:?}"),
@@ -2668,10 +2711,10 @@ mod tests {
             "m",
             "try\n  let x = env(\"CODE\")\ncatch e\n  let caught = e[\"type\"]\nend\n",
         );
-        assert_eq!(
+        assert!(matches!(
             engine.run(&linked, &mut ctx, ExecutionRequest::new()),
-            ExecutionOutcome::Completed
-        );
+            ExecutionOutcome::Completed { .. }
+        ));
     }
 
     /// snapshot は start 前に固定され、実行中に process env を再読しない（CAP-AT-05）。
@@ -2699,7 +2742,7 @@ mod tests {
         unsafe {
             std::env::remove_var("TSG_C3_PROBE");
         }
-        assert_eq!(outcome, ExecutionOutcome::Exited { code: 1 });
+        assert!(matches!(outcome, ExecutionOutcome::Exited { code: c, .. } if c == (1)));
     }
 
     /// Clock grant 済みなら now() は FixedClock の時刻を Unix 秒で返す（CAP-AT-06）。
@@ -2714,7 +2757,7 @@ mod tests {
             &mut ctx,
             ExecutionRequest::new().with_capabilities(clock_granted(42)),
         );
-        assert_eq!(outcome, ExecutionOutcome::Exited { code: 42 });
+        assert!(matches!(outcome, ExecutionOutcome::Exited { code: c, .. } if c == (42)));
     }
 
     /// 同じ FixedClock は同じ結果を返す（決定的、CAP-AT-06）。
@@ -2729,7 +2772,7 @@ mod tests {
                 &mut ctx,
                 ExecutionRequest::new().with_capabilities(clock_granted(100)),
             );
-            assert_eq!(outcome, ExecutionOutcome::Exited { code: 100 });
+            assert!(matches!(outcome, ExecutionOutcome::Exited { code: c, .. } if c == (100)));
         }
     }
 
@@ -2741,7 +2784,7 @@ mod tests {
         let mut ctx = ExecutionContext::new(&engine);
         let linked = compile_link(&engine, "m", "let t = now()\n");
         match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
-            ExecutionOutcome::RuntimeError { error } => {
+            ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, crate::error::ErrorKind::Capability);
             }
             other => panic!("期待: RuntimeError(capability), 実際: {other:?}"),
@@ -2758,10 +2801,10 @@ mod tests {
             "m",
             "try\n  let t = now()\ncatch e\n  let caught = e[\"type\"]\nend\n",
         );
-        assert_eq!(
+        assert!(matches!(
             engine.run(&linked, &mut ctx, ExecutionRequest::new()),
-            ExecutionOutcome::Completed
-        );
+            ExecutionOutcome::Completed { .. }
+        ));
     }
 
     // --- C4: Stdin / Stdout（input / print capability、CAP-AT-07 / CAP-AT-08）---
@@ -2860,7 +2903,7 @@ mod tests {
             &mut ctx,
             ExecutionRequest::new().with_capabilities(stdout_granted(sink.clone())),
         );
-        assert_eq!(outcome, ExecutionOutcome::Completed);
+        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }));
         assert_eq!(sink.lock().unwrap().as_slice(), b"hello\n");
     }
 
@@ -2872,7 +2915,7 @@ mod tests {
         // 既定 request は deny-by-default（Stdout なし）。
         let linked = compile_link(&engine, "m", "print(\"x\")\n");
         match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
-            ExecutionOutcome::RuntimeError { error } => {
+            ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, crate::error::ErrorKind::Capability);
             }
             other => panic!("期待: RuntimeError(capability), 実際: {other:?}"),
@@ -2889,10 +2932,10 @@ mod tests {
             "m",
             "try\n  print(\"x\")\ncatch e\n  let caught = e[\"type\"]\nend\n",
         );
-        assert_eq!(
+        assert!(matches!(
             engine.run(&linked, &mut ctx, ExecutionRequest::new()),
-            ExecutionOutcome::Completed
-        );
+            ExecutionOutcome::Completed { .. }
+        ));
     }
 
     /// print の host adapter 失敗は catch 可能な `host` error で、null へ潰さない（CAP-AT-07）。
@@ -2912,7 +2955,7 @@ mod tests {
             &mut ctx,
             ExecutionRequest::new().with_capabilities(set),
         ) {
-            ExecutionOutcome::RuntimeError { error } => {
+            ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, crate::error::ErrorKind::Host);
             }
             other => panic!("期待: RuntimeError(host), 実際: {other:?}"),
@@ -2930,7 +2973,7 @@ mod tests {
             &mut ctx,
             ExecutionRequest::new().with_capabilities(stdin_granted(&["8"])),
         );
-        assert_eq!(outcome, ExecutionOutcome::Exited { code: 8 });
+        assert!(matches!(outcome, ExecutionOutcome::Exited { code: c, .. } if c == (8)));
     }
 
     /// Stdin grant 済みで入力が尽きたら input は null（EOF、CAP-AT-08）。
@@ -2949,7 +2992,7 @@ mod tests {
             &mut ctx,
             ExecutionRequest::new().with_capabilities(stdin_granted(&[])),
         );
-        assert_eq!(outcome, ExecutionOutcome::Exited { code: 3 });
+        assert!(matches!(outcome, ExecutionOutcome::Exited { code: c, .. } if c == (3)));
     }
 
     /// Stdin 未 grant の input は catch 可能な capability error（未捕捉→RuntimeError、CAP-AT-08）。
@@ -2959,7 +3002,7 @@ mod tests {
         let mut ctx = ExecutionContext::new(&engine);
         let linked = compile_link(&engine, "m", "let x = input()\n");
         match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
-            ExecutionOutcome::RuntimeError { error } => {
+            ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, crate::error::ErrorKind::Capability);
             }
             other => panic!("期待: RuntimeError(capability), 実際: {other:?}"),
@@ -2976,10 +3019,10 @@ mod tests {
             "m",
             "try\n  let x = input()\ncatch e\n  let caught = e[\"type\"]\nend\n",
         );
-        assert_eq!(
+        assert!(matches!(
             engine.run(&linked, &mut ctx, ExecutionRequest::new()),
-            ExecutionOutcome::Completed
-        );
+            ExecutionOutcome::Completed { .. }
+        ));
     }
 
     // =======================================================================
@@ -3018,7 +3061,7 @@ mod tests {
             &mut ctx,
             ExecutionRequest::new().with_deadline_clock(clock.clone()),
         );
-        assert_eq!(outcome, ExecutionOutcome::DeadlineExceeded);
+        assert!(matches!(outcome, ExecutionOutcome::DeadlineExceeded { .. }));
         // catch 不能 terminal なので poison しない・再利用できる。
         assert!(!ctx.is_poisoned());
     }
@@ -3043,7 +3086,7 @@ mod tests {
             &mut ctx,
             ExecutionRequest::new().with_deadline_clock(clock.clone()),
         );
-        assert_eq!(outcome, ExecutionOutcome::DeadlineExceeded);
+        assert!(matches!(outcome, ExecutionOutcome::DeadlineExceeded { .. }));
     }
 
     /// deadline 未達なら通常どおり Completed（clock を進めない）。
@@ -3060,7 +3103,7 @@ mod tests {
             &mut ctx,
             ExecutionRequest::new().with_deadline_clock(clock.clone()),
         );
-        assert_eq!(outcome, ExecutionOutcome::Completed);
+        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }));
     }
 
     /// clock の domain（clock_id）が budget deadline と一致しないと InternalFailure で拒否する。
@@ -3098,7 +3141,7 @@ mod tests {
 
         let linked = compile_link(&engine, "m", "let saved = 7\nlet z = saved + 1\n");
         let outcome = engine.run(&linked, &mut ctx, ExecutionRequest::new());
-        assert_eq!(outcome, ExecutionOutcome::Cancelled);
+        assert!(matches!(outcome, ExecutionOutcome::Cancelled { .. }));
         assert!(!ctx.is_poisoned(), "Cancelled は poison しない");
 
         // cancel された実行は language-state を rollback する（saved は残らない）。
@@ -3106,7 +3149,7 @@ mod tests {
         let mut ctx2 = ExecutionContext::new(&engine);
         let probe = compile_link(&engine, "m", "let echo = saved\n");
         match engine.run(&probe, &mut ctx2, ExecutionRequest::new()) {
-            ExecutionOutcome::RuntimeError { error } => assert_eq!(error.code, ErrorKind::Name),
+            ExecutionOutcome::RuntimeError { error, .. } => assert_eq!(error.code, ErrorKind::Name),
             other => panic!("cancel が副作用を残した: {other:?}"),
         }
     }
@@ -3124,10 +3167,10 @@ mod tests {
             "m",
             "try\n  let a = 1\ncatch e\n  let caught = 1\nend\n",
         );
-        assert_eq!(
+        assert!(matches!(
             engine.run(&linked, &mut ctx, ExecutionRequest::new()),
-            ExecutionOutcome::Cancelled
-        );
+            ExecutionOutcome::Cancelled { .. }
+        ));
     }
 
     /// EMB-AT-21: fuel 上限を超えると BudgetExceeded terminal になり、RuntimeError にはしない。
@@ -3147,7 +3190,7 @@ mod tests {
             "let i = 0\nwhile i < 1000\n  i = i + 1\nend\n",
         );
         match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
-            ExecutionOutcome::BudgetExceeded { error } => {
+            ExecutionOutcome::BudgetExceeded { error, .. } => {
                 // fuel 超過は StepLimit（canonical code "limit"）。
                 assert_eq!(error.code, ErrorKind::StepLimit);
             }
@@ -3175,16 +3218,62 @@ mod tests {
         }
     }
 
+    /// terminal outcome は commit 済みの `usage` を同梱する（仕様第6・12節）。
+    ///
+    /// ループを回す Completed は fuel を消費しているので、`usage.committed.fuel` が
+    /// 0 より大きいことを確認する（usage が空のまま返っていないことの回帰固定）。
+    #[test]
+    fn e11_completed_carries_committed_usage() {
+        let budget = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+        let engine = engine_with_budget(budget);
+        let mut ctx = ExecutionContext::new(&engine);
+
+        let linked = compile_link(&engine, "m", "let i = 0\nwhile i < 10\n  i = i + 1\nend\n");
+        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+            ExecutionOutcome::Completed { usage } => {
+                assert!(
+                    usage.committed.fuel > 0,
+                    "Completed の usage に fuel が反映されていない: {usage:?}"
+                );
+            }
+            other => panic!("期待: Completed, 実際: {other:?}"),
+        }
+    }
+
+    /// budget 超過 terminal も `usage` を同梱し、peak が上限に達している（仕様第6・12節）。
+    #[test]
+    fn e11_budget_exceeded_carries_usage() {
+        let budget = BudgetConfig::for_legacy(5, 1_000_000);
+        let engine = engine_with_budget(budget);
+        let mut ctx = ExecutionContext::new(&engine);
+
+        let linked = compile_link(
+            &engine,
+            "m",
+            "let i = 0\nwhile i < 1000\n  i = i + 1\nend\n",
+        );
+        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+            ExecutionOutcome::BudgetExceeded { usage, .. } => {
+                // fuel 上限 5 に達して停止したので、commit 済み fuel は上限以下で非ゼロ。
+                assert!(
+                    usage.committed.fuel > 0 && usage.committed.fuel <= 5,
+                    "BudgetExceeded の usage が想定外: {usage:?}"
+                );
+            }
+            other => panic!("期待: BudgetExceeded, 実際: {other:?}"),
+        }
+    }
+
     /// budget を設定しない既定 engine では従来どおり Completed（観測挙動不変）。
     #[test]
     fn e11_default_engine_budget_unchanged() {
         let engine = Engine::builder().build().unwrap();
         let mut ctx = ExecutionContext::new(&engine);
         let linked = compile_link(&engine, "m", "let a = 1\nlet b = a + 2\n");
-        assert_eq!(
+        assert!(matches!(
             engine.run(&linked, &mut ctx, ExecutionRequest::new()),
-            ExecutionOutcome::Completed
-        );
+            ExecutionOutcome::Completed { .. }
+        ));
     }
 
     /// ExecutionRequest の Debug は secret（引数値・capability 本文）を出さない（EMB-AT-14）。
@@ -3218,6 +3307,6 @@ mod tests {
             &mut ctx,
             ExecutionRequest::new().with_deadline_clock(clock.clone()),
         );
-        assert_eq!(outcome, ExecutionOutcome::Completed);
+        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }));
     }
 }
