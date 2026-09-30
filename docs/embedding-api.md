@@ -553,7 +553,7 @@ compatibility shimもprocess exitやambient accessを復活させず、script操
 | E8b | 2 | capability profile/options、safe/legacy移行 | EMB-AT-10/11/16、CAP-AT-23〜26、migration warning |
 | E9 | 5/7 | VM experimental adapter/conformance | 同API、差分0でstable化 |
 | E10 | N-1/N | deprecation/migration | compile test |
-| E11 | 3 | budget/deadline/runtime cancel（🟡 tree範囲で実装。`EngineConfig.budget`で有限`BudgetConfig`、`ExecutionRequest::with_deadline_clock`でdeadline clock、`ExecutionContext::cancellation_token()`で実行中cancel。`ExecutionOutcome`に`BudgetExceeded`/`DeadlineExceeded`追加、budget/deadline/cancelをcatch不能terminal化（`ErrorKind::is_uncatchable`をtree/VM共有）。残: 実system monotonic clock実装、`usage: BudgetUsage`のterminal同梱、最終形の必須`BudgetConfig`/`CancellationToken`所有への移行、VM charge parityはSlice 6） | terminal variant境界test |
+| E11 | 3 | budget/deadline/runtime cancel（🟡 tree範囲で実装。`EngineConfig.budget`で有限`BudgetConfig`、`ExecutionRequest::with_deadline_clock`でdeadline clock、`ExecutionContext::cancellation_token()`で実行中cancel。`ExecutionOutcome`に`BudgetExceeded`/`DeadlineExceeded`追加、budget/deadline/cancelをcatch不能terminal化（`ErrorKind::is_uncatchable`をtree/VM共有）。実system monotonic clock（`SystemMonotonicClock`）と全terminal variantへの`usage: BudgetUsage`同梱まで実装済み。残: 最終形の必須`BudgetConfig`/`CancellationToken`所有への移行、VM charge parityはSlice 6） | terminal variant境界test |
 | E12 | 4 | final state machineとpoll/pause/resume | `PollSlice` / `PollResult`、yield/pause/state test |
 | E13 | 6 | canonical audit sink/event/usage完全性 | 8 event、fail-closed、`BudgetUsage` test |
 

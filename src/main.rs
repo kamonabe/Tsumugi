@@ -302,26 +302,26 @@ fn source_id_for(script_path: &str) -> SourceId {
 /// エラー系はいずれも診断を stderr へ出してから code を返す。
 fn exit_code_for_outcome(outcome: EmbeddingOutcome) -> i32 {
     match outcome {
-        EmbeddingOutcome::Completed => 0,
+        EmbeddingOutcome::Completed { .. } => 0,
         // C7（REV-023）: exit(code) は structured terminal。CLI 境界で実際の exit code へ写す。
-        EmbeddingOutcome::Exited { code } => code as i32,
-        EmbeddingOutcome::RuntimeError { error } => {
+        EmbeddingOutcome::Exited { code, .. } => code as i32,
+        EmbeddingOutcome::RuntimeError { error, .. } => {
             eprintln!("{}", format_execution_error(&error));
             1
         }
         // 予算超過（REV-015 E11）: 診断を出して exit 1（第12節の terminal channel 表）。
         // 既存 CLI の step 上限メッセージと byte 一致させるため RuntimeError と同じ formatter。
-        EmbeddingOutcome::BudgetExceeded { error } => {
+        EmbeddingOutcome::BudgetExceeded { error, .. } => {
             eprintln!("{}", format_execution_error(&error));
             1
         }
         // deadline 超過（REV-015 E11）: exit 1（第12節）。CLI は deadline clock を注入しないため
         // 通常この経路には到達しないが、写像は固定しておく。
-        EmbeddingOutcome::DeadlineExceeded => {
+        EmbeddingOutcome::DeadlineExceeded { .. } => {
             eprintln!("実行 deadline を超過しました");
             1
         }
-        EmbeddingOutcome::Cancelled => 130,
+        EmbeddingOutcome::Cancelled { .. } => 130,
         EmbeddingOutcome::InternalFailure { safe_message, .. } => {
             eprintln!("{}", safe_message);
             70
@@ -813,13 +813,19 @@ mod cli_tests {
 
     #[test]
     fn completed_outcome_maps_to_exit_zero() {
-        assert_eq!(exit_code_for_outcome(EmbeddingOutcome::Completed), 0);
+        assert_eq!(
+            exit_code_for_outcome(EmbeddingOutcome::Completed {
+                usage: Default::default(),
+            }),
+            0
+        );
     }
 
     #[test]
     fn runtime_error_outcome_maps_to_exit_one() {
         let outcome = EmbeddingOutcome::RuntimeError {
             error: exec_error(Some(1), "ゼロ除算", Vec::new()),
+            usage: Default::default(),
         };
         assert_eq!(exit_code_for_outcome(outcome), 1);
     }
@@ -827,7 +833,12 @@ mod cli_tests {
     #[test]
     fn cancelled_outcome_maps_to_exit_130() {
         // 第12節: Cancelled は 130（現行 CLI では pre-cancel を発火しないが写像は固定する）。
-        assert_eq!(exit_code_for_outcome(EmbeddingOutcome::Cancelled), 130);
+        assert_eq!(
+            exit_code_for_outcome(EmbeddingOutcome::Cancelled {
+                usage: Default::default(),
+            }),
+            130
+        );
     }
 
     #[test]
@@ -835,6 +846,7 @@ mod cli_tests {
         let outcome = EmbeddingOutcome::InternalFailure {
             fault_id: 1,
             safe_message: "内部障害が発生しました (fault_id=1)".to_string(),
+            usage: Default::default(),
         };
         assert_eq!(exit_code_for_outcome(outcome), 70);
     }
