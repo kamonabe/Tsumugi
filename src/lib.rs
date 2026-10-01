@@ -118,3 +118,16 @@ pub use capability::{
     FilesystemCapability, FilesystemRoot, FsOperation, HostFunctionId, Input, ModuleResolver,
     MountName, Output, ProcessExit, SymlinkPolicy,
 };
+
+// Phase 2 capability — host function registry（スライス C8/E7、`docs/capability-model.md`
+// 第11節）の公開型。埋め込み host はこれらで registry を組み立て、`EngineBuilder::host_functions`
+// へ渡す（登録と grant は別、第11.1節）。
+//
+// `host_function::Arity`（`Exact(u16)` / `Range`）は `builtin_registry::Arity` と同名の別型で、
+// crate root での bare な `Arity` は将来曖昧になり得る。そこで `Embedding*` 別名の前例に倣い
+// `HostArity` として公開して衝突を避ける。他の host 型は衝突がないためそのままの名前で公開する。
+pub use host_function::Arity as HostArity;
+pub use host_function::{
+    AuditValuePolicy, HostCallError, HostCost, HostFunction, HostFunctionDescriptor,
+    HostFunctionRegistry, HostFunctionRegistryBuilder,
+};

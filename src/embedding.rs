@@ -12,9 +12,16 @@
 //!
 //! # 意図的に E1 へ含めない範囲
 //!
-//! - `CapabilitySet` / `HostFunctionRegistry` / `CapabilityKind`（Phase 2、E7）。これらを
-//!   参照する [`ConfigError`] の `DuplicateCapability` / `DuplicateCallableName` と
-//!   `EngineBuilder::host_functions` は E7 で追加する。
+//! - [`EngineBuilder::host_functions`]（Phase 2、E7）は実装済み。build 済みの
+//!   [`crate::host_function::HostFunctionRegistry`] を engine へ格納し、`Engine::run` が
+//!   実行前に evaluator へ注入・実行後にクリアする（登録は engine 単位、grant は
+//!   [`ExecutionRequest::with_capabilities`] で実行単位）。名前衝突 validation（[`ConfigError`]
+//!   の `DuplicateCapability` / `DuplicateCallableName`）は registry build 時に
+//!   [`crate::host_function::HostFunctionRegistryBuilder`] で済むため、engine builder は再検証
+//!   しない。
+//! - import graph 解決（`module_resolver`）と、それに紐づく `ExecutionOutcome::Denied` /
+//!   `HostError` の terminal variant は引き続き保留（C6、ブロック中）。run 時の host function
+//!   denial は catch 可能な `capability` error（未捕捉→`RuntimeError`）として正しく表出する。
 //! - `SourceHash` の実際の計算（SHA-256）は root source を扱う `compile`（E2）で行う。E1 は
 //!   32 byte の値型と constructor だけを用意し、ハッシュ依存クレートを持ち込まない。
 //! - `BudgetUsage` を伴う terminal outcome の `usage` field は、有限 budget を公開する
@@ -254,12 +261,23 @@ fn validate_identifier(
 
 /// [`Engine`] を構築する builder（仕様第3節 `EngineBuilder`）。
 ///
-/// E1 では config と実験 backend 許可だけを扱う。`host_functions`（Phase 2、E7）は
-/// まだ公開しない。
-#[derive(Debug, Default)]
+/// E1 では config と実験 backend 許可だけを扱っていた。E7 で [`Self::host_functions`] を公開し、
+/// build 済みの [`crate::host_function::HostFunctionRegistry`] を engine へ格納する。登録と grant
+/// は別で（capability-model 第11.1節）、grant は実行ごとに
+/// [`ExecutionRequest::with_capabilities`] で渡す。
+#[derive(Debug)]
 pub struct EngineBuilder {
     config: EngineConfig,
     allow_experimental_backend: bool,
+    host_registry: std::sync::Arc<crate::host_function::HostFunctionRegistry>,
+}
+
+impl Default for EngineBuilder {
+    /// [`Self::new`] と同じ既定の builder（`host_registry` が
+    /// [`Arc<HostFunctionRegistry>`] のため derive できない）。
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EngineBuilder {
@@ -268,6 +286,8 @@ impl EngineBuilder {
         Self {
             config: EngineConfig::default(),
             allow_experimental_backend: false,
+            // 既定は空 registry（host function なし）。run-path 挙動は従来と同一。
+            host_registry: std::sync::Arc::new(crate::host_function::HostFunctionRegistry::empty()),
         }
     }
 
@@ -286,10 +306,23 @@ impl EngineBuilder {
         self
     }
 
+    /// build 済みの host function registry を engine へ登録する（Phase 2、E7、第11.1節）。
+    ///
+    /// registry は engine 単位の build-time 設定（link 時に name→ID を固定する）であり、実行ごとに
+    /// 変わる grant（[`crate::capability::CapabilitySet`]）とは別の軸である。名前衝突・descriptor
+    /// validation（[`ConfigError::DuplicateCallableName`] を含む）は
+    /// [`crate::host_function::HostFunctionRegistryBuilder`] の `register`/`build` で既に済んでいる
+    /// ため、ここでは再検証しない（したがって [`Self::build`] の signature は不変）。
+    pub fn host_functions(mut self, registry: crate::host_function::HostFunctionRegistry) -> Self {
+        self.host_registry = std::sync::Arc::new(registry);
+        self
+    }
+
     /// 設定を検証して [`Engine`] を build する。
     ///
     /// `VmExperimental` を選びつつ許可していない場合は
-    /// [`ConfigError::ExperimentalBackendNotEnabled`] を返す。
+    /// [`ConfigError::ExperimentalBackendNotEnabled`] を返す。host function registry の
+    /// validation は registry build 時に済んでいるため、ここでは再検証しない。
     pub fn build(self) -> Result<Engine, ConfigError> {
         if self.config.backend == Backend::VmExperimental && !self.allow_experimental_backend {
             return Err(ConfigError::ExperimentalBackendNotEnabled);
@@ -297,6 +330,7 @@ impl EngineBuilder {
         Ok(Engine {
             id: EngineId::allocate(),
             config: self.config,
+            host_registry: self.host_registry,
         })
     }
 }
@@ -311,6 +345,9 @@ impl EngineBuilder {
 pub struct Engine {
     id: EngineId,
     config: EngineConfig,
+    /// [`EngineBuilder::host_functions`] で登録した registry（既定は空、E7）。実行時に
+    /// `Engine::run` が evaluator へ注入する。
+    host_registry: std::sync::Arc<crate::host_function::HostFunctionRegistry>,
 }
 
 impl Engine {
@@ -791,17 +828,21 @@ impl Engine {
     ) -> Result<CompiledScript, CompileErrors> {
         // lexer / parser / backend の unwind panic を host boundary で捕捉する（第11節 規則1）。
         // compile 中の panic は `CompileDiagnosticCode::InternalFault` へ写す（規則2）。panic
-        // payload / native backtrace は公開診断へ含めない（規則3）。
-        catch_host_unwind(|| self.compile_inner(source, options)).unwrap_or_else(|fault_id| {
-            Err(CompileErrors {
-                diagnostics: vec![CompileDiagnostic {
-                    code: CompileDiagnosticCode::InternalFault,
-                    line: None,
-                    column: None,
-                    safe_message: internal_fault_message(fault_id),
-                }],
-            })
-        })
+        // payload / native backtrace は公開診断へ含めない（規則3）。E7 以降 `&Engine` は
+        // `Arc<dyn HostFunction>` を含み自動 `UnwindSafe` ではないため、panic を上記のとおり
+        // 内部診断へ写して漏らさないことで `AssertUnwindSafe` を正当化する。
+        catch_host_unwind(AssertUnwindSafe(|| self.compile_inner(source, options))).unwrap_or_else(
+            |fault_id| {
+                Err(CompileErrors {
+                    diagnostics: vec![CompileDiagnostic {
+                        code: CompileDiagnosticCode::InternalFault,
+                        line: None,
+                        column: None,
+                        safe_message: internal_fault_message(fault_id),
+                    }],
+                })
+            },
+        )
     }
 
     fn compile_inner(
@@ -843,12 +884,17 @@ impl Engine {
     ) -> Result<LinkedScript, LinkError> {
         // linker の unwind panic を host boundary で捕捉する（第11節 規則1）。link 中の panic は
         // `LinkError::InternalFailure` へ写す（規則2）。payload / backtrace は含めない（規則3）。
-        catch_host_unwind(|| self.link_inner(script, request)).unwrap_or_else(|fault_id| {
-            Err(LinkError::InternalFailure {
-                fault_id,
-                safe_message: internal_fault_message(fault_id),
-            })
-        })
+        // E7 で `Engine` が `Arc<dyn HostFunction>` を保持したため `&Engine` は自動 `UnwindSafe`
+        // ではなくなった。panic は上記のとおり InternalFailure へ写して以後の実行へ漏らさないので、
+        // run 入口と同じく `AssertUnwindSafe` で正当化する。
+        catch_host_unwind(AssertUnwindSafe(|| self.link_inner(script, request))).unwrap_or_else(
+            |fault_id| {
+                Err(LinkError::InternalFailure {
+                    fault_id,
+                    safe_message: internal_fault_message(fault_id),
+                })
+            },
+        )
     }
 
     fn link_inner(
@@ -1300,12 +1346,18 @@ impl Engine {
         // 引数 snapshot と frozen capability 集合を評価器へ注入する（AUD-018 / Phase 2 C1〜）。
         context.evaluator.set_script_args(request.arguments);
         context.evaluator.set_capabilities(request.capabilities);
+        // engine 単位の host function registry を実行前に注入する（E7、capability-model 第11.1節）。
+        // 登録は engine 単位、grant は上の capability 集合（実行単位）という分離を保つ。
+        context
+            .evaluator
+            .set_host_registry(std::sync::Arc::clone(&self.host_registry));
 
         let outcome = Self::run_transactional(context, &program, root_source_bytes);
 
-        // capability は reusable context に持ち越さない（仕様第15節 規則5・6）。次 request の
-        // empty set か再注入まで、ambient 互換の既定へ戻す。
+        // capability 集合も host function registry も reusable context に持ち越さない（仕様第15節
+        // 規則5・6）。次 request の empty set か再注入まで、ambient 互換の既定へ戻す。
         context.evaluator.clear_capabilities();
+        context.evaluator.clear_host_registry();
         outcome
     }
 
@@ -3308,5 +3360,223 @@ mod tests {
             ExecutionRequest::new().with_deadline_clock(clock.clone()),
         );
         assert!(matches!(outcome, ExecutionOutcome::Completed { .. }));
+    }
+
+    // --- E7: host function embedding registration + grant injection ---
+    //
+    // `EngineBuilder::host_functions` で登録した registry が `Engine::run` 経由で evaluator へ
+    // 注入され、grant（`ExecutionRequest::with_capabilities`）と組み合わさって projection する
+    // ことを Engine API レベルで固定する（登録と grant の分離、capability-model 第11.1・11.2節）。
+    // projection 自体は eval 側で既に検証済み（C8）。ここは installation/injection の配線確認。
+
+    use crate::host_function::{
+        Arity as HostArity, AuditValuePolicy, HostCallError, HostCost, HostFunction,
+        HostFunctionDescriptor, HostFunctionRegistry,
+    };
+    use crate::value::Value;
+
+    /// host function id を作る小ヘルパ。
+    fn host_id(n: u128) -> crate::capability::HostFunctionId {
+        crate::capability::HostFunctionId::new(NonZeroU128::new(n).unwrap())
+    }
+
+    /// 指定 id の host function を grant した set（＋結果観測用 ProcessExit）。`exit(...)` で
+    /// 結果を terminal code として観測できるようにする。
+    fn host_fn_granted(id: u128) -> crate::capability::CapabilitySet {
+        crate::capability::CapabilitySet::builder()
+            .grant_host_function(host_id(id))
+            .unwrap()
+            .process_exit(crate::capability::ProcessExit::new(
+                NonZeroU128::new(1).unwrap(),
+            ))
+            .unwrap()
+            .build()
+    }
+
+    /// テスト用 host function（echo か host error）。descriptor と挙動を持つ。
+    struct E7TestFn {
+        descriptor: HostFunctionDescriptor,
+        host_error: bool,
+    }
+    impl HostFunction for E7TestFn {
+        fn descriptor(&self) -> &HostFunctionDescriptor {
+            &self.descriptor
+        }
+        fn call(&self, arguments: &[Value]) -> Result<Value, HostCallError> {
+            if self.host_error {
+                return Err(HostCallError::Host {
+                    category: "lookup".to_string(),
+                });
+            }
+            // echo: 先頭引数を返す（なければ null）。
+            Ok(arguments.first().cloned().unwrap_or(Value::Null))
+        }
+    }
+
+    fn e7_descriptor(id: u128, name: &str, arity: HostArity) -> HostFunctionDescriptor {
+        HostFunctionDescriptor {
+            id: host_id(id),
+            name: name.to_string(),
+            arity,
+            cost: HostCost::default(),
+            argument_audit: Vec::new(),
+            result_audit: AuditValuePolicy::Omit,
+            may_block: false,
+        }
+    }
+
+    /// `lookup` という echo host function 1件だけの registry を作る（id=7, arity Exact(1)）。
+    fn lookup_registry() -> HostFunctionRegistry {
+        HostFunctionRegistry::builder()
+            .register(std::sync::Arc::new(E7TestFn {
+                descriptor: e7_descriptor(7, "lookup", HostArity::Exact(1)),
+                host_error: false,
+            }))
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    /// host error を返す `lookup` 1件（id=7, arity Exact(0)）の registry。
+    fn host_error_registry() -> HostFunctionRegistry {
+        HostFunctionRegistry::builder()
+            .register(std::sync::Arc::new(E7TestFn {
+                descriptor: e7_descriptor(7, "lookup", HostArity::Exact(0)),
+                host_error: true,
+            }))
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    fn engine_with_lookup(registry: HostFunctionRegistry) -> Engine {
+        Engine::builder().host_functions(registry).build().unwrap()
+    }
+
+    /// 登録 + grant された host fn は `Engine::run` から呼べて期待値を返す（Completed/Exited）。
+    #[test]
+    fn e7_registered_and_granted_is_invokable() {
+        let engine = engine_with_lookup(lookup_registry());
+        let mut ctx = ExecutionContext::new(&engine);
+        // echo(42) の結果を exit code として観測する（host callback が引数を受け取った証拠）。
+        let linked = compile_link(&engine, "m", "exit(lookup(42))\n");
+        let outcome = engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_capabilities(host_fn_granted(7)),
+        );
+        assert!(matches!(outcome, ExecutionOutcome::Exited { code: 42, .. }));
+    }
+
+    /// 登録 + grant された host fn の結果を binding に束ねて Completed する。
+    #[test]
+    fn e7_registered_and_granted_completes() {
+        let engine = engine_with_lookup(lookup_registry());
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "let r = lookup(1)\n");
+        let outcome = engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_capabilities(host_fn_granted(7)),
+        );
+        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }));
+    }
+
+    /// 登録済みだが未 grant → 未捕捉で capability RuntimeError（terminal Denied ではない）。
+    #[test]
+    fn e7_registered_but_ungranted_is_capability_runtime_error() {
+        let engine = engine_with_lookup(lookup_registry());
+        let mut ctx = ExecutionContext::new(&engine);
+        // 既定 request は deny-by-default（capability なし）。
+        let linked = compile_link(&engine, "m", "let r = lookup(1)\n");
+        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+            ExecutionOutcome::RuntimeError { error, .. } => {
+                assert_eq!(error.code, ErrorKind::Capability);
+            }
+            other => panic!("期待: RuntimeError(capability), 実際: {other:?}"),
+        }
+    }
+
+    /// 未 grant の host fn 呼び出しは script から catch できる（catchable capability error）。
+    #[test]
+    fn e7_registered_but_ungranted_is_catchable() {
+        let engine = engine_with_lookup(lookup_registry());
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(
+            &engine,
+            "m",
+            "try\n  let r = lookup(1)\ncatch e\n  let caught = e[\"type\"]\nend\n",
+        );
+        assert!(matches!(
+            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            ExecutionOutcome::Completed { .. }
+        ));
+    }
+
+    /// grant 済み host fn の arity mismatch → 未捕捉で argument RuntimeError。
+    #[test]
+    fn e7_granted_arity_mismatch_is_argument_runtime_error() {
+        let engine = engine_with_lookup(lookup_registry());
+        let mut ctx = ExecutionContext::new(&engine);
+        // lookup は Exact(1)。引数0個で呼ぶ。
+        let linked = compile_link(&engine, "m", "let r = lookup()\n");
+        match engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_capabilities(host_fn_granted(7)),
+        ) {
+            ExecutionOutcome::RuntimeError { error, .. } => {
+                assert_eq!(error.code, ErrorKind::Argument);
+            }
+            other => panic!("期待: RuntimeError(argument), 実際: {other:?}"),
+        }
+    }
+
+    /// `HostCallError::Host` を返す host fn → 未捕捉で host RuntimeError。
+    #[test]
+    fn e7_host_failure_is_host_runtime_error() {
+        let engine = engine_with_lookup(host_error_registry());
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "let r = lookup()\n");
+        match engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_capabilities(host_fn_granted(7)),
+        ) {
+            ExecutionOutcome::RuntimeError { error, .. } => {
+                assert_eq!(error.code, ErrorKind::Host);
+            }
+            other => panic!("期待: RuntimeError(host), 実際: {other:?}"),
+        }
+    }
+
+    /// 同名の user binding は host function を shadow する（user 定義が優先）。
+    #[test]
+    fn e7_user_binding_shadows_host_function() {
+        let engine = engine_with_lookup(lookup_registry());
+        let mut ctx = ExecutionContext::new(&engine);
+        // user の lookup は常に 99 を返す。grant 済みでも user 定義が優先される。
+        let linked = compile_link(&engine, "m", "let lookup = fn(x) 99 end\nexit(lookup(1))\n");
+        let outcome = engine.run(
+            &linked,
+            &mut ctx,
+            ExecutionRequest::new().with_capabilities(host_fn_granted(7)),
+        );
+        assert!(matches!(outcome, ExecutionOutcome::Exited { code: 99, .. }));
+    }
+
+    /// 名前衝突 registry は registry build 時に拒否される（Engine builder はその検証に依存し、
+    /// 衝突した registry を受け取らない）。
+    #[test]
+    fn e7_colliding_registry_rejected_at_registry_build() {
+        // `len` は core builtin。登録は registry build でエラー。
+        let err = HostFunctionRegistry::builder()
+            .register(std::sync::Arc::new(E7TestFn {
+                descriptor: e7_descriptor(1, "len", HostArity::Exact(1)),
+                host_error: false,
+            }))
+            .err()
+            .expect("colliding name must fail at registry build");
+        assert!(matches!(err, ConfigError::DuplicateCallableName { .. }));
     }
 }
