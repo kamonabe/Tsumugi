@@ -30,6 +30,42 @@ enum DriveOutcome {
     Yielded,
 }
 
+/// [`Evaluator::run_slice`] が 1 slice 回した結果（REV-015 Slice 5、設計 §4.7）。
+///
+/// 旧 `Option<Result<(),TsumugiError>>`（`None`=yield / `Some`=terminal）を、yield の事由
+/// （slice fuel 枯渇 / host-call pending / 明示 yield）を区別できる enum へ置き換える。
+/// alpha facade（`engine.rs`）の `drive_one_slice` がこれを `SlicePoll` へ写す（設計 §4.3 step 6）。
+#[derive(Debug)]
+pub enum SliceOutcome {
+    /// slice fuel を使い切って文/反復境界で yield した。continuation は評価器に残る
+    /// （旧 `None` に相当、設計 §4.6）。
+    YieldedSliceFuel,
+    /// cooperative host-call が `Pending` を返し、文/反復境界で yield した（設計 §4.4/§4.7）。
+    ///
+    /// handle は直後に [`Evaluator::take_pending_ticket`] で ticket を移送し、waker を登録して
+    /// `Yielded(HostCallPending { call_id })` へ入る。本 Slice（FEAT-002）では ticket の protocol と
+    /// 移送配線を用意し、実際に host-call を Pending にする builtin dispatch は FEAT-003 で載せる。
+    YieldedHostCall { call_id: u64 },
+    /// script / host の明示 yield（`ExplicitYield`）。本 Slice では trigger されない（§4.7）。
+    /// 型として用意し、到達した場合 handle は通常 yield と同じ扱いにする。
+    YieldedExplicit,
+    /// terminal に到達した（旧 `Some(result)` に相当）。transaction は commit / rollback 済み。
+    Terminal(Result<(), TsumugiError>),
+}
+
+/// Pending 中の host-call（REV-015 Slice 5、設計 §4.7）。
+///
+/// `run_slice` が `YieldedHostCall { call_id }` を返した時点で `Evaluator` が保持し、handle が
+/// [`Evaluator::take_pending_ticket`] で ticket 本体だけを引き取る。`call_id` は resume 時の
+/// [`Evaluator::resume_host_call`] の突き合わせに残す。本 Slice では単一 pending を前提とする
+/// （host-call を Pending にできるのは `can_yield=true` の文/反復境界だけ、§4.7）。
+struct PendingHostCall {
+    /// この host call の識別子（resume 時の突き合わせ用）。
+    call_id: u64,
+    /// 型消去済み ticket。handle が引き取るまで保持する（引き取り後は `None`）。
+    ticket: Option<crate::host_pending::TicketErased>,
+}
+
 /// 明示 frame stack 上で 1 文を実行した結果、driver がどう遷移するか（REV-015 Slice 3 PR-b）。
 ///
 /// 従来は `exec_block` / ループ本体が Rust 再帰でブロックへ降り、`EvalResult` を
@@ -271,6 +307,32 @@ pub struct Evaluator {
     /// 埋め込み host が実行単位で注入する（`set_host_registry`）。call site は user binding /
     /// builtin fallback の後にこの registry を引く。
     host_registry: std::sync::Arc<crate::host_function::HostFunctionRegistry>,
+    /// Pending 中の cooperative host-call（REV-015 Slice 5、設計 §4.7）。`run_slice` が
+    /// `YieldedHostCall` を返したときに `Some`。handle が `take_pending_ticket` で ticket を
+    /// 引き取り、resume 時に `resume_host_call` で解消する。本 Slice（FEAT-002）では protocol と
+    /// surface を用意し、実際に Pending を立てる builtin dispatch は FEAT-003 で配線する。
+    pending_host_call: Option<PendingHostCall>,
+    /// 現在の driver 文脈が yield 可能か（REV-015 Slice 5、設計 §4.4/§4.7）。
+    ///
+    /// `run_driver` が開始時に自身の `can_yield` をここへ退避し、戻るとき復元する。
+    /// cooperative host-call dispatch（`eval_call`）はこの値を [`CapabilityCallContext::may_yield`]
+    /// へ渡す。トップレベル driver（`run_slice`）では true、関数本体・callback（`drive_call_body`）
+    /// では false。
+    can_yield_ctx: bool,
+    /// host-call に発番する call_id の次値（REV-015 Slice 5、設計 §4.7）。単調増加。
+    next_host_call_id: u64,
+    /// cooperative host-call の Pending により文/反復境界で yield を要求されたか（設計 §4.7）。
+    ///
+    /// `eval_call` が `Pending` を受けると `pending_host_call` を立ててこのフラグを `true` にし、
+    /// sentinel error を伝播する。`run_driver` はこのフラグを検出すると `handle_error` を通さず
+    /// 現在の文の cursor を巻き戻して `DriveOutcome::Yielded` を返す（同じ文を resume 時に再評価）。
+    yield_for_host_call: bool,
+    /// resume 時に continuation へ注入する host-call 結果（REV-015 Slice 5、設計 §4.7）。
+    ///
+    /// `resume_host_call(call_id, result)` が格納し、同じ文の再評価で `eval_call` が同じ call_id の
+    /// host-call に到達したとき、adapter を二度 dispatch せずこの結果を式結果へ写す（Ok は値、
+    /// Err(AdapterError) は §4.4 の写像で terminal/`host` error）。
+    resumed_host_call: Option<(u64, Result<Value, crate::capability::AdapterError>)>,
 }
 
 /// suspend / resume できる 1 回の実行セッション（REV-015 Slice 3 PR-d-2）。
@@ -318,6 +380,13 @@ impl Evaluator {
             pending_exit: None,
             // 既定は空 registry（host function なし）。埋め込み host が set_host_registry で注入する。
             host_registry: std::sync::Arc::new(crate::host_function::HostFunctionRegistry::empty()),
+            // host-call pending は実行開始時には無い（REV-015 Slice 5）。
+            pending_host_call: None,
+            // 既定は yield 不可（同期経路。run_driver が slice 開始時に設定する）。
+            can_yield_ctx: false,
+            next_host_call_id: 0,
+            yield_for_host_call: false,
+            resumed_host_call: None,
         }
     }
 
@@ -350,6 +419,23 @@ impl Evaluator {
     /// 未 cancel の既定経路（alpha / CLI / REPL）は観測挙動不変。
     pub fn cancellation_token(&self) -> crate::budget::CancellationToken {
         self.budget.cancellation_token()
+    }
+
+    /// cancel checkpoint を評価する（REV-015 Slice 5、設計 §4.6）。
+    ///
+    /// alpha facade（`engine.rs`）が admission queue 待ち中の cancel を観測するための委譲。
+    /// run 中の checkpoint は `run_driver` 内の既存経路を使い、本 method は driver に入らない
+    /// 待機 state（AdmissionQueued）向け。既定経路の観測挙動は変えない（呼ばれなければ no-op）。
+    pub fn checkpoint_cancel(&self) -> Result<(), crate::budget::ControlStop> {
+        self.budget.checkpoint_cancel()
+    }
+
+    /// deadline checkpoint を評価する（REV-015 Slice 5、設計 §4.6）。
+    ///
+    /// clock が注入されていなければ no-op（[`crate::budget::BudgetLedger::checkpoint_deadline`]）。
+    /// alpha facade が admission queue 待ち中の deadline を観測するための委譲。
+    pub fn checkpoint_deadline(&self) -> Result<(), crate::budget::ControlStop> {
+        self.budget.checkpoint_deadline()
     }
 
     /// `args()` が返すスクリプト引数の snapshot を設定する（AUD-018）。
@@ -735,8 +821,12 @@ impl Evaluator {
     ///   rollback 済み、module 解決マーカーも巻き戻し済み。
     ///
     /// セッションが無い状態で呼ぶと `panic`（呼び出し側が begin_execution 済みを保証する）。
-    /// `None` = yield（継続あり）、`Some(result)` = terminal。
-    pub fn run_slice(&mut self, slice_fuel: u64) -> Option<Result<(), TsumugiError>> {
+    ///
+    /// 戻り値は [`SliceOutcome`]（REV-015 Slice 5、設計 §4.7）: `YieldedSliceFuel`（旧 `None`）/
+    /// `YieldedHostCall`（cooperative host-call pending）/ `YieldedExplicit`（明示 yield、本 Slice
+    /// では未 trigger）/ `Terminal(result)`（旧 `Some(result)`）。yield 事由を handle が
+    /// 区別できるようにする（AdmissionQueued/HostCallPending 配線のため）。
+    pub fn run_slice(&mut self, slice_fuel: u64) -> SliceOutcome {
         let base_depth = self
             .session
             .as_ref()
@@ -754,10 +844,20 @@ impl Evaluator {
         match outcome {
             // yield は transaction 境界ではない（§10 規則7）。ここで `finalize_session` を
             // 呼ばず、session（`RunSession`）・永続 frame stack・`env` の submission journal を
-            // そのまま保持したまま `None` を返す。次の `run_slice`（resume）が同じ session と
+            // そのまま保持したまま yield を返す。次の `run_slice`（resume）が同じ session と
             // journal の上で実行を続けるため、yield を何度挟んでも execution 全体が 1 つの
             // transaction になり、terminal で初めて commit / rollback される。
-            Ok(DriveOutcome::Yielded) => None,
+            Ok(DriveOutcome::Yielded) => {
+                // host-call pending が立っていれば HostCallPending、そうでなければ slice fuel 枯渇
+                // の yield（設計 §4.7）。host-call を Pending にする builtin dispatch は FEAT-003 で
+                // 載せるため、本 Slice では通常この分岐は `YieldedSliceFuel` を返す。
+                match self.pending_host_call.as_ref() {
+                    Some(pending) => SliceOutcome::YieldedHostCall {
+                        call_id: pending.call_id,
+                    },
+                    None => SliceOutcome::YieldedSliceFuel,
+                }
+            }
             Ok(DriveOutcome::Done(result)) => {
                 // 本体完了。EvalResult を terminal 結果へ写し、transaction / module を finalize。
                 let final_result = match result {
@@ -766,7 +866,7 @@ impl Evaluator {
                     EvalResult::Continue(line) => Err(TsumugiError::continue_outside_loop(line)),
                 };
                 self.finalize_session(final_result.is_ok());
-                Some(final_result)
+                SliceOutcome::Terminal(final_result)
             }
             Err(e) => {
                 // exit() の structured terminal（C7、REV-023）は成功系 terminal として
@@ -775,9 +875,73 @@ impl Evaluator {
                 // run_driver 内で stop_depth まで済んでいる。
                 let is_exit = matches!(e.kind(), Some(crate::error::ErrorKind::ProcessExit));
                 self.finalize_session(is_exit);
-                Some(Err(e))
+                SliceOutcome::Terminal(Err(e))
             }
         }
+    }
+
+    /// `run_slice` が `YieldedHostCall` を返した直後に handle が呼ぶ ticket 移送（設計 §4.7、
+    /// Finding 3）。Pending 中の host-call の [`crate::host_pending::TicketErased`] を take して
+    /// 返す。handle はこれを `pending_ticket` へ格納し、以後の poll で `try_take_value` を駆動する。
+    /// `call_id` と「結果待ち」フラグは `pending_host_call` に残し、resume 時に突き合わせる。
+    /// pending が無い / 既に ticket を引き取り済みなら `None`。
+    pub fn take_pending_ticket(&mut self) -> Option<crate::host_pending::TicketErased> {
+        self.pending_host_call.as_mut()?.ticket.take()
+    }
+
+    /// handle が `ticket.try_take_value()` で得た結果を注入し、pending を解消する（設計 §4.7）。
+    ///
+    /// 単一 pending を前提とする（§4.7）。`pending_host_call` が `Some` かつ `call_id` 一致を
+    /// 要求し、不一致 / `None` は内部不整合として catch 不能の内部エラーを返す。本 Slice では
+    /// 格納（continuation への値注入）までは行わず、pending を解消して resume 可能にする最小配線
+    /// とする（実際の値注入位置は host-call を Pending にする builtin dispatch と一体で FEAT-003
+    /// が載せる、§4.7）。`result` は呼び出し側が ticket から取り出した
+    /// `Result<Value, AdapterError>`。
+    pub fn resume_host_call(
+        &mut self,
+        call_id: u64,
+        result: Result<Value, crate::capability::AdapterError>,
+    ) -> Result<(), TsumugiError> {
+        match self.pending_host_call.as_ref() {
+            Some(pending) if pending.call_id == call_id => {
+                // pending を解消し、resume 時の再評価で同じ文の cooperative host-call が
+                // 格納結果を式結果へ写せるよう resumed_host_call へ移す（設計 §4.7）。
+                self.pending_host_call = None;
+                self.resumed_host_call = Some((call_id, result));
+                Ok(())
+            }
+            _ => Err(TsumugiError::internal_control(
+                0,
+                format!("host-call resume の call_id 不整合: {call_id}"),
+            )),
+        }
+    }
+
+    /// driver 外の非 terminal 終了から呼ぶ session 中断（REV-015 Slice 5、設計 §4.6 Finding 6）。
+    ///
+    /// AdmissionQueued / HostCallPending 中の cancel/deadline terminal、および非 terminal drop
+    /// （§4.8）から呼ぶ。rollback 要否は **`self.session` の有無だけ** で自己判定する（`started`
+    /// 等は見ない）。session があれば既存の [`Self::finalize_session`]`(false)` で transaction を
+    /// rollback し未完了 module の解決マーカーを巻き戻し、残余 frame を `base_depth` まで巻き戻す。
+    /// session が無ければ no-op（AdmissionQueued は `begin_execution` 前で session 無し）。
+    /// Pending 中の host-call ticket は呼び出し側（poll 分岐 / Drop）が別途 cancel する。
+    pub fn abort_session(&mut self) {
+        // frame 巻き戻しの下限は session の base_depth（begin_execution で root frame を push した
+        // 位置）。finalize_session が session.take() するため、先に base_depth を控える。
+        let base_depth = self.session.as_ref().map(|s| s.base_depth);
+        // session 有無の自己判定は finalize_session に委ねる（§4.6）。session があれば rollback、
+        // 無ければ no-op。
+        self.finalize_session(false);
+        // 残余の永続 frame stack を巻き戻す（yield / host 待ち中に積まれた継続を破棄する）。
+        if let Some(base_depth) = base_depth {
+            self.frames.truncate(base_depth);
+        }
+        // 中断した host-call pending も捨てる（ticket cancel は呼び出し側が済ませる）。
+        self.pending_host_call = None;
+        self.resumed_host_call = None;
+        self.yield_for_host_call = false;
+        // slice 制限を解除し、再利用 context が影響を受けないようにする。
+        self.slice_fuel_limit = None;
     }
 
     /// セッションを畳む（REV-015 Slice 3 PR-d-2）。commit なら transaction を確定、失敗なら
@@ -942,6 +1106,22 @@ impl Evaluator {
         stop_depth: usize,
         can_yield: bool,
     ) -> Result<DriveOutcome, TsumugiError> {
+        // この driver 活性の yield 可否を self へ退避し、cooperative host-call dispatch
+        // （eval_call）が may_yield として読めるようにする（設計 §4.7）。再入（drive_call_body の
+        // run_driver(false)）に備えて以前の値を保存し、戻るとき復元する。
+        let saved_can_yield = self.can_yield_ctx;
+        self.can_yield_ctx = can_yield;
+        let outcome = self.run_driver_inner(stop_depth, can_yield);
+        self.can_yield_ctx = saved_can_yield;
+        outcome
+    }
+
+    /// [`Self::run_driver`] の本体（can_yield 退避/復元を分離した内側ループ）。
+    fn run_driver_inner(
+        &mut self,
+        stop_depth: usize,
+        can_yield: bool,
+    ) -> Result<DriveOutcome, TsumugiError> {
         loop {
             // frame がこの活性の下限まで縮んだ = 本体を最後まで実行した。
             if self.frames.len() <= stop_depth {
@@ -984,6 +1164,12 @@ impl Evaluator {
                 match self.advance_frame() {
                     Ok(()) => {}
                     Err(e) => {
+                        // 反復境界（loop condition / 次 item 評価）での cooperative host-call
+                        // Pending yield。handle_error を通さずそのまま yield する（設計 §4.7）。
+                        if self.yield_for_host_call {
+                            self.yield_for_host_call = false;
+                            return Ok(DriveOutcome::Yielded);
+                        }
                         let e = self.attach_trace(e);
                         match self.handle_error(e, stop_depth) {
                             Ok(()) => {}
@@ -1015,6 +1201,17 @@ impl Evaluator {
                     }
                 }
                 Err(e) => {
+                    // cooperative host-call Pending による yield 要求（設計 §4.7）。handle_error を
+                    // 通さず、この文を resume 時に再評価できるよう cursor を 1 戻して yield する。
+                    // 式評価は Rust 再帰のため、host-call を含む文全体を再実行して continuation を
+                    // 復元する（式の途中状態は保存しない。格納結果は resumed_host_call が持つ）。
+                    if self.yield_for_host_call {
+                        self.yield_for_host_call = false;
+                        if let Some(top) = self.frames.last_mut() {
+                            top.cursor = top.cursor.saturating_sub(1);
+                        }
+                        return Ok(DriveOutcome::Yielded);
+                    }
                     // エラー発生時点（frame をまだ畳む前）の call_stack をトレースとして付加
                     // する。この後 handle_error / unwind_to が Call frame を畳んで call_stack
                     // を巻き戻すため、ここで snapshot しないと最内フレームが欠落する（PR-c）。
@@ -2115,6 +2312,16 @@ impl Evaluator {
             return Ok(value);
         }
 
+        // REV-015 Slice 5: cooperative（ブロックしない）host function（設計 §4.4/§4.7）。
+        // user binding でも builtin でもなく、cooperative 登録名のときに解決する。可能なら
+        // `Pending` で文/反復境界まで yield し、resume 時に同じ文を再評価して格納結果を注入する。
+        if let Expr::Ident(name) = callee
+            && self.env.get_cell(name).is_none()
+            && self.host_registry.contains_cooperative_name(name)
+        {
+            return self.eval_cooperative_call(name, args, line);
+        }
+
         // Phase 2 C8: user binding も builtin も該当しない識別子 callee が **登録 host function**
         // なら、それとして解決する（builtin fallback の後、undefined-name の前。第11.1節
         // 「user binding は builtin/host fallback より優先」）。登録名かどうかを引数評価より前に
@@ -2242,6 +2449,124 @@ impl Evaluator {
             Err(e) => Err(e),
         }
     }
+
+    /// cooperative（ブロックしない）host function を dispatch する（REV-015 Slice 5、設計 §4.7）。
+    ///
+    /// 1. resume 中（`resumed_host_call` が `Some`）なら、adapter を二度呼ばず格納結果を式結果へ
+    ///    写す（同じ文の再評価、単一 pending 前提）。
+    /// 2. それ以外は `count_step` → 引数評価 → capability/arity 検査 → `start(ctx, args)`:
+    ///    - `Ready(Ok(v))` → 値を tracked 化して返す。
+    ///    - `Ready(Err(AdapterError))` → §4.4 の写像（`host` error / catch 不能 terminal）。
+    ///    - `Pending(ticket)`:
+    ///      - `may_yield == true`（文/反復境界） → `pending_host_call` を立て yield 要求する。
+    ///      - `may_yield == false`（関数本体・callback・同期経路） → 規約違反。busy-loop せず
+    ///        catch 不能 terminal（`InternalControl`）にする（Finding 7）。
+    fn eval_cooperative_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<Value, TsumugiError> {
+        // resume: この文の再評価で、先に Pending した cooperative host-call に到達した。adapter を
+        // 二度 dispatch せず格納結果を式結果へ写す（§4.7、単一 pending 前提で最初の 1 件を消費）。
+        if let Some((_call_id, result)) = self.resumed_host_call.take() {
+            return self.finish_cooperative_result(name, result, line);
+        }
+
+        self.count_step(line)?;
+        // 引数を評価してから adapter へ渡す（評価順を確定する）。
+        let mut arg_values = Vec::with_capacity(args.len());
+        for arg in args {
+            arg_values.push(self.eval_expr(arg, line)?);
+        }
+
+        // capability / arity を検査して adapter を取り出す（registry の Arc を clone して借用衝突を
+        // 避ける）。grant 不足は capability error、arity 不一致は argument error（どちらも catch 可能）。
+        let registry = std::sync::Arc::clone(&self.host_registry);
+        let Some(function) = crate::host_function::resolve_cooperative_call(
+            &registry,
+            &self.capabilities,
+            name,
+            arg_values.len(),
+            line,
+        )?
+        else {
+            // contains_cooperative_name が true のため None にはならない（防御的に Null）。
+            return Ok(Value::Null);
+        };
+
+        let call_id = self.next_host_call_id;
+        self.next_host_call_id = self.next_host_call_id.wrapping_add(1);
+        let may_yield = self.can_yield_ctx;
+
+        // CapabilityCallContext を組み立てる（capability / deadline / cancellation / 残量 / may_yield）。
+        let mut ctx = crate::capability::CapabilityCallContext::new(
+            &self.capabilities,
+            self.budget.deadline(),
+            self.budget.cancellation_token(),
+            self.budget.remaining_request_bytes(),
+            self.budget.remaining_response_bytes(),
+            may_yield,
+            call_id,
+        );
+        let poll = function.start(&mut ctx, &arg_values);
+
+        match poll {
+            crate::host_pending::HostCallPoll::Ready(result) => {
+                self.finish_cooperative_result(name, result, line)
+            }
+            crate::host_pending::HostCallPoll::Pending(ticket) => {
+                if !may_yield {
+                    // may_yield=false 文脈での Pending は規約違反（Finding 7）。ticket を捨て、
+                    // busy-loop せず catch 不能 internal terminal へ写す。
+                    ticket.cancel();
+                    let stop = crate::budget::ControlStop::InternalFailure(
+                        crate::budget::InternalFailure::CooperativeAdapterYieldInSyncContext,
+                    );
+                    return Err(self.control_stop_to_error(stop, line));
+                }
+                // 文/反復境界での Pending。pending_host_call を立て、ticket を型消去して保持する。
+                // yield_for_host_call を立てて driver まで巻き戻し、同じ文を resume 時に再評価する。
+                let erased = crate::host_pending::TicketErased::new(ticket);
+                self.pending_host_call = Some(PendingHostCall {
+                    call_id,
+                    ticket: Some(erased),
+                });
+                self.yield_for_host_call = true;
+                // sentinel error（driver が yield_for_host_call を見て回収し、handle_error を通さない）。
+                Err(TsumugiError::internal_control(
+                    line,
+                    "cooperative host-call pending yield",
+                ))
+            }
+        }
+    }
+
+    /// cooperative host-call の [`Result<Value, AdapterError>`] を式結果へ写す（設計 §4.4/§4.7）。
+    ///
+    /// `Ok(value)` は untracked な値を heap 課金しつつ tracked 化して返す（builtin dispatch 境界と
+    /// 同じ扱い）。`Err` は variant ごとに:
+    /// - [`AdapterError::Control`] → [`crate::budget::control_stop_to_error`] 経由の catch 不能
+    ///   terminal（`Cancelled`/`DeadlineExceeded`/`BudgetExceeded`/`InternalControl`）。
+    /// - その他（`Host`/`SecureResolutionUnsupported`/…） → catch 可能な `host` error。
+    fn finish_cooperative_result(
+        &mut self,
+        name: &str,
+        result: Result<Value, crate::capability::AdapterError>,
+        line: usize,
+    ) -> Result<Value, TsumugiError> {
+        match result {
+            Ok(value) => self
+                .budget
+                .track_result(value, ExecutionPhase::Run)
+                .map_err(|stop| self.control_stop_to_error(stop, line)),
+            Err(crate::capability::AdapterError::Control(stop)) => {
+                Err(self.control_stop_to_error(stop, line))
+            }
+            // 回復可能な host 失敗は catch 可能な `host` error へ写す（第11.2節 規則5）。
+            Err(_other) => Err(TsumugiError::host_adapter_failed(line, name, "host")),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2283,8 +2608,10 @@ mod tests {
             .map_err(|(_, e)| e)?;
         loop {
             match eval.run_slice(u64::MAX) {
-                None => continue,
-                Some(result) => return result,
+                SliceOutcome::YieldedSliceFuel
+                | SliceOutcome::YieldedHostCall { .. }
+                | SliceOutcome::YieldedExplicit => continue,
+                SliceOutcome::Terminal(result) => return result,
             }
         }
     }
@@ -2345,8 +2672,10 @@ mod tests {
             .map_err(|(_, e)| e)?;
         loop {
             match eval.run_slice(u64::MAX) {
-                None => continue,
-                Some(result) => return result,
+                SliceOutcome::YieldedSliceFuel
+                | SliceOutcome::YieldedHostCall { .. }
+                | SliceOutcome::YieldedExplicit => continue,
+                SliceOutcome::Terminal(result) => return result,
             }
         }
     }
@@ -2405,11 +2734,13 @@ mod tests {
         let mut yields = 0usize;
         let result = loop {
             match eval.run_slice(slice_fuel) {
-                None => {
+                SliceOutcome::YieldedSliceFuel
+                | SliceOutcome::YieldedHostCall { .. }
+                | SliceOutcome::YieldedExplicit => {
                     yields += 1;
                     assert!(yields < 1_000_000, "run_slice が terminal に到達しない");
                 }
-                Some(result) => break result,
+                SliceOutcome::Terminal(result) => break result,
             }
         };
         (result, eval, yields)

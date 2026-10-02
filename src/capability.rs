@@ -304,6 +304,109 @@ pub enum AdapterError {
     /// directory entry 名が非 UTF-8（REV-009 §17.4）。safe profile では lossy 変換で同一視せず、
     /// category `invalid_encoding` の catch 可能な `host` error へ写す。
     NonUtf8EntryName,
+    /// deadline / cancel / budget 超過・内部制御信号を運ぶ catch 不能 terminal（REV-015
+    /// Slice 5、設計 §4.4）。
+    ///
+    /// cooperative adapter が cancel / deadline / request・response byte 上限での途中停止 /
+    /// 同期文脈での yield 契約違反を観測したとき、`host` error へ潰さずこの variant で
+    /// [`crate::budget::ControlStop`] を運ぶ。dispatcher は [`crate::budget::control_stop_to_error`]
+    /// 経由で `Cancelled` / `DeadlineExceeded` / `BudgetExceeded` / `InternalControl` の
+    /// catch 不能 terminal へ写す。
+    Control(crate::budget::ControlStop),
+}
+
+/// cooperative host call の 1 回ぶんの実行 context（REV-015 Slice 5、設計 §4.4）。
+///
+/// [`crate::host_pending::CooperativeAdapter::start`] に `&mut` で渡す。adapter はこの
+/// context 経由で capability 判定・deadline・cancellation・request/response 残量・
+/// yield 可否（`may_yield`）を参照する。同期 adapter（`Input`/`Output` 等）と同じ
+/// authority・budget・deadline・cancellation を共有させるための横断型（FR-8）。
+///
+/// field は `pub(crate)`。adapter 実装からは getter で読む（`capabilities()` /
+/// `deadline()` / `cancellation()` / `remaining_request_bytes()` /
+/// `remaining_response_bytes()` / `may_yield()` / `call_id()`）。audit correlation id は
+/// Phase 6 で field 追加する（本 Slice では `call_id` のみ）。
+pub struct CapabilityCallContext<'a> {
+    pub(crate) capabilities: &'a CapabilitySet,
+    pub(crate) deadline: crate::budget::MonotonicInstant,
+    pub(crate) cancellation: crate::budget::CancellationToken,
+    pub(crate) remaining_request_bytes: u64,
+    pub(crate) remaining_response_bytes: u64,
+    /// この host call を `Pending` にできるか（Finding 7）。yield 可能なトップレベル driver
+    /// 文脈（文/反復境界、`can_yield=true`）でのみ `true`。関数本体/callback/同期経路
+    /// （`can_yield=false`）では `false` になり、adapter は `Ready` を返す契約。
+    pub(crate) may_yield: bool,
+    pub(crate) call_id: u64,
+}
+
+impl<'a> CapabilityCallContext<'a> {
+    /// cooperative host call 1 回ぶんの context を作る（crate 内部の dispatch から呼ぶ）。
+    pub(crate) fn new(
+        capabilities: &'a CapabilitySet,
+        deadline: crate::budget::MonotonicInstant,
+        cancellation: crate::budget::CancellationToken,
+        remaining_request_bytes: u64,
+        remaining_response_bytes: u64,
+        may_yield: bool,
+        call_id: u64,
+    ) -> Self {
+        Self {
+            capabilities,
+            deadline,
+            cancellation,
+            remaining_request_bytes,
+            remaining_response_bytes,
+            may_yield,
+            call_id,
+        }
+    }
+
+    /// この call で参照できる capability 集合。
+    pub fn capabilities(&self) -> &CapabilitySet {
+        self.capabilities
+    }
+
+    /// 実行 deadline（Engine の monotonic clock domain）。
+    pub fn deadline(&self) -> crate::budget::MonotonicInstant {
+        self.deadline
+    }
+
+    /// cancellation token。provider はこれを協調的に観測して停止する（FR-9）。
+    pub fn cancellation(&self) -> &crate::budget::CancellationToken {
+        &self.cancellation
+    }
+
+    /// request byte の残量。provider はこれを超える payload を送る前に停止する。
+    pub fn remaining_request_bytes(&self) -> u64 {
+        self.remaining_request_bytes
+    }
+
+    /// response byte の残量。provider はこれを超える stream を全量 buffer する前に停止する。
+    pub fn remaining_response_bytes(&self) -> u64 {
+        self.remaining_response_bytes
+    }
+
+    /// この host call を `Pending` にできるか（§4.4 の `may_yield` 契約）。
+    pub fn may_yield(&self) -> bool {
+        self.may_yield
+    }
+
+    /// この host call の識別子。
+    pub fn call_id(&self) -> u64 {
+        self.call_id
+    }
+}
+
+impl std::fmt::Debug for CapabilityCallContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapabilityCallContext")
+            .field("deadline", &self.deadline)
+            .field("remaining_request_bytes", &self.remaining_request_bytes)
+            .field("remaining_response_bytes", &self.remaining_response_bytes)
+            .field("may_yield", &self.may_yield)
+            .field("call_id", &self.call_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// [`Input::read_line`] の1行読み取り結果（仕様第7節 `InputLine`）。

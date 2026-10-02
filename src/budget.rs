@@ -29,6 +29,7 @@
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// heap 論理サイズ表の revision。初期実装は 1 だけを受理する（§3.1 / §5.1）。
@@ -632,6 +633,11 @@ pub enum ControlStop {
 pub enum InternalFailure {
     /// `AllocationId(u64)` を使い切った。0 へ wrap せず terminal にする。
     AllocationIdExhausted,
+    /// cooperative adapter が同期文脈（`may_yield=false`）で規約違反の `Pending` を返した
+    /// （REV-015 Slice 5、設計 §4.4 Finding N1）。関数本体・callback・同期経路では adapter は
+    /// `Ready` を返す契約で、違反時は busy-loop せず catch 不能 terminal にする。
+    /// [`control_stop_to_error`] が [`crate::error::ErrorKind::InternalControl`] へ写す。
+    CooperativeAdapterYieldInSyncContext,
 }
 
 // =============================================================================
@@ -643,10 +649,17 @@ pub enum InternalFailure {
 /// `cancel()` は idempotent かつ thread-safe で、最初の `false -> true` を linearization
 /// point とする。[`BudgetLedger`] の charge 前確認（§7-1）と driver ループの文/反復境界
 /// checkpoint（REV-015 Slice 4）で consult する。Ready/Yielded/Paused/host call 待ちの
-/// handle を wake する waker 連携は Slice 5（host pending）の範囲。
+/// handle を wake する waker 連携は Slice 5（host pending）で
+/// [`CancellationToken::register_waker`] により実効化する。
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken {
     flag: Arc<std::sync::atomic::AtomicBool>,
+    /// cancel 時に wake する登録済み waker（REV-015 Slice 5、設計 §4.5）。
+    ///
+    /// handle は `cancellation_token()` 取得後 / `set_waker` 時に自分の waker をここへ登録する。
+    /// `cancel()` の `false -> true` CAS が成功した **後に** この waker を wake する（既存の
+    /// `cancel()->bool` linearization 契約は変えない）。未登録なら wake は no-op。
+    waker: Arc<Mutex<Option<crate::host_pending::ExecutionWaker>>>,
 }
 
 impl CancellationToken {
@@ -658,9 +671,33 @@ impl CancellationToken {
     ///
     /// 最初の `false -> true` を linearization point とし、そのとき `true` を返す。既に
     /// cancel 済みなら状態を変えず `false` を返す（別スレッドからの呼び出しに対して安全）。
+    /// CAS が成功した場合に限り、登録済み waker を wake する（REV-015 Slice 5、設計 §4.5）。
     pub fn cancel(&self) -> bool {
         // swap は以前の値を返す。false（未 cancel）だった初回だけ true を返す。
-        !self.flag.swap(true, Ordering::SeqCst)
+        let newly_cancelled = !self.flag.swap(true, Ordering::SeqCst);
+        if newly_cancelled {
+            // CAS 成功後にだけ wake する（linearization point の後。設計 §4.5）。waker clone を
+            // lock 解放後に wake し、wake 中に lock を保持しない。
+            let waker = self
+                .waker
+                .lock()
+                .expect("cancel waker mutex poisoned")
+                .clone();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+        newly_cancelled
+    }
+
+    /// cancel 時に wake する waker を登録する（REV-015 Slice 5、設計 §4.5）。
+    ///
+    /// handle が作成 thread から自分の [`crate::host_pending::ExecutionWaker`] を登録し、
+    /// 別 thread の `cancel()` が Ready/Yielded/Paused/host 待ちの handle を wake できるように
+    /// する（§8）。以前の登録は置換する。`cancel()` の `false -> true` linearization 契約は
+    /// 変えない（wake は CAS 成功後にのみ行う）。
+    pub fn register_waker(&self, waker: &crate::host_pending::ExecutionWaker) {
+        *self.waker.lock().expect("cancel waker mutex poisoned") = Some(waker.clone());
     }
 
     /// キャンセル済みか。
@@ -992,6 +1029,31 @@ impl BudgetLedger {
     /// 呼ぶことで協調的 cancel を要求できる（§8）。charge 前と文/反復境界で consult される。
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    /// この実行の deadline instant（REV-015 Slice 5、cooperative host-call context 用）。
+    ///
+    /// `config.deadline` をそのまま返す。clock 未注入でも値は返るが、deadline の実効化は
+    /// 注入 clock に依存する（§4.6）。cooperative adapter はこの instant を使って有限 timeout を
+    /// 設定する（FR-9）。
+    pub fn deadline(&self) -> MonotonicInstant {
+        self.config.deadline
+    }
+
+    /// host-call request byte の残量（上限 − committed − reserved、飽和減算、REV-015 Slice 5）。
+    pub fn remaining_request_bytes(&self) -> u64 {
+        self.config
+            .max_host_request_bytes
+            .saturating_sub(self.committed.host_request_bytes)
+            .saturating_sub(self.reserved.host_request_bytes)
+    }
+
+    /// host-call response byte の残量（上限 − committed − reserved、飽和減算、REV-015 Slice 5）。
+    pub fn remaining_response_bytes(&self) -> u64 {
+        self.config
+            .max_host_response_bytes
+            .saturating_sub(self.committed.host_response_bytes)
+            .saturating_sub(self.reserved.host_response_bytes)
     }
 
     /// 現在の使用量 snapshot（§3）。
@@ -2304,6 +2366,12 @@ pub fn control_stop_to_error(
         ControlStop::InternalFailure(InternalFailure::AllocationIdExhausted) => {
             TsumugiError::internal(line, "AllocationId を割り当てできません")
         }
+        ControlStop::InternalFailure(InternalFailure::CooperativeAdapterYieldInSyncContext) => {
+            TsumugiError::internal_control(
+                line,
+                "cooperative adapter が同期文脈で yield を要求しました",
+            )
+        }
     }
 }
 
@@ -2506,6 +2574,32 @@ mod tests {
         assert_eq!(err.kind(), Some(crate::error::ErrorKind::DeadlineExceeded));
     }
 
+    /// cooperative adapter の同期文脈 yield 違反は InternalControl（catch 不能）へ写り、
+    /// 既存の AllocationIdExhausted（Internal、catch 可能）とは別種別になる（設計 §4.4 Finding N1）。
+    #[test]
+    fn cooperative_yield_in_sync_context_maps_to_internal_control() {
+        use crate::error::ErrorKind;
+        let err = control_stop_to_error(
+            ControlStop::InternalFailure(InternalFailure::CooperativeAdapterYieldInSyncContext),
+            0,
+            7,
+        );
+        assert_eq!(err.kind(), Some(ErrorKind::InternalControl));
+        assert!(ErrorKind::is_uncatchable(err.kind()), "catch 不能");
+
+        // 既存の AllocationIdExhausted は Internal（catch 可能）のまま。
+        let alloc_err = control_stop_to_error(
+            ControlStop::InternalFailure(InternalFailure::AllocationIdExhausted),
+            0,
+            7,
+        );
+        assert_eq!(alloc_err.kind(), Some(ErrorKind::Internal));
+        assert!(
+            !ErrorKind::is_uncatchable(alloc_err.kind()),
+            "Internal は catch 可能のまま（NFR-1）"
+        );
+    }
+
     // -------------------------------------------------------------------------
     // runtime cancel（§8 / REV-015 Slice 4）
     // -------------------------------------------------------------------------
@@ -2519,6 +2613,37 @@ mod tests {
         assert!(token.is_cancelled());
         assert!(!token.cancel(), "2 回目以降は false（既に cancel 済み）");
         assert!(!token.cancel());
+    }
+
+    /// 登録 waker は cancel の CAS 成功時に 1 回だけ鳴る（REV-015 Slice 5、設計 §4.5）。
+    /// `cancel()->bool` の linearization 契約（false→true は 1 回）は変わらない。
+    #[test]
+    fn cancel_wakes_registered_waker_only_after_successful_cas() {
+        use crate::host_pending::{ExecutionWaker, Wake};
+        use std::sync::atomic::AtomicUsize;
+
+        struct CountWake {
+            count: Arc<AtomicUsize>,
+        }
+        impl Wake for CountWake {
+            fn wake(&self) {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let waker = ExecutionWaker::new(Arc::new(CountWake {
+            count: Arc::clone(&count),
+        }));
+        let token = CancellationToken::new();
+        token.register_waker(&waker);
+
+        // 初回 cancel（false→true CAS 成功）で waker が 1 回鳴る。
+        assert!(token.cancel());
+        assert_eq!(count.load(Ordering::SeqCst), 1, "CAS 成功で 1 回 wake");
+        // 2 回目以降は CAS 失敗（既に cancel 済み）なので wake しない。
+        assert!(!token.cancel());
+        assert_eq!(count.load(Ordering::SeqCst), 1, "2 回目は wake しない");
     }
 
     /// clone した token の cancel は元の token へも観測される（handle 共有経路、§8）。
