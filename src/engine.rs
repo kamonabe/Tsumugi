@@ -22,6 +22,7 @@
 
 use std::marker::PhantomData;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::ast::Program;
 use crate::budget::BudgetUsage;
@@ -29,15 +30,38 @@ use crate::error::TsumugiError;
 use crate::eval::{Evaluator, RunPhase};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
+use crate::scheduler::{AdmissionSlot, ExecutionSlotId, SchedulerShared, SlotState};
+
+pub use crate::scheduler::{AdmissionPhase, EngineLimits, StartError};
 
 /// Tsumugi スクリプトをコンパイルして実行するエントリポイント。
-#[derive(Debug, Default)]
-pub struct Engine;
+///
+/// # 協調スケジューラ（REV-015 Slice 5）
+///
+/// `Engine` は Engine 全体で共有する協調制御層 [`SchedulerShared`] を `Arc` で保持する
+/// （有限 active/queue slot の admission と run-turn FIFO、設計 §4.1）。`create_execution` /
+/// `start` は handle 生成前に 1 個の slot を予約し、満杯なら [`StartError::Backpressure`] を
+/// 返す（handle を作らず context を変更しない）。
+#[derive(Clone)]
+pub struct Engine {
+    shared: Arc<SchedulerShared>,
+}
 
 impl Engine {
-    /// 新しい実行エンジンを作成する。
+    /// 既定の [`EngineLimits`] で新しい実行エンジンを作成する。
     pub fn new() -> Self {
-        Self
+        Self {
+            shared: Arc::new(SchedulerShared::new()),
+        }
+    }
+
+    /// 指定した [`EngineLimits`] で実行エンジンを作成する（REV-015 Slice 5、設計 §4.1）。
+    ///
+    /// active/queue 上限と既定 slice fuel をテストや埋め込み host が指定する opt-in 入口。
+    pub fn with_limits(limits: EngineLimits) -> Self {
+        Self {
+            shared: Arc::new(SchedulerShared::with_limits(limits)),
+        }
     }
 
     /// ソースをパースし、再利用可能なスクリプトを作成する。
@@ -58,48 +82,99 @@ impl Engine {
 
     /// `CompiledScript` から実行 handle を作る（第9節、Created フェーズから開始）。
     ///
-    /// import 解決（Link）を含めて同じ handle で進める入口である。PR-a では
-    /// [`ExecutionHandle::poll`] が最初の呼び出しで Link と実行を terminal まで行う。
+    /// import 解決（Link）を含めて同じ handle で進める入口である。[`ExecutionHandle::poll`] が
+    /// 最初の呼び出しで Link と実行を進める。
+    ///
+    /// # 協調スケジューラ（REV-015 Slice 5、設計 §4.1）
+    ///
+    /// handle 生成前に [`SchedulerShared::admit`](crate::scheduler::SchedulerShared::admit) で
+    /// slot を 1 個予約する（phase は [`AdmissionPhase::Created`]）。active 上限に空きがあれば
+    /// active slot を得て `Created` から、満杯なら queue slot を得て
+    /// `Yielded(AdmissionQueued { resume_to: Created })` から始まる。active/queue 共に満杯なら
+    /// [`StartError::Backpressure`] を返し、**handle を作らず context の `&mut` 借用も発生しない**。
+    ///
+    /// 仕様 §9.1 の `link_options: LinkOptions` 引数は capability/import 制御（Phase 2）に属し
+    /// 現行コードに無いため本 Slice では据え置き、引数は追加しない。`&CompiledScript` を保持し
+    /// 初回 poll の `begin_execution` で Link する（`Result` 化のみ行う。設計 §4.1）。
     pub fn create_execution<'e, 's, 'c>(
         &'e self,
         script: &'s CompiledScript,
         context: &'c mut ExecutionContext,
         request: ExecutionRequest,
-    ) -> ExecutionHandle<'e, 's, 'c> {
-        ExecutionHandle {
+    ) -> Result<ExecutionHandle<'e, 's, 'c>, StartError> {
+        // admit を context 借用より前に呼ぶ（backpressure => handle 無し・context 不変、AC-1）。
+        let slot = self.shared.admit(AdmissionPhase::Created)?;
+        Ok(Self::new_handle(
+            Arc::clone(&self.shared),
+            slot,
+            AdmissionPhase::Created,
             script,
             context,
             request,
-            state: ExecutionState::Created,
-            outcome: None,
-            transactional: false,
-            started: false,
-            _engine: PhantomData,
-            _not_send: PhantomData,
-        }
+        ))
     }
 
     /// `CompiledScript` から Linked フェーズ開始相当の実行 handle を作る（第9節）。
     ///
-    /// 仕様の `Engine::start(&LinkedScript, ...)` に対応する互換入口。PR-a では
-    /// `LinkedScript` 型を導入せず `CompiledScript` を受け取り、poll 時に Link を行う。
-    /// 公開状態は [`ExecutionState::Linked`] から始まる。
+    /// 仕様の `Engine::start(&LinkedScript, ...)` に対応する互換入口。本 Slice では
+    /// `LinkedScript` 型を導入せず `CompiledScript` を受け取り、poll 時に Link を行う
+    /// （`Result` 化のみ、設計 §4.1）。active なら公開状態は [`ExecutionState::Linked`] から、
+    /// queue なら `Yielded(AdmissionQueued { resume_to: Linked })` から始まる。
     pub fn start<'e, 's, 'c>(
         &'e self,
         script: &'s CompiledScript,
         context: &'c mut ExecutionContext,
         request: ExecutionRequest,
+    ) -> Result<ExecutionHandle<'e, 's, 'c>, StartError> {
+        let slot = self.shared.admit(AdmissionPhase::Linked)?;
+        Ok(Self::new_handle(
+            Arc::clone(&self.shared),
+            slot,
+            AdmissionPhase::Linked,
+            script,
+            context,
+            request,
+        ))
+    }
+
+    /// admit 済み slot から handle を組み立てる（設計 §4.1）。queue slot なら初期状態は
+    /// `Yielded(AdmissionQueued { resume_to })`、active slot なら `resume_to` 相当の
+    /// `Created` / `Linked`。
+    fn new_handle<'e, 's, 'c>(
+        shared: Arc<SchedulerShared>,
+        slot: AdmissionSlot,
+        resume_to: AdmissionPhase,
+        script: &'s CompiledScript,
+        context: &'c mut ExecutionContext,
+        request: ExecutionRequest,
     ) -> ExecutionHandle<'e, 's, 'c> {
+        let slot_id = slot.slot_id();
+        let slot_state = slot.slot_state_arc();
+        let state = if slot.is_active() {
+            match resume_to {
+                AdmissionPhase::Created => ExecutionState::Created,
+                AdmissionPhase::Linked => ExecutionState::Linked,
+            }
+        } else {
+            ExecutionState::Yielded(YieldReason::AdmissionQueued { resume_to })
+        };
         ExecutionHandle {
             script,
             context,
             request,
-            state: ExecutionState::Linked,
+            state,
             outcome: None,
             transactional: false,
             started: false,
+            shared,
+            slot_id,
+            slot_state,
+            waker: None,
+            pending_ticket: None,
+            run_turn_registered: false,
             _engine: PhantomData,
             _not_send: PhantomData,
+            slot,
         }
     }
 
@@ -119,7 +194,11 @@ impl Engine {
         context: &mut ExecutionContext,
     ) -> Result<ExecutionOutcome, TsumugiError> {
         let request = ExecutionRequest::new();
-        let mut handle = self.create_execution(script, context, request);
+        // 単一 execution・既定 limits では admit が必ず成功する（active=0<max）。防御的に
+        // Backpressure を従来互換の internal error へ写し、Ok(Completed)/Err 契約を保つ（設計 §4.1）。
+        let mut handle = self
+            .create_execution(script, context, request)
+            .map_err(Self::start_error_to_tsumugi_error)?;
         Self::drive_to_outcome(&mut handle)
     }
 
@@ -137,9 +216,19 @@ impl Engine {
         context: &mut ExecutionContext,
     ) -> Result<ExecutionOutcome, TsumugiError> {
         let request = ExecutionRequest::new();
-        let mut handle = self.create_execution(script, context, request);
+        let mut handle = self
+            .create_execution(script, context, request)
+            .map_err(Self::start_error_to_tsumugi_error)?;
         handle.transactional = true;
         Self::drive_to_outcome(&mut handle)
+    }
+
+    /// 同期 wrapper 用に [`StartError`] を従来互換の [`TsumugiError`] へ写す（設計 §4.1）。
+    ///
+    /// 同期経路（単一 execution・既定 limits）は構造的に backpressure に到達しないが、防御的に
+    /// internal error へ写して `Ok(Completed)` / `Err` の戻り値契約を保つ。
+    fn start_error_to_tsumugi_error(error: StartError) -> TsumugiError {
+        TsumugiError::internal(0, format!("実行の受理に失敗しました: {error:?}"))
     }
 
     /// handle を terminal まで poll し、従来互換の `Result` へ写す。
@@ -179,6 +268,12 @@ impl Engine {
     }
 }
 
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// パース済みで、実行可能な Tsumugi スクリプト。
 pub struct CompiledScript {
     program: Program,
@@ -205,6 +300,24 @@ impl ExecutionContext {
         Self {
             evaluator: Evaluator::new(),
         }
+    }
+
+    /// deadline clock を注入した実行コンテキストを作成する（REV-015 Slice 5、設計 §4.6）。
+    ///
+    /// alpha facade で admission queue 待ち・host 待ち中の deadline を機能させる唯一の clock
+    /// 注入経路。`checkpoint_deadline` は注入 clock を基準に判定し、clock 未注入（既存
+    /// [`Self::new`]）なら no-op のまま（NFR-1、観測挙動不変）。clock の domain は台帳の
+    /// `BudgetConfig.deadline` と一致する必要があり、別 domain の clock は
+    /// [`crate::budget::ConfigError::ForeignClock`] を [`StartError::Config`] として返す。
+    pub fn new_with_clock(
+        clock: std::sync::Arc<dyn crate::budget::MonotonicClock>,
+    ) -> Result<Self, StartError> {
+        let mut evaluator = Evaluator::new();
+        evaluator
+            .validate_budget_against(clock.as_ref())
+            .map_err(StartError::Config)?;
+        evaluator.set_deadline_clock(clock);
+        Ok(Self { evaluator })
     }
 
     /// スクリプトファイルの完全なパスを設定する。
@@ -300,11 +413,21 @@ pub enum ExecutionState {
 
 /// yield の理由（第9節 `YieldReason`）。
 ///
-/// 仕様の 6 種のうち、`SliceFuelExhausted`（REV-015 Slice 3 で実効化）と `ExplicitYield`
-/// だけを持つ。`AdmissionQueued` / `HostCallPending` / `AuditBackpressure` /
-/// `SchedulerPreempted` は scheduler・host pending（Slice 5）で導入する。
+/// `SliceFuelExhausted`（REV-015 Slice 3 で実効化）と `ExplicitYield` に加え、Slice 5 で
+/// `AdmissionQueued`（admission queue 待ち）と `SchedulerPreempted`（run-turn で非 head）を
+/// 配線する。`HostCallPending` は host pending protocol（FEAT-002）で追加する。
+///
+/// `AuditBackpressure`（仕様 §9）は本 enum に **加えない**: audit event emission は Phase 6 で
+/// あり、backpressure を audit sink の詰まりへ変換する機構は audit sink が入って初めて意味を
+/// 持つ。variant を今足すと「返り得ない公開 variant」になり、「state と outcome で terminal
+/// 理由を二重定義しない」精神に反するため、依存機構が入る Phase 6 で追加する（設計 §4.6）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum YieldReason {
+    /// admission queue で active slot の空きを待っている（Slice 5、設計 §4.1/§4.6）。
+    ///
+    /// この yield の間は link を含む semantic work を一切行わない。active slot が空いて FIFO
+    /// 先頭へ昇格すると `resume_to` の [`AdmissionPhase`]（`Created` / `Linked`）へ戻る。
+    AdmissionQueued { resume_to: AdmissionPhase },
     /// slice fuel を使い切った（第4.2節）。REV-015 Slice 3 PR-d で実効化。
     SliceFuelExhausted,
     /// script / host による明示 yield。
@@ -314,6 +437,12 @@ pub enum YieldReason {
     /// 拡張になるため据え置く（enum variant だけ用意する）。host からの協調停止は現状
     /// [`ExecutionHandle::pause`] で表現する。
     ExplicitYield,
+    /// run-turn FIFO で先頭でないため semantic work をせず譲った（Slice 5、設計 §4.3）。
+    ///
+    /// これは [`PollResult`] の **reason としてのみ** 返り、`self.state` は遷移させない
+    /// （Finding 4）。非 head poll は元の `Ready` / `Yielded(..)` を保ったまま、戻り値だけ
+    /// `SchedulerPreempted` になる。run-turn 内の自分の位置も変えない（FR-3）。
+    SchedulerPreempted,
 }
 
 /// pause の理由（第9節 `PauseReason`）。PR-a では返さない骨格。
@@ -420,9 +549,42 @@ pub struct ExecutionHandle<'engine, 'script, 'context> {
     /// 実行セッションを開始済みか（REV-015 Slice 3 PR-d-2）。初回 poll で `begin_execution`
     /// を呼んで true にし、以降の poll は `run_slice` で resume する。
     started: bool,
+    /// Engine 全体で共有する協調制御層（Slice 5、設計 §4.1）。run-turn 登録・head 判定・
+    /// AdmissionQueued 昇格の観測に使う。`Arc<SchedulerShared>` は `Send + Sync` だが、handle
+    /// 全体は `_not_send` により `!Send + !Sync` のまま。
+    shared: Arc<SchedulerShared>,
+    /// この execution の slot id（run-turn / admission の識別子）。
+    slot_id: ExecutionSlotId,
+    /// 昇格通知を poll 時に lock なしで読む read-only ミラー（設計 §4.1/§4.3）。
+    slot_state: Arc<SlotState>,
+    /// host/ticket 完了・cancel・deadline が state を ready にしたときに鳴らす waker。
+    ///
+    /// **FEAT-001 placeholder**: `ExecutionWaker` 型は host pending protocol（FEAT-002、
+    /// `src/host_pending.rs`）で導入する。本 FEAT では `Option<()>` とし、`set_waker` と
+    /// cancel/host-call ticket との配線は FEAT-002 が担う。
+    #[allow(dead_code)]
+    waker: Option<()>,
+    /// host-call pending 中のみ `Some` となる型消去 ticket（設計 §4.4/§4.8）。
+    ///
+    /// **FEAT-001 placeholder**: `TicketErased` 型は FEAT-002 で導入する。本 FEAT では
+    /// `Option<()>` とし、host-call pending 分岐（poll step 4）と Drop の detach 配線は
+    /// FEAT-002 が差し替える。
+    #[allow(dead_code)]
+    pending_ticket: Option<()>,
+    /// run-turn FIFO へ push 済みか（設計 §4.3 step 5）。
+    run_turn_registered: bool,
     _engine: PhantomData<&'engine Engine>,
     /// `!Send + !Sync` を保証する（第9.1節）。別スレッドへ move させない。
     _not_send: PhantomData<*const ()>,
+    /// handle が所有する admission slot の RAII トークン（設計 §4.1/§4.8）。
+    ///
+    /// **末尾 field** に置く: Rust は field を宣言順に drop するため、将来の `impl Drop` 本体で
+    /// cancel linearize / ticket detach / rollback（§4.8 step 1-4）を行った後に、この field の
+    /// drop で slot が解放される（§4.8 step 5）ようにする。本 FEAT では明示 `Drop` 本体は持たず、
+    /// この field の [`AdmissionSlot`] 自身の `Drop` が slot を 1 個だけ解放する（§4.1 INV-2）。
+    /// 読み取りはしないが RAII 解放のため保持し続ける。
+    #[allow(dead_code)]
+    slot: AdmissionSlot,
 }
 
 impl ExecutionHandle<'_, '_, '_> {
@@ -462,43 +624,109 @@ impl ExecutionHandle<'_, '_, '_> {
     /// 評価器の永続 continuation に状態が残る。次の poll で続きから resume する。terminal に
     /// 達すると [`PollResult::Terminal`] を返す。terminal 後の poll は [`HandleError::Terminal`]。
     pub fn poll(&mut self, slice: PollSlice) -> Result<PollResult, HandleError> {
-        match self.state {
-            ExecutionState::Terminal => Err(HandleError::Terminal),
-            ExecutionState::Paused(_) => Err(HandleError::InvalidState {
-                operation: "poll",
-                state: self.state.clone(),
-            }),
-            // Created / Linked / Ready / Yielded はいずれも Running を経て 1 slice 進む。
-            _ => {
-                self.state = ExecutionState::Running;
-                let poll = self.drive_one_slice(slice.max_fuel);
+        // (1) terminal guard / (2) paused guard（設計 §4.3）。
+        match &self.state {
+            ExecutionState::Terminal => return Err(HandleError::Terminal),
+            ExecutionState::Paused(_) => {
+                return Err(HandleError::InvalidState {
+                    operation: "poll",
+                    state: self.state.clone(),
+                });
+            }
+            _ => {}
+        }
+
+        // (3) AdmissionQueued: cancel/deadline checkpoint → 昇格確認（設計 §4.3 step 3）。
+        if let ExecutionState::Yielded(YieldReason::AdmissionQueued { resume_to }) = self.state {
+            // queue 待ち中の cancel/deadline を発火する（§4.6）。AdmissionQueued は
+            // begin_execution 前・session 無しのため rollback 不要（§4.6）。
+            if let Some(outcome) = self.checkpoint_terminal() {
+                return Ok(self.finish_terminal(outcome));
+            }
+            // 昇格済みか（別 thread の release_active が SlotState を Active へ store したか）。
+            if !self.slot_state.is_active() {
+                // 未昇格: semantic work をせず AdmissionQueued を返す（FR-2）。
                 let usage = self.context.budget_usage();
-                match poll {
-                    // slice fuel を使い切って協調停止した（§4.2）。continuation は
-                    // 評価器の永続 frame stack に残り、次 poll で resume する。
-                    SlicePoll::Yielded => {
-                        self.state = ExecutionState::Yielded(YieldReason::SliceFuelExhausted);
-                        Ok(PollResult::Yielded {
-                            reason: YieldReason::SliceFuelExhausted,
-                            usage,
-                        })
-                    }
-                    SlicePoll::Terminal(outcome) => {
-                        // terminal は 1 回だけセットする（§8 / §15.3）。handle は !Send + !Sync で
-                        // 単一スレッド運用のため、cancel（別スレッドが token を立てるだけ）と正常
-                        // 完了の決着は必ずこの poll 内で単一スレッド的に行われる。ここで state を
-                        // Terminal にすると、以後の poll / pause / resume は先頭の
-                        // `ExecutionState::Terminal` 分岐で `HandleError::Terminal` になり、後から
-                        // 到達した cancel は outcome を変えない（cancel の linearization point は
-                        // token の compare-and-set＝`CancellationToken::cancel` の false→true だが、
-                        // それが観測されるのは次 checkpoint であり、既に terminal 済みなら無視される）。
-                        self.state = ExecutionState::Terminal;
-                        self.outcome = Some(outcome.clone());
-                        Ok(PollResult::Terminal { outcome, usage })
-                    }
-                }
+                return Ok(PollResult::Yielded {
+                    reason: YieldReason::AdmissionQueued { resume_to },
+                    usage,
+                });
+            }
+            // 昇格済み: resume_to（Created/Linked）へ遷移して step 5 以降へ落とす。昇格直後は
+            // まだ run-turn 未登録なので、step 5 の登録ロジックが push_back して head を待つ。
+            self.state = match resume_to {
+                AdmissionPhase::Created => ExecutionState::Created,
+                AdmissionPhase::Linked => ExecutionState::Linked,
+            };
+        }
+
+        // (4) HostCallPending 分岐は FEAT-002（host pending protocol）で追加する。
+
+        // (5) run-turn 登録と head 判定（設計 §4.3 step 5）。
+        if !self.run_turn_registered {
+            self.shared.run_turn_push_back(self.slot_id);
+            self.run_turn_registered = true;
+        }
+        if !self.shared.is_head(self.slot_id) {
+            // 非 head: semantic work せず SchedulerPreempted を reason としてだけ返す。
+            // self.state は遷移させない（Finding 4）。run-turn 内の位置も変えない（FR-3）。
+            let usage = self.context.budget_usage();
+            return Ok(PollResult::Yielded {
+                reason: YieldReason::SchedulerPreempted,
+                usage,
+            });
+        }
+
+        // (6) head 路: 1 slice 進める（設計 §4.3 step 6）。
+        self.state = ExecutionState::Running;
+        let poll = self.drive_one_slice(slice.max_fuel);
+        let usage = self.context.budget_usage();
+        match poll {
+            // slice fuel を使い切って協調停止した（§4.2）。continuation は評価器の永続 frame
+            // stack に残り、run-turn 先頭を末尾へ回して（§12.1 規則 2/3）次 poll で resume する。
+            SlicePoll::Yielded => {
+                self.shared.run_turn_rotate(self.slot_id);
+                self.state = ExecutionState::Yielded(YieldReason::SliceFuelExhausted);
+                Ok(PollResult::Yielded {
+                    reason: YieldReason::SliceFuelExhausted,
+                    usage,
+                })
+            }
+            SlicePoll::Terminal(outcome) => {
+                // terminal は 1 回だけセットする（§8 / §15.3）。handle は !Send + !Sync で
+                // 単一スレッド運用のため、cancel（別スレッドが token を立てるだけ）と正常
+                // 完了の決着は必ずこの poll 内で単一スレッド的に行われる。ここで state を
+                // Terminal にすると、以後の poll / pause / resume は先頭の
+                // `ExecutionState::Terminal` 分岐で `HandleError::Terminal` になり、後から
+                // 到達した cancel は outcome を変えない。
+                self.shared.run_turn_remove(self.slot_id);
+                Ok(self.finish_terminal(outcome))
             }
         }
+    }
+
+    /// AdmissionQueued 中の cancel/deadline checkpoint（設計 §4.3 step 3 / §4.6）。
+    ///
+    /// cancel が立っていれば [`ExecutionOutcome::Cancelled`]、deadline 到達なら
+    /// [`ExecutionOutcome::DeadlineExceeded`] を返す。どちらでもなければ `None`。clock 未注入の
+    /// context では `checkpoint_deadline` は no-op（設計 §4.6、`ExecutionContext::new_with_clock`
+    /// で clock を注入した場合のみ deadline 側が機能する）。
+    fn checkpoint_terminal(&self) -> Option<ExecutionOutcome> {
+        if self.context.evaluator.checkpoint_cancel().is_err() {
+            return Some(ExecutionOutcome::Cancelled);
+        }
+        if self.context.evaluator.checkpoint_deadline().is_err() {
+            return Some(ExecutionOutcome::DeadlineExceeded);
+        }
+        None
+    }
+
+    /// terminal state をセットして [`PollResult::Terminal`] を組み立てる（§8 / §15.3）。
+    fn finish_terminal(&mut self, outcome: ExecutionOutcome) -> PollResult {
+        let usage = self.context.budget_usage();
+        self.state = ExecutionState::Terminal;
+        self.outcome = Some(outcome.clone());
+        PollResult::Terminal { outcome, usage }
     }
 
     /// host 要求による pause（第9節、REV-015 Slice 4）。

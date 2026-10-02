@@ -352,6 +352,23 @@ impl Evaluator {
         self.budget.cancellation_token()
     }
 
+    /// cancel checkpoint を評価する（REV-015 Slice 5、設計 §4.6）。
+    ///
+    /// alpha facade（`engine.rs`）が admission queue 待ち中の cancel を観測するための委譲。
+    /// run 中の checkpoint は `run_driver` 内の既存経路を使い、本 method は driver に入らない
+    /// 待機 state（AdmissionQueued）向け。既定経路の観測挙動は変えない（呼ばれなければ no-op）。
+    pub fn checkpoint_cancel(&self) -> Result<(), crate::budget::ControlStop> {
+        self.budget.checkpoint_cancel()
+    }
+
+    /// deadline checkpoint を評価する（REV-015 Slice 5、設計 §4.6）。
+    ///
+    /// clock が注入されていなければ no-op（[`crate::budget::BudgetLedger::checkpoint_deadline`]）。
+    /// alpha facade が admission queue 待ち中の deadline を観測するための委譲。
+    pub fn checkpoint_deadline(&self) -> Result<(), crate::budget::ControlStop> {
+        self.budget.checkpoint_deadline()
+    }
+
     /// `args()` が返すスクリプト引数の snapshot を設定する（AUD-018）。
     pub fn set_script_args(&mut self, args: Vec<String>) {
         self.script_args = args;

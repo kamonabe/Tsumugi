@@ -117,7 +117,9 @@ fn create_execution_polls_to_completed_terminal() {
     let script = engine.compile("let x = 1 + 2\n").unwrap();
     let mut context = ExecutionContext::new();
 
-    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let mut handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
     assert_eq!(handle.state(), ExecutionState::Created);
     assert!(handle.outcome().is_none());
 
@@ -139,7 +141,9 @@ fn start_begins_at_linked_state() {
     let script = engine.compile("let x = 1\n").unwrap();
     let mut context = ExecutionContext::new();
 
-    let handle = engine.start(&script, &mut context, ExecutionRequest::new());
+    let handle = engine
+        .start(&script, &mut context, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
     assert_eq!(handle.state(), ExecutionState::Linked);
 }
 
@@ -150,7 +154,9 @@ fn poll_after_terminal_is_rejected() {
     let script = engine.compile("let x = 1\n").unwrap();
     let mut context = ExecutionContext::new();
 
-    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let mut handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
     let _ = handle
         .poll(PollSlice::default())
         .expect("最初の poll が失敗した");
@@ -169,7 +175,9 @@ fn pause_resume_after_terminal_are_rejected() {
     let script = engine.compile("let x = 1\n").unwrap();
     let mut context = ExecutionContext::new();
 
-    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let mut handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
     let _ = handle.poll(PollSlice::default()).unwrap();
 
     assert_eq!(handle.pause(), Err(HandleError::Terminal));
@@ -184,7 +192,9 @@ fn runtime_error_surfaces_as_runtime_error_outcome() {
     let script = engine.compile("let y = missing_name\n").unwrap();
     let mut context = ExecutionContext::new();
 
-    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let mut handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
     let result = handle.poll(PollSlice::default()).unwrap();
     match result {
         PollResult::Terminal {
@@ -206,7 +216,9 @@ fn link_error_surfaces_as_link_error_outcome() {
     let script = engine.compile("import \"__no_such_module__\"\n").unwrap();
     let mut context = ExecutionContext::new();
 
-    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let mut handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
     let result = handle.poll(PollSlice::default()).unwrap();
     match result {
         PollResult::Terminal {
@@ -234,7 +246,9 @@ fn execute_matches_poll_to_terminal_outcome() {
     // poll 経由（handle を terminal まで）。
     let script_b = engine.compile(source).unwrap();
     let mut ctx_b = ExecutionContext::new();
-    let mut handle = engine.create_execution(&script_b, &mut ctx_b, ExecutionRequest::new());
+    let mut handle = engine
+        .create_execution(&script_b, &mut ctx_b, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
     let via_poll = handle.poll(PollSlice::default()).unwrap();
     assert!(matches!(
         via_poll,
@@ -254,7 +268,9 @@ fn handle_reuses_context_bindings() {
     let mut context = ExecutionContext::new();
 
     {
-        let mut h = engine.create_execution(&define, &mut context, ExecutionRequest::new());
+        let mut h = engine
+            .create_execution(&define, &mut context, ExecutionRequest::new())
+            .expect("単一 execution の admit は成功する");
         assert!(matches!(
             h.poll(PollSlice::default()).unwrap(),
             PollResult::Terminal {
@@ -264,7 +280,9 @@ fn handle_reuses_context_bindings() {
         ));
     }
     {
-        let mut h = engine.create_execution(&use_it, &mut context, ExecutionRequest::new());
+        let mut h = engine
+            .create_execution(&use_it, &mut context, ExecutionRequest::new())
+            .expect("単一 execution の admit は成功する");
         assert!(matches!(
             h.poll(PollSlice::default()).unwrap(),
             PollResult::Terminal {
@@ -328,7 +346,9 @@ end\n";
     // (A) 大きな slice 1 回で terminal まで（分割なし）。
     let script_a = engine.compile(source).unwrap();
     let mut ctx_a = ExecutionContext::new();
-    let mut handle_a = engine.create_execution(&script_a, &mut ctx_a, ExecutionRequest::new());
+    let mut handle_a = engine
+        .create_execution(&script_a, &mut ctx_a, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
     let big_slice = PollSlice {
         max_fuel: 10_000_000,
     };
@@ -343,7 +363,9 @@ end\n";
     // (B) 小さな slice で複数回 poll。少なくとも 1 回は yield し、最後は同じ terminal。
     let script_b = engine.compile(source).unwrap();
     let mut ctx_b = ExecutionContext::new();
-    let mut handle_b = engine.create_execution(&script_b, &mut ctx_b, ExecutionRequest::new());
+    let mut handle_b = engine
+        .create_execution(&script_b, &mut ctx_b, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
     let small_slice = PollSlice { max_fuel: 16 };
 
     let mut yields = 0usize;
@@ -394,7 +416,9 @@ end\n";
     let engine = Engine::new();
     let script = engine.compile(source).unwrap();
     let mut context = ExecutionContext::new();
-    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let mut handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
     let small_slice = PollSlice { max_fuel: 16 };
 
     // 初回 poll は yield する（100 反復は 16 fuel に収まらない）。
@@ -435,7 +459,9 @@ let bad = missing_name\n";
     let engine = Engine::new();
     let script = engine.compile(source).unwrap();
     let mut context = ExecutionContext::new();
-    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let mut handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
     let small_slice = PollSlice { max_fuel: 16 };
 
     let outcome = loop {
@@ -462,7 +488,9 @@ fn pause_from_created_resumes_to_created_and_completes() {
     let engine = Engine::new();
     let script = engine.compile("let x = 1 + 2\n").unwrap();
     let mut context = ExecutionContext::new();
-    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let mut handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
     assert_eq!(handle.state(), ExecutionState::Created);
 
     // Created から pause。resume_to は Created。
@@ -508,7 +536,9 @@ end\n";
     let engine = Engine::new();
     let script = engine.compile(source).unwrap();
     let mut context = ExecutionContext::new();
-    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let mut handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
     let small_slice = PollSlice { max_fuel: 16 };
 
     // 初回 poll で yield させる。
@@ -557,7 +587,9 @@ fn double_pause_is_rejected() {
     let engine = Engine::new();
     let script = engine.compile("let x = 1\n").unwrap();
     let mut context = ExecutionContext::new();
-    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let mut handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
 
     handle.pause().expect("最初の pause は成功する");
     // 2 回目の pause は Paused 状態からは不正。
@@ -579,7 +611,9 @@ fn resume_without_pause_is_rejected() {
     let engine = Engine::new();
     let script = engine.compile("let x = 1\n").unwrap();
     let mut context = ExecutionContext::new();
-    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let mut handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
 
     assert_eq!(
         handle.resume(),
@@ -596,7 +630,9 @@ fn pause_and_resume_after_terminal_are_rejected() {
     let engine = Engine::new();
     let script = engine.compile("let x = 1\n").unwrap();
     let mut context = ExecutionContext::new();
-    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let mut handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
 
     // terminal まで進める。
     let _ = handle.poll(PollSlice::default()).unwrap();
@@ -622,7 +658,9 @@ end\n";
     let engine = Engine::new();
     let script = engine.compile(source).unwrap();
     let mut context = ExecutionContext::new();
-    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let mut handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
 
     // handle から cancel token を取り、実行前に cancel する（別スレッドの cancel を模す）。
     let token: CancellationToken = handle.cancellation_token();
@@ -653,7 +691,9 @@ end\n";
     let engine = Engine::new();
     let script = engine.compile(source).unwrap();
     let mut context = ExecutionContext::new();
-    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let mut handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
     let token = handle.cancellation_token();
     let small_slice = PollSlice { max_fuel: 16 };
 
@@ -682,7 +722,9 @@ fn cancel_after_completion_does_not_change_outcome() {
     let engine = Engine::new();
     let script = engine.compile("let x = 1 + 2\n").unwrap();
     let mut context = ExecutionContext::new();
-    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let mut handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
     let token = handle.cancellation_token();
 
     // 正常完了させる。
@@ -715,7 +757,9 @@ end\n";
     let engine = Engine::new();
     let script = engine.compile(source).unwrap();
     let mut context = ExecutionContext::new();
-    let mut handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let mut handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
     let token = handle.cancellation_token();
 
     // Created から pause。
@@ -738,11 +782,239 @@ fn cancel_token_is_idempotent_across_clones() {
     let engine = Engine::new();
     let script = engine.compile("let x = 1\n").unwrap();
     let mut context = ExecutionContext::new();
-    let handle = engine.create_execution(&script, &mut context, ExecutionRequest::new());
+    let handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("単一 execution の admit は成功する");
 
     let token_a = handle.cancellation_token();
     let token_b = handle.cancellation_token();
     assert!(token_a.cancel(), "初回 cancel は true");
     assert!(!token_b.cancel(), "clone を跨いでも 2 回目は false");
     assert!(token_a.is_cancelled() && token_b.is_cancelled());
+}
+
+// =============================================================================
+// scheduler admission / run-turn（REV-015 Slice 5、実行制御仕様 §9 / §15.3、設計 §4.1/§4.3）
+// =============================================================================
+
+use tsumugi::{AdmissionPhase, EngineLimits};
+
+/// 小さい EngineLimits（active=1, queue=small）を作るヘルパ。
+fn limited_engine(max_active: usize, max_queued: usize) -> Engine {
+    Engine::with_limits(EngineLimits {
+        max_active_executions: std::num::NonZeroUsize::new(max_active).unwrap(),
+        max_queued_executions: max_queued,
+        default_slice_fuel: std::num::NonZeroU64::new(10_000).unwrap(),
+    })
+}
+
+/// active + queue 満杯で create_execution が Backpressure を返し、handle を作らず context を
+/// 変更しない（AC-1、設計 §4.1）。
+#[test]
+fn admission_full_create_returns_no_handle_no_context_change() {
+    let engine = limited_engine(1, 1);
+    let script = engine.compile("let a = 1\n").unwrap();
+
+    // active=1 を占有する handle A（context_a）。
+    let mut ctx_a = ExecutionContext::new();
+    let _handle_a = engine
+        .create_execution(&script, &mut ctx_a, ExecutionRequest::new())
+        .expect("1 個目は active を取れる");
+
+    // queue=1 を占有する handle B（context_b）。
+    let mut ctx_b = ExecutionContext::new();
+    let _handle_b = engine
+        .create_execution(&script, &mut ctx_b, ExecutionRequest::new())
+        .expect("2 個目は queue を取れる");
+
+    // 3 個目は active+queue 満杯で Backpressure。context_c は変更されない。
+    let mut ctx_c = ExecutionContext::new();
+    let before = ctx_c.budget_usage().committed.fuel;
+    match engine.create_execution(&script, &mut ctx_c, ExecutionRequest::new()) {
+        Err(tsumugi::StartError::Backpressure {
+            active,
+            queued,
+            limit,
+        }) => {
+            assert_eq!(active, 1);
+            assert_eq!(queued, 1);
+            assert_eq!(limit, 1);
+        }
+        Ok(_) => panic!("満杯なのに handle が作られた"),
+        Err(other) => panic!("Backpressure を期待したが {other:?}"),
+    }
+    // context は借用すら発生せず不変（admit は borrow より前に失敗する）。
+    assert_eq!(ctx_c.budget_usage().committed.fuel, before);
+}
+
+/// queue 待ち handle は Yielded(AdmissionQueued) から始まり、active が空くと昇格して
+/// resume_to（Created）へ戻る。昇格前の poll は semantic work をせず AdmissionQueued を返す
+/// （設計 §4.1/§4.3、§6.2 matrix の AdmissionQueued 行）。
+#[test]
+fn admission_queued_row_promotes_to_resume_to_on_active_release() {
+    let engine = limited_engine(1, 2);
+    let script = engine.compile("let a = 1\n").unwrap();
+
+    let mut ctx_a = ExecutionContext::new();
+    let handle_a = engine
+        .create_execution(&script, &mut ctx_a, ExecutionRequest::new())
+        .expect("active");
+    assert_eq!(handle_a.state(), ExecutionState::Created);
+
+    let mut ctx_b = ExecutionContext::new();
+    let mut handle_b = engine
+        .create_execution(&script, &mut ctx_b, ExecutionRequest::new())
+        .expect("queue");
+    // queue 待ちは AdmissionQueued(resume_to: Created) から始まる。
+    assert_eq!(
+        handle_b.state(),
+        ExecutionState::Yielded(YieldReason::AdmissionQueued {
+            resume_to: AdmissionPhase::Created,
+        })
+    );
+
+    // 昇格前の poll は semantic work をせず AdmissionQueued を返す（state 不変）。
+    match handle_b.poll(PollSlice::default()).unwrap() {
+        PollResult::Yielded {
+            reason: YieldReason::AdmissionQueued { resume_to },
+            ..
+        } => assert_eq!(resume_to, AdmissionPhase::Created),
+        other => panic!("AdmissionQueued を期待: {other:?}"),
+    }
+    assert_eq!(
+        handle_b.state(),
+        ExecutionState::Yielded(YieldReason::AdmissionQueued {
+            resume_to: AdmissionPhase::Created,
+        })
+    );
+
+    // active を解放すると handle_b が FIFO 先頭から昇格する。
+    drop(handle_a);
+    // 次の poll で昇格を観測し resume_to（Created）へ戻って semantic work を進め、terminal へ。
+    let outcome = loop {
+        match handle_b.poll(PollSlice::default()).unwrap() {
+            PollResult::Yielded { .. } => continue,
+            PollResult::Terminal { outcome, .. } => break outcome,
+            PollResult::Paused { .. } => panic!("pause は要求していない"),
+        }
+    };
+    assert_eq!(outcome, ExecutionOutcome::Completed);
+}
+
+/// 非 head の poll は SchedulerPreempted を reason としてだけ返し、state は不変（Finding 4、
+/// §6.2 matrix の非 head 行）。pause/resume は SchedulerPreempted を巻き込まない。
+#[test]
+fn non_head_poll_returns_scheduler_preempted_without_state_change() {
+    // active=2 で A/B を同時 active にし、A を run-turn へ先に登録してから B を poll する。
+    let engine = limited_engine(2, 0);
+    // A は複数 slice に分かれる重いスクリプト（1 回の poll で terminal にしない）。
+    let heavy = "\
+let i = 0\n\
+while i < 500\n\
+  i = i + 1\n\
+end\n";
+    let script_a = engine.compile(heavy).unwrap();
+    let script_b = engine.compile("let b = 1\n").unwrap();
+
+    let mut ctx_a = ExecutionContext::new();
+    let mut handle_a = engine
+        .create_execution(&script_a, &mut ctx_a, ExecutionRequest::new())
+        .expect("A active");
+    let mut ctx_b = ExecutionContext::new();
+    let mut handle_b = engine
+        .create_execution(&script_b, &mut ctx_b, ExecutionRequest::new())
+        .expect("B active");
+
+    // A を小さい slice で poll して run-turn に登録しつつ yield させる（run_turn=[A]、head は A）。
+    let small = PollSlice { max_fuel: 16 };
+    match handle_a.poll(small).unwrap() {
+        PollResult::Yielded {
+            reason: YieldReason::SliceFuelExhausted,
+            ..
+        } => {}
+        other => panic!("A は slice yield を期待: {other:?}"),
+    }
+
+    // B を poll すると B が run-turn 末尾へ登録され（run_turn=[A,B]）、head でないため
+    // SchedulerPreempted を返す。state は元の Created のまま（Finding 4）。
+    assert_eq!(handle_b.state(), ExecutionState::Created);
+    match handle_b.poll(small).unwrap() {
+        PollResult::Yielded {
+            reason: YieldReason::SchedulerPreempted,
+            ..
+        } => {}
+        other => panic!("非 head は SchedulerPreempted を期待: {other:?}"),
+    }
+    assert_eq!(
+        handle_b.state(),
+        ExecutionState::Created,
+        "SchedulerPreempted は state を遷移させない（Finding 4）"
+    );
+
+    // pause/resume は SchedulerPreempted を巻き込まず、元の Created の resume_to へ戻る。
+    handle_b.pause().expect("pause は成功する");
+    assert_eq!(
+        handle_b.state(),
+        ExecutionState::Paused(PausedState {
+            reason: PauseReason::HostRequested,
+            resume_to: ResumeState::Created,
+        })
+    );
+    handle_b.resume().expect("resume は成功する");
+    assert_eq!(handle_b.state(), ExecutionState::Created);
+}
+
+/// pause → resume が元の resume_to（Created / Linked / Ready / Yielded）へ戻る
+/// （既存 pause_from_* の補完、§6.2 の pause_resume_returns_to_resume_to）。
+#[test]
+fn pause_resume_returns_to_resume_to() {
+    let engine = Engine::new();
+
+    // Created。
+    {
+        let script = engine.compile("let x = 1\n").unwrap();
+        let mut context = ExecutionContext::new();
+        let mut handle = engine
+            .create_execution(&script, &mut context, ExecutionRequest::new())
+            .expect("admit");
+        handle.pause().unwrap();
+        handle.resume().unwrap();
+        assert_eq!(handle.state(), ExecutionState::Created);
+    }
+
+    // Linked（start 入口）。
+    {
+        let script = engine.compile("let x = 1\n").unwrap();
+        let mut context = ExecutionContext::new();
+        let mut handle = engine
+            .start(&script, &mut context, ExecutionRequest::new())
+            .expect("admit");
+        handle.pause().unwrap();
+        handle.resume().unwrap();
+        assert_eq!(handle.state(), ExecutionState::Linked);
+    }
+
+    // Yielded(SliceFuelExhausted)。
+    {
+        let source = "\
+let i = 0\n\
+while i < 100\n\
+  i = i + 1\n\
+end\n";
+        let script = engine.compile(source).unwrap();
+        let mut context = ExecutionContext::new();
+        let mut handle = engine
+            .create_execution(&script, &mut context, ExecutionRequest::new())
+            .expect("admit");
+        match handle.poll(PollSlice { max_fuel: 16 }).unwrap() {
+            PollResult::Yielded { .. } => {}
+            other => panic!("yield を期待: {other:?}"),
+        }
+        handle.pause().unwrap();
+        handle.resume().unwrap();
+        assert_eq!(
+            handle.state(),
+            ExecutionState::Yielded(YieldReason::SliceFuelExhausted)
+        );
+    }
 }

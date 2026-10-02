@@ -25,6 +25,7 @@ pub(crate) mod limits;
 pub mod module;
 pub mod parser;
 pub mod sandbox;
+pub mod scheduler;
 pub mod token;
 pub mod value;
 
@@ -56,10 +57,15 @@ pub mod vm;
 pub(crate) mod vm;
 
 pub use engine::{
-    CompiledScript, Engine, ExecutionContext, ExecutionHandle, ExecutionOutcome, ExecutionRequest,
-    ExecutionState, HandleError, PauseReason, PausedState, PollResult, PollSlice, ResumeState,
-    YieldReason,
+    AdmissionPhase, CompiledScript, Engine, ExecutionContext, ExecutionHandle, ExecutionOutcome,
+    ExecutionRequest, ExecutionState, HandleError, PauseReason, PausedState, PollResult, PollSlice,
+    ResumeState, YieldReason,
 };
+
+// 協調スケジューラの公開型（REV-015 Slice 5、実行制御仕様 §9 / §12）。`Engine::with_limits`
+// の引数 `EngineLimits` と、`create_execution` / `start` の `Result` の失敗型 `StartError` を
+// crate root へ re-export する。
+pub use scheduler::{EngineLimits, StartError};
 
 // 協調的 cancel token（REV-015 Slice 4、実行制御仕様 §8）。`ExecutionHandle::cancellation_token`
 // / `EmbeddingContext::cancellation_token` の戻り値型として公開する。別スレッドへ渡せる
