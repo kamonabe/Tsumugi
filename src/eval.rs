@@ -30,6 +30,42 @@ enum DriveOutcome {
     Yielded,
 }
 
+/// [`Evaluator::run_slice`] が 1 slice 回した結果（REV-015 Slice 5、設計 §4.7）。
+///
+/// 旧 `Option<Result<(),TsumugiError>>`（`None`=yield / `Some`=terminal）を、yield の事由
+/// （slice fuel 枯渇 / host-call pending / 明示 yield）を区別できる enum へ置き換える。
+/// alpha facade（`engine.rs`）の `drive_one_slice` がこれを `SlicePoll` へ写す（設計 §4.3 step 6）。
+#[derive(Debug)]
+pub enum SliceOutcome {
+    /// slice fuel を使い切って文/反復境界で yield した。continuation は評価器に残る
+    /// （旧 `None` に相当、設計 §4.6）。
+    YieldedSliceFuel,
+    /// cooperative host-call が `Pending` を返し、文/反復境界で yield した（設計 §4.4/§4.7）。
+    ///
+    /// handle は直後に [`Evaluator::take_pending_ticket`] で ticket を移送し、waker を登録して
+    /// `Yielded(HostCallPending { call_id })` へ入る。本 Slice（FEAT-002）では ticket の protocol と
+    /// 移送配線を用意し、実際に host-call を Pending にする builtin dispatch は FEAT-003 で載せる。
+    YieldedHostCall { call_id: u64 },
+    /// script / host の明示 yield（`ExplicitYield`）。本 Slice では trigger されない（§4.7）。
+    /// 型として用意し、到達した場合 handle は通常 yield と同じ扱いにする。
+    YieldedExplicit,
+    /// terminal に到達した（旧 `Some(result)` に相当）。transaction は commit / rollback 済み。
+    Terminal(Result<(), TsumugiError>),
+}
+
+/// Pending 中の host-call（REV-015 Slice 5、設計 §4.7）。
+///
+/// `run_slice` が `YieldedHostCall { call_id }` を返した時点で `Evaluator` が保持し、handle が
+/// [`Evaluator::take_pending_ticket`] で ticket 本体だけを引き取る。`call_id` は resume 時の
+/// [`Evaluator::resume_host_call`] の突き合わせに残す。本 Slice では単一 pending を前提とする
+/// （host-call を Pending にできるのは `can_yield=true` の文/反復境界だけ、§4.7）。
+struct PendingHostCall {
+    /// この host call の識別子（resume 時の突き合わせ用）。
+    call_id: u64,
+    /// 型消去済み ticket。handle が引き取るまで保持する（引き取り後は `None`）。
+    ticket: Option<crate::host_pending::TicketErased>,
+}
+
 /// 明示 frame stack 上で 1 文を実行した結果、driver がどう遷移するか（REV-015 Slice 3 PR-b）。
 ///
 /// 従来は `exec_block` / ループ本体が Rust 再帰でブロックへ降り、`EvalResult` を
@@ -271,6 +307,11 @@ pub struct Evaluator {
     /// 埋め込み host が実行単位で注入する（`set_host_registry`）。call site は user binding /
     /// builtin fallback の後にこの registry を引く。
     host_registry: std::sync::Arc<crate::host_function::HostFunctionRegistry>,
+    /// Pending 中の cooperative host-call（REV-015 Slice 5、設計 §4.7）。`run_slice` が
+    /// `YieldedHostCall` を返したときに `Some`。handle が `take_pending_ticket` で ticket を
+    /// 引き取り、resume 時に `resume_host_call` で解消する。本 Slice（FEAT-002）では protocol と
+    /// surface を用意し、実際に Pending を立てる builtin dispatch は FEAT-003 で配線する。
+    pending_host_call: Option<PendingHostCall>,
 }
 
 /// suspend / resume できる 1 回の実行セッション（REV-015 Slice 3 PR-d-2）。
@@ -318,6 +359,8 @@ impl Evaluator {
             pending_exit: None,
             // 既定は空 registry（host function なし）。埋め込み host が set_host_registry で注入する。
             host_registry: std::sync::Arc::new(crate::host_function::HostFunctionRegistry::empty()),
+            // host-call pending は実行開始時には無い（REV-015 Slice 5）。
+            pending_host_call: None,
         }
     }
 
@@ -752,8 +795,12 @@ impl Evaluator {
     ///   rollback 済み、module 解決マーカーも巻き戻し済み。
     ///
     /// セッションが無い状態で呼ぶと `panic`（呼び出し側が begin_execution 済みを保証する）。
-    /// `None` = yield（継続あり）、`Some(result)` = terminal。
-    pub fn run_slice(&mut self, slice_fuel: u64) -> Option<Result<(), TsumugiError>> {
+    ///
+    /// 戻り値は [`SliceOutcome`]（REV-015 Slice 5、設計 §4.7）: `YieldedSliceFuel`（旧 `None`）/
+    /// `YieldedHostCall`（cooperative host-call pending）/ `YieldedExplicit`（明示 yield、本 Slice
+    /// では未 trigger）/ `Terminal(result)`（旧 `Some(result)`）。yield 事由を handle が
+    /// 区別できるようにする（AdmissionQueued/HostCallPending 配線のため）。
+    pub fn run_slice(&mut self, slice_fuel: u64) -> SliceOutcome {
         let base_depth = self
             .session
             .as_ref()
@@ -771,10 +818,20 @@ impl Evaluator {
         match outcome {
             // yield は transaction 境界ではない（§10 規則7）。ここで `finalize_session` を
             // 呼ばず、session（`RunSession`）・永続 frame stack・`env` の submission journal を
-            // そのまま保持したまま `None` を返す。次の `run_slice`（resume）が同じ session と
+            // そのまま保持したまま yield を返す。次の `run_slice`（resume）が同じ session と
             // journal の上で実行を続けるため、yield を何度挟んでも execution 全体が 1 つの
             // transaction になり、terminal で初めて commit / rollback される。
-            Ok(DriveOutcome::Yielded) => None,
+            Ok(DriveOutcome::Yielded) => {
+                // host-call pending が立っていれば HostCallPending、そうでなければ slice fuel 枯渇
+                // の yield（設計 §4.7）。host-call を Pending にする builtin dispatch は FEAT-003 で
+                // 載せるため、本 Slice では通常この分岐は `YieldedSliceFuel` を返す。
+                match self.pending_host_call.as_ref() {
+                    Some(pending) => SliceOutcome::YieldedHostCall {
+                        call_id: pending.call_id,
+                    },
+                    None => SliceOutcome::YieldedSliceFuel,
+                }
+            }
             Ok(DriveOutcome::Done(result)) => {
                 // 本体完了。EvalResult を terminal 結果へ写し、transaction / module を finalize。
                 let final_result = match result {
@@ -783,7 +840,7 @@ impl Evaluator {
                     EvalResult::Continue(line) => Err(TsumugiError::continue_outside_loop(line)),
                 };
                 self.finalize_session(final_result.is_ok());
-                Some(final_result)
+                SliceOutcome::Terminal(final_result)
             }
             Err(e) => {
                 // exit() の structured terminal（C7、REV-023）は成功系 terminal として
@@ -792,9 +849,71 @@ impl Evaluator {
                 // run_driver 内で stop_depth まで済んでいる。
                 let is_exit = matches!(e.kind(), Some(crate::error::ErrorKind::ProcessExit));
                 self.finalize_session(is_exit);
-                Some(Err(e))
+                SliceOutcome::Terminal(Err(e))
             }
         }
+    }
+
+    /// `run_slice` が `YieldedHostCall` を返した直後に handle が呼ぶ ticket 移送（設計 §4.7、
+    /// Finding 3）。Pending 中の host-call の [`crate::host_pending::TicketErased`] を take して
+    /// 返す。handle はこれを `pending_ticket` へ格納し、以後の poll で `try_take_value` を駆動する。
+    /// `call_id` と「結果待ち」フラグは `pending_host_call` に残し、resume 時に突き合わせる。
+    /// pending が無い / 既に ticket を引き取り済みなら `None`。
+    pub fn take_pending_ticket(&mut self) -> Option<crate::host_pending::TicketErased> {
+        self.pending_host_call.as_mut()?.ticket.take()
+    }
+
+    /// handle が `ticket.try_take_value()` で得た結果を注入し、pending を解消する（設計 §4.7）。
+    ///
+    /// 単一 pending を前提とする（§4.7）。`pending_host_call` が `Some` かつ `call_id` 一致を
+    /// 要求し、不一致 / `None` は内部不整合として catch 不能の内部エラーを返す。本 Slice では
+    /// 格納（continuation への値注入）までは行わず、pending を解消して resume 可能にする最小配線
+    /// とする（実際の値注入位置は host-call を Pending にする builtin dispatch と一体で FEAT-003
+    /// が載せる、§4.7）。`result` は呼び出し側が ticket から取り出した
+    /// `Result<Value, AdapterError>`。
+    pub fn resume_host_call(
+        &mut self,
+        call_id: u64,
+        result: Result<Value, crate::capability::AdapterError>,
+    ) -> Result<(), TsumugiError> {
+        match self.pending_host_call.as_ref() {
+            Some(pending) if pending.call_id == call_id => {
+                // 本 Slice では result を continuation へ注入する評価点が未配線（FEAT-003）。
+                // pending を解消して resume 可能状態に戻す。result は FEAT-003 が式結果へ写す。
+                let _ = result;
+                self.pending_host_call = None;
+                Ok(())
+            }
+            _ => Err(TsumugiError::internal(
+                0,
+                format!("host-call resume の call_id 不整合: {call_id}"),
+            )),
+        }
+    }
+
+    /// driver 外の非 terminal 終了から呼ぶ session 中断（REV-015 Slice 5、設計 §4.6 Finding 6）。
+    ///
+    /// AdmissionQueued / HostCallPending 中の cancel/deadline terminal、および非 terminal drop
+    /// （§4.8）から呼ぶ。rollback 要否は **`self.session` の有無だけ** で自己判定する（`started`
+    /// 等は見ない）。session があれば既存の [`Self::finalize_session`]`(false)` で transaction を
+    /// rollback し未完了 module の解決マーカーを巻き戻し、残余 frame を `base_depth` まで巻き戻す。
+    /// session が無ければ no-op（AdmissionQueued は `begin_execution` 前で session 無し）。
+    /// Pending 中の host-call ticket は呼び出し側（poll 分岐 / Drop）が別途 cancel する。
+    pub fn abort_session(&mut self) {
+        // frame 巻き戻しの下限は session の base_depth（begin_execution で root frame を push した
+        // 位置）。finalize_session が session.take() するため、先に base_depth を控える。
+        let base_depth = self.session.as_ref().map(|s| s.base_depth);
+        // session 有無の自己判定は finalize_session に委ねる（§4.6）。session があれば rollback、
+        // 無ければ no-op。
+        self.finalize_session(false);
+        // 残余の永続 frame stack を巻き戻す（yield / host 待ち中に積まれた継続を破棄する）。
+        if let Some(base_depth) = base_depth {
+            self.frames.truncate(base_depth);
+        }
+        // 中断した host-call pending も捨てる（ticket cancel は呼び出し側が済ませる）。
+        self.pending_host_call = None;
+        // slice 制限を解除し、再利用 context が影響を受けないようにする。
+        self.slice_fuel_limit = None;
     }
 
     /// セッションを畳む（REV-015 Slice 3 PR-d-2）。commit なら transaction を確定、失敗なら
@@ -2300,8 +2419,10 @@ mod tests {
             .map_err(|(_, e)| e)?;
         loop {
             match eval.run_slice(u64::MAX) {
-                None => continue,
-                Some(result) => return result,
+                SliceOutcome::YieldedSliceFuel
+                | SliceOutcome::YieldedHostCall { .. }
+                | SliceOutcome::YieldedExplicit => continue,
+                SliceOutcome::Terminal(result) => return result,
             }
         }
     }
@@ -2362,8 +2483,10 @@ mod tests {
             .map_err(|(_, e)| e)?;
         loop {
             match eval.run_slice(u64::MAX) {
-                None => continue,
-                Some(result) => return result,
+                SliceOutcome::YieldedSliceFuel
+                | SliceOutcome::YieldedHostCall { .. }
+                | SliceOutcome::YieldedExplicit => continue,
+                SliceOutcome::Terminal(result) => return result,
             }
         }
     }
@@ -2422,11 +2545,13 @@ mod tests {
         let mut yields = 0usize;
         let result = loop {
             match eval.run_slice(slice_fuel) {
-                None => {
+                SliceOutcome::YieldedSliceFuel
+                | SliceOutcome::YieldedHostCall { .. }
+                | SliceOutcome::YieldedExplicit => {
                     yields += 1;
                     assert!(yields < 1_000_000, "run_slice が terminal に到達しない");
                 }
-                Some(result) => break result,
+                SliceOutcome::Terminal(result) => break result,
             }
         };
         (result, eval, yields)

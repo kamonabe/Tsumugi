@@ -955,7 +955,7 @@ impl Engine {
 // ===========================================================================
 
 use crate::budget::BudgetUsage;
-use crate::eval::{Evaluator, RunPhase};
+use crate::eval::{Evaluator, RunPhase, SliceOutcome};
 
 /// 1 回の実行に対する不変の設定（仕様第6節 `ExecutionRequest`）。
 ///
@@ -1389,14 +1389,19 @@ impl Engine {
         loop {
             // 大きな slice で 1 回ずつ回す（協調 yield の実効化は Phase 4）。同期実行なので
             // terminal まで回し切る。
+            // run_slice は SliceOutcome を返す（REV-015 Slice 5、設計 §4.7）。同期経路は
+            // slice=u64::MAX のため yield は実質起きず、host-call pending も Ready フォールバック
+            // のため起きないが、型に合わせて全 yield 変種を continue で回し切る（観測挙動不変、§7）。
             match context.evaluator.run_slice(u64::MAX) {
-                None => continue, // yield（Phase 1 では slice=u64::MAX のため実質起きない）
-                Some(Ok(())) => {
+                SliceOutcome::YieldedSliceFuel
+                | SliceOutcome::YieldedHostCall { .. }
+                | SliceOutcome::YieldedExplicit => continue,
+                SliceOutcome::Terminal(Ok(())) => {
                     // commit 済みの usage を同梱する（仕様第6・12節）。
                     let usage = context.evaluator.budget_usage();
                     return ExecutionOutcome::Completed { usage };
                 }
-                Some(Err(error)) => {
+                SliceOutcome::Terminal(Err(error)) => {
                     // exit() の structured terminal（C7、REV-023）を Exited outcome へ写す。
                     // run_slice は既に language-state を commit 済み（Exited は Completed と同じ
                     // 規則5 commit）。cancel / deadline / budget 超過は catch 不能 terminal 信号

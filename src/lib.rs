@@ -20,6 +20,7 @@ pub mod env;
 pub mod error;
 pub mod eval;
 pub mod host_function;
+pub mod host_pending;
 pub mod lexer;
 pub(crate) mod limits;
 pub mod module;
@@ -66,6 +67,10 @@ pub use engine::{
 // の引数 `EngineLimits` と、`create_execution` / `start` の `Result` の失敗型 `StartError` を
 // crate root へ re-export する。
 pub use scheduler::{EngineLimits, StartError};
+
+// host-call pending プロトコルの公開型（REV-015 Slice 5、実行制御仕様 §9 / 設計 §4.4）。
+// cooperative adapter が `Pending` を返す host-call の ticket / waker surface。
+pub use host_pending::{ExecutionWaker, HostCallCompleter, HostCallPoll, HostCallTicket, Wake};
 
 // 協調的 cancel token（REV-015 Slice 4、実行制御仕様 §8）。`ExecutionHandle::cancellation_token`
 // / `EmbeddingContext::cancellation_token` の戻り値型として公開する。別スレッドへ渡せる

@@ -1018,3 +1018,151 @@ end\n";
         );
     }
 }
+
+// =============================================================================
+// host pending protocol: set_waker / new_with_clock / 非 terminal drop
+// （REV-015 Slice 5、設計 §4.5 / §4.6 / §4.8）
+// =============================================================================
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tsumugi::{BudgetConfigError, ExecutionWaker, FakeClock, StartError, Wake};
+
+/// wake 回数を数える fake Wake（thread を使わず決定的に検証する）。
+struct CountWake {
+    count: Arc<AtomicUsize>,
+}
+
+impl Wake for CountWake {
+    fn wake(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn fake_waker() -> (ExecutionWaker, Arc<AtomicUsize>) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let waker = ExecutionWaker::new(Arc::new(CountWake {
+        count: Arc::clone(&count),
+    }));
+    (waker, count)
+}
+
+/// set_waker は Some で置換・None で解除でき、terminal 後は Err(Terminal)（設計 §4.5、AC-4）。
+#[test]
+fn set_waker_replace_clear_and_terminal_err() {
+    let engine = Engine::new();
+    let script = engine.compile("let x = 1\n").unwrap();
+    let mut context = ExecutionContext::new();
+    let mut handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("admit");
+
+    let (w1, _c1) = fake_waker();
+    let (w2, _c2) = fake_waker();
+    assert_eq!(handle.set_waker(Some(w1)), Ok(()), "初回設定は Ok");
+    assert_eq!(handle.set_waker(Some(w2)), Ok(()), "置換は Ok");
+    assert_eq!(handle.set_waker(None), Ok(()), "解除は Ok");
+
+    // terminal まで駆動する。
+    loop {
+        match handle.poll(PollSlice::default()).unwrap() {
+            PollResult::Terminal { .. } => break,
+            _ => continue,
+        }
+    }
+    // terminal 後は Err(Terminal)。
+    let (w3, _c3) = fake_waker();
+    assert_eq!(handle.set_waker(Some(w3)), Err(HandleError::Terminal));
+}
+
+/// set_waker で登録した waker は、別経路の cancel() で鳴る（cancel waker 連携、設計 §4.5 / §8）。
+#[test]
+fn set_waker_registers_on_cancellation_token() {
+    let engine = Engine::new();
+    // 1 文で終わらない、yield する程度のループにして cancel 前に待機 state を作る。
+    let source = "let i = 0\nwhile i < 1000\n  i = i + 1\nend\n";
+    let script = engine.compile(source).unwrap();
+    let mut context = ExecutionContext::new();
+    let mut handle = engine
+        .create_execution(&script, &mut context, ExecutionRequest::new())
+        .expect("admit");
+
+    let (waker, count) = fake_waker();
+    handle.set_waker(Some(waker)).expect("set_waker");
+
+    // 1 slice だけ進めて yield 状態にする。
+    match handle.poll(PollSlice { max_fuel: 16 }).unwrap() {
+        PollResult::Yielded { .. } => {}
+        other => panic!("yield を期待: {other:?}"),
+    }
+
+    // 別経路の cancel で登録 waker が鳴る（CAS 成功時 1 回）。
+    let token = handle.cancellation_token();
+    assert!(token.cancel(), "初回 cancel は true");
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "cancel で waker が 1 回鳴る"
+    );
+
+    // 次 poll は Cancelled terminal（queue/run いずれでも catch 不能）。
+    loop {
+        match handle.poll(PollSlice { max_fuel: 16 }).unwrap() {
+            PollResult::Terminal { outcome, .. } => {
+                assert_eq!(outcome, ExecutionOutcome::Cancelled);
+                break;
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// ExecutionContext::new_with_clock は foreign clock を ConfigError で弾く（設計 §4.6、AC-4）。
+///
+/// 既定 context（`ExecutionContext::new()`）の budget は legacy 由来で、別 domain の
+/// FakeClock（clock_id が一致しない）は foreign clock として拒否される。
+#[test]
+fn new_with_clock_rejects_foreign_clock() {
+    let foreign = Arc::new(FakeClock::new());
+    // legacy budget の deadline domain と FakeClock の domain は一致しないため ForeignClock。
+    // ExecutionContext は Debug 非実装なので、Err であることと StartError 内容を分けて確認する。
+    match ExecutionContext::new_with_clock(foreign) {
+        Ok(_) => panic!("foreign clock は new_with_clock で弾かれるべき"),
+        Err(error) => assert_eq!(
+            error,
+            StartError::Config(BudgetConfigError::ForeignClock),
+            "foreign clock は ConfigError::ForeignClock で拒否される"
+        ),
+    }
+}
+
+/// 非 terminal の handle を drop すると cancel が linearize され、rollback が blocking なしで
+/// 完了する（設計 §4.8、AC-5 の smoke）。drop 後も同じ context の cancel 済み状態を観測できる。
+#[test]
+fn nonterminal_drop_cancels_and_rolls_back_without_blocking() {
+    let engine = Engine::new();
+    let source = "let i = 0\nwhile i < 1000\n  i = i + 1\nend\n";
+    let script = engine.compile(source).unwrap();
+    let mut context = ExecutionContext::new();
+
+    // drop 後に観測するため cancel token を先に取り出す。
+    let token = {
+        let mut handle = engine
+            .create_execution(&script, &mut context, ExecutionRequest::new())
+            .expect("admit");
+        let token = handle.cancellation_token();
+        // 待機 state（yield）まで進める。
+        match handle.poll(PollSlice { max_fuel: 16 }).unwrap() {
+            PollResult::Yielded { .. } => {}
+            other => panic!("yield を期待: {other:?}"),
+        }
+        assert!(!token.is_cancelled(), "drop 前は未 cancel");
+        token
+        // ここで handle が drop される（非 terminal）。
+    };
+    // drop が cancel を linearize した（§4.8 step 1）。blocking せずに戻っている。
+    assert!(
+        token.is_cancelled(),
+        "非 terminal drop で cancel が linearize される"
+    );
+}

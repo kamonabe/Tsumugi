@@ -27,7 +27,8 @@ use std::sync::Arc;
 use crate::ast::Program;
 use crate::budget::BudgetUsage;
 use crate::error::TsumugiError;
-use crate::eval::{Evaluator, RunPhase};
+use crate::eval::{Evaluator, RunPhase, SliceOutcome};
+use crate::host_pending::{ExecutionWaker, TicketErased};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::scheduler::{AdmissionSlot, ExecutionSlotId, SchedulerShared, SlotState};
@@ -414,8 +415,8 @@ pub enum ExecutionState {
 /// yield の理由（第9節 `YieldReason`）。
 ///
 /// `SliceFuelExhausted`（REV-015 Slice 3 で実効化）と `ExplicitYield` に加え、Slice 5 で
-/// `AdmissionQueued`（admission queue 待ち）と `SchedulerPreempted`（run-turn で非 head）を
-/// 配線する。`HostCallPending` は host pending protocol（FEAT-002）で追加する。
+/// `AdmissionQueued`（admission queue 待ち）・`HostCallPending`（cooperative host-call 待ち）・
+/// `SchedulerPreempted`（run-turn で非 head）を配線する。
 ///
 /// `AuditBackpressure`（仕様 §9）は本 enum に **加えない**: audit event emission は Phase 6 で
 /// あり、backpressure を audit sink の詰まりへ変換する機構は audit sink が入って初めて意味を
@@ -430,6 +431,13 @@ pub enum YieldReason {
     AdmissionQueued { resume_to: AdmissionPhase },
     /// slice fuel を使い切った（第4.2節）。REV-015 Slice 3 PR-d で実効化。
     SliceFuelExhausted,
+    /// cooperative host-call が `Pending` を返し結果を待っている（Slice 5、設計 §4.4/§4.7）。
+    ///
+    /// この yield の間は run-turn FIFO から外れ、ticket へ 1 個の
+    /// [`ExecutionWaker`](crate::host_pending::ExecutionWaker) を登録して待つ。adapter executor が
+    /// 結果を ticket へ格納して wake すると、次 poll が `try_take_value` で取り出し resume する
+    /// （continuation は作成 thread の poll でだけ進む、INV-7）。`call_id` は host-call の識別子。
+    HostCallPending { call_id: u64 },
     /// script / host による明示 yield。
     ///
     /// pause/resume の状態機械は Slice 4 (D) で実効化済みだが、この `ExplicitYield` を
@@ -557,20 +565,17 @@ pub struct ExecutionHandle<'engine, 'script, 'context> {
     slot_id: ExecutionSlotId,
     /// 昇格通知を poll 時に lock なしで読む read-only ミラー（設計 §4.1/§4.3）。
     slot_state: Arc<SlotState>,
-    /// host/ticket 完了・cancel・deadline が state を ready にしたときに鳴らす waker。
-    ///
-    /// **FEAT-001 placeholder**: `ExecutionWaker` 型は host pending protocol（FEAT-002、
-    /// `src/host_pending.rs`）で導入する。本 FEAT では `Option<()>` とし、`set_waker` と
-    /// cancel/host-call ticket との配線は FEAT-002 が担う。
-    #[allow(dead_code)]
-    waker: Option<()>,
+    /// host/ticket 完了・cancel・deadline が state を ready にしたときに鳴らす waker
+    /// （REV-015 Slice 5、設計 §4.5）。[`Self::set_waker`] で設定し、host-call pending 進入時に
+    /// ticket へ、取得時に `CancellationToken` へ登録する。別 thread から invoke してよい唯一の
+    /// handle 由来 handle（`Send + Sync`）。
+    waker: Option<ExecutionWaker>,
     /// host-call pending 中のみ `Some` となる型消去 ticket（設計 §4.4/§4.8）。
     ///
-    /// **FEAT-001 placeholder**: `TicketErased` 型は FEAT-002 で導入する。本 FEAT では
-    /// `Option<()>` とし、host-call pending 分岐（poll step 4）と Drop の detach 配線は
-    /// FEAT-002 が差し替える。
-    #[allow(dead_code)]
-    pending_ticket: Option<()>,
+    /// `run_slice` が `YieldedHostCall` を返した直後に `evaluator.take_pending_ticket()` から
+    /// 移送する（§4.3 step 6）。以後の poll で `try_take_value()` を駆動し、cancel/deadline/drop
+    /// 時は `cancel()` で遅着結果を破棄する（§4.6/§4.8）。
+    pending_ticket: Option<TicketErased>,
     /// run-turn FIFO へ push 済みか（設計 §4.3 step 5）。
     run_turn_registered: bool,
     _engine: PhantomData<&'engine Engine>,
@@ -582,7 +587,8 @@ pub struct ExecutionHandle<'engine, 'script, 'context> {
     /// cancel linearize / ticket detach / rollback（§4.8 step 1-4）を行った後に、この field の
     /// drop で slot が解放される（§4.8 step 5）ようにする。本 FEAT では明示 `Drop` 本体は持たず、
     /// この field の [`AdmissionSlot`] 自身の `Drop` が slot を 1 個だけ解放する（§4.1 INV-2）。
-    /// 読み取りはしないが RAII 解放のため保持し続ける。
+    /// 読み取りはしないが RAII 解放のため保持し続ける。[`Drop`] 本体（§4.8 step 1-4）の後に、
+    /// この field drop（step 5）で slot が解放される。
     #[allow(dead_code)]
     slot: AdmissionSlot,
 }
@@ -660,7 +666,52 @@ impl ExecutionHandle<'_, '_, '_> {
             };
         }
 
-        // (4) HostCallPending 分岐は FEAT-002（host pending protocol）で追加する。
+        // (4) HostCallPending: cancel/deadline checkpoint を try_take より先に発火（設計 §4.3
+        // step 4 / §4.6 linearization）。
+        if let ExecutionState::Yielded(YieldReason::HostCallPending { call_id }) = self.state {
+            // checkpoint（cancel→deadline）を try_take より先に評価する（host response 対 cancel
+            // の linearization、§4.6 Finding 8）。cancel/deadline なら ticket を cancel して遅着
+            // response を破棄し、session を rollback（HostCallPending は begin_execution 済みで
+            // session 有り、§4.6）してから terminal にする。
+            if let Some(outcome) = self.checkpoint_terminal() {
+                if let Some(ticket) = &self.pending_ticket {
+                    ticket.cancel();
+                }
+                self.pending_ticket = None;
+                self.context.evaluator.abort_session();
+                self.shared.run_turn_remove(self.slot_id);
+                self.run_turn_registered = false;
+                return Ok(self.finish_terminal(outcome));
+            }
+            // cancel/deadline でなければ ticket の完了を確認する。
+            let taken = self
+                .pending_ticket
+                .as_ref()
+                .and_then(|ticket| ticket.try_take_value());
+            match taken {
+                // 未完了: semantic work せず HostCallPending を返す（work しない、§4.3 step 4）。
+                None => {
+                    let usage = self.context.budget_usage();
+                    return Ok(PollResult::Yielded {
+                        reason: YieldReason::HostCallPending { call_id },
+                        usage,
+                    });
+                }
+                // 完了: 結果を Evaluator の pending host-call 位置へ注入し resume 可能にする。
+                Some(result) => {
+                    if let Err(error) = self.context.evaluator.resume_host_call(call_id, result) {
+                        // call_id 不整合などの内部不整合は catch 不能 terminal（§4.7）。
+                        self.pending_ticket = None;
+                        self.context.evaluator.abort_session();
+                        self.shared.run_turn_remove(self.slot_id);
+                        self.run_turn_registered = false;
+                        return Ok(self.finish_terminal(ExecutionOutcome::RuntimeError { error }));
+                    }
+                    self.pending_ticket = None;
+                    // 下の run-turn 判定（step 5）へ落とす。resume 後は run-turn へ再登録する。
+                }
+            }
+        }
 
         // (5) run-turn 登録と head 判定（設計 §4.3 step 5）。
         if !self.run_turn_registered {
@@ -684,11 +735,42 @@ impl ExecutionHandle<'_, '_, '_> {
         match poll {
             // slice fuel を使い切って協調停止した（§4.2）。continuation は評価器の永続 frame
             // stack に残り、run-turn 先頭を末尾へ回して（§12.1 規則 2/3）次 poll で resume する。
-            SlicePoll::Yielded => {
+            SlicePoll::YieldedSliceFuel => {
                 self.shared.run_turn_rotate(self.slot_id);
                 self.state = ExecutionState::Yielded(YieldReason::SliceFuelExhausted);
                 Ok(PollResult::Yielded {
                     reason: YieldReason::SliceFuelExhausted,
+                    usage,
+                })
+            }
+            // cooperative host-call が Pending を返した（設計 §4.3 step 6 host-pending 分岐）。
+            // ticket を評価器から移送して handle が保持し、handle の waker を ticket へ登録する。
+            // run-turn から外して run_turn_registered=false に戻す（再 Ready は waker 後の次 poll
+            // で step 5 が末尾へ再登録する）。
+            SlicePoll::YieldedHostCall { call_id } => {
+                // 評価器が保持する TicketErased を handle 側へ移す（Finding 3、§4.7）。
+                if let Some(ticket) = self.context.evaluator.take_pending_ticket() {
+                    // waker が設定済みなら ticket へ登録する（host 完了時に handle を wake、§4.5）。
+                    if let Some(waker) = &self.waker {
+                        ticket.register_waker(waker);
+                    }
+                    self.pending_ticket = Some(ticket);
+                }
+                self.shared.run_turn_remove(self.slot_id);
+                self.run_turn_registered = false;
+                self.state = ExecutionState::Yielded(YieldReason::HostCallPending { call_id });
+                Ok(PollResult::Yielded {
+                    reason: YieldReason::HostCallPending { call_id },
+                    usage,
+                })
+            }
+            // 明示 yield（本 Slice では未 trigger、§4.7）。通常 yield と同じ扱いで run-turn rotate。
+            // SchedulerPreempted にはしない（preempt は非 head poll の reason、Finding 4）。
+            SlicePoll::YieldedExplicit => {
+                self.shared.run_turn_rotate(self.slot_id);
+                self.state = ExecutionState::Yielded(YieldReason::ExplicitYield);
+                Ok(PollResult::Yielded {
+                    reason: YieldReason::ExplicitYield,
                     usage,
                 })
             }
@@ -703,6 +785,30 @@ impl ExecutionHandle<'_, '_, '_> {
                 Ok(self.finish_terminal(outcome))
             }
         }
+    }
+
+    /// handle の wake handle を設定する（REV-015 Slice 5、設計 §4.5）。
+    ///
+    /// `Some(w)` で以前の waker を置換し、`None` で解除する。host-call ticket 完了・cancel・
+    /// deadline・admission 昇格が state を ready にしたときに、この waker を鳴らして host に
+    /// 次 poll を促す。設定した waker は [`crate::budget::CancellationToken`] にも登録し、別 thread
+    /// の `cancel()` が待機中の handle を wake できるようにする（§8/§4.5）。別 thread から許可する
+    /// handle 由来の操作は cancel と waker invocation だけ（§9.1）。terminal state では
+    /// [`HandleError::Terminal`]、それ以外（非 pending を含む）は no-op 成功。
+    pub fn set_waker(&mut self, waker: Option<ExecutionWaker>) -> Result<(), HandleError> {
+        if self.state == ExecutionState::Terminal {
+            return Err(HandleError::Terminal);
+        }
+        // cancel waker 連携: 設定した waker を cancel token へ登録する（解除時は登録しない）。
+        if let Some(waker) = &waker {
+            self.cancellation_token().register_waker(waker);
+            // host-call pending 中に差し替えられた場合は、現在の ticket へも登録し直す（§4.5）。
+            if let Some(ticket) = &self.pending_ticket {
+                ticket.register_waker(waker);
+            }
+        }
+        self.waker = waker;
+        Ok(())
     }
 
     /// AdmissionQueued 中の cancel/deadline checkpoint（設計 §4.3 step 3 / §4.6）。
@@ -836,15 +942,17 @@ impl ExecutionHandle<'_, '_, '_> {
             }
         }
 
-        // 1 slice ぶん実行する。None = yield、Some(result) = terminal。
+        // 1 slice ぶん実行する。SliceOutcome を SlicePoll へ写す（REV-015 Slice 5、設計 §4.7）。
         match self.context.evaluator.run_slice(slice_fuel) {
-            None => SlicePoll::Yielded,
-            Some(Ok(())) => SlicePoll::Terminal(ExecutionOutcome::Completed),
+            SliceOutcome::YieldedSliceFuel => SlicePoll::YieldedSliceFuel,
+            SliceOutcome::YieldedHostCall { call_id } => SlicePoll::YieldedHostCall { call_id },
+            SliceOutcome::YieldedExplicit => SlicePoll::YieldedExplicit,
+            SliceOutcome::Terminal(Ok(())) => SlicePoll::Terminal(ExecutionOutcome::Completed),
             // 実行フェーズの失敗（transaction は commit/rollback を run_slice が済ませている）。
             // cancel / deadline は catch 不能 terminal 信号なので専用 outcome へ写し、
             // RuntimeError に埋もれさせない（REV-015 Slice 4、§8）。予算超過（limit 系）を
             // 含む他の未捕捉エラーは RuntimeError。
-            Some(Err(error)) => {
+            SliceOutcome::Terminal(Err(error)) => {
                 let outcome = match error.kind() {
                     Some(crate::error::ErrorKind::Cancelled) => ExecutionOutcome::Cancelled,
                     Some(crate::error::ErrorKind::DeadlineExceeded) => {
@@ -858,10 +966,40 @@ impl ExecutionHandle<'_, '_, '_> {
     }
 }
 
-/// [`ExecutionHandle::drive_one_slice`] の結果（REV-015 Slice 3 PR-d-2）。
+/// [`ExecutionHandle::drive_one_slice`] の結果（REV-015 Slice 3 PR-d-2 / Slice 5 §4.3/§4.7）。
 enum SlicePoll {
     /// slice fuel を使い切って協調停止した。continuation は評価器に残る。
-    Yielded,
+    YieldedSliceFuel,
+    /// cooperative host-call が `Pending` を返して停止した（Slice 5、設計 §4.4/§4.7）。
+    YieldedHostCall { call_id: u64 },
+    /// 明示 yield（本 Slice では未 trigger、設計 §4.7）。
+    YieldedExplicit,
     /// terminal に達した。
     Terminal(ExecutionOutcome),
+}
+
+impl Drop for ExecutionHandle<'_, '_, '_> {
+    /// 非 terminal handle の drop 時に cancel を linearize し、host-call を detach し、
+    /// language-state を rollback する（REV-015 Slice 5、設計 §4.8）。panic / blocking I/O を
+    /// しない。audit 実発行（orphan-audit queue / `AuditUnavailable`）は Phase 6 で追補する。
+    fn drop(&mut self) {
+        // terminal に到達済みなら何もしない（slot は field drop で解放される）。
+        if self.state == ExecutionState::Terminal {
+            return;
+        }
+        // 1. cancel linearize: cancel()->bool の false->true CAS が linearization point（§4.8 step 1）。
+        //    既に cancel 済み / terminal 済みなら no-op。
+        self.cancellation_token().cancel();
+        // 2. pending host-call を Detached close: ticket cancel で遅着 result を破棄する（step 2）。
+        if let Some(ticket) = &self.pending_ticket {
+            ticket.cancel();
+        }
+        self.pending_ticket = None;
+        // 3. language-state rollback + continuation 破棄（step 3、Finding 6）。rollback 要否は
+        //    abort_session 内部の self.session 有無で自己判定する（started は見ない）。
+        self.context.evaluator.abort_session();
+        // 4. logical Terminal(Cancelled) append は context 側の cancel 済み状態で満たす。context は
+        //    poison しない（正常な cancel 終了、§4.8 step 4 / §10 規則4）。
+        // 5. slot 解放は末尾 field `slot: AdmissionSlot` の drop で 1 個だけ行われる（step 5、§4.1）。
+    }
 }
