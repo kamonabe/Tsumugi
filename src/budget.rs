@@ -633,6 +633,11 @@ pub enum ControlStop {
 pub enum InternalFailure {
     /// `AllocationId(u64)` を使い切った。0 へ wrap せず terminal にする。
     AllocationIdExhausted,
+    /// cooperative adapter が同期文脈（`may_yield=false`）で規約違反の `Pending` を返した
+    /// （REV-015 Slice 5、設計 §4.4 Finding N1）。関数本体・callback・同期経路では adapter は
+    /// `Ready` を返す契約で、違反時は busy-loop せず catch 不能 terminal にする。
+    /// [`control_stop_to_error`] が [`crate::error::ErrorKind::InternalControl`] へ写す。
+    CooperativeAdapterYieldInSyncContext,
 }
 
 // =============================================================================
@@ -1024,6 +1029,31 @@ impl BudgetLedger {
     /// 呼ぶことで協調的 cancel を要求できる（§8）。charge 前と文/反復境界で consult される。
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    /// この実行の deadline instant（REV-015 Slice 5、cooperative host-call context 用）。
+    ///
+    /// `config.deadline` をそのまま返す。clock 未注入でも値は返るが、deadline の実効化は
+    /// 注入 clock に依存する（§4.6）。cooperative adapter はこの instant を使って有限 timeout を
+    /// 設定する（FR-9）。
+    pub fn deadline(&self) -> MonotonicInstant {
+        self.config.deadline
+    }
+
+    /// host-call request byte の残量（上限 − committed − reserved、飽和減算、REV-015 Slice 5）。
+    pub fn remaining_request_bytes(&self) -> u64 {
+        self.config
+            .max_host_request_bytes
+            .saturating_sub(self.committed.host_request_bytes)
+            .saturating_sub(self.reserved.host_request_bytes)
+    }
+
+    /// host-call response byte の残量（上限 − committed − reserved、飽和減算、REV-015 Slice 5）。
+    pub fn remaining_response_bytes(&self) -> u64 {
+        self.config
+            .max_host_response_bytes
+            .saturating_sub(self.committed.host_response_bytes)
+            .saturating_sub(self.reserved.host_response_bytes)
     }
 
     /// 現在の使用量 snapshot（§3）。
@@ -2336,6 +2366,12 @@ pub fn control_stop_to_error(
         ControlStop::InternalFailure(InternalFailure::AllocationIdExhausted) => {
             TsumugiError::internal(line, "AllocationId を割り当てできません")
         }
+        ControlStop::InternalFailure(InternalFailure::CooperativeAdapterYieldInSyncContext) => {
+            TsumugiError::internal_control(
+                line,
+                "cooperative adapter が同期文脈で yield を要求しました",
+            )
+        }
     }
 }
 
@@ -2536,6 +2572,32 @@ mod tests {
         let err =
             control_stop_to_error(ControlStop::DeadlineExceeded { deadline, observed }, 42, 7);
         assert_eq!(err.kind(), Some(crate::error::ErrorKind::DeadlineExceeded));
+    }
+
+    /// cooperative adapter の同期文脈 yield 違反は InternalControl（catch 不能）へ写り、
+    /// 既存の AllocationIdExhausted（Internal、catch 可能）とは別種別になる（設計 §4.4 Finding N1）。
+    #[test]
+    fn cooperative_yield_in_sync_context_maps_to_internal_control() {
+        use crate::error::ErrorKind;
+        let err = control_stop_to_error(
+            ControlStop::InternalFailure(InternalFailure::CooperativeAdapterYieldInSyncContext),
+            0,
+            7,
+        );
+        assert_eq!(err.kind(), Some(ErrorKind::InternalControl));
+        assert!(ErrorKind::is_uncatchable(err.kind()), "catch 不能");
+
+        // 既存の AllocationIdExhausted は Internal（catch 可能）のまま。
+        let alloc_err = control_stop_to_error(
+            ControlStop::InternalFailure(InternalFailure::AllocationIdExhausted),
+            0,
+            7,
+        );
+        assert_eq!(alloc_err.kind(), Some(ErrorKind::Internal));
+        assert!(
+            !ErrorKind::is_uncatchable(alloc_err.kind()),
+            "Internal は catch 可能のまま（NFR-1）"
+        );
     }
 
     // -------------------------------------------------------------------------

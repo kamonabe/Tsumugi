@@ -1166,3 +1166,400 @@ fn nonterminal_drop_cancels_and_rolls_back_without_blocking() {
         "非 terminal drop で cancel が linearize される"
     );
 }
+
+// =============================================================================
+// REV-015 Slice 5 FEAT-003: §15.3 state·race（cooperative host-call を含む）
+// =============================================================================
+
+use std::sync::Mutex;
+use tsumugi::{
+    CapabilitySet, CooperativeHostFunction, HostCallCompleter, HostCallPoll, HostCallTicket,
+    HostFunctionDescriptor, HostFunctionId, HostFunctionRegistry, Value,
+};
+
+// cooperative host call は `Value`（`!Send`）を返すため completer<Value> は !Send。作成 thread の
+// thread_local へ stash して、テスト（同一 thread）が complete する（設計 §9.1 / §6.1）。
+thread_local! {
+    static COMPLETERS: std::cell::RefCell<Vec<HostCallCompleter<Value>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// cooperative adapter が観測可能な副作用（§15.3 irreversible host effect）を記録する。
+    static HOST_EFFECTS: std::cell::RefCell<Vec<i64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_completer() -> Option<HostCallCompleter<Value>> {
+    COMPLETERS.with(|c| c.borrow_mut().pop())
+}
+
+fn host_fn_id(n: u128) -> HostFunctionId {
+    HostFunctionId::new(std::num::NonZeroU128::new(n).unwrap())
+}
+
+/// テスト駆動の cooperative adapter（Send + Sync。completer は thread_local 経由）。
+struct FakeCoop {
+    descriptor: HostFunctionDescriptor,
+    /// `Some(n)` なら `Ready(Ok(Int(n)))`、`None` なら `Pending`。
+    ready_int: Mutex<Option<i64>>,
+    /// start で記録する副作用（HOST_EFFECTS へ push する値）。rollback 不能の host effect 観測用。
+    effect: Mutex<Option<i64>>,
+    next_id: std::sync::atomic::AtomicUsize,
+}
+
+impl FakeCoop {
+    fn new(id: u128, name: &str) -> Arc<Self> {
+        Arc::new(Self {
+            descriptor: HostFunctionDescriptor {
+                id: host_fn_id(id),
+                name: name.to_string(),
+                arity: tsumugi::HostArity::Exact(0),
+                cost: tsumugi::HostCost::default(),
+                argument_audit: Vec::new(),
+                result_audit: tsumugi::AuditValuePolicy::Omit,
+                may_block: true,
+            },
+            ready_int: Mutex::new(None),
+            effect: Mutex::new(None),
+            next_id: std::sync::atomic::AtomicUsize::new(1),
+        })
+    }
+}
+
+impl CooperativeHostFunction for FakeCoop {
+    fn descriptor(&self) -> &HostFunctionDescriptor {
+        &self.descriptor
+    }
+
+    fn start(
+        &self,
+        _context: &mut tsumugi::CapabilityCallContext<'_>,
+        _arguments: &[Value],
+    ) -> HostCallPoll<Value> {
+        // 観測可能な副作用（host effect）を記録する。rollback で消えないことを後で確認する。
+        if let Some(e) = *self.effect.lock().unwrap() {
+            HOST_EFFECTS.with(|v| v.borrow_mut().push(e));
+        }
+        if let Some(n) = self.ready_int.lock().unwrap().take() {
+            return HostCallPoll::Ready(Ok(Value::Int(n)));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst) as u64;
+        let (ticket, completer): (HostCallTicket<Value>, HostCallCompleter<Value>) =
+            tsumugi::new_ticket::<Value>(id);
+        COMPLETERS.with(|c| c.borrow_mut().push(completer));
+        HostCallPoll::Pending(ticket)
+    }
+}
+
+fn coop_ctx(id: u128, adapter: Arc<dyn CooperativeHostFunction>) -> ExecutionContext {
+    let registry = HostFunctionRegistry::builder()
+        .register_cooperative(adapter)
+        .expect("register")
+        .build()
+        .expect("build");
+    let caps = CapabilitySet::builder()
+        .grant_host_function(host_fn_id(id))
+        .expect("grant")
+        .build();
+    let mut ctx = ExecutionContext::new();
+    ctx.set_host_registry(Arc::new(registry));
+    ctx.set_capabilities(caps);
+    ctx
+}
+
+/// 各非 terminal state（Ready / Yielded(SliceFuel) / HostCallPending / Paused）から cancel でき、
+/// terminal event は 1 回だけ（2 回目 poll は HandleError::Terminal）（§15.3、AC-7）。
+#[test]
+fn cancel_from_each_nonterminal_state_single_terminal() {
+    let engine = Engine::new();
+
+    // --- HostCallPending から cancel ---
+    {
+        let adapter = FakeCoop::new(1, "h");
+        let script = engine.compile("let x = h()\n").unwrap();
+        let mut ctx = coop_ctx(1, adapter);
+        let mut handle = engine
+            .create_execution(&script, &mut ctx, ExecutionRequest::new())
+            .expect("active");
+        // HostCallPending へ。
+        match handle.poll(PollSlice::default()).unwrap() {
+            PollResult::Yielded {
+                reason: YieldReason::HostCallPending { .. },
+                ..
+            } => {}
+            other => panic!("HostCallPending を期待: {other:?}"),
+        }
+        handle.cancellation_token().cancel();
+        match handle.poll(PollSlice::default()).unwrap() {
+            PollResult::Terminal { outcome, .. } => {
+                assert_eq!(outcome, ExecutionOutcome::Cancelled)
+            }
+            other => panic!("Cancelled を期待: {other:?}"),
+        }
+        // terminal event は 1 回だけ: 2 回目 poll は HandleError::Terminal。
+        assert_eq!(
+            handle.poll(PollSlice::default()),
+            Err(HandleError::Terminal)
+        );
+    }
+
+    // --- Yielded(SliceFuel) から cancel ---
+    {
+        let script = engine
+            .compile("let i = 0\nwhile i < 1000\n  i = i + 1\nend\n")
+            .unwrap();
+        let mut ctx = ExecutionContext::new();
+        let mut handle = engine
+            .create_execution(&script, &mut ctx, ExecutionRequest::new())
+            .expect("active");
+        match handle.poll(PollSlice { max_fuel: 16 }).unwrap() {
+            PollResult::Yielded {
+                reason: YieldReason::SliceFuelExhausted,
+                ..
+            } => {}
+            other => panic!("SliceFuelExhausted を期待: {other:?}"),
+        }
+        handle.cancellation_token().cancel();
+        loop {
+            match handle.poll(PollSlice { max_fuel: 16 }).unwrap() {
+                PollResult::Terminal { outcome, .. } => {
+                    assert_eq!(outcome, ExecutionOutcome::Cancelled);
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert_eq!(
+            handle.poll(PollSlice { max_fuel: 16 }),
+            Err(HandleError::Terminal)
+        );
+    }
+
+    // --- Paused から cancel ---
+    {
+        let script = engine.compile("let a = 1\n").unwrap();
+        let mut ctx = ExecutionContext::new();
+        let mut handle = engine
+            .create_execution(&script, &mut ctx, ExecutionRequest::new())
+            .expect("active");
+        handle.pause().expect("pause");
+        handle.cancellation_token().cancel();
+        // Paused では poll できない。resume してから poll すると Cancelled。
+        handle.resume().expect("resume");
+        loop {
+            match handle.poll(PollSlice::default()).unwrap() {
+                PollResult::Terminal { outcome, .. } => {
+                    assert_eq!(outcome, ExecutionOutcome::Cancelled);
+                    break;
+                }
+                _ => continue,
+            }
+        }
+    }
+}
+
+/// host response 対 cancel の linearization（§15.3、AC-7）: HostCallPending の poll は
+/// cancel checkpoint を try_take より先に評価するため、complete 済みでも cancel 済みなら
+/// cancel が勝ち、格納/遅着 response は破棄される（§4.6 Finding 8）。
+#[test]
+fn host_response_vs_cancel_linearization() {
+    let engine = Engine::new();
+
+    // (a) complete してから cancel → cancel が勝つ（response は破棄）。
+    {
+        let adapter = FakeCoop::new(1, "h");
+        let script = engine.compile("let x = h()\n").unwrap();
+        let mut ctx = coop_ctx(1, adapter);
+        let mut handle = engine
+            .create_execution(&script, &mut ctx, ExecutionRequest::new())
+            .expect("active");
+        let _ = handle.poll(PollSlice::default()).unwrap(); // HostCallPending
+        let completer = take_completer().expect("completer");
+        completer.complete(Ok(Value::Int(7)));
+        handle.cancellation_token().cancel();
+        match handle.poll(PollSlice::default()).unwrap() {
+            PollResult::Terminal { outcome, .. } => {
+                assert_eq!(
+                    outcome,
+                    ExecutionOutcome::Cancelled,
+                    "cancel が response より先に観測される（§4.6）"
+                );
+            }
+            other => panic!("Cancelled を期待: {other:?}"),
+        }
+    }
+
+    // (b) cancel せず complete のみ → response で resume して完了する。
+    {
+        let adapter = FakeCoop::new(2, "h2");
+        let script = engine.compile("let x = h2()\n").unwrap();
+        let mut ctx = coop_ctx(2, adapter);
+        let mut handle = engine
+            .create_execution(&script, &mut ctx, ExecutionRequest::new())
+            .expect("active");
+        let _ = handle.poll(PollSlice::default()).unwrap();
+        let completer = take_completer().expect("completer");
+        completer.complete(Ok(Value::Int(9)));
+        let outcome = loop {
+            match handle.poll(PollSlice::default()).unwrap() {
+                PollResult::Terminal { outcome, .. } => break outcome,
+                _ => continue,
+            }
+        };
+        assert_eq!(outcome, ExecutionOutcome::Completed);
+    }
+}
+
+/// poll / pause / resume は HostCallPending からの terminal 後に拒否される（§15.3）。
+#[test]
+fn poll_pause_resume_rejected_after_terminal_host_pending() {
+    let engine = Engine::new();
+    let adapter = FakeCoop::new(1, "h");
+    let script = engine.compile("let x = h()\n").unwrap();
+    let mut ctx = coop_ctx(1, adapter);
+    let mut handle = engine
+        .create_execution(&script, &mut ctx, ExecutionRequest::new())
+        .expect("active");
+    let _ = handle.poll(PollSlice::default()).unwrap(); // HostCallPending
+    let completer = take_completer().expect("completer");
+    completer.complete(Ok(Value::Int(1)));
+    loop {
+        match handle.poll(PollSlice::default()).unwrap() {
+            PollResult::Terminal { .. } => break,
+            _ => continue,
+        }
+    }
+    // terminal 後は poll / pause / resume すべて拒否。
+    assert_eq!(
+        handle.poll(PollSlice::default()),
+        Err(HandleError::Terminal)
+    );
+    assert_eq!(handle.pause(), Err(HandleError::Terminal));
+    assert_eq!(handle.resume(), Err(HandleError::Terminal));
+}
+
+/// host-call pending を跨いで pause/resume しても continuation（binding）が保たれる（§15.3）。
+#[test]
+fn yield_pause_resume_preserve_continuation_host_pending() {
+    let engine = Engine::new();
+    let adapter = FakeCoop::new(1, "h");
+    // host-call の結果を変数へ束縛し、後続で参照する。
+    let script = engine.compile("let x = h()\nlet y = x + 1\n").unwrap();
+    let mut ctx = coop_ctx(1, adapter);
+    let mut handle = engine
+        .create_execution(&script, &mut ctx, ExecutionRequest::new())
+        .expect("active");
+
+    // HostCallPending へ。
+    match handle.poll(PollSlice::default()).unwrap() {
+        PollResult::Yielded {
+            reason: YieldReason::HostCallPending { .. },
+            ..
+        } => {}
+        other => panic!("HostCallPending を期待: {other:?}"),
+    }
+    // host 待ち中に pause → resume（continuation は保たれる）。
+    handle.pause().expect("pause");
+    handle.resume().expect("resume");
+    // 結果を注入して resume → 完了。x=42 が束縛され y=43 まで到達する。
+    let completer = take_completer().expect("completer");
+    completer.complete(Ok(Value::Int(42)));
+    let outcome = loop {
+        match handle.poll(PollSlice::default()).unwrap() {
+            PollResult::Terminal { outcome, .. } => break outcome,
+            _ => continue,
+        }
+    };
+    assert_eq!(outcome, ExecutionOutcome::Completed);
+}
+
+/// 未完了 terminal（cancel）で session が畳まれ、host-call pending を含む continuation が
+/// 破棄される（§15.3、§4.6/§4.8 の abort_session 経路）。cancel 後は handle が terminal で、
+/// 以後の poll が拒否されることで「未完了のまま畳まれた」ことを固定する。
+#[test]
+fn rollback_on_noncompleted_terminal_host_pending() {
+    let engine = Engine::new();
+    let adapter = FakeCoop::new(1, "h");
+    let script = engine.compile("let x = h()\nlet y = x + 1\n").unwrap();
+    let mut ctx = coop_ctx(1, adapter);
+    let mut handle = engine
+        .create_execution(&script, &mut ctx, ExecutionRequest::new())
+        .expect("active");
+    // HostCallPending（begin_execution 済み・session 有り）へ。
+    match handle.poll(PollSlice::default()).unwrap() {
+        PollResult::Yielded {
+            reason: YieldReason::HostCallPending { .. },
+            ..
+        } => {}
+        other => panic!("HostCallPending を期待: {other:?}"),
+    }
+    // cancel → abort_session が session を rollback し continuation（frame stack）を破棄する。
+    handle.cancellation_token().cancel();
+    match handle.poll(PollSlice::default()).unwrap() {
+        PollResult::Terminal { outcome, .. } => assert_eq!(outcome, ExecutionOutcome::Cancelled),
+        other => panic!("Cancelled を期待: {other:?}"),
+    }
+    // 未完了のまま畳まれた: 以後の poll は拒否され、継続は残らない（terminal 1 回だけ）。
+    assert_eq!(
+        handle.poll(PollSlice::default()),
+        Err(HandleError::Terminal)
+    );
+}
+
+/// cooperative adapter が出した観測可能な host effect は、cancel で language-state が rollback
+/// されても消えずに残る（§15.3、Finding N3）。
+#[test]
+fn irreversible_host_effect_persists_after_rollback() {
+    HOST_EFFECTS.with(|v| v.borrow_mut().clear());
+    let engine = Engine::new();
+    let adapter = FakeCoop::new(1, "h");
+    *adapter.effect.lock().unwrap() = Some(99); // start で HOST_EFFECTS へ 99 を push。
+    let script = engine.compile("let x = h()\n").unwrap();
+    let mut ctx = coop_ctx(1, adapter);
+    {
+        let mut handle = engine
+            .create_execution(&script, &mut ctx, ExecutionRequest::new())
+            .expect("active");
+        // start が呼ばれ host effect が記録される（Pending）。
+        let _ = handle.poll(PollSlice::default()).unwrap();
+        // cancel で terminal（language-state は rollback される）。
+        handle.cancellation_token().cancel();
+        loop {
+            match handle.poll(PollSlice::default()).unwrap() {
+                PollResult::Terminal { .. } => break,
+                _ => continue,
+            }
+        }
+    }
+    // host effect（外部作用）は rollback で消えない。
+    HOST_EFFECTS.with(|v| {
+        assert_eq!(
+            v.borrow().as_slice(),
+            &[99],
+            "既に出た host effect は abort_session の rollback で消えない（§4.8 step3）"
+        );
+    });
+}
+
+/// host-call pending の非 terminal handle を drop すると cancel linearize + ticket detach +
+/// rollback が blocking なしで完了する（§15.3、§4.8）。
+#[test]
+fn nonterminal_drop_rolls_back_and_closes_without_blocking_host_pending() {
+    let engine = Engine::new();
+    let adapter = FakeCoop::new(1, "h");
+    let script = engine.compile("let x = h()\n").unwrap();
+    let mut ctx = coop_ctx(1, adapter);
+    let token = {
+        let mut handle = engine
+            .create_execution(&script, &mut ctx, ExecutionRequest::new())
+            .expect("active");
+        let token = handle.cancellation_token();
+        let _ = handle.poll(PollSlice::default()).unwrap(); // HostCallPending
+        assert!(!token.is_cancelled(), "drop 前は未 cancel");
+        token
+        // handle drop（非 terminal・host 待ち）。
+    };
+    // drop が cancel を linearize し、ticket を detach、rollback した（blocking なし）。
+    assert!(token.is_cancelled(), "host 待ち drop で cancel linearize");
+    // drop 後に遅着 complete しても何も起きない（ticket detach 済み）。
+    if let Some(completer) = take_completer() {
+        completer.complete(Ok(Value::Int(0)));
+    }
+}

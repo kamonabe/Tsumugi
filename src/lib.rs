@@ -71,6 +71,12 @@ pub use scheduler::{EngineLimits, StartError};
 // host-call pending プロトコルの公開型（REV-015 Slice 5、実行制御仕様 §9 / 設計 §4.4）。
 // cooperative adapter が `Pending` を返す host-call の ticket / waker surface。
 pub use host_pending::{ExecutionWaker, HostCallCompleter, HostCallPoll, HostCallTicket, Wake};
+// cooperative adapter + bounded executor の公開型（REV-015 Slice 5、設計 §4.4 / FR-8/FR-9）。
+// 登録しなければ cooperative path は一切起きない（opt-in、§7）。
+pub use host_pending::{
+    AdapterExecutor, AdapterExecutorLimits, CancelObserver, CooperativeAdapter, SubmitError,
+    new_ticket,
+};
 
 // 協調的 cancel token（REV-015 Slice 4、実行制御仕様 §8）。`ExecutionHandle::cancellation_token`
 // / `EmbeddingContext::cancellation_token` の戻り値型として公開する。別スレッドへ渡せる
@@ -88,6 +94,11 @@ pub use budget::{
 // `budget::ConfigError` は `embedding::ConfigError` と名前衝突するため、budget 側は
 // `BudgetConfigError` として別名公開する。
 pub use budget::ConfigError as BudgetConfigError;
+
+// cooperative adapter が catch 不能 terminal（cancel/deadline/budget/internal-control）を運ぶ
+// 制御信号型（REV-015 Slice 5、設計 §4.4）。`AdapterError::Control(ControlStop)` に載せる。
+pub use budget::{BudgetExceeded, BudgetResource, BudgetUnit, ControlStop, ExecutionPhase};
+pub use capability::AdapterError;
 
 // Phase 1 embedding（スライス E1、`docs/embedding-api.md` 第3・8節）の公開型。
 //
@@ -124,8 +135,8 @@ pub use embedding::ContextError;
 // Phase 2 capability（スライス C1、`docs/capability-model.md` 第3・8・13節）の公開型。
 // alpha facade と名前衝突しないため、そのまま crate root へ re-export する。
 pub use capability::{
-    CapabilityKind, CapabilitySet, CapabilitySetBuilder, CapabilitySetId, Clock,
-    DataClassification, DirectoryHandle, EnvironmentSnapshot, EnvironmentValue,
+    CapabilityCallContext, CapabilityKind, CapabilitySet, CapabilitySetBuilder, CapabilitySetId,
+    Clock, DataClassification, DirectoryHandle, EnvironmentSnapshot, EnvironmentValue,
     FilesystemCapability, FilesystemRoot, FsOperation, HostFunctionId, Input, ModuleResolver,
     MountName, Output, ProcessExit, SymlinkPolicy,
 };
@@ -139,6 +150,10 @@ pub use capability::{
 // `HostArity` として公開して衝突を避ける。他の host 型は衝突がないためそのままの名前で公開する。
 pub use host_function::Arity as HostArity;
 pub use host_function::{
-    AuditValuePolicy, HostCallError, HostCost, HostFunction, HostFunctionDescriptor,
-    HostFunctionRegistry, HostFunctionRegistryBuilder,
+    AuditValuePolicy, CooperativeHostFunction, HostCallError, HostCost, HostFunction,
+    HostFunctionDescriptor, HostFunctionRegistry, HostFunctionRegistryBuilder,
 };
+
+// cooperative host function / adapter テストが script 値を構築・判定するために `Value` を
+// crate root へ公開する（REV-015 Slice 5）。host 側は `Response → Value` 変換の責務を担う（OQ-9）。
+pub use value::Value;

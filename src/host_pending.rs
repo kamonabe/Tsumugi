@@ -23,11 +23,13 @@
 //! [`HostCallTicket`]（`T: Send` のとき）だけ。continuation / context は渡さない（§9.1）。
 //! 公開 `ExecutionHandle`（`engine.rs`）は `!Send + !Sync` のまま。
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::capability::AdapterError;
+use crate::budget::{CancellationToken, MonotonicInstant};
+use crate::capability::{AdapterError, CapabilityCallContext};
 use crate::value::Value;
 
 /// 作成 thread の poll を起こす edge-triggered な wake hint（設計 §4.5）。
@@ -290,9 +292,160 @@ impl std::fmt::Debug for TicketErased {
     }
 }
 
+/// cooperative（ブロックしない）host adapter（設計 §4.4 / FR-8）。
+///
+/// 各 Phase-2 同期 adapter の request/response 型ごとに Phase-4 で登録できる。同期 adapter は
+/// 常に `Ready` 相当で `Pending` API を持たない。cooperative 実装は同じ capability 判定・
+/// budget reservation・deadline・cancellation・audit correlation（[`CapabilityCallContext`]）を
+/// 使い、Phase-2 sync trait を別 thread へ暗黙 offload して擬似 `Pending` へ変換してはならない
+/// （non-offload 契約、§4.4）。
+///
+/// `start` は [`CapabilityCallContext::may_yield`] が `false`（関数本体・callback・同期経路）の
+/// とき **必ず `Ready` を返す**。規約違反の `Pending` は dispatcher が catch 不能 terminal
+/// （`ErrorKind::InternalControl`）にする（Finding 7）。
+pub trait CooperativeAdapter<Request, Response>: Send + Sync + 'static {
+    /// host call を開始する。即時完了なら [`HostCallPoll::Ready`]、未完了なら
+    /// [`HostCallPoll::Pending`] を返す。
+    fn start(
+        &self,
+        context: &mut CapabilityCallContext<'_>,
+        request: Request,
+    ) -> HostCallPoll<Response>;
+}
+
+/// provider が協調 cancel を観測する view（設計 §4.4）。
+///
+/// [`AdapterExecutor::submit`] が実行する `f` へ cancel token の read-only view を渡す。
+/// provider は cancel 不能 API では deadline 以下の有限 timeout を設定し、cancel 観測後は
+/// 結果/副作用を script へ返さない（FR-9）。
+pub struct CancelObserver {
+    cancellation: CancellationToken,
+}
+
+impl CancelObserver {
+    /// cancel token から observer を作る。
+    pub fn new(cancellation: CancellationToken) -> Self {
+        Self { cancellation }
+    }
+
+    /// cancel が要求されたか。
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+}
+
+impl std::fmt::Debug for CancelObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancelObserver")
+            .field("cancelled", &self.cancellation.is_cancelled())
+            .finish()
+    }
+}
+
+/// [`AdapterExecutor`] の有限上限（設計 §4.4 / FR-9）。
+#[derive(Debug, Clone, Copy)]
+pub struct AdapterExecutorLimits {
+    /// thread pool の最大 thread 数。
+    pub max_threads: NonZeroUsize,
+    /// queue に積める最大 job 数（満杯なら backpressure）。
+    pub max_queued: usize,
+    /// 同時実行の最大数。
+    pub max_concurrency: NonZeroUsize,
+}
+
+/// Engine 本体と別の有限 thread pool を持つ adapter executor（設計 §4.4 / NFR-2 / FR-9）。
+///
+/// `submit` された job を executor thread 上で実行し、[`HostCallCompleter`] 経由で結果を
+/// 書き戻す。queue 満杯のときは caller thread を block せず、cooperative adapter の `start` が
+/// `Pending` ではなく `Ready(Err(backpressure))` を返せるよう [`SubmitError::QueueFull`] を返す
+/// （NFR-2「詰まりを yield/backpressure へ変換」）。Engine の scheduler/context/audit lock を
+/// 保持したまま `submit` を呼ばない（NFR-4）。
+///
+/// 本 Slice は worker thread を spawn する最小実装を提供するが、§6 のテストは thread を使わない
+/// `FakeHostExecutor` で決定的に検証する（NFR-3）。
+pub struct AdapterExecutor {
+    limits: AdapterExecutorLimits,
+    inner: Arc<Mutex<ExecutorInner>>,
+}
+
+/// executor の内部状態（queue 長と稼働中 job 数を会計する）。
+struct ExecutorInner {
+    /// queue + 実行中の合計 job 数。`max_queued` と突き合わせて backpressure 判定する。
+    outstanding: usize,
+}
+
+/// `submit` が backpressure で受け付けられなかったことを表す（設計 §4.4 / OQ-5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitError {
+    /// executor queue が満杯。cooperative adapter は `Ready(Err(backpressure))` へ写す。
+    QueueFull,
+}
+
+impl AdapterExecutor {
+    /// 有限上限から executor を作る。
+    pub fn new(limits: AdapterExecutorLimits) -> Self {
+        Self {
+            limits,
+            inner: Arc::new(Mutex::new(ExecutorInner { outstanding: 0 })),
+        }
+    }
+
+    /// 現在の上限を返す。
+    pub fn limits(&self) -> AdapterExecutorLimits {
+        self.limits
+    }
+
+    /// job を executor thread へ投入する（設計 §4.4）。
+    ///
+    /// queue 満杯なら caller を block せず [`SubmitError::QueueFull`] を返す（cooperative adapter
+    /// 側が `Ready(Err(backpressure))` へ写す）。受理した job は executor thread 上で `f` を
+    /// 実行し、`CancelObserver` と `deadline` を渡して結果を `completer` へ書き戻す。
+    pub fn submit<T, F>(
+        &self,
+        completer: HostCallCompleter<T>,
+        deadline: MonotonicInstant,
+        cancel: CancellationToken,
+        f: F,
+    ) -> Result<(), SubmitError>
+    where
+        F: FnOnce(&CancelObserver, MonotonicInstant) -> Result<T, AdapterError> + Send + 'static,
+        T: Send + 'static,
+    {
+        {
+            let mut inner = self.inner.lock().expect("adapter executor mutex poisoned");
+            if inner.outstanding >= self.limits.max_queued {
+                return Err(SubmitError::QueueFull);
+            }
+            inner.outstanding += 1;
+        }
+        let inner = Arc::clone(&self.inner);
+        // 有限 thread pool の最小実装: 1 job = 1 短命 thread。max_threads/max_concurrency の
+        // 厳密な上限適用は本 Slice のテスト（thread 無しの FakeHostExecutor）では駆動されない。
+        std::thread::spawn(move || {
+            let observer = CancelObserver::new(cancel);
+            let result = f(&observer, deadline);
+            completer.complete(result);
+            let mut guard = inner.lock().expect("adapter executor mutex poisoned");
+            guard.outstanding = guard.outstanding.saturating_sub(1);
+        });
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for AdapterExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let outstanding = self.inner.lock().map(|g| g.outstanding).unwrap_or_default();
+        f.debug_struct("AdapterExecutor")
+            .field("limits", &self.limits)
+            .field("outstanding", &outstanding)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::budget::MonotonicClock;
     use std::sync::atomic::AtomicUsize;
 
     /// wake 回数を数える fake Wake（設計 §6.1）。thread を使わず決定的に検証する。
@@ -432,5 +585,47 @@ mod tests {
         assert_send_sync::<ExecutionWaker>();
         assert_send_sync::<HostCallTicket<i32>>();
         assert_send_sync::<HostCallCompleter<i32>>();
+    }
+
+    #[test]
+    fn adapter_executor_queue_full_is_backpressure() {
+        // max_queued=0 なら最初の submit が caller を block せず即 QueueFull（設計 §4.4 / AC-4）。
+        let executor = AdapterExecutor::new(AdapterExecutorLimits {
+            max_threads: NonZeroUsize::new(1).unwrap(),
+            max_queued: 0,
+            max_concurrency: NonZeroUsize::new(1).unwrap(),
+        });
+        let (_ticket, completer) = new_ticket::<i32>(1);
+        let deadline = crate::budget::FakeClock::new().now();
+        let cancel = CancellationToken::new();
+        let out = executor.submit(completer, deadline, cancel, |_obs, _dl| Ok(42));
+        assert_eq!(out, Err(SubmitError::QueueFull));
+    }
+
+    #[test]
+    fn adapter_executor_runs_job_and_completes_ticket() {
+        // thread 上で f を実行し completer へ結果を書き戻す（最小動作確認）。
+        let executor = AdapterExecutor::new(AdapterExecutorLimits {
+            max_threads: NonZeroUsize::new(1).unwrap(),
+            max_queued: 4,
+            max_concurrency: NonZeroUsize::new(1).unwrap(),
+        });
+        let (ticket, completer) = new_ticket::<i32>(2);
+        let deadline = crate::budget::FakeClock::new().now();
+        let cancel = CancellationToken::new();
+        executor
+            .submit(completer, deadline, cancel, |obs, _dl| {
+                assert!(!obs.is_cancelled());
+                Ok(7)
+            })
+            .expect("submit accepted");
+        // thread 完了を待つ（決定的でないため polling）。本番テストは FakeHostExecutor を使う。
+        for _ in 0..1000 {
+            if let Some(Ok(7)) = ticket.try_take() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("job did not complete");
     }
 }

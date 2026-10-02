@@ -31,9 +31,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::capability::HostFunctionId;
+use crate::capability::{CapabilityCallContext, HostFunctionId};
 use crate::embedding::ConfigError;
 use crate::error::TsumugiError;
+use crate::host_pending::HostCallPoll;
 use crate::value::Value;
 
 /// host function の引数個数契約（仕様第11.1節 `Arity`）。
@@ -332,14 +333,43 @@ pub enum HostCallError {
     },
 }
 
+/// 登録 host function を cooperative（ブロックしない）経路で呼び出す object-safe な実体
+/// （REV-015 Slice 5、設計 §4.4 / §2.5、OQ-9）。
+///
+/// 型付きの [`crate::host_pending::CooperativeAdapter<Request, Response>`] を registry へ格納
+/// できるよう、Request を評価済み `&[Value]`、Response を `Value` に固定した object-safe な
+/// wrapper。`Request → 型付き request` と `Response → Value` の変換責務は **登録側**（この
+/// trait を実装する host 側）に置く（OQ-9）。即時完了なら [`HostCallPoll::Ready`]、未完了なら
+/// [`HostCallPoll::Pending`] を返す。
+///
+/// `start` は [`CapabilityCallContext::may_yield`] が `false` のとき必ず `Ready` を返す契約
+/// （Finding 7）。違反時の catch 不能 terminal 化は tree 評価器の dispatch が行う。
+pub trait CooperativeHostFunction: Send + Sync + 'static {
+    /// この function の descriptor（同期 [`HostFunction`] と同じ型を共有する）。
+    fn descriptor(&self) -> &HostFunctionDescriptor;
+
+    /// host call を開始する。arity は呼び出し側が検証済み。
+    fn start(
+        &self,
+        context: &mut CapabilityCallContext<'_>,
+        arguments: &[Value],
+    ) -> HostCallPoll<Value>;
+}
+
 /// 登録済み host function の immutable な registry（仕様第11.1節 `HostFunctionRegistry`）。
 ///
 /// name→ID と ID→function を保持する。build 後は不変で、run 中の name lookup・registry 差替え
 /// をしない（第11.1節。link 時に name→ID を固定する）。
+///
+/// REV-015 Slice 5 で cooperative（ブロックしない）host function を相乗りで保持する（設計
+/// §2.5/§4.4）。cooperative 版は `by_coop_name`（公開名 → [`CooperativeHostFunction`]）に格納し、
+/// tree 評価器の dispatch が可能な文脈（`can_yield`）で `start` を呼ぶ。同期 `by_name` と名前は
+/// 排他で、同じ公開名を同期・cooperative の両方へ登録することはできない（build error）。
 #[derive(Clone, Default)]
 pub struct HostFunctionRegistry {
     by_id: BTreeMap<HostFunctionId, Arc<dyn HostFunction>>,
     by_name: BTreeMap<String, HostFunctionId>,
+    by_coop_name: BTreeMap<String, Arc<dyn CooperativeHostFunction>>,
 }
 
 impl HostFunctionRegistry {
@@ -365,13 +395,27 @@ impl HostFunctionRegistry {
     }
 
     /// 公開名が登録されているか（call site が引数評価前に host 経路を選ぶ判定に使う）。
+    /// 同期・cooperative のどちらの登録でも true。
     pub(crate) fn contains_name(&self, name: &str) -> bool {
-        self.by_name.contains_key(name)
+        self.by_name.contains_key(name) || self.by_coop_name.contains_key(name)
+    }
+
+    /// 公開名が cooperative host function として登録されているか（REV-015 Slice 5）。
+    pub(crate) fn contains_cooperative_name(&self, name: &str) -> bool {
+        self.by_coop_name.contains_key(name)
+    }
+
+    /// 公開名から cooperative host function を引く（REV-015 Slice 5、call site の解決）。
+    pub(crate) fn lookup_cooperative(
+        &self,
+        name: &str,
+    ) -> Option<&Arc<dyn CooperativeHostFunction>> {
+        self.by_coop_name.get(name)
     }
 
     /// 登録済み function が1つも無いか。
     pub fn is_empty(&self) -> bool {
-        self.by_id.is_empty()
+        self.by_id.is_empty() && self.by_coop_name.is_empty()
     }
 }
 
@@ -380,6 +424,10 @@ impl std::fmt::Debug for HostFunctionRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostFunctionRegistry")
             .field("names", &self.by_name.keys().collect::<Vec<_>>())
+            .field(
+                "cooperative_names",
+                &self.by_coop_name.keys().collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -388,6 +436,7 @@ impl std::fmt::Debug for HostFunctionRegistry {
 pub struct HostFunctionRegistryBuilder {
     by_id: BTreeMap<HostFunctionId, Arc<dyn HostFunction>>,
     by_name: BTreeMap<String, HostFunctionId>,
+    by_coop_name: BTreeMap<String, Arc<dyn CooperativeHostFunction>>,
 }
 
 impl HostFunctionRegistryBuilder {
@@ -395,6 +444,7 @@ impl HostFunctionRegistryBuilder {
         Self {
             by_id: BTreeMap::new(),
             by_name: BTreeMap::new(),
+            by_coop_name: BTreeMap::new(),
         }
     }
 
@@ -419,8 +469,8 @@ impl HostFunctionRegistryBuilder {
         if crate::builtin_registry::is_public_builtin(&name) {
             return Err(ConfigError::DuplicateCallableName { name });
         }
-        // 他 host function との名前重複。
-        if self.by_name.contains_key(&name) {
+        // 他 host function との名前重複（同期・cooperative の両方と排他）。
+        if self.by_name.contains_key(&name) || self.by_coop_name.contains_key(&name) {
             return Err(ConfigError::DuplicateCallableName { name });
         }
         // ID 重複。
@@ -435,11 +485,42 @@ impl HostFunctionRegistryBuilder {
         Ok(self)
     }
 
+    /// cooperative（ブロックしない）host function を1つ登録する（REV-015 Slice 5、設計 §4.4）。
+    ///
+    /// 同期 [`Self::register`] と同じ名前検査（keyword / builtin / 他登録名との衝突）を行う。
+    /// cooperative 版は capability authority を同期版と同じく `HostFunction` に相乗りさせるため、
+    /// descriptor の ID は `capabilities` の grant 検査に使う。VM 経路は cooperative を解決せず
+    /// `Ready` 相当の同期経路のみを扱う（VM は変更しない、設計 §4.7）。
+    pub fn register_cooperative(
+        mut self,
+        function: Arc<dyn CooperativeHostFunction>,
+    ) -> Result<Self, ConfigError> {
+        let descriptor = function.descriptor();
+        descriptor.validate()?;
+        let name = descriptor.name.clone();
+
+        // core keyword・core/context builtin との衝突。
+        if is_core_keyword(&name) {
+            return Err(ConfigError::DuplicateCallableName { name });
+        }
+        if crate::builtin_registry::is_public_builtin(&name) {
+            return Err(ConfigError::DuplicateCallableName { name });
+        }
+        // 同期・cooperative の両方の登録名と排他。
+        if self.by_name.contains_key(&name) || self.by_coop_name.contains_key(&name) {
+            return Err(ConfigError::DuplicateCallableName { name });
+        }
+
+        self.by_coop_name.insert(name, function);
+        Ok(self)
+    }
+
     /// registry を freeze する。
     pub fn build(self) -> Result<HostFunctionRegistry, ConfigError> {
         Ok(HostFunctionRegistry {
             by_id: self.by_id,
             by_name: self.by_name,
+            by_coop_name: self.by_coop_name,
         })
     }
 }
@@ -481,6 +562,36 @@ pub fn resolve_host_call(
             Err(TsumugiError::host_adapter_failed(line, name, &category))
         }
     }
+}
+
+/// cooperative host call の call site を解決し、capability / arity を検査して adapter を返す
+/// （REV-015 Slice 5、設計 §4.4）。
+///
+/// `resolve_host_call` の cooperative 版。grant / arity の error precedence は同期版と同じ
+/// （capability → arity）。戻り値は `Ok(Some(adapter))` が「grant 済み・arity OK で start を
+/// 呼べる」、`Ok(None)` が「この name は cooperative host function ではない」、`Err` が
+/// catch 可能な capability / argument error。実際の `start` 呼び出しと [`HostCallPoll`] の解釈は
+/// 呼び出し側（tree 評価器）が行う（`CapabilityCallContext` の構築に budget/deadline が要るため）。
+pub fn resolve_cooperative_call<'r>(
+    registry: &'r HostFunctionRegistry,
+    capabilities: &crate::capability::CapabilitySet,
+    name: &str,
+    arg_count: usize,
+    line: usize,
+) -> Result<Option<&'r Arc<dyn CooperativeHostFunction>>, TsumugiError> {
+    let Some(function) = registry.lookup_cooperative(name) else {
+        return Ok(None);
+    };
+    let descriptor = function.descriptor();
+    // authority 検査を start より先に行う（第3.7節 error precedence）。
+    if !capabilities.contains_host_function(descriptor.id) {
+        return Err(TsumugiError::capability_denied(line, name));
+    }
+    // arity 検査（catch 可能な argument error、第11.2節 規則1）。
+    if !descriptor.arity.accepts(arg_count) {
+        return Err(TsumugiError::host_function_arity(line, name, arg_count));
+    }
+    Ok(Some(function))
 }
 
 #[cfg(test)]

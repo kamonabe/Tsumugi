@@ -125,6 +125,14 @@ pub enum ErrorKind {
     Host,
     /// VM 内部エラー（コンパイラバグ等）
     Internal,
+    /// 内部制御信号の不変条件破れ（REV-015 Slice 5）。
+    ///
+    /// cooperative adapter が `may_yield=false`（関数本体・callback・同期経路）で規約違反の
+    /// `Pending` を返した場合などに使う catch 不能 terminal（設計 §4.4 Finding N1）。
+    /// `ErrorKind::Internal`（catch 可能）とは別の種別で、`is_uncatchable` に含める。
+    /// canonical error inventory には属さない内部制御信号であり、`e["type"]` としては
+    /// script へ露出しない。
+    InternalControl,
     /// 上記に該当しないランタイムエラー
     Runtime,
 }
@@ -155,6 +163,7 @@ impl ErrorKind {
                     | ErrorKind::SourceLimit
                     | ErrorKind::HeapLimit
                     | ErrorKind::IoLimit
+                    | ErrorKind::InternalControl
             )
         )
     }
@@ -190,6 +199,8 @@ impl ErrorKind {
             Self::Io => "io",
             Self::Host => "host",
             Self::Internal => "internal",
+            // 内部制御信号（terminal へ写す）。script の `e["type"]` へは出ない。
+            Self::InternalControl => "internal_control",
             Self::Runtime => "runtime",
         }
     }
@@ -925,6 +936,19 @@ impl TsumugiError {
             format!("内部エラー: {}", detail.into()),
         )
     }
+
+    /// 内部制御信号の不変条件破れ（REV-015 Slice 5、設計 §4.4 Finding N1）。
+    ///
+    /// `ErrorKind::InternalControl` の catch 不能 terminal を生成する。cooperative adapter が
+    /// 同期文脈（`may_yield=false`）で規約違反の `Pending` を返した場合などに
+    /// `control_stop_to_error` 経由で使う。`internal`（catch 可能）とは別種別。
+    pub fn internal_control(line: usize, detail: impl Into<String>) -> Self {
+        Self::runtime_with_kind(
+            line,
+            ErrorKind::InternalControl,
+            format!("内部制御エラー: {}", detail.into()),
+        )
+    }
 }
 
 impl fmt::Display for TsumugiError {
@@ -948,3 +972,24 @@ impl fmt::Display for TsumugiError {
 }
 
 impl std::error::Error for TsumugiError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `InternalControl` は catch 不能、`Internal` は catch 可能のまま（REV-015 Slice 5、
+    /// 設計 §4.4 Finding N1 / NFR-1）。
+    #[test]
+    fn internal_control_is_uncatchable_internal_is_not() {
+        assert!(ErrorKind::is_uncatchable(Some(ErrorKind::InternalControl)));
+        assert!(!ErrorKind::is_uncatchable(Some(ErrorKind::Internal)));
+    }
+
+    /// `internal_control` constructor は `InternalControl` kind・`"internal_control"` type を持つ。
+    #[test]
+    fn internal_control_constructor_sets_kind_and_type() {
+        let err = TsumugiError::internal_control(3, "test");
+        assert_eq!(err.kind(), Some(ErrorKind::InternalControl));
+        assert_eq!(err.error_type(), "internal_control");
+    }
+}

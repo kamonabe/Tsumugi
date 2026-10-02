@@ -352,6 +352,25 @@ impl ExecutionContext {
     pub fn budget_usage(&self) -> BudgetUsage {
         self.evaluator.budget_usage()
     }
+
+    /// この実行に付与する capability 集合を設定する（Phase 2 C1〜）。
+    ///
+    /// 既定は ambient 互換 set（`ProcessExit` を grant）。cooperative / 同期 host function を
+    /// 呼ぶには、その `HostFunction` authority を grant した frozen set をここで注入する。
+    pub fn set_capabilities(&mut self, capabilities: crate::capability::CapabilitySet) {
+        self.evaluator.set_capabilities(capabilities);
+    }
+
+    /// この実行の host function registry を設定する（Phase 2 C8 / REV-015 Slice 5）。
+    ///
+    /// cooperative（ブロックしない）host function の登録も含む（設計 §4.4、opt-in、§7）。
+    /// registry を設定しなければ cooperative path は一切起きない。
+    pub fn set_host_registry(
+        &mut self,
+        registry: std::sync::Arc<crate::host_function::HostFunctionRegistry>,
+    ) {
+        self.evaluator.set_host_registry(registry);
+    }
 }
 
 impl Default for ExecutionContext {
