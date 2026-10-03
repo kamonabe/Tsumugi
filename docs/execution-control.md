@@ -724,11 +724,11 @@ run-turn queueはEngine全体でFIFO round-robinとし、continuation自体で�
   `new_str`）を通す。tree は `Evaluator::eval_expr` の `Expr::Str`・`BinOp`（`eval_binop`
   結果）・`Expr::FStr` で、VM は `OpCode::LoadConst`（String 定数のみ）・`OpCode::Add`
   （結果が String のとき）・`OpCode::FStrConcat` で課金する。既定上限では観測挙動を
-  変えない。既知の tree/VM 差（第14節 Slice 6 で解消）: VM の f-string はリテラル部分を
-  個別の String 定数として `LoadConst` するため、それぞれが 1 度課金される。tree は
-  リテラル部分を `push_str` で結合してから最終 body だけを課金するため、リテラル部分を
-  含む f-string の cumulative `StringAllocations`/`StringBytes` は VM の方が多い。VM が
-  experimental の間の既知差として許容する。
+  変えない。tree/VM の f-string リテラル部分の課金差は第14節 Slice 6 で解消済み: VM は
+  f-string のリテラル部分を課金しない `LoadConstRaw`（定数表からの非課金 load）で積み、
+  tree と同じく結合後の最終 body だけを `FStrConcat` が課金する。これにより tree は
+  リテラルを `push_str` で結合し個別課金しない会計と一致し、リテラル部分を含む f-string の
+  cumulative `StringAllocations`/`StringBytes` が両 engine で等しくなる。
 - source / import accounting（✅ 実装済み）: per-item `SingleSourceBytes` と cumulative
   `SourceCount`/`SourceBytes`、`ImportCount`/`ImportBytes` を
   `BudgetLedger::charge_source` / `charge_import` で課金する。§5.3 のとおり root を
@@ -1040,6 +1040,16 @@ VM charge parity（Slice 6）はこの slice の対象外で VM は cooperative 
 - VMへ`Charge` opcodeと同じcontinuation/outcome契約を実装
 - treeとのcharge trace、terminal boundaryをpaired testで一致させる
 - 一致するまでVMはexperimentalであり、production schedulerへadmitしない
+
+既知差の解消状況（順次 paired test で固定していく）:
+
+- **f-string のリテラル部分の課金差（✅ 解消済み）**: VM は f-string のリテラル部分を
+  課金しない `LoadConstRaw`（定数表からの非課金 load）で積み、tree と同じく結合後の最終
+  body だけを `FStrConcat` が課金する。これで tree の「リテラルを `push_str` で結合し
+  個別課金しない」会計と一致し、cumulative `StringAllocations`/`StringBytes` と live heap が
+  両 engine で等しくなる。paired test は `tests/integration.rs` の
+  `fstring_literal_parts_not_charged_in_both_engines`（リテラルの余分課金がないこと）と
+  `fstring_final_body_is_charged_in_both_engines`（最終 body は両 engine で課金すること）。
 
 ## 15. 境界受入テスト
 

@@ -1861,6 +1861,58 @@ fn string_allocations_limit_gates_shared_builtin_in_both_engines() {
 }
 
 #[test]
+fn fstring_literal_parts_not_charged_in_both_engines() {
+    // REV-015 Slice 6（VM charge parity）: f-string のリテラル部分は、tree engine では
+    // push_str で結合され個別課金されず、結合後の最終 body だけが課金される。VM も
+    // LoadConstRaw でリテラルを課金なしに積むようにして同じ会計へ揃えた。
+    //
+    // f"AAAAAAAAAA{1}" はリテラル "AAAAAAAAAA"(10 byte) と式 1 からなり、最終 body
+    // "AAAAAAAAAA1"(11 byte) を生成する。cumulative string bytes へ課金されるのは
+    // この最終 body の 11 byte だけで、リテラル 10 byte は課金されない。上限 15 は
+    // 11 を許すが、リテラルを二重課金すると 21 > 15 で超過する。両 engine が成功
+    // すること（＝VM がリテラルを余分課金しないこと）を固定する。
+    let source = "print(f\"AAAAAAAAAA{1}\")\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_STRING_BYTES", "15")]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(
+            !stderr.contains("文字列の総バイト数が上限を超えました"),
+            "{mode}で f-string のリテラル部分が cumulative string bytes へ余分課金された: {stderr}"
+        );
+        assert!(
+            stdout.contains("AAAAAAAAAA1"),
+            "{mode}で f-string が正しく出力されない: stdout={stdout} stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn fstring_final_body_is_charged_in_both_engines() {
+    // REV-015 Slice 6（VM charge parity）: リテラル部分は課金しないが、結合後の最終
+    // body は tree/VM とも課金する。上限を最終 body の byte 数未満にすると両 engine で
+    // cumulative string bytes 上限に達することを固定する（課金が消えていないことの確認）。
+    //
+    // f"AAAAAAAAAA{1}" の最終 body は 11 byte。上限 10 は 11 を許さないため超過する。
+    let source = "print(f\"AAAAAAAAAA{1}\")\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[("TSUMUGI_MAX_STRING_BYTES", "10")]);
+        let (_stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("文字列の総バイト数が上限を超えました"),
+            "{mode}で f-string の最終 body に cumulative string bytes 上限が適用されていない: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn single_string_limit_gates_string_literal_in_both_engines() {
     // REV-015 Slice 2: 文字列リテラルは dispatch を経由しないが、materialize 時に
     // 課金される。6 byte の "123456" を上限 5 で拒否する。

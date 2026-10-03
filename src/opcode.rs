@@ -32,6 +32,18 @@ pub enum OpCode {
     /// operand: 定数テーブルのインデックス
     LoadConst(usize),
 
+    /// 定数テーブルからスタックに値をロードするが、String body の課金を行わない
+    /// （REV-015 Slice 6）。f-string のリテラル部分専用。
+    /// operand: 定数テーブルのインデックス
+    ///
+    /// `LoadConst` は String 定数を materialize 時に `track_result` で課金するが、
+    /// f-string のリテラル部分は tree engine（`eval.rs` の `Expr::FStr`）では
+    /// `push_str` で結合され個別課金されない。VM でも同じ会計にするため、リテラル
+    /// パーツはこの命令で課金なしに積み、結合後の最終 body だけを `FStrConcat` が
+    /// 課金する。これにより tree/VM の cumulative string accounting と live heap が
+    /// 一致する。
+    LoadConstRaw(usize),
+
     // --- 算術演算（スタックから2つpop → 結果をpush） ---
     Add,
     Sub,

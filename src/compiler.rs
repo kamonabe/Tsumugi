@@ -753,8 +753,11 @@ impl Compiler {
                 for part in parts {
                     match part {
                         FStrExprPart::Literal(s) => {
-                            self.chunk
-                                .emit_constant(Value::str_constant(s.clone()), line);
+                            // リテラル部分は課金なしで積む（REV-015 Slice 6）。tree engine は
+                            // リテラルを push_str で結合し個別課金しないため、VM も LoadConstRaw
+                            // を使い、結合後の最終 body だけを FStrConcat が課金する。
+                            let idx = self.chunk.add_constant(Value::str_constant(s.clone()));
+                            self.chunk.emit(OpCode::LoadConstRaw(idx), line);
                         }
                         FStrExprPart::Expr(expr) => {
                             self.compile_expr(expr, line)?;

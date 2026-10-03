@@ -1016,6 +1016,13 @@ impl Vm {
                 };
                 self.stack.push(value);
             }
+            OpCode::LoadConstRaw(idx) => {
+                // f-string のリテラル部分を課金なしで積む（REV-015 Slice 6）。tree engine は
+                // リテラルを push_str で結合し個別課金しないため、ここでも track_result を
+                // 通さず素通しし、結合後の最終 body だけを FStrConcat が課金する。
+                let value = self.constant(idx, line)?;
+                self.stack.push(value);
+            }
             OpCode::Add => {
                 let right = self.pop(line)?;
                 let left = self.pop(line)?;
