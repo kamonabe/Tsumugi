@@ -151,8 +151,9 @@ fn verify_chunk(chunk: &Chunk, upvalue_count: usize) -> Result<(), ChunkVerifyEr
 
     for op in &chunk.code {
         match op {
-            // (V2) 定数参照
-            OpCode::LoadConst(i) => {
+            // (V2) 定数参照。LoadConstRaw（f-string リテラル専用、REV-015 Slice 6）も
+            // 同じ定数 index 範囲検査を受ける。
+            OpCode::LoadConst(i) | OpCode::LoadConstRaw(i) => {
                 if *i >= chunk.constants.len() {
                     return Err(ChunkVerifyError::BadConstant);
                 }
