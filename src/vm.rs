@@ -200,6 +200,15 @@ impl Vm {
         self.budget.set_total_fuel(max_steps);
     }
 
+    /// 現在の実行予算 usage（live/peak heap・fuel など）の snapshot を返す。
+    ///
+    /// tree engine の [`crate::eval::Evaluator::budget_usage`] と対称の read-only
+    /// アクセサで、tree/VM の charge trace を paired test で突き合わせる（REV-015
+    /// Slice 6 VM charge parity）ために使う。
+    pub fn budget_usage(&self) -> crate::budget::BudgetUsage {
+        self.budget.usage()
+    }
+
     /// 関数値へ新しい FunctionId を発番する（AUD-048）。
     ///
     /// MakeClosure 実行のたびに呼ぶ。u64 を使い切った場合は internal error を返す
@@ -1002,12 +1011,16 @@ impl Vm {
         match instruction {
             OpCode::LoadConst(idx) => {
                 let value = self.constant(idx, line)?;
-                // 文字列リテラルは dispatch を経由しないため、materialize 時に課金する
-                // （REV-015 Slice 2）。定数表の String は untracked なので track_result が
-                // cumulative string accounting と live heap（new_str）へ昇格させる。Int /
-                // Float / Bool や空 collection 定数は untracked のまま素通しする（後者の
-                // 課金差は Slice 6 の VM charge parity で扱う既知差）。
-                let value = if matches!(value, Value::Str(_)) {
+                // 文字列・collection リテラルは dispatch を経由しないため、materialize 時に
+                // 課金する（REV-015 Slice 2 / Slice 6）。定数表の String / List / Dict は
+                // untracked なので track_result が cumulative string accounting と live heap
+                // （String は new_str、collection は body の §5.1 論理サイズ）へ昇格させる。
+                // 空 collection リテラル `[]` / `{}` も生成時に body を課金し、tree engine
+                // （`eval.rs` の `Expr::List`/`Expr::Dict` が `new_list`/`new_dict` で生成時
+                // 課金）と一致する。非空リテラルは track_result が空 body を 1 度課金したあと、
+                // 後続の `ListPush`/`DictInsert` が tracked backing へ delta 課金するため合計は
+                // tree と同じになり二重課金しない。Int / Float / Bool は backing を持たず素通し。
+                let value = if matches!(value, Value::Str(_) | Value::List(_) | Value::Dict(_)) {
                     self.budget
                         .track_result(value, ExecutionPhase::Run)
                         .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?

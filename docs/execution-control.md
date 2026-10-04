@@ -802,10 +802,19 @@ run-turn queueはEngine全体でFIFO round-robinとし、continuation自体で�
   観測挙動を変えない。
   - 既知の tree/VM 差（第14節 Slice 6 で解消）: VM の `push`/`pop` は `CallBuiltin` +
     書き戻しで backing を full-clone してから `track_result` で丸ごと課金するため、tree の
-    in-place delta 課金と異なり push のたびに peak_heap がスパイクする。VM の空リテラル
-    `x=[]` は untracked 定数のまま変数へ渡り、最初の mutation まで body 24 byte を課金
-    しない。いずれも既定上限では観測に影響しないが、configured 上限では tree と live/peak
-    が食い違い得る。VM が experimental の間の既知差として許容する。
+    in-place delta 課金と異なり push のたびに peak_heap がスパイクする。既定上限では観測に
+    影響しないが、configured 上限では tree と live/peak が食い違い得る。VM が experimental の
+    間の既知差として許容する。
+  - 空リテラル差（✅ Slice 6 で解消済み）: 以前は VM の空リテラル `x=[]` / `x={}` が
+    untracked 定数のまま変数へ渡り、最初の mutation まで body 24 byte を課金しなかった。
+    `OpCode::LoadConst` が String だけでなく List / Dict も `track_result` に通すように
+    して、空 collection も materialize 時に body を課金し、tree engine（`eval.rs` の
+    `Expr::List`/`Expr::Dict` が `new_list`/`new_dict` で生成時課金）と揃えた。非空リテラル
+    は `track_result` が空 body を 1 度課金したあと `ListPush`/`DictInsert` が tracked
+    backing へ delta 課金するため合計は tree と同じで二重課金しない。paired test は
+    `tests/scaling.rs` の `empty_collection_literal_live_heap_matches_across_engines`
+    （スカラー変数の増分を基準に、空 List/Dict の増分がちょうど body ぶん多いことを両
+    engine で固定）。
 - 未実装（後続 PR）: AST / bytecode chunk / imported module record / rollback journal の
   per-drop 追跡（PR-d）。cell・tree/VM 関数 instance・String body は PR-b/PR-c で実装済み。
   - サブスライス分割（実装順）: collection per-drop（案A PR-a、✅ 済み）に続けて、

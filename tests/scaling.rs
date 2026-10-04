@@ -883,3 +883,97 @@ fn closures_defined_in_a_loop_are_released_in_both_engines() {
         );
     }
 }
+
+/// 実行完了後の論理 live heap（`BudgetUsage::live_heap_bytes`）を返す。
+///
+/// 実アロケータではなく budget 台帳を測るため決定的で、`MEASURE_LOCK` は不要。
+/// engine 破棄前に snapshot するので、保持中の言語状態（生存変数など）が
+/// live heap に反映される。
+fn live_heap_after(source: &str, use_vm: bool) -> u64 {
+    let tokens = Lexer::new(source).tokenize();
+    let program = Parser::new(tokens).parse().expect("パースに失敗");
+
+    if use_vm {
+        let chunk = Compiler::new().compile(&program).expect("コンパイルに失敗");
+        let mut vm = Vm::new(chunk);
+        vm.run().expect("VM実行に失敗");
+        vm.budget_usage().live_heap_bytes
+    } else {
+        let mut evaluator = Evaluator::new();
+        evaluator
+            .run(&program, source.len() as u64)
+            .expect("ツリーウォーク実行に失敗");
+        evaluator.budget_usage().live_heap_bytes
+    }
+}
+
+/// REV-015 Slice 6（VM charge parity）: 空 collection リテラル `[]` / `{}` の生成 body を
+/// VM も materialize 時に課金し、tree engine（`new_list`/`new_dict` が生成時課金）と論理
+/// live heap が一致することを固定する。
+///
+/// 以前は VM の空リテラルが untracked 定数のまま変数へ渡り、最初の mutation まで body を
+/// 課金しなかったため、保持した空 collection のぶんだけ VM の live heap が tree より小さく
+/// なる既知差があった。`LoadConst` が List/Dict も `track_result` に通すようにして解消した。
+///
+/// 実アロケータではなく budget 台帳を測るため決定的で、`MEASURE_LOCK` は不要。
+#[test]
+fn empty_collection_literal_live_heap_matches_across_engines() {
+    use tsumugi::budget::heap_size;
+
+    // 空 collection を変数束縛で保持する。保持しているので per-drop release されず live
+    // heap に残る。非空リテラル構築や mutation は push/pop の full-clone 差（別の既知差）を
+    // 混ぜるため避け、空リテラルの body 課金だけを測る。
+    //
+    // tree/VM で変数ストレージモデルが違う（tree=cell、VM=globals）ため、保持した
+    // collection の live heap 絶対値や増分の engine 間一致は使えない。代わりに各 engine
+    // 内で「スカラー 1 変数を増やしたときの増分（＝変数ストレージ 1 本ぶん、body なし）」を
+    // 基準に、「空 collection 1 個を増やしたときの増分」がちょうど空 collection body ぶん
+    // 多いことを固定する。VM が空リテラル body を課金しないと、この差が body ぶん足りない。
+    let scalar_source = |n: usize| {
+        let mut s = String::new();
+        for i in 0..n {
+            s.push_str(&format!("let s{i} = 0\n"));
+        }
+        s
+    };
+    let empty_list_source = |n: usize| {
+        let mut s = String::new();
+        for i in 0..n {
+            s.push_str(&format!("let l{i} = []\n"));
+        }
+        s
+    };
+    let empty_dict_source = |n: usize| {
+        let mut s = String::new();
+        for i in 0..n {
+            s.push_str(&format!("let d{i} = {{}}\n"));
+        }
+        s
+    };
+
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree" };
+        // 1 変数あたりの増分（線形なので n=2 と n=1 の差）。
+        let scalar_per_var = live_heap_after(&scalar_source(2), use_vm)
+            .saturating_sub(live_heap_after(&scalar_source(1), use_vm));
+        let list_per_var = live_heap_after(&empty_list_source(2), use_vm)
+            .saturating_sub(live_heap_after(&empty_list_source(1), use_vm));
+        let dict_per_var = live_heap_after(&empty_dict_source(2), use_vm)
+            .saturating_sub(live_heap_after(&empty_dict_source(1), use_vm));
+
+        // 空 List 変数の増分 − スカラー変数の増分 = 空 List body（24 byte）。
+        assert_eq!(
+            list_per_var.saturating_sub(scalar_per_var),
+            heap_size::list_body(0),
+            "{mode}: 空 List の生成 body が live heap に課金されていない \
+             (list_per_var={list_per_var}, scalar_per_var={scalar_per_var})"
+        );
+        // 空 Dict 変数の増分 − スカラー変数の増分 = 空 Dict body（24 byte）。
+        assert_eq!(
+            dict_per_var.saturating_sub(scalar_per_var),
+            heap_size::dict_body(0, 0),
+            "{mode}: 空 Dict の生成 body が live heap に課金されていない \
+             (dict_per_var={dict_per_var}, scalar_per_var={scalar_per_var})"
+        );
+    }
+}
