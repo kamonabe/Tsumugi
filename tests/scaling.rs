@@ -915,10 +915,19 @@ fn live_heap_after(source: &str, use_vm: bool) -> u64 {
 /// 課金しなかったため、保持した空 collection のぶんだけ VM の live heap が tree より小さく
 /// なる既知差があった。`LoadConst` が List/Dict も `track_result` に通すようにして解消した。
 ///
-/// 実アロケータではなく budget 台帳を測るため決定的で、`MEASURE_LOCK` は不要。
+/// 測定する値は論理 budget 台帳なので engine 内部で決定的だが、engine を実行すると
+/// `#[global_allocator]` の `LIVE`/`ALLOCATED` カウンタを動かす。これが他の実アロケータ
+/// 測定テスト（`retained_bytes` / `execute_bytes` 系）と並列に走るとそれらの測定区間へ
+/// 確保ノイズを漏らすため、`MEASURE_LOCK` を取って直列化する。
 #[test]
 fn empty_collection_literal_live_heap_matches_across_engines() {
     use tsumugi::budget::heap_size;
+
+    // engine 実行がグローバルアロケータカウンタを動かすため、他の測定と直列化する。
+    // poison は無視する（他テストの失敗でロックが汚れても使い続ける）。
+    let _guard = MEASURE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
 
     // 空 collection を変数束縛で保持する。保持しているので per-drop release されず live
     // heap に残る。非空リテラル構築や mutation は push/pop の full-clone 差（別の既知差）を
