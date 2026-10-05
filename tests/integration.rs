@@ -1580,7 +1580,7 @@ fn tree_repl_retries_failed_import() {
     assert_eq!(
         stderr
             .matches(
-                "import に失敗しました: モジュールの構文が不正です: tests/fixtures/import_bad_syntax.tsg"
+                "import に失敗しました: モジュールの構文が不正です: tests/fixtures/import_bad_syntax.tsg (2行目: 想定外の文字: '@')"
             )
             .count(),
         2,

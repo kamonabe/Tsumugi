@@ -44,7 +44,7 @@
 | P1 | REV-013 | `args()`がhost process argvを読む | ⬜ | REV表 P1 |
 | P1 | REV-014 | sandbox/env/limits/stdio/clockがprocess-global | ⬜ | REV表 P1 |
 | ~~P1~~ | ~~REV-018~~ | ~~internal module／raw bytecode公開が安全境界を弱める~~ | ✅ | 完了（`chunk`/`compiler`/`opcode`/`verifier`/`vm`を`unstable-bytecode` feature下でのみ公開、安定surfaceは`Engine`系） |
-| P1 | REV-020 | import先parse errorの原因を捨てる | ⬜ | REV表 P1 |
+| ~~P1~~ | ~~REV-020~~ | ~~import先parse errorの原因を捨てる~~ | ✅ | 完了（`parse_module`がimport先parse errorの先頭要素の行・メッセージをcanonical wrapper messageへ保持。`TsumugiError`の構造拡張は行わずメッセージ保持で原因診断を残す） |
 | ~~P1~~ | ~~REV-021~~ | ~~`remove_dir`の再帰削除とcapabilityの不整合~~ | ✅ | 完了（§17.6、仕様revision 0.20。`remove_dir`を空のみへ変更し再帰削除を新規`remove_tree`＝`RecursiveDelete`へ分離。budget/cancel/auditはPhase 3/4/6） |
 | P1 | AUD-018 | CLIからscript引数を渡せない（capability profile/optionsはE8bで別追跡） | 🟡 | AUD crosswalk（E8a完了。importなしtree file/stdinは`EmbeddingRequest::with_arguments`→`Engine::run`経由。import・REPLの引数転送はE7で統合するまでalpha facade。E8b残） |
 | P1 | AUD-021 | language-spec/LANG_GUIDE/design drift継続 | 🟡 | AUD P2表（意味論確定後に継続更新） |
@@ -322,7 +322,7 @@ commit `092da35d0a01c6e3f403123df8416ec0819746d7` を対象に、production sour
 | REV-013 | `args()`がhost process argvを読み、tree/VMで解析規則も異なる。runtime coreから`std::env::args_os()`を除去し、`ExecutionRequest.arguments`のみを公開する | embedding | 設計◎（[組み込みAPI](embedding-api.md)、AUD-018） | ✅ 完了（AUD-018 E8aと一体）。`src/builtin.rs`（tree）・`src/vm.rs`（VM）の`args()`から`std::env::args_os()`を除去し、`Evaluator` / `Vm`のscript_args snapshotを返すよう統一。tree/VMで解析規則差（skip 2 vs skip 1+`--vm` filter）も解消。CLIのみが`std::env::args_os()`をargv取得に使い、runtime coreからは参照しない |
 | REV-014 | sandbox/env/limits/stdio/clockがprocess-globalまたはfirst-use global。`EngineConfig`／`ExecutionRequest`へ移し、library coreが`std::env`等を直接参照しないようにする | embedding | 設計◎（[capability-model](capability-model.md)、[組み込みAPI](embedding-api.md)、AUD-014と関連） | ⬜ 未実装 |
 | REV-018 | internal module／raw bytecodeの公開が安全境界とstable surfaceを弱める。stable rootをEngine等へ限定し、internalsを`pub(crate)`にする（REV-004〜006の根因） | 公開API | 設計◎（[組み込みAPI](embedding-api.md)、§17.2と共通の封印作業） | ✅ 完了。`chunk`/`compiler`/`opcode`/`verifier`/`vm`を`unstable-bytecode` feature（`default`で有効）でのみ`pub`にし、feature無効時は`pub(crate)`。安定利用者は`default-features = false`でraw bytecode surfaceを封印できる。安定embedding surfaceは`Engine`系のみ。`Vm::new`はREV-006により`VerifiedChunk`だけを受け取るため、feature有効でもraw `Chunk`を直接VMへ渡せない |
-| REV-020 | import先parse errorの原因を捨て、wrapper messageだけを返す。原因診断を保持する | import diagnostics | 設計○（[組み込みAPI](embedding-api.md) error契約） | ⬜ 未実装 |
+| REV-020 | import先parse errorの原因を捨て、wrapper messageだけを返す。原因診断を保持する | import diagnostics | 設計○（[組み込みAPI](embedding-api.md) error契約） | ✅ 完了（`parse_module`の`.map_err`で捨てていたparse errorの先頭要素の行・メッセージを、canonical wrapper messageへ`(N行目: ...)`として連結し保持。`TsumugiError`の構造拡張（causeフィールド追加）は設計正本で未確定のため行わず、メッセージ保持で原因診断を残す最小改修。errorsが空の場合は従来のpathのみmessageへフォールバック） |
 | REV-021 | 現行`remove_dir`は再帰削除だが次期capabilityは`EmptyDirectory`へ割当て。`remove_dir`を空のみへ変更し、再帰削除を`remove_tree`（`RecursiveDelete`）へ分離する | filesystem capability | ✅ 確定済み（[次期意味論・実装決定](semantic-decisions.md)§17.6） | ✅ 完了（仕様revision 0.20。`FsOperation::RecursiveDelete`・`RemoveKind::Tree`追加、`builtin_remove_dir`を空のみ・新規`builtin_remove_tree`、capability経路は`remove_dir`→`EmptyDirectory`（非空は`host` category `directory_not_empty`）・`remove_tree`→`RecursiveDelete`、symlinkはlink自体を削除。ambient/capability・tree/VM共通handler。budget/cancel/auditはPhase 3/4/6） |
 
 ### P2 — Medium / Quality
