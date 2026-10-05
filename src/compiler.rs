@@ -802,18 +802,39 @@ impl Compiler {
         // を満たした名前だけに到達するため、ここでの欠落は内部不整合である（AUD-049）。
         let builtin_id = self.resolve_builtin_id(name, line)?;
 
-        // push/pop は第一引数のリストを破壊的に変更する
-        // → 実行後に元の変数スロットを更新する
+        // push は第一引数のリストを破壊的に変更する。
         //
-        // REV-015 案A（heap accounting）の注記: この lowering は `CallBuiltin` が
-        // 新しい List を返し（builtin_core は full-clone で untracked backing を作る）、
-        // dispatch 境界の `track_result` が list_body(N±1) を丸ごと課金する。tree engine の
-        // in-place delta 課金（`list_push_tracked`）と異なり、VM では push のたびに新旧
-        // backing が一瞬同時に live になり peak_heap がスパイクする。既定上限では観測挙動は
-        // 変わらないが、configured 上限では tree と VM で live/peak が食い違う。charge trace
-        // の tree/VM 完全一致は第14節 Slice 6（VM charge parity、VM が experimental の間）で
-        // 解消する。本 PR ではこの差異を既知の VM experimental 差として許容する。
-        if (name == "push" || name == "pop")
+        // REV-015 Slice 6 push charge parity: 対象 binding storage を直接書き換える
+        // `ListPushBinding`（`SetIndex` と同じ in-place 経路）へ lowering する。以前は
+        // `CallBuiltin(builtin_push)` が full-clone した untracked backing を返し、dispatch
+        // 境界の `track_result` が list_body(N+1) を丸ごと課金していた。これだと push のたびに
+        // 新旧 backing が一瞬同時に live になり peak_heap がスパイクし、tree engine の in-place
+        // delta 課金（`list_push_tracked`）と configured 上限下で食い違っていた。binding storage
+        // 経由なら backing の `Rc` を operand stack へ複製しないため、一意所有では COW 複製なしの
+        // delta（+32 byte）で済み、tree と peak_heap が一致する（共有 backing は tree と同じく
+        // `detach_list` が COW 複製する）。`builtin_push` は builtin registry 契約・エラー
+        // メッセージ parity のため残置する（tree からの直接呼び出しが消えても削除しない）。
+        if name == "push"
+            && !args.is_empty()
+            && let Expr::Ident(var_name) = &args[0]
+        {
+            let target = self.resolve_mutation_target(var_name, line);
+            if let MutationTarget::Global(global) = &target {
+                // 未定義 binding は value の副作用より先に報告する（tree の get_cell 検査と
+                // 同じ順序。IndexAssign の lowering と対称）。
+                self.chunk.emit(OpCode::RequireGlobal(global.clone()), line);
+            }
+            // 第2引数（push する値）だけを評価する。対象 List は binding storage から
+            // in-place で読む（operand stack へ複製しない）。
+            self.compile_expr(&args[1], line)?;
+            self.chunk.emit(OpCode::ListPushBinding(target), line);
+            // push 式の結果は Null。
+            self.chunk.emit_constant(Value::Null, line);
+            return Ok(());
+        }
+
+        // pop は第一引数のリストを破壊的に変更する → 実行後に元の変数スロットを更新する。
+        if name == "pop"
             && !args.is_empty()
             && let Expr::Ident(var_name) = &args[0]
         {
@@ -824,19 +845,12 @@ impl Compiler {
             }
             self.chunk
                 .emit(OpCode::CallBuiltin(builtin_id, arg_count), line);
-            if name == "push" {
-                self.emit_set_mutation_target(&target, line);
-                self.chunk.emit(OpCode::Pop, line);
-                self.chunk.emit_constant(Value::Null, line);
-            }
-            if name == "pop" {
-                // pop の戻り値（取り出した要素）はスタックに残したまま、変数側の
-                // List を PopUpdate で更新する。内部命令なので source から呼べない。
-                self.emit_get_mutation_target(&target, line);
-                self.chunk.emit(OpCode::PopUpdate, line);
-                self.emit_set_mutation_target(&target, line);
-                self.chunk.emit(OpCode::Pop, line);
-            }
+            // pop の戻り値（取り出した要素）はスタックに残したまま、変数側の
+            // List を PopUpdate で更新する。内部命令なので source から呼べない。
+            self.emit_get_mutation_target(&target, line);
+            self.chunk.emit(OpCode::PopUpdate, line);
+            self.emit_set_mutation_target(&target, line);
+            self.chunk.emit(OpCode::Pop, line);
             return Ok(());
         }
 
