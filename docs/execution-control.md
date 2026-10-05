@@ -314,6 +314,252 @@ heap quotaはallocator、platform、Rust compilerに依存しない論理サイ�
 - imported module record、ASTまたはbytecode、module IDはheapにも課金する。
 - 既存の`MAX_AST_DEPTH`、`MAX_IMPORT_DEPTH`、`MAX_USER_CALL_DEPTH`は構造的上限として残し、byte/count budgetとは独立に先に検査する。
 
+#### closure が retain する code の課金（A-1、REV-015 Slice 6）
+
+`charge_link` が課金する artifact token（AST / bytecode chunk）は **REPL 入力（artifact）の
+寿命**に結びつく。しかし closure を定義した入力が終わっても、その closure が生き残る限り、
+closure が握る code（tree=`FnDef.body` の `Rc<[Stmt]>`、VM=`VmFn.chunk` の prototype
+`Rc<Chunk>`）はメモリ上に残る。従来はこの retained code が次入力の artifact release で
+課金から外れていた（両 engine 対称の under-charge）。これを **A-1 モデル**で閉じる。両 engine
+を「reachable な code は課金し続ける」挙動へ揃え、retained closure の code を reachable な限り
+両 engine とも課金し続ける（従来の release-時に落ちる under-charge を解消する）。**課金の有無と
+release 寿命は両 engine で一致する**が、課金額は engine ごとの artifact 単位（tree=`ast_node`、
+VM=`bytecode_chunk`）のままで、§5.3 の「AST または bytecode」どおり数値は engine 固有であって
+よい（A-2 のような engine 共通の単一基準へ寄せる＝ byte 単位で `live_heap` / `peak_heap` を
+一致させることは**しない**）。これにより resource 消費の backend 差（＝「片方だけ落ちる」
+非対称）を解消し、[決定性・監査仕様](determinism-and-audit.md) §3 の決定性要件（terminal 時
+`BudgetUsage` の backend 一致＝課金の有無・寿命が揃うこと）および manifesto 原則 5 を満たす。
+
+A-1 の設計原則は 1 つに尽きる: **retained-code token は closure instance ではなく、課金対象の
+distinct code object（`Rc` の backing 同一性）に紐づける**。PR-c の header token は function
+instance 固有（instance ごとに別物で、複数 instance 間で共有されない）だったが、retained code
+は複数の closure instance が同一 `Rc` を共有しうる（下記の生成経路を参照）ため、header と同じ
+instance 単位では N 個の instance が同一 code を N 回課金してしまう。したがって retained-code
+token は **code object 単位で 1 つ**とし、instance はそれを `Rc::clone`（無課金）で共有する。
+この一点で、以下に挙げる instance 間共有・ネスト closure・dead branch のいずれの穴も塞がる。
+
+- **課金単位は distinct code object（§5.2「共有は 1 回課金」の token 層での具体化）**: closure が
+  retain する code の §5.1 論理サイズは、その code object（tree=`FnDef.body` の `Rc<[Stmt]>`、
+  VM=prototype `Rc<Chunk>`）に対して **Link/adopt 時（tree=`charge_link` の Link、
+  VM=`charge_chunk_tree` の adopt＝`ExecutionPhase::Compile`）に 1 本の token で 1 回だけ**
+  課金する（課金の timing と token 保持者の移譲は下記「ownership transfer」で定義）。
+  同じ `Rc` を共有する
+  2 個目以降の closure instance は、既存トークンへの `Rc::clone` だけを持ち、追加課金しない。
+  - **実現機構（設計として確定・実装者が選ぶ余地を残さない）**: retained-code token を
+    **code object（distinct `Rc<[Stmt]>` / `Rc<Chunk>`）ごとに 1 本の `Rc<HeapToken>`
+    （`HeapToken = Tracked<()>`）として立て、closure instance はそれを `Rc::clone` で共有する**
+    方式を採る。この `Rc<HeapToken>` は Link/adopt 時に課金して立て（下記「ownership transfer」）、
+    生成前は artifact 側が code object との対応で保持し、生成時に closure instance
+    （tree=`Value::Fn`、VM=`Value::VmFn`）へ `Rc::clone` 共有する。同じ code object を共有する
+    2 個目以降の instance も同じ `Rc<HeapToken>` を `Rc::clone` するだけで追加課金しない。
+    - **token と code object の対応付け（正準方式・tree / VM 対称の side-table）**:
+      生成時に「いま instantiate しようとしている body / prototype」から「その事前課金済み
+      token」を引くために、**両 engine とも `Rc::as_ptr` を key にした side-table で引く**。
+      当初案（VM だけ `FunctionPrototype` に `retain_token` slot を足す）は却下する。理由は
+      次のとおり現行コードでは実装不能だからである: `FunctionPrototype` は `Rc<Chunk>` の
+      中に共有保持され（`src/chunk.rs:53`、`CallFrame.chunk: Rc<Chunk>` `src/vm.rs:28`）、
+      `charge_chunk_tree_into` は `&Chunk` 共有参照で走査する（`src/vm.rs:299-317`）。
+      interior mutability なしに prototype 内の slot へは書き込めず、REPL 経路では adopt 前に
+      既に `Rc` の strong ref が複数本あり `Rc::get_mut` も不可（`src/vm.rs:363-388`）。
+      したがって slot 書き込み方式は成立しない。両 engine を次の side-table 方式に統一する。
+      - **VM**: `Vm` が `HashMap<*const Chunk, Weak<HeapToken>>` を 1 本持つ。key は
+        `Rc::as_ptr(&prototype.chunk)`（`FunctionPrototype.chunk` は `Rc<Chunk>`、
+        `src/chunk.rs:22`）。adopt 時の `charge_chunk_tree_into` 走査で各 distinct prototype
+        chunk を課金し、立てた strong `Rc<HeapToken>` は `chunk_tokens` へ（artifact 保持）、
+        同じ token の `Weak` を side-table へ登録する。`MakeClosure`（`src/vm.rs:1273` 近傍）は
+        手元の `prototype.chunk`（および下記の transitive な子孫 prototype chunk）を
+        `Rc::as_ptr` で side-table から引き、`Weak::upgrade` して得た strong を `Rc::clone` で
+        `VmFn` の retain-token 集合へ載せる。`FunctionPrototype` / `Chunk` へのフィールド追加は
+        不要（`Chunk` を可変にせず、`PartialEq`/`Clone` 派生〔`src/chunk.rs:11,41`〕も変えない）。
+      - **tree**: `Evaluator` が `HashMap<*const [Stmt], Weak<HeapToken>>` を 1 本持つ。key は
+        `Rc::as_ptr(&body)`（`FnDef.body` / `Lambda.body` は `Block = Rc<[Stmt]>`、
+        `src/ast.rs:14`）。Link 時の per-body 課金で立てた strong `Rc<HeapToken>` は
+        `ast_token` 相当の artifact 保持側へ、`Weak` を side-table へ登録する。closure 生成点
+        （`src/eval.rs` の `Stmt::FnDef` / `Expr::Lambda` 評価）は、生成する closure の body
+        （および下記 transitive な内側 body）を `Rc::as_ptr` で引き、`Weak::upgrade` して得た
+        strong を `Rc::clone` で `Value::Fn` の retain-token 集合へ載せる。
+    - **side-table は `Weak` の index であり token 寿命を一切縛らない（跨入力の鍵）**:
+      side-table が持つのは `Weak<HeapToken>` だけなので、side-table 自身は token を生かさない。
+      token の寿命は常に strong 参照（artifact 保持側の `chunk_tokens`/`ast_token` 相当、または
+      生成済み closure instance が握る `Rc::clone`）の参照カウントだけが決める。これにより
+      side-table は **`Vm` / `Evaluator` の寿命を通じて持ち続けてよい**（入力ごとに破棄しない）。
+      REPL 入力をまたいで生成される closure（下記不変量）でも `Weak::upgrade` が成立する限り
+      token を引けるためである。upgrade が失敗する `Weak`（token が既に release 済み）は
+      dead entry であり、次回同 key 挿入時に上書きするか、入力入れ替え時に掃除してよい
+      （掃除は性能最適化であって budget 不変量には影響しない）。
+    - **跨入力生成の不変量（finding 2・両 engine 共通）**: closure 生成（tree=`FnDef`/`Lambda`
+      評価、VM=`MakeClosure`）は、その code object を adopt/Link した入力と**必ずしも同一
+      入力ではない**。top-level closure は定義入力内で生成されるが、ネストした内側 closure は
+      外側 closure が後続入力で call されて初めて生成されうる（例: 入力 N で `fn outer() { fn
+      inner()... }` を定義し、入力 N+1 で `outer()` を呼ぶと `inner` の生成は入力 N+1）。
+      この跨ぎを安全にするため、本設計は **(1) side-table を `Weak` の長命 index にする**（直前
+      項）ことと、**(2) closure 生成時にその closure が reachable に握る code object subtree
+      全体（自分の code object + transitive な子孫 code object）の token を一括で `Rc::clone`
+      して instance へ移譲する**こと（下記「生成時はトークンを移譲する」で定義）で担保する。
+      (2) により、外側 closure が生き残れば内側 prototype/body の token も外側 instance の
+      strong 参照で生き続け、後続入力の内側生成時に `Weak::upgrade` が成立する。raw-pointer
+      key の跨入力 ABA（drop 済みアドレスの再利用）は、upgrade 可否が token の生死で判定される
+      ため実害を生まない（dead な `Weak` は upgrade 失敗で弾かれ、生きている token だけが引ける）。
+    - **token 保持構造自体は無課金**: 両 engine の side-table（`HashMap<_, Weak<HeapToken>>`）・
+      artifact 保持側の token 集合・closure instance 側の retain-token 集合は、いずれも
+      **budget の内部簿記であってそれ自体は課金しない**（現行の
+      `chunk_tokens: Vec<Rc<HeapToken>>` / `ast_token` を課金対象にしていないのと同じ扱い）。
+      これらは課金対象の code object 本体ではなく token への参照を保持するだけの bookkeeping で
+      あるため、`live_heap` の「課金の有無と寿命が backend 間で一致」不変量には影響しない。
+  - **tree**: `FnDef.body`（`ast_heap_size` と同じ `ast_node` 単位＝64 + 所有 identifier /
+    string literal の byte 長）を本体 AST の論理サイズとして、その body `Rc<[Stmt]>` に紐づく
+    token で 1 回だけ課金する。
+  - **VM**: closure が握る prototype chunk を `charge_chunk_tree` と同じ `bytecode_chunk`
+    （64 + 16×opcode + 32×constant）で課金する。**その prototype が transitive に抱える
+    子・孫 prototype も含めて**、各 distinct chunk に紐づく token で 1 回ずつ課金する
+    （§5.2 の共有は 1 回課金）。
+- **ネスト closure の transitive 規則（tree / VM 対称）**: `FnDef.body` / `Lambda.body` には
+  さらにネストした `FnDef` / `Lambda` を書け、`ast_heap_size` は body へ再帰展開する。したがって
+  tree 側も VM の prototype 走査と対称に、**各 distinct body AST slice はちょうど 1 つの token が
+  課金する**ものとして扱う。
+  - **tree**: 外側 closure の token が `FnDef.body` を課金する際、body 内にネストした
+    `FnDef` / `Lambda` の body（＝内側の distinct `Rc<[Stmt]>`）は、**その内側 closure の token
+    が課金する責務**とし、外側 token の走査対象から除外する。どの body がどの token に属するかは
+    code object（`Rc<[Stmt]>` の backing 同一性）で判定する。これにより外側と内側が同じ内側
+    body を二重課金しない。tree の各 `FnDef` / `Lambda` ノードの body は原則 distinct な `Rc`
+    だが、仮にパーサ/linker が同一 `Rc<[Stmt]>` を複数ノードへ共有させても、backing 同一性
+    （`Rc::as_ptr`）で 1 token に畳まれるため §5.2「共有は 1 回課金」と整合する。
+  - **VM**: 同様に、prototype が抱える子孫 prototype は、それ自体が別の `MakeClosure` の対象なら
+    その内側 closure の token が課金する責務とし、外側の走査対象から除外する。
+- **二重課金回避境界（最重要）と ownership transfer の発火条件**: artifact token（入力単位）と
+  retained-code token（code object 寿命）が **同じ code object を同時に課金してはならない**。
+  ただし責務移譲の発火点は「linked program の走査（closure 生成**前**）」ではなく
+  「**closure が実際に生成された時点**」である。この時間差を取り違えると、評価されない
+  `FnDef` / `Lambda`（dead branch の定義、束縛も返却もされず捨てられる lambda）で body が
+  どちらの token にも載らない uncharged 状態になり、§5.2「reachable な code は課金」と矛盾する。
+  現行の token は 1 個の `Tracked<()>` が生成時 `bytes` を課金し `Drop` でちょうどその `bytes`
+  を release する（partial release / 途中での再配賦 API は持たない。tree の `ast_token` は
+  `ast_heap_size(linked_program)` を 1 本の lump token で課金している）。この性質を前提に、
+  lump token からの差し引きではなく **Link 時の per-code-object 分割 + 生成時のトークン移譲**で
+  境界を実現する。
+  - **Link/adopt 時に artifact 課金を「非 closure 部」と「code object ごと」に分割して積む**:
+    Link/adopt（tree=`charge_link` の Link、VM=`charge_chunk_tree` の adopt）で artifact を課金
+    する際、(a) closure body / prototype に該当しない top-level code は従来どおり artifact token
+    で課金し、(b) 各 closure body / prototype（distinct `Rc<[Stmt]>` / `Rc<Chunk>`）は **それぞれ
+    独立した `Rc<HeapToken>` を 1 本ずつ立てて課金する**。この per-code-object token の strong
+    参照は生成前は **artifact 保持側（tree=`ast_token` 相当、VM=`chunk_tokens`）が保持し**、
+    その `Weak` を side-table（上記「token と code object の対応付け」）へ index として登録して、
+    closure が生成されるまでは artifact の寿命で生かす。
+    - **全ネスト深度を eager に列挙すること（tree / VM 対称・最重要）**: この分割走査は
+      **linked program 全体をネスト深度に関わらず走り、どんな深さにある distinct body / prototype
+      に対しても 1 本ずつ token を立てなければならない**。top-level の `FnDef` / `Lambda` だけを
+      列挙して body 内にネストした closure を取りこぼすと、その内側 body が uncharged になり本
+      設計が塞ごうとしている穴が再発する。
+      - **VM**: 列挙は既存挙動そのものを使える。`charge_chunk_tree_into`（`src/vm.rs:299-317`）が
+        `for prototype in &chunk.prototypes` を **transitive に再帰**し、到達されない深いネスト
+        prototype も含め全 distinct chunk を adopt 時に 1 回ずつ課金する。各 prototype を課金した
+        strong token を `chunk_tokens` へ積み、その `Weak` を side-table
+        （key=`Rc::as_ptr(&prototype.chunk)`）へ登録するだけで、列挙漏れは起きない。prototype は
+        compile 時に distinct に作られるため backing 同一性での重複判定が素直に成立する。
+      - **tree**: tree は VM と違い **既存の `ast_heap_size`（`src/ast.rs:489`）の走査を
+        そのまま再利用できない**。現行 `ast_heap_size` は 1 本の flat worklist で、`FnDef` /
+        `Lambda` に当たると body を個々の `Stmt` へ平坦展開して push し
+        （`src/ast.rs:548-549`, `:585-586` 近傍）、どの `Stmt` がどの body slice に属するか・
+        その body の論理サイズ小計を保持しない。したがって per-code-object 課金では、
+        **body（`Rc<[Stmt]>`）を単位に小計を区切る走査へ再構成する**: `FnDef` / `Lambda` に
+        当たったら body を worklist へ平坦展開せず、その body を 1 つの課金単位として小計を
+        計算し、body 内にさらにネストした `FnDef` / `Lambda` の body は再帰的に別単位へ切り出す。
+        外側 token が内側 body を二重課金しないよう、外側小計からは内側 body slice ぶんを除外
+        する（上記「ネスト closure の transitive 規則」の tree 項と同じ境界）。任意のネスト深度の
+        distinct body を列挙し、各 slice に 1 本ずつ token を立てて side-table
+        （key=`Rc::as_ptr(&body)`）へ `Weak` を登録する。top-level だけを列挙する実装は禁止。
+        「`ast_heap_size` をそのまま再利用」は per-body 小計を保持しない以上成立しないため、
+        この走査構造の改造は本設計の必須作業である（「再利用」という語で過小評価しない）。
+    これにより dead branch の body やネストした未到達 lambda も Link/adopt 時点で必ずどこかの
+    token に載り、uncharged 状態を作らない（§5.2「reachable な code は課金」を満たす）。
+  - **生成時はトークンを「移譲」する（再課金も差し引きもしない・subtree 一括）**: closure が
+    実際に生成された瞬間（tree=`FnDef` / `Lambda` 評価、VM=`MakeClosure`）に、その closure が
+    reachable に握る code object subtree 全体 — **自分の code object（tree=`FnDef.body`、
+    VM=`VmFn.chunk`）に加えて、そこから transitive に辿れる子孫 code object（内側 body /
+    子孫 prototype chunk）すべて** — の per-code-object token を、side-table から `Rc::as_ptr`
+    で引き `Weak::upgrade` して得た strong を `Rc::clone` し、closure instance（tree=`Value::Fn`、
+    VM=`Value::VmFn`）の retain-token 集合へ載せる。追加課金は発生しない（既に Link/adopt 時に
+    1 回課金済み）。同じ code object を共有する 2 個目以降の instance も同じ `Rc<HeapToken>` を
+    `Rc::clone` するだけ。subtree 一括で移譲するのは、内側 closure が後続入力で初めて生成される
+    場合でも（上記「跨入力生成の不変量」）、外側 instance が内側 token の strong を握り続けて
+    side-table の `Weak::upgrade` を成立させ続けるためである。こうして「生成時に責務が
+    artifact 保持から closure instance 保持へ移る」。lump token からの byte 差し引きは行わない
+    ため、`Tracked` の partial release 不在と矛盾しない。
+  - **移譲は `Rc::clone`（共有）であり token の move-out ではない（課金 phase と生成 phase の
+    時間差を跨ぐ鍵）**: per-code-object token は Link/adopt 時（VM は `ExecutionPhase::Compile`、
+    `src/vm.rs:310` 近傍）に立って artifact 保持側（VM=`chunk_tokens`、tree=`ast_token` 相当）へ
+    strong が入り、side-table には `Weak` だけが入る。生成（VM=`MakeClosure`、tree=`FnDef` /
+    `Lambda` 評価）はずっと後に、場合によっては**複数入力をまたいで**走る。この時間差を安全に
+    跨ぐため、移譲は **保持側から token を取り出して move するのではなく、side-table 経由で
+    `Weak::upgrade` した strong を `Rc::clone` して共有を増やす**操作と定義する。生成時点で
+    closure instance が独立した強参照（`Rc` clone）を握る。
+  - **artifact release との接続（両 engine とも自分の clone を無条件 release、生存は instance の
+    独立 `Rc` が担保）**: REPL が次入力で artifact を入れ替えるとき、VM は
+    **`chunk_tokens.clear()` で自分が持つ strong を無条件に（移譲済みの prototype 分も含めて）
+    drop する**（`src/vm.rs:383` 近傍）。tree も対称に、`ast_token = None` と artifact 保持側の
+    per-body token 集合を無条件に drop する。「移譲されたものだけ残す」フィルタリングは両 engine
+    とも不要かつ行わない。移譲済み code object の課金が生き残るのは、生きている closure instance
+    が握る**独立した `Rc` clone** が last-ref ではないため `Tracked::Drop`
+    （`src/value.rs:180-186`、last-ref でのみ release）が発火しないから、という一点のみで担保
+    される。side-table はこの release に関与しない（`Weak` のみ保持し token 寿命を縛らない。
+    上記「side-table は `Weak` の index」）。生成済み closure 側に `Rc::clone` の強参照が残る
+    ため、その token は last-ref になるまで release されず、closure が生きている限り課金が残る。
+    これが A-1 の核心である。
+    - **帰結（取り違え防止）**: 移譲を「保持側コレクションからの move-out」とモデル化しては
+      ならない。move-out にすると、入力 N で生成した closure がまだ生きているのに入力 N+1 の
+      無条件 clear が「残った未移譲分だけ」を落とそうとして実装が複雑化し、かつ clone 共有の
+      意味論から外れる。正準モデルは「side-table 経由の `Weak::upgrade` → `Rc::clone` 共有 +
+      保持側の無条件 clear + last-ref release」であり、未移譲 only のフィルタは不要。dead branch
+      等「一度も移譲されなかった」token も、この無条件 clear で artifact 保持側の strong が落ち、
+      他に強参照がないので last-ref として正しく release される（side-table の `Weak` は
+      dangling になるだけで token を生かさない）。
+  - 要約すると、各 distinct code object は常に **ちょうど 1 つの `Rc<HeapToken>`** に課金され、
+    その token の保持者が「artifact 側（生成前・未生成）」から「closure instance 側（生成後）」へ
+    移るだけで、課金額は Link 時の 1 回から変化しない。§5.2 の `AllocationId` visited-set と同じ
+    「同じ object は 1 回だけ課金」の不変量を token 層でも守る。
+- **release 寿命（retained-code token を retain する最後の `Rc` が drop された時点で落とす）**:
+  retained-code token は、その code object を retain する **最後の `Rc<HeapToken>` が drop された
+  時点**で `Tracked` の `Drop`（`src/value.rs:180-186`、last strong ref の drop 時に発火）が
+  live heap を release する。生成後は token の保持者が closure instance（および
+  同じ code object を共有する他 instance）だけになるため、これは「その code object を retain
+  する最後の closure instance が drop した瞬間」と一致する。closure instance が複数共有されて
+  いても 1 個の drop では release せず、最後の 1 個まで retained code を live heap に残す
+  （§5.2「到達可能性が残る object は release しない」）。生成されずに artifact 側へ残った token は
+  artifact release 時（REPL 入れ替え）に drop されて release される。これは PR-c の関数
+  header per-drop 追跡（`Value::Fn` / `Value::VmFn` の `header: Rc<Tracked<()>>` を生成時課金・
+  drop で release）と**同じ per-drop パターンの横展開**だが、header が instance 固有トークン
+  なのに対し retained-code は **code object 単位の共有トークン**である点が異なる。header token
+  （instance の固定 overhead）と retained-code token（本体 AST / prototype chunk の論理サイズ）
+  は別トークンとして並置する。
+- **§5.3「AST または bytecode」原則との整合**: tree は AST を、VM は bytecode chunk を課金する
+  という engine ごとの別 artifact の建付けは A-1 でも維持する（A-2 のように engine 共通の
+  単一基準へ寄せない）。したがって retained closure の課金額も engine ごとに（tree=`ast_node` /
+  VM=`bytecode_chunk`）異なる数値になってよく、A-1 が backend 間で揃えるのは **課金の有無と
+  release 寿命**であって `live_heap` / `peak_heap` の byte 単位の数値一致ではない。
+  [決定性・監査仕様](determinism-and-audit.md) §15.5 differential は retained closure を含めて
+  charge trace を突合するが、その突合対象は
+  「reachable な限り課金され続けること・release 寿命が一致すること」および code artifact に
+  既に認められている engine 固有サイズ差であり、code artifact の byte 単位数値一致ではない。
+
+> **設計レビュー対応メモ（REV-015 Slice 6 PR-6b, 2 巡目）**: 本 A-1 設計はレビュー指摘を次の
+> とおり反映した。
+> - *[HIGH] VM の `FunctionPrototype.retain_token` slot 方式が実装不能*: `Chunk` は `Rc<Chunk>`
+>   共有・`charge_chunk_tree_into` は `&Chunk` 走査で interior mutability なしに slot へ書けない
+>   （`src/vm.rs:299-317`, `:363-388`, `src/chunk.rs:53`）。→ **slot 方式を却下し、VM も tree と
+>   対称な `Rc::as_ptr` key の side-table 方式へ統一**した（上記「token と code object の対応付け」）。
+> - *[MEDIUM] side-table 寿命と跨入力 ABA*: closure 生成は adopt/Link 入力と別入力になりうる
+>   （VM の `MakeClosure` は複数 `run_repl_chunk` を跨ぐ、tree の内側 closure も外側 call 入力で
+>   初生成）。→ **side-table を `Weak` の長命 index にし、生成時に subtree 全体の token を一括
+>   `Rc::clone` 移譲**する不変量を明記（「side-table は `Weak` の index」「跨入力生成の不変量」
+>   「生成時はトークンを移譲する（subtree 一括）」）。ABA は upgrade 可否が token の生死で判定
+>   されるため実害なしと固定。
+> - *[MEDIUM] tree の per-body 分割が `ast_heap_size` の flat worklist では成立しない*: 現行走査は
+>   body を個々の `Stmt` へ平坦展開し per-body 小計を保持しない（`src/ast.rs:548-549`, `:585-586`）。
+>   → **「走査を body 単位の小計へ再構成する必須作業」である旨を明記**し「再利用」表現を撤回
+>   （「全ネスト深度を eager に列挙」tree 項）。
+> - *[NIT] body の `Rc` 共有有無*: → tree の body は原則 distinct `Rc`、共有されても backing
+>   同一性で 1 token に畳まれ §5.2 と整合、の一文を追加（「ネスト closure の transitive 規則」tree 項）。
+
 ## 6. Input、output、host callの課金
 
 ### 6.1 共通規則
@@ -875,7 +1121,8 @@ run-turn queueはEngine全体でFIFO round-robinとし、continuation自体で�
         1 回ずつ `bytecode_chunk`（64 + 16×opcode + 32×constant）で課金する（§5.2 の共有は
         1 回課金）。`Vm::run` は execution 寿命で保持し、`run_repl_chunk` は入力単位で
         入れ替えて release する。持続 closure が prototype chunk を retain する REPL ケースの
-        parity 差は第14節 Slice 6（VM が experimental の間）で扱う。
+        parity 差は第14節 Slice 6 で closure-retain 課金（下記「closure が retain する code の
+        課金（A-1）」）として扱う（VM が experimental の間）。
       - **rollback journal entry**（両 engine、AUD-024）: undo journal（tree=`SubmissionJournal`、
         VM=`ReplStackCheckpoint`）が entry ごとに `rollback_journal_entry` の固定 overhead
         （48 byte）を課金するトークンを積み、submission の commit / rollback で journal ごと
@@ -1094,8 +1341,28 @@ VM charge parity（Slice 6）はこの slice の対象外で VM は cooperative 
   `push_to_shared_backing_has_no_spike_across_engines`（共有 backing への push もスパイク
   しないこと）・`push_live_heap_is_linear_not_quadratic_across_engines`（live heap が O(N) に
   収まる回帰ゲート）。
-  なお Slice 6 全体は未完了で、REPL 持続 closure が prototype chunk を retain する parity 差
-  （本節で前述）と §15.5 differential matrix の全自動化が残る。
+
+- **REPL 持続 closure が retain する code の課金差（設計確定 A-1・実装は後続）**: closure を
+  定義した入力の次の REPL 入力で、両 engine とも前入力の artifact 課金を丸ごと release する
+  （tree=`ast_token = None`、VM=`chunk_tokens.clear()`）。しかし生き残った closure が握る code
+  （tree=`FnDef.body` の `Rc<[Stmt]>`、VM=`VmFn.chunk` の prototype `Rc<Chunk>`）はメモリ上に
+  残るのに**どちらの engine でも再課金されず**、両 engine が対称に under-charge する。release
+  で落ちる論理サイズが engine ごとに違う（tree=AST body / VM=prototype chunk）ため、入力を
+  またいだ `live_heap_bytes` / `peak_heap_bytes` が backend 間でズレる。この差は push/pop と
+  違い「VM だけが誤り」ではなく「両 engine が retain を取りこぼす」非対称であり、§5.3 の
+  **A-1「reachable な code は課金し続ける」モデル**（closure 寿命トークンで課金）で両 engine
+  を揃えて閉じる。これにより reachable code の**課金の有無と release 寿命が backend 間で一致**
+  する（従来の「次入力で落ちる」under-charge が両 engine から消える）。ただし課金額は engine
+  ごとの artifact 単位（tree=`ast_node` / VM=`bytecode_chunk`）のままで、§5.3 の「AST または
+  bytecode」どおり `live_heap` / `peak_heap` の数値そのものは engine 固有であってよい（byte
+  単位の数値一致まで求める A-2 は採らない）。これにより [決定性・監査仕様](determinism-and-audit.md)
+  §3 の「terminal 時 `BudgetUsage` の backend 一致」要件（課金の有無・寿命が揃うこと）および
+  manifesto 原則 5（resource 消費の backend 差＝「片方だけ落ちる」非対称を許容しない）を満たす。
+  差を仕様として受容する案（A-3）は採らない。実装は本 slice の後続
+  shot で tree / VM 双方へ入れ、paired test で固定する。実装詳細の課金規則・二重課金回避
+  境界・release 寿命は §5.3「AST または bytecode」で定義する。
+  なお Slice 6 全体は未完了で、上記 closure retain 課金の実装（closure 寿命トークンの配線）と
+  §15.5 differential matrix の全自動化が残る。
 
 ## 15. 境界受入テスト
 
