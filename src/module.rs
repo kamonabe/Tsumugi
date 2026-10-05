@@ -232,15 +232,22 @@ fn parse_module(source: &str, path: &str, line: usize) -> Result<Program, Tsumug
     let tokens = crate::lexer::Lexer::new(source).tokenize();
     crate::parser::Parser::new(tokens)
         .parse()
-        .map_err(|_errors| {
-            // parse詳細はcauseとして保持する設計だが、cause機構は未実装のため
-            // 現状は canonical wrapper message のみを返す（AUD-019）。
-            import_error(
-                line,
-                format!(
+        .map_err(|errors| {
+            // TsumugiError の構造拡張（cause フィールド）は設計正本で未確定のため行わず、
+            // 原因 parse error の行・メッセージを canonical wrapper message へ組み込んで
+            // 保持する（REV-020）。先頭要素を代表として載せ、原因診断を捨てない。
+            let message = match errors.first() {
+                Some(cause) => format!(
+                    "import に失敗しました: モジュールの構文が不正です: {} ({}行目: {})",
+                    path,
+                    cause.line(),
+                    cause.message()
+                ),
+                None => format!(
                     "import に失敗しました: モジュールの構文が不正です: {}",
                     path
                 ),
-            )
+            };
+            import_error(line, message)
         })
 }

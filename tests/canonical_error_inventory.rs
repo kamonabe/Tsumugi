@@ -569,7 +569,8 @@ fn import_errors_are_identical_across_engines() {
             label: "構文が不正なモジュール",
             source: "import \"tests/fixtures/import_bad_syntax.tsg\"\n",
             kind: ErrorKind::Import,
-            message: "import に失敗しました: モジュールの構文が不正です: tests/fixtures/import_bad_syntax.tsg",
+            // wrapper message へ原因 parse error の行・メッセージを保持する（REV-020）。
+            message: "import に失敗しました: モジュールの構文が不正です: tests/fixtures/import_bad_syntax.tsg (2行目: 想定外の文字: '@')",
             line: 1,
         },
     ];
@@ -592,5 +593,31 @@ fn import_errors_are_identical_across_engines() {
             case.label
         );
         assert_eq!(tree.line(), case.line, "{}: line 不一致", case.label);
+    }
+}
+
+/// REV-020: import 先モジュールに構文エラーがある場合、import エラーの message へ
+/// 原因 parse error の行番号・元メッセージが保持される（原因診断を捨てない）。
+///
+/// `import_bad_syntax.tsg` は 2 行目に不正トークン `@` を含む。wrapper message へ
+/// `(2行目: 想定外の文字: '@')` が連結されることを tree/VM 両経路で確認する。
+#[test]
+fn import_parse_error_preserves_cause_in_message() {
+    let source = "import \"tests/fixtures/import_bad_syntax.tsg\"\n";
+    for (engine, error) in [("tree", run_tree(source)), ("VM", run_vm(source))] {
+        assert_eq!(
+            error.kind(),
+            Some(ErrorKind::Import),
+            "{engine}: import error を期待"
+        );
+        let message = error.message();
+        assert!(
+            message.contains("2行目"),
+            "{engine}: 原因の行番号が message に無い: {message}"
+        );
+        assert!(
+            message.contains("想定外の文字: '@'"),
+            "{engine}: 原因メッセージが message に無い: {message}"
+        );
     }
 }
