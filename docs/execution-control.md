@@ -321,8 +321,14 @@ heap quotaはallocator、platform、Rust compilerに依存しない論理サイ�
 closure が握る code（tree=`FnDef.body` の `Rc<[Stmt]>`、VM=`VmFn.chunk` の prototype
 `Rc<Chunk>`）はメモリ上に残る。従来はこの retained code が次入力の artifact release で
 課金から外れていた（両 engine 対称の under-charge）。これを **A-1 モデル**で閉じる。両 engine
-を「reachable な code は課金し続ける」挙動へ揃え、backend 間で `live_heap` / `peak_heap` が
-一致するようにする（§3 の決定性要件・manifesto 原則 5）。
+を「reachable な code は課金し続ける」挙動へ揃え、retained closure の code を reachable な限り
+両 engine とも課金し続ける（従来の release-時に落ちる under-charge を解消する）。**課金の有無と
+release 寿命は両 engine で一致する**が、課金額は engine ごとの artifact 単位（tree=`ast_node`、
+VM=`bytecode_chunk`）のままで、§5.3 の「AST または bytecode」どおり数値は engine 固有であって
+よい（A-2 のような engine 共通の単一基準へ寄せる＝ byte 単位で `live_heap` / `peak_heap` を
+一致させることは**しない**）。これにより resource 消費の backend 差（＝「片方だけ落ちる」
+非対称）を解消し、§3 の決定性要件（terminal 時 `BudgetUsage` の backend 一致＝課金の有無・寿命
+が揃うこと）および manifesto 原則 5 を満たす。
 
 A-1 の設計原則は 1 つに尽きる: **retained-code token は closure instance ではなく、課金対象の
 distinct code object（`Rc` の backing 同一性）に紐づける**。PR-c の header token は function
@@ -417,8 +423,12 @@ token は **code object 単位で 1 つ**とし、instance はそれを `Rc::clo
   は別トークンとして並置する。
 - **§5.3「AST または bytecode」原則との整合**: tree は AST を、VM は bytecode chunk を課金する
   という engine ごとの別 artifact の建付けは A-1 でも維持する（A-2 のように engine 共通の
-  単一基準へ寄せない）。両 engine の数値一致は、§15.5 differential が retained closure を
-  含めて charge trace を突合することで保証する。
+  単一基準へ寄せない）。したがって retained closure の課金額も engine ごとに（tree=`ast_node` /
+  VM=`bytecode_chunk`）異なる数値になってよく、A-1 が backend 間で揃えるのは **課金の有無と
+  release 寿命**であって `live_heap` / `peak_heap` の byte 単位の数値一致ではない。§15.5
+  differential は retained closure を含めて charge trace を突合するが、その突合対象は
+  「reachable な限り課金され続けること・release 寿命が一致すること」および code artifact に
+  既に認められている engine 固有サイズ差であり、code artifact の byte 単位数値一致ではない。
 
 ## 6. Input、output、host callの課金
 
@@ -1211,10 +1221,14 @@ VM charge parity（Slice 6）はこの slice の対象外で VM は cooperative 
   またいだ `live_heap_bytes` / `peak_heap_bytes` が backend 間でズレる。この差は push/pop と
   違い「VM だけが誤り」ではなく「両 engine が retain を取りこぼす」非対称であり、§5.3 の
   **A-1「reachable な code は課金し続ける」モデル**（closure 寿命トークンで課金）で両 engine
-  を揃えて閉じる。これにより reachable code の課金有無と `live_heap` / `peak_heap` の数値が
-  backend 間で一致し、[決定性・監査仕様](determinism-and-audit.md) §3 の「terminal 時
-  `BudgetUsage` の backend 一致」要件および manifesto 原則 5（resource 消費の backend 差を
-  許容しない）を満たす。差を仕様として受容する案（A-3）は採らない。実装は本 slice の後続
+  を揃えて閉じる。これにより reachable code の**課金の有無と release 寿命が backend 間で一致**
+  する（従来の「次入力で落ちる」under-charge が両 engine から消える）。ただし課金額は engine
+  ごとの artifact 単位（tree=`ast_node` / VM=`bytecode_chunk`）のままで、§5.3 の「AST または
+  bytecode」どおり `live_heap` / `peak_heap` の数値そのものは engine 固有であってよい（byte
+  単位の数値一致まで求める A-2 は採らない）。これにより [決定性・監査仕様](determinism-and-audit.md)
+  §3 の「terminal 時 `BudgetUsage` の backend 一致」要件（課金の有無・寿命が揃うこと）および
+  manifesto 原則 5（resource 消費の backend 差＝「片方だけ落ちる」非対称を許容しない）を満たす。
+  差を仕様として受容する案（A-3）は採らない。実装は本 slice の後続
   shot で tree / VM 双方へ入れ、paired test で固定する。実装詳細の課金規則・二重課金回避
   境界・release 寿命は §5.3「AST または bytecode」で定義する。
   なお Slice 6 全体は未完了で、上記 closure retain 課金の実装（closure 寿命トークンの配線）と

@@ -829,7 +829,7 @@ Phase 5/6実装完了には次をすべて自動化する。
 
 - stdout/stderrではなくFakeHost effect logをbyte単位・順序込みで比較する
 - StableError全field、function identity生成履歴、context rollback、fuel/yield、`normalize_for_conformance`後のaudit payloadを完全一致させる
-- §3の「terminal時`BudgetUsage`のbackend一致」に従い、charge traceの完全一致はREPL持続closureがretainするcode（tree=本体AST／VM=prototype chunk）の課金も含める。[実行予算・協調実行仕様](execution-control.md) §5.3のA-1モデル（closure寿命トークンで課金）により両engineの`live_heap`/`peak_heap`が一致することを前提とする
+- §3の「terminal時`BudgetUsage`のbackend一致」に従い、charge traceの突合はREPL持続closureがretainするcode（tree=本体AST／VM=prototype chunk）の課金も含める。[実行予算・協調実行仕様](execution-control.md) §5.3のA-1モデル（closure寿命トークンで課金）により、retained closureのcodeがreachableな限り両engineとも課金し続ける（従来の片側だけrelease-時に落ちるunder-chargeが解消する）ことを突合する。突合対象は**課金の有無とrelease寿命が両engineで一致すること**であり、課金額はengineごとのartifact単位（tree=`ast_node`／VM=`bytecode_chunk`）のままで、§5.3「ASTまたはbytecode」どおりcode artifactの`live_heap`/`peak_heap`数値はengine固有であってよい（byte単位の数値一致まで求めるA-2は採らない）
 - AUD-019/024/048の専用fixtureと、AUD-022の生成matrix/fuzzで差分0件を確認する
 - 差分が1件でもあるbuildではVM production featureを有効化できないCI gateを置く
 
