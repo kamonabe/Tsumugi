@@ -800,11 +800,22 @@ run-turn queueはEngine全体でFIFO round-robinとし、continuation自体で�
   が tracked へ変換して課金する。tree/VM 両対応。未捕捉エラーの AUD-024 rollback では、
   巻き戻しで drop される tracked collection が `Drop` で自動 release される。既定上限では
   観測挙動を変えない。
-  - 既知の tree/VM 差（第14節 Slice 6 で解消）: VM の `push`/`pop` は `CallBuiltin` +
-    書き戻しで backing を full-clone してから `track_result` で丸ごと課金するため、tree の
-    in-place delta 課金と異なり push のたびに peak_heap がスパイクする。既定上限では観測に
-    影響しないが、configured 上限では tree と live/peak が食い違い得る。VM が experimental の
-    間の既知差として許容する。
+  - push/pop の full-clone 差（✅ Slice 6 で解消済み）: 以前は VM の `push`/`pop` が
+    `CallBuiltin` + 書き戻しで backing を full-clone してから `track_result` で丸ごと課金
+    したため、tree の in-place delta 課金と異なり操作のたびに新旧 backing が一瞬同時に
+    live になり peak_heap がスパイクしていた。`pop` は `OpCode::PopUpdate`（→
+    `list_pop_tracked`）、`push` は `OpCode::ListPushBinding`（→ `list_push_tracked`）で、
+    どちらも対象 binding storage を直接書き換える in-place 経路へ切り替え、tree engine と
+    同じ primitive を通すようにして解消した。`ListPushBinding` は `SetIndex` と同じ binding
+    storage 経路で、backing の `Rc` を operand stack へ複製しないため、一意所有では COW
+    複製なしの delta（+32 byte）だけを課金する（共有 backing は tree と同じく `detach_list`
+    が COW 複製する）。`builtin_push` / `builtin_pop` は builtin registry 契約・エラー
+    メッセージ parity のため残置する。paired test は `tests/scaling.rs` の
+    `push_peak_heap_has_no_full_clone_spike_across_engines`（push 後に
+    `peak_heap == live_heap` となり full-clone スパイクが消えたことを両 engine で固定）・
+    `push_to_shared_backing_has_no_spike_across_engines`（共有 backing への push も
+    スパイクしないことを固定）・`push_live_heap_is_linear_not_quadratic_across_engines`
+    （live heap が O(N) に収まる回帰ゲート）。
   - 空リテラル差（✅ Slice 6 で解消済み）: 以前は VM の空リテラル `x=[]` / `x={}` が
     untracked 定数のまま変数へ渡り、最初の mutation まで body 24 byte を課金しなかった。
     `OpCode::LoadConst` が String だけでなく List / Dict も `track_result` に通すように
@@ -1059,6 +1070,32 @@ VM charge parity（Slice 6）はこの slice の対象外で VM は cooperative 
   両 engine で等しくなる。paired test は `tests/integration.rs` の
   `fstring_literal_parts_not_charged_in_both_engines`（リテラルの余分課金がないこと）と
   `fstring_final_body_is_charged_in_both_engines`（最終 body は両 engine で課金すること）。
+
+- **空 collection リテラルの課金差（✅ 解消済み）**: VM の `x=[]` / `x={}` を materialize 時に
+  body 課金し、tree と揃えた（詳細は第5節 collection per-drop の既知差リストを参照）。paired
+  test は `tests/scaling.rs` の `empty_collection_literal_live_heap_matches_across_engines`。
+
+- **`pop` の full-clone 差（✅ 解消済み）**: VM の `pop` を `OpCode::PopUpdate`（→
+  `list_pop_tracked`）で in-place delta release 化し、tree の `budget_list_pop` と揃えた。
+
+- **`push` の full-clone 差（✅ 解消済み）**: 以前は VM の `push` だけが
+  `CallBuiltin(builtin_push)` 経路で、builtin が backing を full-clone した untracked List を
+  返し、dispatch 境界の `track_result` が list_body(N+1) を丸ごと課金していた。push 済みの旧
+  backing もまだ live なので、push のたびに新旧が一瞬同時に live になり `peak_heap` が
+  `live_heap` を上回ってスパイクしていた（tree は `list_push_tracked` の in-place delta 課金で
+  スパイクしない）。`pop` の `PopUpdate` と対称に、VM の `push` を対象 binding storage を直接
+  書き換える in-place 命令 `OpCode::ListPushBinding`（`SetIndex` と同じ binding storage 経路で
+  `list_push_tracked` を呼ぶ）へ切り替えて解消した。backing の `Rc` を operand stack へ複製
+  しないため、一意所有では COW 複製なしの delta（+32 byte）だけを課金し、tree と `peak_heap`
+  が一致する（共有 backing は tree と同じく `detach_list` が COW 複製する）。`builtin_push` は
+  builtin registry 契約・エラーメッセージ parity のため残置する。paired test は
+  `tests/scaling.rs` の `push_peak_heap_has_no_full_clone_spike_across_engines`（push 後に
+  `peak_heap == live_heap` となりスパイクが消えたことを両 engine で固定）・
+  `push_to_shared_backing_has_no_spike_across_engines`（共有 backing への push もスパイク
+  しないこと）・`push_live_heap_is_linear_not_quadratic_across_engines`（live heap が O(N) に
+  収まる回帰ゲート）。
+  なお Slice 6 全体は未完了で、REPL 持続 closure が prototype chunk を retain する parity 差
+  （本節で前述）と §15.5 differential matrix の全自動化が残る。
 
 ## 15. 境界受入テスト
 

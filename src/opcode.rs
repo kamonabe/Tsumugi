@@ -193,6 +193,17 @@ pub enum OpCode {
     /// 除外した。
     PopUpdate,
 
+    /// `push(var, value)` の in-place 更新用の内部命令（source から到達不能）。
+    ///
+    /// スタックトップの value を pop し、対象 binding が保持する List 末尾へ in-place で
+    /// push する（値は積まない。式の結果は呼び出し側が別途 Null を積む）。binding storage
+    /// を直接書き換えるため backing の `Rc` を operand stack へ複製せず、一意所有なら
+    /// COW 複製なしの delta 課金（+32 byte）で済む。これにより tree engine の
+    /// `list_push_tracked` 直呼びと peak_heap が一致する（REV-015 Slice 6 push charge parity）。
+    /// `SetIndex` と同じ binding storage 経路で、未定義 binding の検査は呼び出し側が
+    /// 先行して行う。
+    ListPushBinding(MutationTarget),
+
     /// プログラム終了
     Return,
 

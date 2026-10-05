@@ -907,6 +907,121 @@ fn live_heap_after(source: &str, use_vm: bool) -> u64 {
     }
 }
 
+/// 実行完了後の論理 peak heap（`BudgetUsage::peak_heap_bytes`）を返す。
+///
+/// `live_heap_after` と同型の in-process ヘルパー。peak は実行中に観測した live heap の
+/// 最大値なので、一瞬だけ新旧 backing が同時 live になる full-clone スパイクを捉えられる。
+/// 実アロケータではなく budget 台帳を測るため決定的で、`MEASURE_LOCK` は不要。
+fn peak_heap_after(source: &str, use_vm: bool) -> u64 {
+    let tokens = Lexer::new(source).tokenize();
+    let program = Parser::new(tokens).parse().expect("パースに失敗");
+
+    if use_vm {
+        let chunk = Compiler::new().compile(&program).expect("コンパイルに失敗");
+        let mut vm = Vm::new(chunk);
+        vm.run().expect("VM実行に失敗");
+        vm.budget_usage().peak_heap_bytes
+    } else {
+        let mut evaluator = Evaluator::new();
+        evaluator
+            .run(&program, source.len() as u64)
+            .expect("ツリーウォーク実行に失敗");
+        evaluator.budget_usage().peak_heap_bytes
+    }
+}
+
+/// `let x = []` に N 回 push する source を組み立てる。
+fn push_n_source(n: usize) -> String {
+    let mut s = String::from("let x = []\n");
+    for i in 0..n {
+        s.push_str(&format!("push(x, {i})\n"));
+    }
+    s
+}
+
+/// REV-015 Slice 6（VM charge parity）push charge parity: `push` の full-clone 課金差を解消
+/// したことを固定する。
+///
+/// 以前は VM の `push` だけが `CallBuiltin(builtin_push)` 経路で、builtin が backing を
+/// full-clone した untracked List を返し、dispatch 境界の `track_result` が list_body(N+1)
+/// を丸ごと課金していた。この間 push 済みの旧 backing もまだ live なので、push のたびに
+/// 新旧が一瞬同時に live になり `peak_heap_bytes` が `live_heap_bytes` を上回って
+/// スパイクしていた（tree engine は `list_push_tracked` の in-place delta 課金なので
+/// スパイクしない）。VM の `push` を binding storage 上の in-place 経路（`ListPushBinding`）へ
+/// 切り替え、tree と同じ `list_push_tracked` primitive を通すことでスパイクを解消した。
+///
+/// 両 engine で変数ストレージモデルが違う（tree=cell、VM=globals）ため、保持した List の
+/// live/peak 絶対値そのものは engine 間で一致しない（`empty_collection_literal_live_heap_
+/// matches_across_engines` と同じ理由）。そこで full-clone スパイクの有無だけを捉える
+/// 不変量「push 後の `peak_heap_bytes == live_heap_bytes`（＝実行中に final live を超える
+/// 一時スパイクが無い）」を両 engine で突き合わせる。full-clone 時代の VM はこの不変量を
+/// 破っていた（peak > live）。
+#[test]
+fn push_peak_heap_has_no_full_clone_spike_across_engines() {
+    for n in [1usize, 10, 100] {
+        let source = push_n_source(n);
+        for use_vm in [false, true] {
+            let mode = if use_vm { "VM" } else { "tree-walk" };
+            let peak = peak_heap_after(&source, use_vm);
+            let live = live_heap_after(&source, use_vm);
+            // in-place delta 課金なら、実行中の live 最大値は最終 live に等しい
+            // （push のたびに +32 を積むだけで新旧同時 live のスパイクが無い）。
+            assert_eq!(
+                peak, live,
+                "{mode}: push({n} 回) 後に full-clone スパイクが残っている \
+                 (peak_heap={peak}, live_heap={live})。in-place 課金なら一致するはず。"
+            );
+        }
+    }
+}
+
+/// REV-015 Slice 6 push charge parity の回帰ゲート: push 後の `live_heap_bytes` が要素数に
+/// 線形（O(N)）で、tree/VM どちらも full-clone 時代の O(N^2) 保持に退行していないことを
+/// 固定する。
+///
+/// full-clone が各 push で list_body(k) を丸ごと課金・保持し続けると live は O(N^2) に
+/// なるが、in-place delta 課金なら最終サイズぶん（O(N)）に収束する。各 engine 内で
+/// n=100 と n=200 の live 増分比が約 2 倍（線形）に収まることを確認する。absolute 値は
+/// storage モデル差で engine 間一致しないため、engine ごとに線形性だけを突き合わせる。
+#[test]
+fn push_live_heap_is_linear_not_quadratic_across_engines() {
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree-walk" };
+        let live100 = live_heap_after(&push_n_source(100), use_vm) as f64;
+        let live200 = live_heap_after(&push_n_source(200), use_vm) as f64;
+        // 線形なら live200/live100 ≈ 2。O(N^2) なら ≈ 4 に近づく。
+        let ratio = live200 / live100;
+        assert!(
+            (1.8..=2.2).contains(&ratio),
+            "{mode}: push 後の live heap が要素数に線形でない \
+             (live100={live100}, live200={live200}, 比={ratio:.2})"
+        );
+    }
+}
+
+/// REV-015 Slice 6 push charge parity の安全確認: 共有 backing（`Rc::strong_count > 1`）への
+/// push が tree/VM どちらも同じ COW primitive（`detach_list`）を通り、full-clone スパイクを
+/// 生まないことを固定する。
+///
+/// 別変数へ代入して backing を共有させた List へ push すると、両 engine とも `detach_list` が
+/// 複製して新しい tracked backing を作る（旧 backing は別名が握り続けるため live に残る）。
+/// 複製ぶんは最終 live に反映されるが、複製後に旧 backing を超える一時スパイクは生じない
+/// ため、ここでも `peak_heap_bytes == live_heap_bytes` が両 engine で成り立つ。
+#[test]
+fn push_to_shared_backing_has_no_spike_across_engines() {
+    let source = "let x = [1, 2, 3, 4, 5]\nlet y = x\npush(x, 6)\n";
+    for use_vm in [false, true] {
+        let mode = if use_vm { "VM" } else { "tree-walk" };
+        let peak = peak_heap_after(source, use_vm);
+        let live = live_heap_after(source, use_vm);
+        assert_eq!(
+            peak, live,
+            "{mode}: 共有 backing への push で full-clone スパイクが出ている \
+             (peak_heap={peak}, live_heap={live})"
+        );
+    }
+}
+
 /// REV-015 Slice 6（VM charge parity）: 空 collection リテラル `[]` / `{}` の生成 body を
 /// VM も materialize 時に課金し、tree engine（`new_list`/`new_dict` が生成時課金）と論理
 /// live heap が一致することを固定する。

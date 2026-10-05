@@ -1486,6 +1486,10 @@ impl Vm {
                 let index = self.pop(line)?;
                 self.assign_index_binding(&target, &index, value, line)?;
             }
+            OpCode::ListPushBinding(target) => {
+                let value = self.pop(line)?;
+                self.list_push_binding(&target, value, line)?;
+            }
             OpCode::ToIterList => {
                 let value = self.pop(line)?;
                 let list = match value {
@@ -1816,6 +1820,66 @@ impl Vm {
                 );
                 self.stack[stack_index] = slot;
                 result
+            }
+        }
+    }
+
+    /// `push(var, value)` を対象 binding storage 上で in-place に実行する（REV-015 Slice 6
+    /// push charge parity）。tree engine の `builtin_collection("push")` と同じ論理位置・
+    /// 同じ primitive（`list_push_tracked`）を通す。
+    ///
+    /// binding storage を直接書き換えるため、backing の `Rc` を operand stack へ複製しない。
+    /// 一意所有の List なら `detach_list` が COW 複製なしで in-place 更新し、delta（+32 byte）
+    /// だけを課金する。これにより full-clone 経路（旧 `CallBuiltin(builtin_push)`）の peak_heap
+    /// スパイクが消え、tree と一致する。共有 backing は tree と同じく `detach_list` が COW
+    /// 複製する。型・上限検査は tree と同じ順序・同じエラー（`builtin_arg_type` /
+    /// `collection_limit`）で行う。
+    fn list_push_binding(
+        &mut self,
+        target: &MutationTarget,
+        value: Value,
+        line: usize,
+    ) -> Result<(), TsumugiError> {
+        match self.resolve_binding_storage(target, line)? {
+            BindingStorage::Cell(cell) => {
+                // cell は self とは別の Rc なので、cell の借用と &mut self.budget は両立する。
+                {
+                    let borrowed = cell.borrow();
+                    let Value::List(v) = &*borrowed else {
+                        return Err(TsumugiError::builtin_arg_type(
+                            line, "push", 1, "List", &borrowed,
+                        ));
+                    };
+                    self.check_collection(v.len().saturating_add(1), line)?;
+                }
+                self.checkpoint_cell(&cell);
+                cell.borrow_mut()
+                    .list_push_tracked(value, &mut self.budget, ExecutionPhase::Run)
+                    .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))
+            }
+            BindingStorage::Stack(stack_index) => {
+                if stack_index >= self.stack.len() {
+                    return Err(internal_error(line, "push の対象slotが不正です"));
+                }
+                match &self.stack[stack_index] {
+                    Value::List(v) => {
+                        let candidate = v.len().saturating_add(1);
+                        self.check_collection(candidate, line)?;
+                    }
+                    other => {
+                        return Err(TsumugiError::builtin_arg_type(
+                            line, "push", 1, "List", other,
+                        ));
+                    }
+                }
+                self.checkpoint_stack_slot(stack_index);
+                // self.stack と self.budget を同時可変借用できないため、slot を一旦
+                // 取り出して in-place push し、書き戻す。slot を take するので backing の
+                // Rc は一意所有のまま（strong_count 1）で、tree と同じ in-place 経路を通る。
+                let mut slot = std::mem::replace(&mut self.stack[stack_index], Value::Null);
+                let result = slot.list_push_tracked(value, &mut self.budget, ExecutionPhase::Run);
+                self.stack[stack_index] = slot;
+                result.map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))
             }
         }
     }
