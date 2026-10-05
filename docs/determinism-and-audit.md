@@ -829,6 +829,7 @@ Phase 5/6実装完了には次をすべて自動化する。
 
 - stdout/stderrではなくFakeHost effect logをbyte単位・順序込みで比較する
 - StableError全field、function identity生成履歴、context rollback、fuel/yield、`normalize_for_conformance`後のaudit payloadを完全一致させる
+- §3の「terminal時`BudgetUsage`のbackend一致」に従い、charge traceの完全一致はREPL持続closureがretainするcode（tree=本体AST／VM=prototype chunk）の課金も含める。[実行予算・協調実行仕様](execution-control.md) §5.3のA-1モデル（closure寿命トークンで課金）により両engineの`live_heap`/`peak_heap`が一致することを前提とする
 - AUD-019/024/048の専用fixtureと、AUD-022の生成matrix/fuzzで差分0件を確認する
 - 差分が1件でもあるbuildではVM production featureを有効化できないCI gateを置く
 
