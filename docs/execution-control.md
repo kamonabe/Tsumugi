@@ -327,8 +327,8 @@ release 寿命は両 engine で一致する**が、課金額は engine ごとの
 VM=`bytecode_chunk`）のままで、§5.3 の「AST または bytecode」どおり数値は engine 固有であって
 よい（A-2 のような engine 共通の単一基準へ寄せる＝ byte 単位で `live_heap` / `peak_heap` を
 一致させることは**しない**）。これにより resource 消費の backend 差（＝「片方だけ落ちる」
-非対称）を解消し、§3 の決定性要件（terminal 時 `BudgetUsage` の backend 一致＝課金の有無・寿命
-が揃うこと）および manifesto 原則 5 を満たす。
+非対称）を解消し、[決定性・監査仕様](determinism-and-audit.md) §3 の決定性要件（terminal 時
+`BudgetUsage` の backend 一致＝課金の有無・寿命が揃うこと）および manifesto 原則 5 を満たす。
 
 A-1 の設計原則は 1 つに尽きる: **retained-code token は closure instance ではなく、課金対象の
 distinct code object（`Rc` の backing 同一性）に紐づける**。PR-c の header token は function
@@ -340,20 +340,51 @@ token は **code object 単位で 1 つ**とし、instance はそれを `Rc::clo
 
 - **課金単位は distinct code object（§5.2「共有は 1 回課金」の token 層での具体化）**: closure が
   retain する code の §5.1 論理サイズは、その code object（tree=`FnDef.body` の `Rc<[Stmt]>`、
-  VM=prototype `Rc<Chunk>`）に対して **Link 時に 1 本の token で 1 回だけ**課金する（課金の
-  timing と token 保持者の移譲は下記「ownership transfer」で定義）。同じ `Rc` を共有する
+  VM=prototype `Rc<Chunk>`）に対して **Link/adopt 時（tree=`charge_link` の Link、
+  VM=`charge_chunk_tree` の adopt＝`ExecutionPhase::Compile`）に 1 本の token で 1 回だけ**
+  課金する（課金の timing と token 保持者の移譲は下記「ownership transfer」で定義）。
+  同じ `Rc` を共有する
   2 個目以降の closure instance は、既存トークンへの `Rc::clone` だけを持ち、追加課金しない。
   - **実現機構（設計として確定・実装者が選ぶ余地を残さない）**: retained-code token を
     **code object（distinct `Rc<[Stmt]>` / `Rc<Chunk>`）ごとに 1 本の `Rc<HeapToken>`
     （`HeapToken = Tracked<()>`）として立て、closure instance はそれを `Rc::clone` で共有する**
-    方式を採る。この `Rc<HeapToken>` は Link 時に課金して立て（下記「ownership transfer」）、
+    方式を採る。この `Rc<HeapToken>` は Link/adopt 時に課金して立て（下記「ownership transfer」）、
     生成前は artifact 側が code object との対応で保持し、生成時に closure instance
     （tree=`Value::Fn`、VM=`Value::VmFn`）へ `Rc::clone` 共有する。同じ code object を共有する
     2 個目以降の instance も同じ `Rc<HeapToken>` を `Rc::clone` するだけで追加課金しない。
-    `Rc::as_ptr` を key にした per-ledger map を**別途新設して token を保持する**方式は採らない
-    （map 自体の寿命・GC が別の課金対象になり設計が増えるため）。code object と `Rc<HeapToken>`
-    の対応は、artifact 側の保持ベクタおよび closure instance のフィールドという現有の所有構造で
-    表現する。
+    - **token と code object の対応付け（正準方式・lookup は検索ではなくフィールド読み）**:
+      生成時に「いま instantiate しようとしている body / prototype」から「その事前課金済み
+      token」を引くために、**code object が握る carrier そのものに token slot を持たせる**。
+      具体的には:
+      - **VM**: `FunctionPrototype`（`src/chunk.rs`、`chunk: Rc<Chunk>` を持つ）に
+        `retain_token: Option<Rc<HeapToken>>`（または同等の token slot）を 1 本足す。
+        adopt 時の `charge_chunk_tree_into` 走査で各 prototype を課金した `Rc<HeapToken>` を
+        その prototype 自身の slot に格納する。`MakeClosure`（`src/vm.rs:1273` 近傍）は手元の
+        `prototype` から `retain_token` をフィールド読みで取り出し、`Rc::clone` して `VmFn` へ
+        載せる（検索・map 不要）。
+      - **tree**: closure 生成点（`src/eval.rs` の `Stmt::FnDef` / `Expr::Lambda` 評価）が
+        手に持つのは body の `Rc<[Stmt]>`。これを key にした **artifact 寿命の side-table
+        （`Evaluator` が持つ `HashMap<*const [Stmt], Rc<HeapToken>>`、key は
+        `Rc::as_ptr(&body)`）** を 1 つ用意し、Link 時の per-body 課金でここへ登録する。生成時は
+        `Rc::as_ptr(&body)` でこの side-table を 1 回引いて token を取り、`Rc::clone` して
+        `Value::Fn` へ載せる。この side-table は **artifact 単位（1 REPL 入力）で作り直す
+        短命構造**で、`ast_token` と同じ artifact release（`ast_token = None` 時）に丸ごと破棄
+        する。VM の token slot と違い tree の `FnDef` ノードへフィールドを足さないのは、AST node
+        型を token 保持用に汚さないため（side-table は Link〜生成〜artifact release の 1 入力内
+        でしか生きない）。
+    - 却下する方式: 「`Rc::as_ptr` を key にした **artifact 寿命を超えて生き続ける per-ledger
+      グローバル map** を token の正準保持者として新設する」方式は採らない。理由は token 寿命を
+      map の寿命が縛ってしまい `Tracked` の last-ref release 意味論と二重管理になるためであり、
+      map の byte が課金対象になるからではない（下記のとおり token 保持構造自体は無課金）。
+      tree 側の side-table は key→token の index にすぎず、token の寿命は依然
+      `Rc<HeapToken>` の参照カウントが決める（side-table が drop されても closure instance が
+      握る `Rc` が生きていれば token は落ちない）。
+    - **token 保持構造自体は無課金**: VM の `FunctionPrototype.retain_token` slot・tree の
+      side-table・closure instance 側のフィールドは、いずれも **budget の内部簿記であって
+      それ自体は課金しない**（現行の `chunk_tokens: Vec<Rc<HeapToken>>` / `ast_token` を課金
+      対象にしていないのと同じ扱い）。これらは課金対象の code object 本体ではなく、token への
+      参照を保持するだけの bookkeeping であるため、`live_heap` の「課金の有無と寿命が backend 間
+      で一致」不変量には影響しない。
   - **tree**: `FnDef.body`（`ast_heap_size` と同じ `ast_node` 単位＝64 + 所有 identifier /
     string literal の byte 長）を本体 AST の論理サイズとして、その body `Rc<[Stmt]>` に紐づく
     token で 1 回だけ課金する。
@@ -383,14 +414,30 @@ token は **code object 単位で 1 つ**とし、instance はそれを `Rc::clo
   `ast_heap_size(linked_program)` を 1 本の lump token で課金している）。この性質を前提に、
   lump token からの差し引きではなく **Link 時の per-code-object 分割 + 生成時のトークン移譲**で
   境界を実現する。
-  - **Link 時に artifact 課金を「非 closure 部」と「code object ごと」に分割して積む**: Link
-    （tree=`charge_link`、VM=`charge_chunk_tree` / `run_repl_chunk`）で artifact を課金する際、
-    (a) closure body / prototype に該当しない top-level code は従来どおり artifact token で
-    課金し、(b) 各 closure body / prototype（distinct `Rc<[Stmt]>` / `Rc<Chunk>`）は **それぞれ
+  - **Link/adopt 時に artifact 課金を「非 closure 部」と「code object ごと」に分割して積む**:
+    Link/adopt（tree=`charge_link` の Link、VM=`charge_chunk_tree` の adopt）で artifact を課金
+    する際、(a) closure body / prototype に該当しない top-level code は従来どおり artifact token
+    で課金し、(b) 各 closure body / prototype（distinct `Rc<[Stmt]>` / `Rc<Chunk>`）は **それぞれ
     独立した `Rc<HeapToken>` を 1 本ずつ立てて課金する**。この per-code-object token は生成前は
-    **artifact 側（tree=`Evaluator`、VM=`Vm`）が保持ベクタに持ち**、closure が生成されるまでは
-    artifact の寿命で生かす。これにより dead branch の body も Link 時点で必ずどこかの token に
-    載り、uncharged 状態を作らない（§5.2「reachable な code は課金」を満たす）。
+    **artifact 側（tree=`Evaluator` の side-table、VM=各 `FunctionPrototype.retain_token` slot）が
+    保持し**、closure が生成されるまでは artifact の寿命で生かす。
+    - **全ネスト深度を eager に列挙すること（tree / VM 対称・最重要）**: この分割走査は
+      **linked program 全体をネスト深度に関わらず走り、どんな深さにある distinct body / prototype
+      に対しても 1 本ずつ token を立てなければならない**。top-level の `FnDef` / `Lambda` だけを
+      列挙して body 内にネストした closure を取りこぼすと、その内側 body が uncharged になり本
+      設計が塞ごうとしている穴が再発する。
+      - **VM**: これは既存挙動そのもの。`charge_chunk_tree_into`（`src/vm.rs:300-317`）が
+        `for prototype in &chunk.prototypes` を **transitive に再帰**し、到達されない深いネスト
+        prototype も含め全 distinct chunk を adopt 時に 1 回ずつ課金する。各 prototype を課金した
+        token をその prototype の `retain_token` slot に格納するだけで、列挙漏れは起きない。
+      - **tree**: **VM の transitive 再帰と対称に、`ast_heap_size`（`src/ast.rs:489`）が辿るのと
+        同じ linked program 全体の走査を再利用して**、任意のネスト深度にある distinct
+        `FnDef.body` / `Lambda.body` slice をすべて列挙し、各 slice に 1 本ずつ token を立てて
+        side-table（key=`Rc::as_ptr(&body)`）へ登録する。top-level だけを列挙する実装は禁止。
+        `ast_heap_size` は既にネストした body ノード（`src/ast.rs:544-551`, `:588-591`）へ
+        再帰展開しているので、同じ走査で per-body の分割点を拾える。
+    これにより dead branch の body やネストした未到達 lambda も Link/adopt 時点で必ずどこかの
+    token に載り、uncharged 状態を作らない（§5.2「reachable な code は課金」を満たす）。
   - **生成時はトークンを「移譲」する（再課金も差し引きもしない）**: closure が実際に生成された
     瞬間（tree=`FnDef` / `Lambda` 評価、VM=`MakeClosure`）に、その code object に対応する
     per-code-object token（上記 (b) で既に課金済みの `Rc<HeapToken>`）を closure instance へ
@@ -398,19 +445,39 @@ token は **code object 単位で 1 つ**とし、instance はそれを `Rc::clo
     object を共有する 2 個目以降の instance も同じ `Rc<HeapToken>` を `Rc::clone` するだけ。
     こうして「生成時に責務が artifact 保持から closure instance 保持へ移る」。lump token からの
     byte 差し引きは行わないため、`Tracked` の partial release 不在と矛盾しない。
-  - **artifact release との接続**: REPL が次入力で artifact を入れ替えるとき、artifact token
-    （top-level 非 closure 部）と、**どの closure にも移譲されなかった** per-code-object token
-    （dead branch など生成されなかった body の分）を release する（tree=`ast_token = None` +
-    保持ベクタの未移譲 token を drop、VM=`chunk_tokens.clear()` + 同様）。一方、生成済み closure
-    へ `Rc::clone` 済みの token は closure instance 側に強参照が残るため release されず、closure
-    が生きている限り課金が残る。これが A-1 の核心である。
+  - **移譲は `Rc::clone`（共有）であり vector からの move-out ではない（VM の課金 phase と生成
+    phase の時間差を跨ぐ鍵）**: VM では per-prototype token は adopt 時（`ExecutionPhase::Compile`、
+    `src/vm.rs:310`）に立って `FunctionPrototype.retain_token` slot と `chunk_tokens` に入るが、
+    `MakeClosure` はずっと後の `Run` 時に、場合によっては**複数の `run_repl_chunk` 呼び出しを
+    またいで**走る。この時間差を安全に跨ぐため、移譲は **slot / vector から token を取り出して
+    move するのではなく、`Rc::clone` で共有を増やす**操作と定義する。生成時点で closure
+    instance（`VmFn`）が独立した強参照（`Rc` clone）を 1 本握る。
+  - **artifact release との接続（VM は自分の clone を無条件 release、生存は instance の独立
+    `Rc` が担保）**: REPL が次入力で artifact を入れ替えるとき、VM は **`chunk_tokens.clear()`
+    で自分が持つ clone を無条件に（移譲済みの prototype 分も含めて）drop する**
+    （`src/vm.rs:383`）。「移譲されたものだけ残す」フィルタリングは不要かつ行わない。移譲済みの
+    prototype の課金が生き残るのは、生きている `VmFn` が握る**独立した `Rc` clone** が last-ref
+    ではないため `Tracked::Drop`（`src/value.rs:180-186`、last-ref でのみ release）が発火しない
+    から、という一点のみで担保される。tree も対称に、`ast_token = None` に加えて側テーブル
+    （key=`Rc::as_ptr(&body)` の `Rc<HeapToken>` index）を丸ごと破棄し、自分の clone を無条件に
+    drop する。どちらの engine も「生成済み closure へ移譲されたか」でフィルタしない。生成済み
+    closure 側に `Rc::clone` の強参照が残るため、その token は last-ref になるまで release されず、
+    closure が生きている限り課金が残る。これが A-1 の核心である。
+    - **帰結（取り違え防止）**: 移譲を「vector からの move-out」とモデル化してはならない。
+      move-out にすると、入力 N で生成した closure がまだ生きているのに入力 N+1 の
+      `chunk_tokens.clear()` が「vector に残った未移譲分だけ」を落とそうとして実装が複雑化し、
+      かつ clone 共有の意味論から外れる。正準モデルは「clone 共有 + 無条件 clear + last-ref
+      release」であり、未移譲 only のフィルタは不要。dead branch 等「一度も移譲されなかった」
+      token も、この無条件 clear で artifact 側の clone が落ち、他に強参照がないので last-ref と
+      して正しく release される。
   - 要約すると、各 distinct code object は常に **ちょうど 1 つの `Rc<HeapToken>`** に課金され、
     その token の保持者が「artifact 側（生成前・未生成）」から「closure instance 側（生成後）」へ
     移るだけで、課金額は Link 時の 1 回から変化しない。§5.2 の `AllocationId` visited-set と同じ
     「同じ object は 1 回だけ課金」の不変量を token 層でも守る。
-- **release 寿命（retained-code token の参照カウントが 0 で落とす）**: retained-code token は、
-  その code object に対応する `Rc<HeapToken>` の**参照カウントが 0 になった時点**で `Tracked`
-  の `Drop` が live heap を release する。生成後は token の保持者が closure instance（および
+- **release 寿命（retained-code token を retain する最後の `Rc` が drop された時点で落とす）**:
+  retained-code token は、その code object を retain する **最後の `Rc<HeapToken>` が drop された
+  時点**で `Tracked` の `Drop`（`src/value.rs:180-186`、last strong ref の drop 時に発火）が
+  live heap を release する。生成後は token の保持者が closure instance（および
   同じ code object を共有する他 instance）だけになるため、これは「その code object を retain
   する最後の closure instance が drop した瞬間」と一致する。closure instance が複数共有されて
   いても 1 個の drop では release せず、最後の 1 個まで retained code を live heap に残す
@@ -425,8 +492,9 @@ token は **code object 単位で 1 つ**とし、instance はそれを `Rc::clo
   という engine ごとの別 artifact の建付けは A-1 でも維持する（A-2 のように engine 共通の
   単一基準へ寄せない）。したがって retained closure の課金額も engine ごとに（tree=`ast_node` /
   VM=`bytecode_chunk`）異なる数値になってよく、A-1 が backend 間で揃えるのは **課金の有無と
-  release 寿命**であって `live_heap` / `peak_heap` の byte 単位の数値一致ではない。§15.5
-  differential は retained closure を含めて charge trace を突合するが、その突合対象は
+  release 寿命**であって `live_heap` / `peak_heap` の byte 単位の数値一致ではない。
+  [決定性・監査仕様](determinism-and-audit.md) §15.5 differential は retained closure を含めて
+  charge trace を突合するが、その突合対象は
   「reachable な限り課金され続けること・release 寿命が一致すること」および code artifact に
   既に認められている engine 固有サイズ差であり、code artifact の byte 単位数値一致ではない。
 
