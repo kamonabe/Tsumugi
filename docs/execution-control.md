@@ -1358,11 +1358,13 @@ VM charge parity（Slice 6）はこの slice の対象外で VM は cooperative 
   単位の数値一致まで求める A-2 は採らない）。これにより [決定性・監査仕様](determinism-and-audit.md)
   §3 の「terminal 時 `BudgetUsage` の backend 一致」要件（課金の有無・寿命が揃うこと）および
   manifesto 原則 5（resource 消費の backend 差＝「片方だけ落ちる」非対称を許容しない）を満たす。
-  差を仕様として受容する案（A-3）は採らない。実装は本 slice の後続
-  shot で tree / VM 双方へ入れ、paired test で固定する。実装詳細の課金規則・二重課金回避
-  境界・release 寿命は §5.3「AST または bytecode」で定義する。
-  なお Slice 6 全体は未完了で、上記 closure retain 課金の実装（closure 寿命トークンの配線）と
-  §15.5 differential matrix の全自動化が残る。
+  差を仕様として受容する案（A-3）は採らない。**実装済み（PR-6b, commit `5be0ea2`）**で
+  tree / VM 双方へ closure 寿命トークンを配線し、`tests/closure_retain.rs` の paired test で
+  固定した（PR-6c で differential matrix `tests/differential.rs` へ集約し `closure_retain.rs` は
+  harness へ載せ替えた）。実装詳細の課金規則・二重課金回避境界・release 寿命は §5.3
+  「AST または bytecode」で定義する。
+  closure retain 課金は PR-6b で実装済みであり、**Slice 6 の残作業は §15.5 charge/budget
+  parity matrix の自動化のみ**である（下記 §15.5 の PR-6c 線引きを参照）。
 
 ## 15. 境界受入テスト
 
@@ -1412,6 +1414,29 @@ VM charge parity（Slice 6）はこの slice の対象外で VM は cooperative 
 - 同一fixtureのtree/VMで、charge trace、usage、yield位置、terminal reason、context commit結果、host effect順序が完全一致する
 - AUD-022の網羅matrixへ各budget境界、REPL継続、pause/resume、cancel、host pendingを追加する
 - subprocess timeout付きstress/fuzzでpanic、abort、OOM前の無制限allocation、terminal後実行がない
+
+> **PR-6c 線引き（REV-015 Slice 6）**: PR-6c-min の射程は、同一 fixture を tree/VM で走らせて
+> **budget usage（engine 間不変な軸）+ terminal reason（`TsumugiError` 全 field）+ stdout/stderr の
+> tree/VM parity** を突合する differential matrix（`tests/differential.rs`）までとする。以下は defer:
+> - **(1) execution-trace determinism**（yield 位置 / host-effect 順序ログ / audit payload /
+>   charge 系列 trace の完全一致）→ Phase 5/6 の differential gate。基盤（`DeterminismInput` /
+>   `normalize_for_conformance` / effect log 比較 / charge trace 記録 API）が未実装のため Slice 6
+>   単独では成立しない。
+> - **(2) pause/resume・cancel・host pending**（上記 2 番目の箇条書き）→ **VM 対象外**。VM は
+>   scheduler 非経由（Ready フォールバック・`vm.rs` 不変、本節 Slice 5 本文）で該当実行経路を
+>   持たず differential が原理的に成立しない。tree 側は `tests/scheduler_api.rs` で担保済み。
+> - **(3) fuzz/stress/生成 matrix**（上記 3 番目の箇条書き）→ AUD-022 / REV-024 / Phase 7
+>   （[検証・リリース・運用設計](verification-release-operations.md) Slice 3）。
+>
+> **比較は軸別ポリシーを用いる**: engine 間不変な軸（I/O counter・string/source/import counts・
+> per-item peak・terminal reason の kind/message）は exact 一致を要求し、**fuel count と absolute
+> heap（`live_heap`/`peak_heap`）は向き・符号・release 寿命の一致**で突合する（byte-exact 一致は
+> §5.3 の A-1 どおり backend 間で成立しないため要求しない。fuel 枯渇の terminal `line` も step
+> 粒度差で engine 間に差があり、fuel parity は StepLimit terminal の observable 一致で担保する）。
+>
+> **PR-6c-min 完了 = Slice 6 charge-parity-matrix 自動化の完了であって、VM の experimental 卒業
+> ではない。** 卒業 gate は determinism/audit conformance（§16・[決定性・監査仕様](determinism-and-audit.md)
+> Slice 6）であり後続フェーズの管轄である。
 
 ## 16. 完了条件
 

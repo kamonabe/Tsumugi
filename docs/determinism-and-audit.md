@@ -833,6 +833,24 @@ Phase 5/6実装完了には次をすべて自動化する。
 - AUD-019/024/048の専用fixtureと、AUD-022の生成matrix/fuzzで差分0件を確認する
 - 差分が1件でもあるbuildではVM production featureを有効化できないCI gateを置く
 
+> **PR-6c 線引き（REV-015 Slice 6）**: この§15.5のうち、**charge/budget parity**（budget usageの
+> engine間不変な軸・terminal reason=`TsumugiError`全field・stdout/stderrのtree/VM一致）は
+> REV-015 Slice 6 PR-6cで`tests/differential.rs`に自動化済みである。比較は軸別ポリシーを用い、
+> engine間不変な軸（I/O counter・string/source/import counts・per-item peak・terminal reasonの
+> kind/message）はexact一致を、fuel countとabsolute heap（`live_heap`/`peak_heap`）は向き・符号・
+> release寿命の一致を突合する（byte-exact一致は§5.3のA-1どおりbackend間で成立しないため要求しない。
+> fuel枯渇のterminal `line`もstep粒度差でengine間に差があり、fuel parityはStepLimit terminalの
+> observable一致で担保する）。
+>
+> 一方、**FakeHost effect logのbyte/順序比較・StableError生成履歴・`normalize_for_conformance`後の
+> audit payload・yield/fuelの完全一致・AUD-019/024/048 fixture・AUD-022生成matrix/fuzz**は
+> Phase 5/6のdifferential gateの管轄で、PR-6cの射程外である（基盤が未実装）。
+> **pause/resume・cancel・host pending**はVMがscheduler非経由（Readyフォールバック・`vm.rs`不変）で
+> 実行経路を持たないため**VM対象外**（treeは`tests/scheduler_api.rs`で担保）。
+>
+> **PR-6c-min完了はVMのexperimental卒業ではない。** 卒業gateは本節§16のconformance（differential
+> matrix/fuzz差分0件・差分0件CI gate）であり後続フェーズの管轄である。
+
 ## 16. Phase完了条件
 
 Phase 5は、treeが唯一のproduction backendとなり、すべてのambient inputがHostBoundaryへ移り、DeterminismInputとbackend非依存規則が自動検証され、VMのproduction化に差分0件gateが設定された時点で完了とする。
