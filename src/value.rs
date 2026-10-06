@@ -419,6 +419,15 @@ pub enum Value {
         /// する。captured cell 実体は cell 側（`SharedValue`）で別途課金するため、ここでは
         /// header ぶんだけを持つ。`clone`（＝関数値の共有）は `Rc` ハンドル共有で無課金。
         header: Rc<FnHeader>,
+        /// この closure が retain する code object subtree（自分の `FnDef.body` と、そこから
+        /// transitive に辿れる内側 `FnDef` / `Lambda` の body）の §5.1 論理サイズ（`ast_node`
+        /// 単位）を課金する共有トークン集合（A-1、REV-015 Slice 6）。各トークンは Link 時に
+        /// code object 単位で 1 回だけ課金され、生成時に side-table 経由で `Rc::clone` 共有
+        /// される（追加課金なし）。この closure instance が生きているあいだ強参照を保ち、
+        /// その code object を retain する最後の `Rc` が drop した時点で release する（§5.2）。
+        /// header（instance 固有）とは別トークンとして並置する。`clone`（関数値の共有）は
+        /// `Rc` ハンドル共有で無課金。
+        retain_tokens: Vec<Rc<HeapToken>>,
     },
     /// VM用関数値（コンパイル済みバイトコード）
     /// Rc<Chunk> により関数呼び出し・クロージャ生成時のディープコピーを回避
@@ -435,6 +444,14 @@ pub enum Value {
         /// トークン（REV-015 PR-c）。生成時に課金し、最後の参照 drop で release する。
         /// upvalue cell 実体は cell 側で別途課金するため header ぶんだけを持つ。
         header: Rc<FnHeader>,
+        /// この closure が retain する code object subtree（自分の prototype `chunk` と、
+        /// そこから transitive に辿れる子孫 prototype chunk）の §5.1 論理サイズ
+        /// （`bytecode_chunk` 単位）を課金する共有トークン集合（A-1、REV-015 Slice 6）。
+        /// 各トークンは adopt 時に chunk 単位で 1 回だけ課金され、`MakeClosure` 時に
+        /// side-table 経由で `Rc::clone` 共有される（追加課金なし）。この closure instance が
+        /// 生きているあいだ強参照を保ち、その chunk を retain する最後の `Rc` が drop した
+        /// 時点で release する（§5.2）。header（instance 固有）とは別トークンとして並置する。
+        retain_tokens: Vec<Rc<HeapToken>>,
     },
     /// 構造化エラー値（try/catch で捕捉したエラー）
     /// Display では message を返すため、既存の文字列結合と互換性がある。

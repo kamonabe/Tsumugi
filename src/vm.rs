@@ -121,6 +121,20 @@ pub struct Vm {
     /// 入れ替えて release する。
     chunk_tokens: Vec<Rc<crate::value::HeapToken>>,
 
+    /// closure が retain する prototype chunk を課金する retained-code token の side-table
+    /// （A-1、REV-015 Slice 6、§5.3）。key は `Rc::as_ptr(&prototype.chunk)`（`*const Chunk`）、
+    /// value は adopt 時に立てた token（`chunk_tokens` が strong を保持）の `Weak`。
+    ///
+    /// `MakeClosure` は手元の `prototype.chunk`（および transitive な子孫 prototype chunk）を
+    /// この表から `Rc::as_ptr` で引き、`Weak::upgrade` した strong を `Rc::clone` して `VmFn`
+    /// の retain-token 集合へ載せる。closure 生成は adopt 入力と別入力になりうる（`MakeClosure`
+    /// は複数 `run_repl_chunk` を跨ぐ）ため、この表は `Weak` の長命 index として `Vm` の寿命を
+    /// 通じて保持し、入力ごとに破棄しない。`Weak` のみを持つので token 寿命は縛らない（token の
+    /// 生死は `chunk_tokens` または生成済み `VmFn` が握る strong だけが決める）。upgrade 失敗の
+    /// dead entry は次回同 key 挿入で上書きする（get-or-insert ではなく常に上書き）。raw-pointer
+    /// の跨入力 ABA は upgrade 可否＝token の生死で判定されるため実害がない（§5.3）。
+    retain_token_table: HashMap<*const Chunk, std::rc::Weak<crate::value::HeapToken>>,
+
     /// 関数値へ発番する次の FunctionId（AUD-048）。単調増加し、
     /// REPL の失敗入力でも巻き戻さない。
     next_function_id: u64,
@@ -157,6 +171,7 @@ impl Vm {
             try_handlers: Vec::new(),
             pending_heap_stop: None,
             chunk_tokens: Vec::new(),
+            retain_token_table: HashMap::new(),
             next_function_id: 0,
             script_args: Vec::new(),
             capabilities: crate::capability::CapabilitySet::ambient_compat(),
@@ -175,6 +190,7 @@ impl Vm {
             try_handlers: Vec::new(),
             pending_heap_stop: None,
             chunk_tokens: Vec::new(),
+            retain_token_table: HashMap::new(),
             next_function_id: 0,
             script_args: Vec::new(),
             capabilities: crate::capability::CapabilitySet::ambient_compat(),
@@ -288,9 +304,15 @@ impl Vm {
     /// `MakeClosure` で `VmFn` へ clone 共有されるが、それは同じ backing の共有なので
     /// 追加課金しない。charge は `Compile` フェーズ相当（adopt 時）に行う。再帰は
     /// prototype 木の深さに比例するが、深さは compile 時の関数ネストで有限。
+    ///
+    /// A-1（REV-015 Slice 6、§5.3）: 各 distinct chunk に立てた token の `Weak` を
+    /// `retain_token_table`（key=`Rc::as_ptr`）へ登録する。closure が retain する prototype
+    /// chunk を `MakeClosure` が後からこの表経由で引けるようにするため。root chunk も登録
+    /// するが（closure に retain されないため upgrade されずに終わるだけで無害）、prototype
+    /// chunk の登録が本質。
     fn charge_chunk_tree(
         &mut self,
-        chunk: &Chunk,
+        chunk: &Rc<Chunk>,
     ) -> Result<Vec<Rc<crate::value::HeapToken>>, TsumugiError> {
         let mut tokens = Vec::new();
         self.charge_chunk_tree_into(chunk, &mut tokens)?;
@@ -299,7 +321,7 @@ impl Vm {
 
     fn charge_chunk_tree_into(
         &mut self,
-        chunk: &Chunk,
+        chunk: &Rc<Chunk>,
         tokens: &mut Vec<Rc<crate::value::HeapToken>>,
     ) -> Result<(), TsumugiError> {
         let bytes = crate::budget::heap_size::bytecode_chunk(
@@ -309,11 +331,52 @@ impl Vm {
         let token =
             Value::new_heap_token(bytes, &self.budget.heap_handle(), ExecutionPhase::Compile)
                 .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, 0))?;
+        // retained-code token の side-table へ `Weak` を登録する（A-1、§5.3）。同 key への
+        // 再挿入は常に新 `Weak` で上書きする（get-or-insert ではない）。dead entry（upgrade
+        // 失敗）が raw-pointer ABA で残っていてもこの上書きで差し替わる。strong は `tokens`
+        // （後に `chunk_tokens` へ）が保持し、side-table は token 寿命を縛らない。
+        self.retain_token_table
+            .insert(Rc::as_ptr(chunk), Rc::downgrade(&token));
         tokens.push(token);
         for prototype in &chunk.prototypes {
             self.charge_chunk_tree_into(&prototype.chunk, tokens)?;
         }
         Ok(())
+    }
+
+    /// `MakeClosure` が、生成する closure の握る prototype chunk subtree（自分の chunk ＋
+    /// transitive な子孫 prototype chunk）の retained-code token を side-table から一括で引き、
+    /// `Rc::clone` した強参照集合を返す（A-1、REV-015 Slice 6、§5.3）。
+    ///
+    /// subtree 全体を一括で移譲するのは、内側 closure が後続入力で初めて生成される場合でも、
+    /// 外側 instance が子孫 token の strong を握り続けて side-table の `Weak::upgrade` を成立
+    /// させ続けるため（跨入力生成の不変量）。追加課金はしない（adopt 時に 1 回課金済み）。
+    /// upgrade に失敗した entry は（通常発生しないが）黙って skip する。
+    fn retain_tokens_for_chunk(&self, chunk: &Rc<Chunk>) -> Vec<Rc<crate::value::HeapToken>> {
+        let mut tokens = Vec::new();
+        let mut seen: std::collections::HashSet<*const Chunk> = std::collections::HashSet::new();
+        self.collect_retain_tokens(chunk, &mut tokens, &mut seen);
+        tokens
+    }
+
+    fn collect_retain_tokens(
+        &self,
+        chunk: &Rc<Chunk>,
+        tokens: &mut Vec<Rc<crate::value::HeapToken>>,
+        seen: &mut std::collections::HashSet<*const Chunk>,
+    ) {
+        // backing 同一性で 1 回だけ（§5.2 の共有は 1 回課金）。
+        if !seen.insert(Rc::as_ptr(chunk)) {
+            return;
+        }
+        if let Some(weak) = self.retain_token_table.get(&Rc::as_ptr(chunk))
+            && let Some(strong) = weak.upgrade()
+        {
+            tokens.push(strong);
+        }
+        for prototype in &chunk.prototypes {
+            self.collect_retain_tokens(&prototype.chunk, tokens, seen);
+        }
     }
 
     /// チャンクを実行する
@@ -1265,6 +1328,11 @@ impl Vm {
                     ExecutionPhase::Run,
                 )
                 .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))?;
+                // closure が retain する prototype chunk subtree（自分の chunk ＋ transitive な
+                // 子孫 prototype chunk）の retained-code token を side-table から一括で引き、
+                // `Rc::clone` した強参照を `VmFn` へ移譲する（A-1、REV-015 Slice 6、§5.3）。
+                // 追加課金はしない（adopt 時に 1 回課金済み）。
+                let retain_tokens = self.retain_tokens_for_chunk(&prototype.chunk);
                 self.stack.push(Value::VmFn {
                     id,
                     name: prototype.name.clone(),
@@ -1273,6 +1341,7 @@ impl Vm {
                     chunk: prototype.chunk.clone(),
                     upvalues: upvalue_cells,
                     header,
+                    retain_tokens,
                 });
             }
             OpCode::PrepareCall => {
@@ -2339,6 +2408,7 @@ mod tests {
             chunk: Rc::new(recursive),
             upvalues: Vec::new(),
             header: Value::fn_header_untracked(),
+            retain_tokens: Vec::new(),
         };
         let mut main = Chunk::new();
         main.emit_constant(function, 1);

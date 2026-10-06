@@ -1,5 +1,7 @@
 //! Tsumugi の抽象構文木（AST）
 
+use std::rc::Rc;
+
 /// プログラム全体 = 文のリスト
 pub type Program = Vec<Stmt>;
 
@@ -486,6 +488,13 @@ pub(crate) fn referenced_names(body: &[Stmt]) -> std::collections::HashSet<Strin
 /// tree evaluator は AST を直接実行するため、この論理サイズを Link フェーズで live heap
 /// へ課金する。VM は AST を bytecode へ compile するため、代わりに bytecode chunk を
 /// 課金する（§5.3「AST または bytecode」）。
+///
+/// A-1（REV-015 Slice 6、§5.3）以降、production の課金経路は `ast_closure_body_sizes`
+/// （非 closure 部と closure body 単位へ分割する走査）へ移った。本関数は program 全体の
+/// 論理サイズを一括で返す参照実装として test に残し、`root_bytes + Σ body_bytes` が本関数の
+/// 返り値と一致する（＝全 node がちょうど 1 つの owner に属し二重計上も漏れもない）ことの
+/// 回帰ゲートに使う。
+#[cfg(test)]
 pub(crate) fn ast_heap_size(program: &Program) -> u64 {
     use crate::budget::heap_size;
 
@@ -604,6 +613,331 @@ pub(crate) fn ast_heap_size(program: &Program) -> u64 {
     }
 
     total
+}
+
+/// closure が retain する code を course-object 単位の token で課金する（A-1、REV-015
+/// Slice 6）ための、AST を「非 closure 部（artifact token が課金する root）」と「各 distinct
+/// closure body（`FnDef.body` / `Lambda.body` の `Rc<[Stmt]>`）」へ分割し、それぞれの §5.1
+/// 論理サイズ小計を返す走査（`docs/execution-control.md` §5.3）。
+///
+/// `ast_heap_size` は 1 本の flat worklist で全 node を平坦に積み per-body 小計を保持しない
+/// ため、per-code-object 課金にはそのまま使えない（設計レビュー対応メモ参照）。本関数は
+/// body（`Rc<[Stmt]>`）を課金単位に区切る所有者スコープ走査へ再構成する:
+///
+/// - `AST program root`（64）＋ どの closure body にも属さない top-level node の `ast_node`
+///   小計を `root_bytes` として返す。
+/// - 各 `FnDef` / `Lambda` の body（distinct `Rc<[Stmt]>`）は 1 つの課金単位として、その body
+///   直下の node の `ast_node` 小計を計算する。body 内にさらにネストした `FnDef` / `Lambda`
+///   の body は再帰的に別単位へ切り出し、外側 body の小計からは除外する（二重課金回避境界）。
+/// - どの body がどの単位に属するかは backing 同一性（`Rc::as_ptr`）で判定する。同一
+///   `Rc<[Stmt]>` が複数ノードへ共有されても 1 単位に畳む（§5.2「共有は 1 回課金」）。
+///
+/// 戻り値 `bodies` の各 `Rc<[Stmt]>` は backing 同一性で一意化済み（同一 pointer は 1 回だけ）。
+/// 任意のネスト深度の distinct body を eager に列挙するため、評価されない dead branch / 未到達
+/// lambda の body も必ずどこかの単位に載り、uncharged 状態を作らない（§5.2）。
+pub(crate) fn ast_closure_body_sizes(program: &Program) -> (u64, Vec<(Block, u64)>) {
+    use crate::budget::heap_size;
+
+    let mut root_bytes = heap_size::AST_ROOT;
+    let mut bodies: Vec<(Block, u64)> = Vec::new();
+    // 既に単位として登録した body の backing pointer（§5.2 の 1 回課金・重複畳み込み用）。
+    let mut seen: std::collections::HashSet<*const [Stmt]> = std::collections::HashSet::new();
+
+    // owner スコープ単位で node を走査し、その owner の小計を返す。closure body に当たったら
+    // worklist へ平坦展開せず、別単位として `bodies` へ切り出して再帰する（境界）。
+    fn owned(bytes: &mut u64, s: &str) {
+        *bytes = bytes.saturating_add(s.len() as u64);
+    }
+
+    // 1 つの owner スコープ（root または 1 つの body）に属する stmt 列の `ast_node` 小計を
+    // 計算する。ネストした closure body は `bodies` へ切り出し、ここでは数えない。
+    fn walk_stmts(
+        stmts: &[Stmt],
+        subtotal: &mut u64,
+        bodies: &mut Vec<(Block, u64)>,
+        seen: &mut std::collections::HashSet<*const [Stmt]>,
+    ) {
+        for stmt in stmts {
+            walk_stmt(stmt, subtotal, bodies, seen);
+        }
+    }
+
+    fn record_body(
+        body: &Block,
+        bodies: &mut Vec<(Block, u64)>,
+        seen: &mut std::collections::HashSet<*const [Stmt]>,
+    ) {
+        // backing 同一性で 1 回だけ単位化する（同一 Rc の重複共有を畳む）。
+        if !seen.insert(Rc::as_ptr(body)) {
+            return;
+        }
+        let mut body_bytes = 0u64;
+        walk_stmts(body, &mut body_bytes, bodies, seen);
+        bodies.push((Rc::clone(body), body_bytes));
+    }
+
+    fn walk_stmt(
+        stmt: &Stmt,
+        subtotal: &mut u64,
+        bodies: &mut Vec<(Block, u64)>,
+        seen: &mut std::collections::HashSet<*const [Stmt]>,
+    ) {
+        let mut owned_bytes = 0u64;
+        match stmt {
+            Stmt::Let { name, value, .. } | Stmt::Assign { name, value, .. } => {
+                owned(&mut owned_bytes, name);
+                walk_expr(value, subtotal, bodies, seen);
+            }
+            Stmt::IndexAssign {
+                name, index, value, ..
+            } => {
+                owned(&mut owned_bytes, name);
+                walk_expr(index, subtotal, bodies, seen);
+                walk_expr(value, subtotal, bodies, seen);
+            }
+            Stmt::Return { value, .. } | Stmt::ExprStmt { expr: value, .. } => {
+                walk_expr(value, subtotal, bodies, seen);
+            }
+            Stmt::If {
+                condition,
+                then_body,
+                else_body,
+                ..
+            } => {
+                walk_expr(condition, subtotal, bodies, seen);
+                walk_stmts(then_body, subtotal, bodies, seen);
+                walk_stmts(else_body, subtotal, bodies, seen);
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                walk_expr(condition, subtotal, bodies, seen);
+                walk_stmts(body, subtotal, bodies, seen);
+            }
+            Stmt::For {
+                var, iter, body, ..
+            } => {
+                owned(&mut owned_bytes, var);
+                walk_expr(iter, subtotal, bodies, seen);
+                walk_stmts(body, subtotal, bodies, seen);
+            }
+            Stmt::FnDef {
+                name, params, body, ..
+            } => {
+                owned(&mut owned_bytes, name);
+                for p in params {
+                    owned(&mut owned_bytes, p);
+                }
+                // body は外側 owner に数えず、別の課金単位として切り出す（境界）。
+                record_body(body, bodies, seen);
+            }
+            Stmt::Import { path, .. } => owned(&mut owned_bytes, path),
+            Stmt::TryCatch {
+                try_body,
+                var,
+                catch_body,
+                ..
+            } => {
+                owned(&mut owned_bytes, var);
+                walk_stmts(try_body, subtotal, bodies, seen);
+                walk_stmts(catch_body, subtotal, bodies, seen);
+            }
+            Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        }
+        *subtotal = subtotal.saturating_add(heap_size::ast_node(owned_bytes));
+    }
+
+    fn walk_expr(
+        expr: &Expr,
+        subtotal: &mut u64,
+        bodies: &mut Vec<(Block, u64)>,
+        seen: &mut std::collections::HashSet<*const [Stmt]>,
+    ) {
+        let mut owned_bytes = 0u64;
+        match expr {
+            Expr::Str(s) => owned(&mut owned_bytes, s),
+            Expr::Ident(name) => owned(&mut owned_bytes, name),
+            Expr::List(items) => {
+                for item in items {
+                    walk_expr(item, subtotal, bodies, seen);
+                }
+            }
+            Expr::Dict(pairs) => {
+                for (key, value) in pairs {
+                    walk_expr(key, subtotal, bodies, seen);
+                    walk_expr(value, subtotal, bodies, seen);
+                }
+            }
+            Expr::BinOp { left, right, .. } => {
+                walk_expr(left, subtotal, bodies, seen);
+                walk_expr(right, subtotal, bodies, seen);
+            }
+            Expr::UnaryOp { expr, .. } => walk_expr(expr, subtotal, bodies, seen),
+            Expr::Call { callee, args } => {
+                walk_expr(callee, subtotal, bodies, seen);
+                for arg in args {
+                    walk_expr(arg, subtotal, bodies, seen);
+                }
+            }
+            Expr::Lambda { params, body } => {
+                for p in params {
+                    owned(&mut owned_bytes, p);
+                }
+                // body は外側 owner に数えず、別の課金単位として切り出す（境界）。
+                record_body(body, bodies, seen);
+            }
+            Expr::Index { object, index } => {
+                walk_expr(object, subtotal, bodies, seen);
+                walk_expr(index, subtotal, bodies, seen);
+            }
+            Expr::FStr(parts) => {
+                for part in parts {
+                    match part {
+                        FStrExprPart::Literal(s) => owned(&mut owned_bytes, s),
+                        FStrExprPart::Expr(child) => walk_expr(child, subtotal, bodies, seen),
+                    }
+                }
+            }
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Null => {}
+        }
+        *subtotal = subtotal.saturating_add(heap_size::ast_node(owned_bytes));
+    }
+
+    walk_stmts(program, &mut root_bytes, &mut bodies, &mut seen);
+    (root_bytes, bodies)
+}
+
+/// 1 つの closure body（`FnDef.body` / `Lambda.body`）と、そこから transitive に辿れる
+/// 子孫 closure body（内側 `FnDef` / `Lambda` の body）の backing pointer を列挙する
+/// （A-1、REV-015 Slice 6）。
+///
+/// closure 生成時（`Stmt::FnDef` / `Expr::Lambda` 評価）に、その closure が reachable に握る
+/// body subtree 全体の token を side-table から一括で引くために使う。自分の body と、body 内に
+/// ネストした全 closure body（深さ無制限）を backing 同一性（`Rc::as_ptr`）で列挙する。
+pub(crate) fn closure_body_subtree_ptrs(body: &Block) -> Vec<*const [Stmt]> {
+    let mut ptrs: Vec<*const [Stmt]> = Vec::new();
+    let mut seen: std::collections::HashSet<*const [Stmt]> = std::collections::HashSet::new();
+
+    fn collect_stmts(
+        stmts: &[Stmt],
+        ptrs: &mut Vec<*const [Stmt]>,
+        seen: &mut std::collections::HashSet<*const [Stmt]>,
+    ) {
+        for stmt in stmts {
+            collect_stmt(stmt, ptrs, seen);
+        }
+    }
+
+    fn add_body(
+        body: &Block,
+        ptrs: &mut Vec<*const [Stmt]>,
+        seen: &mut std::collections::HashSet<*const [Stmt]>,
+    ) {
+        if !seen.insert(Rc::as_ptr(body)) {
+            return;
+        }
+        ptrs.push(Rc::as_ptr(body));
+        collect_stmts(body, ptrs, seen);
+    }
+
+    fn collect_stmt(
+        stmt: &Stmt,
+        ptrs: &mut Vec<*const [Stmt]>,
+        seen: &mut std::collections::HashSet<*const [Stmt]>,
+    ) {
+        match stmt {
+            Stmt::Let { value, .. } | Stmt::Assign { value, .. } => collect_expr(value, ptrs, seen),
+            Stmt::IndexAssign { index, value, .. } => {
+                collect_expr(index, ptrs, seen);
+                collect_expr(value, ptrs, seen);
+            }
+            Stmt::Return { value, .. } | Stmt::ExprStmt { expr: value, .. } => {
+                collect_expr(value, ptrs, seen)
+            }
+            Stmt::If {
+                condition,
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_expr(condition, ptrs, seen);
+                collect_stmts(then_body, ptrs, seen);
+                collect_stmts(else_body, ptrs, seen);
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                collect_expr(condition, ptrs, seen);
+                collect_stmts(body, ptrs, seen);
+            }
+            Stmt::For { iter, body, .. } => {
+                collect_expr(iter, ptrs, seen);
+                collect_stmts(body, ptrs, seen);
+            }
+            Stmt::FnDef { body, .. } => add_body(body, ptrs, seen),
+            Stmt::TryCatch {
+                try_body,
+                catch_body,
+                ..
+            } => {
+                collect_stmts(try_body, ptrs, seen);
+                collect_stmts(catch_body, ptrs, seen);
+            }
+            Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Import { .. } => {}
+        }
+    }
+
+    fn collect_expr(
+        expr: &Expr,
+        ptrs: &mut Vec<*const [Stmt]>,
+        seen: &mut std::collections::HashSet<*const [Stmt]>,
+    ) {
+        match expr {
+            Expr::List(items) => {
+                for item in items {
+                    collect_expr(item, ptrs, seen);
+                }
+            }
+            Expr::Dict(pairs) => {
+                for (key, value) in pairs {
+                    collect_expr(key, ptrs, seen);
+                    collect_expr(value, ptrs, seen);
+                }
+            }
+            Expr::BinOp { left, right, .. } => {
+                collect_expr(left, ptrs, seen);
+                collect_expr(right, ptrs, seen);
+            }
+            Expr::UnaryOp { expr, .. } => collect_expr(expr, ptrs, seen),
+            Expr::Call { callee, args } => {
+                collect_expr(callee, ptrs, seen);
+                for arg in args {
+                    collect_expr(arg, ptrs, seen);
+                }
+            }
+            Expr::Lambda { body, .. } => add_body(body, ptrs, seen),
+            Expr::Index { object, index } => {
+                collect_expr(object, ptrs, seen);
+                collect_expr(index, ptrs, seen);
+            }
+            Expr::FStr(parts) => {
+                for part in parts {
+                    if let FStrExprPart::Expr(child) = part {
+                        collect_expr(child, ptrs, seen);
+                    }
+                }
+            }
+            Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::Str(_)
+            | Expr::Bool(_)
+            | Expr::Null
+            | Expr::Ident(_) => {}
+        }
+    }
+
+    add_body(body, &mut ptrs, &mut seen);
+    ptrs
 }
 
 /// Parserが複合式を構築するたびに、危険な深さへ到達していないか確認する。
@@ -725,6 +1059,76 @@ mod tests {
             assert!(
                 names.contains(expected),
                 "{expected} が集められていない: {names:?}"
+            );
+        }
+    }
+
+    /// A-1（REV-015 Slice 6）: 分割走査 `ast_closure_body_sizes` の
+    /// `root_bytes + Σ body_bytes` は、program 全体を一括計算する `ast_heap_size` と一致する。
+    /// ＝全 node がちょうど 1 つの owner（root か 1 つの closure body）に属し、二重計上も漏れも
+    /// ない。closure を含まないプログラムでは body は 0 個で root だけになる。
+    #[test]
+    fn closure_body_split_sums_to_total() {
+        for source in [
+            "let a = 1\nlet b = 2\n",
+            "let f = fn(x)\n  return x + 1\nend\n",
+            "fn outer(x)\n  fn inner(y)\n    return x + y\n  end\n  return inner\nend\n",
+            "let g = fn()\n  let h = fn() return 1 end\n  if true\n    let k = fn() return 2 end\n  end\n  return h\nend\n",
+        ] {
+            let program = parse_program(source);
+            let total = ast_heap_size(&program);
+            let (root_bytes, bodies) = ast_closure_body_sizes(&program);
+            let sum: u64 = root_bytes
+                + bodies
+                    .iter()
+                    .map(|(_, b)| *b)
+                    .fold(0u64, u64::saturating_add);
+            assert_eq!(
+                sum, total,
+                "root + Σbody が全体サイズと一致しない: source={source:?}"
+            );
+        }
+    }
+
+    /// closure を含まないプログラムは body 単位を 1 つも生まず、root がすべてを数える。
+    #[test]
+    fn no_closure_yields_no_body_units() {
+        let program = parse_program("let a = 1\nlet b = a + 2\nprint(b)\n");
+        let (root_bytes, bodies) = ast_closure_body_sizes(&program);
+        assert!(
+            bodies.is_empty(),
+            "closure がないので body 単位は 0 個のはず"
+        );
+        assert_eq!(root_bytes, ast_heap_size(&program));
+    }
+
+    /// ネストした closure の body は、各深度ごとに distinct な単位として eager に列挙される。
+    /// `closure_body_subtree_ptrs` は外側 body を起点に自分と全子孫 body を返す。
+    #[test]
+    fn nested_closure_bodies_enumerated_at_all_depths() {
+        let program = parse_program(
+            "fn outer(x)\n  fn mid(y)\n    fn inner(z)\n      return x + y + z\n    end\n    return inner\n  end\n  return mid\nend\n",
+        );
+        let (_root, bodies) = ast_closure_body_sizes(&program);
+        // outer / mid / inner の 3 つの body 単位。
+        assert_eq!(bodies.len(), 3, "全ネスト深度の body が列挙されるはず");
+
+        // outer の body を起点にした subtree は 3 つの body ptr（outer/mid/inner）を含む。
+        let Stmt::FnDef {
+            body: outer_body, ..
+        } = &program[0]
+        else {
+            panic!("先頭文は FnDef のはず");
+        };
+        let ptrs = closure_body_subtree_ptrs(outer_body);
+        assert_eq!(ptrs.len(), 3, "outer から transitive に 3 body を辿るはず");
+        // 列挙された ptr は分割走査が立てた body 単位の key と一致する。
+        let body_keys: std::collections::HashSet<*const [Stmt]> =
+            bodies.iter().map(|(b, _)| Rc::as_ptr(b)).collect();
+        for p in &ptrs {
+            assert!(
+                body_keys.contains(p),
+                "subtree ptr が body 単位に対応するはず"
             );
         }
     }
