@@ -276,7 +276,35 @@ pub struct Evaluator {
     /// 寿命でトークンを保持する。REPL では入力ごとに charge_link で入れ替えて release し、
     /// 前入力の AST を持ち越さない。VM は AST を bytecode へ compile するため、代わりに
     /// bytecode chunk を課金する（§5.3「AST または bytecode」）。
+    ///
+    /// A-1（REV-015 Slice 6、§5.3）では、この token は linked program の **非 closure 部**
+    /// （`AST program root` ＋ どの closure body にも属さない top-level node）だけを課金する。
+    /// 各 closure body（`FnDef.body` / `Lambda.body`）は `body_tokens` が code object 単位で
+    /// 別途課金する。
     ast_token: Option<Rc<crate::value::HeapToken>>,
+    /// 各 distinct closure body（`FnDef.body` / `Lambda.body` の `Rc<[Stmt]>`）の §5.1 論理
+    /// サイズ（`ast_node` 単位）を課金する retained-code token の artifact 保持側（A-1、
+    /// REV-015 Slice 6、§5.3）。Link 時に body ごとに 1 本立てて strong をここへ積み、`Weak` を
+    /// `retain_token_table` へ登録する。closure 生成までは artifact の寿命で token を生かし、
+    /// 生成時に closure instance（`Value::Fn`）へ `Rc::clone` 共有される。REPL では `ast_token`
+    /// と対称に入力ごとに無条件 clear して自分の strong を drop する（移譲済み token は生きて
+    /// いる closure instance 側 strong が last-ref を阻むので release されない）。
+    body_tokens: Vec<Rc<crate::value::HeapToken>>,
+    /// closure が retain する body を課金する retained-code token の side-table（A-1、
+    /// REV-015 Slice 6、§5.3）。key は `Rc::as_ptr(&body)`（`*const [Stmt]` fat pointer、
+    /// ptr+len で backing 同一性＝同一 `Rc` の slice を一意に指す。thin pointer へ落とさない）、
+    /// value は Link 時に立てた token（`body_tokens` が strong を保持）の `Weak`。
+    ///
+    /// 内側 closure は外側 closure が後続入力で call されて初めて生成されうる（跨入力生成）
+    /// ため、この表は `Weak` の長命 index として `Evaluator` の寿命を通じて保持し、入力ごとに
+    /// 破棄しない。`Weak` のみを持つので token 寿命は縛らない（生死は `body_tokens` または
+    /// 生成済み `Value::Fn` が握る strong だけが決める）。同 key への再挿入は常に新 `Weak` で
+    /// 上書きする（get-or-insert ではない）。raw-pointer の跨入力 ABA は upgrade 可否＝token の
+    /// 生死で判定されるため実害がない（§5.3）。
+    retain_token_table: std::collections::HashMap<
+        *const [crate::ast::Stmt],
+        std::rc::Weak<crate::value::HeapToken>,
+    >,
     /// 明示実行 frame の永続スタック（REV-015 Slice 3 PR-d）。従来は 1 回の実行ごとに
     /// `run_driver` のローカル `Vec<Frame>` を作っていたが、PR-d で `'static` になった frame を
     /// Evaluator が保持することで、跨 `poll` で continuation を維持し slice fuel 枯渇時に
@@ -370,6 +398,8 @@ impl Evaluator {
             next_function_id: 0,
             script_args: Vec::new(),
             ast_token: None,
+            body_tokens: Vec::new(),
+            retain_token_table: std::collections::HashMap::new(),
             frames: Vec::new(),
             slice_fuel_used: 0,
             slice_fuel_limit: None,
@@ -661,16 +691,59 @@ impl Evaluator {
             self.loader
                 .register_record_token(module.path.clone(), token);
         }
-        // 実行対象 AST（linked program）を live heap へ課金する（REV-015 PR-d）。前入力の
-        // AST token を先に drop（release）してから今回ぶんを課金し、二重計上しない。tree
+        // 実行対象 AST（linked program）を live heap へ課金する（REV-015 PR-d / Slice 6）。
+        // 前入力の token を先に drop（release）してから今回ぶんを課金し、二重計上しない。tree
         // engine は AST を直接実行するため execution の寿命でトークンを保持する。
+        //
+        // A-1（REV-015 Slice 6、§5.3）: linked program を「非 closure 部（root）」と「各
+        // distinct closure body」へ分割し、非 closure 部は `ast_token`（artifact 単位）で、各
+        // closure body は `body_tokens`（code object 単位）で別々の token を立てて課金する。
+        // closure body token の `Weak` を `retain_token_table` へ登録し、closure 生成時に
+        // instance へ移譲できるようにする。これにより retained closure の code が、closure が
+        // reachable な限り（artifact release 後も）課金され続ける。
+        //
+        // `ast_token` / `body_tokens` は入力ごとに無条件 clear して自分の strong を drop する。
+        // 生成済み closure instance が握る独立した `Rc::clone` は last-ref を阻むため、移譲済み
+        // code object の課金は closure が生きている限り残る（それが A-1 の核心）。dead branch /
+        // 未到達 lambda の body token は誰にも移譲されず、この clear で last-ref release される。
         self.ast_token = None;
-        let ast_bytes = crate::ast::ast_heap_size(linked_program);
+        self.body_tokens.clear();
+        let (root_bytes, body_sizes) = crate::ast::ast_closure_body_sizes(linked_program);
         let ast_token =
-            Value::new_heap_token(ast_bytes, &self.budget.heap_handle(), ExecutionPhase::Link)
+            Value::new_heap_token(root_bytes, &self.budget.heap_handle(), ExecutionPhase::Link)
                 .map_err(|stop| self.control_stop_to_error(stop, 0))?;
         self.ast_token = Some(ast_token);
+        for (body, body_bytes) in body_sizes {
+            let token =
+                Value::new_heap_token(body_bytes, &self.budget.heap_handle(), ExecutionPhase::Link)
+                    .map_err(|stop| self.control_stop_to_error(stop, 0))?;
+            // 同 key への再挿入は常に新 `Weak` で上書きする（get-or-insert ではない）。
+            self.retain_token_table
+                .insert(Rc::as_ptr(&body), Rc::downgrade(&token));
+            self.body_tokens.push(token);
+        }
         Ok(())
+    }
+
+    /// closure 生成時（`Stmt::FnDef` / `Expr::Lambda` 評価）に、その closure が reachable に
+    /// 握る body subtree 全体（自分の body ＋ transitive な内側 body）の retained-code token を
+    /// side-table から一括で引き、`Rc::clone` した強参照集合を返す（A-1、REV-015 Slice 6、
+    /// §5.3）。
+    ///
+    /// subtree 一括で移譲するのは、内側 closure が後続入力で初めて生成される場合でも、外側
+    /// instance が内側 token の strong を握り続けて side-table の `Weak::upgrade` を成立させ
+    /// 続けるため（跨入力生成の不変量）。追加課金はしない（Link 時に 1 回課金済み）。upgrade に
+    /// 失敗した entry は（通常発生しないが）黙って skip する。
+    fn retain_tokens_for_body(&self, body: &crate::ast::Block) -> Vec<Rc<crate::value::HeapToken>> {
+        let mut tokens = Vec::new();
+        for ptr in crate::ast::closure_body_subtree_ptrs(body) {
+            if let Some(weak) = self.retain_token_table.get(&ptr)
+                && let Some(strong) = weak.upgrade()
+            {
+                tokens.push(strong);
+            }
+        }
+        tokens
     }
 
     /// プログラム全体を実行
@@ -1770,6 +1843,10 @@ impl Evaluator {
                         .capture_referenced(&crate::ast::referenced_names(body)),
                 );
                 let header = self.new_fn_header(captured.len(), *line)?;
+                // closure が retain する body subtree の retained-code token を side-table から
+                // 一括で引き、`Rc::clone` した強参照を `Value::Fn` へ移譲する（A-1、REV-015
+                // Slice 6、§5.3）。追加課金はしない（Link 時に 1 回課金済み）。
+                let retain_tokens = self.retain_tokens_for_body(body);
                 self.env_set(
                     name,
                     Value::Fn {
@@ -1781,6 +1858,7 @@ impl Evaluator {
                         }),
                         captured,
                         header,
+                        retain_tokens,
                     },
                     *line,
                 )?;
@@ -2040,6 +2118,9 @@ impl Evaluator {
                         .capture_referenced(&crate::ast::referenced_names(body)),
                 );
                 let header = self.new_fn_header(captured.len(), line)?;
+                // closure が retain する body subtree の retained-code token を一括移譲する
+                // （A-1、REV-015 Slice 6、§5.3）。追加課金なし。
+                let retain_tokens = self.retain_tokens_for_body(body);
                 Ok(Value::Fn {
                     id,
                     def: Rc::new(FnDef {
@@ -2049,6 +2130,7 @@ impl Evaluator {
                     }),
                     captured,
                     header,
+                    retain_tokens,
                 })
             }
 

@@ -3942,6 +3942,7 @@ mod tests {
             }),
             captured: StdRc::new(captured),
             header: Value::fn_header_untracked(),
+            retain_tokens: Vec::new(),
         };
         l.charge_context_baseline([func], ExecutionPhase::Link)
             .unwrap();
