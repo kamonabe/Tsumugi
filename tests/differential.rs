@@ -286,10 +286,6 @@ enum ParityMode {
     /// 跨入力の usage 累積・rollback/release を見る fixture（source_bytes 累積・index recover・
     /// rollback release）に使う。byte-exact な heap 絶対値一致は設計 §5.3 A-1 により要求しない。
     InvariantAxesAndTrend,
-    /// 課金の有無・release 寿命（符号の向き）のみ突合する。engine 固有の表現差（tree=ast_node /
-    /// VM=bytecode_chunk）で live_heap/peak の絶対値が異なってよい retained-closure 系に使う
-    /// （設計 §5.3 A-1）。入力間 live_heap 増減の符号のみ突合する。
-    ChargedAndReleased,
 }
 
 /// REPL 継続 fixture の宣言。
@@ -375,12 +371,101 @@ fn assert_repl(fixture: &ReplFixture) {
             // 比較しない（fuel parity は fuel 境界 fixture と step env 行で担保。設計 §5.3 A-1）。
             assert_heap_trend_agrees(fixture.label, &tree, &vm);
         }
-        ParityMode::ChargedAndReleased => {
-            // 絶対値ではなく「入力間で live_heap が増える/減る向き（符号）」が両 engine で揃うこと
-            // を突合する（設計 §5.3 A-1）。
-            assert_heap_trend_agrees(fixture.label, &tree, &vm);
-        }
     }
+}
+
+// =============================================================================
+// in-process ランナー: retained-closure 課金（paired retained-vs-dropped）
+// =============================================================================
+//
+// retained-closure 系は「入力間増減の符号が両 engine で一致」だけでは **同方向の回帰**
+// （両 engine が同時に retained code を誤って release する / drop しても誰も release しない）を
+// 取りこぼす。削除した `closure_retain.rs` は 2 系列（retained vs dropped）を回し各 engine で
+// `retained > dropped` という **engine 内の絶対不変量** を assert していた。これを harness にも
+// 戻す: paired fixture で (1) 各 engine 内の `retained[cmp] > dropped[cmp]`（不変量 1/3）、
+// (2) 各 engine 内の drop 後の release = `post_drop < pre_drop`（不変量 2）、(3) engine 間の
+// 符号一致（不変量 4）を同時に固定する。live_heap 絶対値の engine 間 byte-exact 一致は
+// 設計 §5.3 A-1 により要求しない（engine 内の大小関係のみ使う）。
+
+/// retained-closure 課金の paired fixture 宣言。
+///
+/// `retained` と `dropped` は入力列。両列の先頭入力は closure を定義する共通 prefix で、
+/// 末尾（または指定遷移）で retained 列は closure を保持し続け、dropped 列は closure を drop する。
+struct PairedClosureFixture {
+    label: &'static str,
+    /// closure を保持し続ける入力列。
+    retained: &'static [&'static str],
+    /// 同じ prefix で最後に closure を drop する対照入力列。
+    dropped: &'static [&'static str],
+    /// `retained[cmp] > dropped[cmp]` を比較する入力 index（closure 保持 vs drop が分岐した後）。
+    cmp: usize,
+    /// drop による release を見る遷移: `pre` 入力後 > `post` 入力後（同一 dropped 列内の release）。
+    /// `None` のとき release 遷移の assert を省く（dropped 列が単純再束縛でないなど）。
+    release: Option<(usize, usize)>,
+}
+
+/// paired retained-vs-dropped fixture を両 engine で回し、engine 内の絶対不変量 +
+/// engine 間の符号一致を突合する。
+fn assert_paired_closure(fixture: &PairedClosureFixture) {
+    let (tree_retained, vm_retained) = both_engines_per_input(fixture.retained);
+    let (tree_dropped, vm_dropped) = both_engines_per_input(fixture.dropped);
+
+    let cmp = fixture.cmp;
+    let tree_r = tree_retained[cmp].live_heap_bytes;
+    let tree_d = tree_dropped[cmp].live_heap_bytes;
+    let vm_r = vm_retained[cmp].live_heap_bytes;
+    let vm_d = vm_dropped[cmp].live_heap_bytes;
+
+    // 不変量 1/3（engine 内の絶対不変量）: closure を保持する列は、drop する列より入力 cmp 完了後の
+    // live_heap が厳密に大きい。これを **各 engine 内で独立に** assert する。両 engine が同方向に
+    // 誤って release する回帰（符号一致だけでは通ってしまう）をここで落とす。
+    assert!(
+        tree_r > tree_d,
+        "[{}] tree: 保持 closure の retained code が入力{cmp} 後も課金され続けるはず \
+         (retained={tree_r}, dropped={tree_d})",
+        fixture.label
+    );
+    assert!(
+        vm_r > vm_d,
+        "[{}] VM: 保持 closure の retained code が入力{cmp} 後も課金され続けるはず \
+         (retained={vm_r}, dropped={vm_d})",
+        fixture.label
+    );
+
+    // 不変量 2（engine 内の release 寿命）: drop 列で closure を捨てる入力の後は、retained code が
+    // release され live_heap が減る（`post < pre`）。各 engine 内で独立に assert する。drop しても
+    // 誰も release しない回帰をここで落とす。
+    if let Some((pre, post)) = fixture.release {
+        let tree_pre = tree_dropped[pre].live_heap_bytes;
+        let tree_post = tree_dropped[post].live_heap_bytes;
+        let vm_pre = vm_dropped[pre].live_heap_bytes;
+        let vm_post = vm_dropped[post].live_heap_bytes;
+        assert!(
+            tree_post < tree_pre,
+            "[{}] tree: closure を drop した入力後は retained code が release されるはず \
+             (pre={tree_pre}, post={tree_post})",
+            fixture.label
+        );
+        assert!(
+            vm_post < vm_pre,
+            "[{}] VM: closure を drop した入力後は retained code が release されるはず \
+             (pre={vm_pre}, post={vm_post})",
+            fixture.label
+        );
+    }
+
+    // 不変量 4（engine 間の符号一致）: `retained[cmp] - dropped[cmp]` の符号が両 engine で揃う。
+    // 絶対値は engine 固有（tree=ast_node / VM=bytecode_chunk）で異なってよい（§5.3 A-1）が、
+    // 「保持列が drop 列より多い」という向きは両 engine で一致する。片方だけ落ちる非対称を禁じる。
+    let tree_delta = tree_r as i128 - tree_d as i128;
+    let vm_delta = vm_r as i128 - vm_d as i128;
+    assert_eq!(
+        tree_delta.signum(),
+        vm_delta.signum(),
+        "[{}] retained-dropped の符号が tree/VM で不一致 \
+         (tree_delta={tree_delta}, vm_delta={vm_delta})",
+        fixture.label
+    );
 }
 
 /// 入力間の live_heap 増減の向き（符号）が両 engine で揃うことを突合する（軸(B)・設計 §5.3 A-1）。
@@ -706,25 +791,30 @@ fn repl_continuation_rollback_release_agrees() {
 /// retained closure code の課金持続/解放（集約元: closure_retain.rs の 4 不変量）。
 ///
 /// closure が retain する code（tree=`FnDef.body`、VM=prototype `Rc<Chunk>`）は、engine 固有の
-/// 表現差で live_heap/peak の絶対値が異なってよい（§5.3 A-1）。よって `ChargedAndReleased` で
-/// 「入力間の live_heap 増減の向き（符号）」のみ突合する（byte-exact は要求しない）。
+/// 表現差で live_heap/peak の絶対値が異なってよい（§5.3 A-1）。よって byte-exact な engine 間
+/// 数値一致は求めず、**engine 内の大小関係（絶対不変量）+ engine 間の符号一致**で突合する。
 ///
-/// 不変量（closure_retain.rs から移植）:
-/// 1. closure を定義して保持したまま無関係入力を回しても retained code は両 engine で課金され続ける。
-/// 2. closure を drop する入力の後は両 engine とも retained code を release する。
-/// 3. 課金の有無・release 寿命の向きが両 engine で一致する（片方だけ落ちる非対称を禁じる）。
+/// 単純な「入力間増減の符号が両 engine で一致」だけだと、両 engine が同方向に誤って release する
+/// 回帰（例: 無関係入力で retained code を落とす / drop しても release しない）が符号一致のまま
+/// 通ってしまう。そこで paired fixture（retained 列 vs dropped 列）で各 engine 内の絶対不変量を
+/// assert する。削除した `closure_retain.rs` の以下 4 不変量を移植する。
+///
+/// - 不変量1: closure を保持したまま無関係入力を回しても retained code は課金され続ける（保持列 > drop 列、各 engine 内で独立に）。
+/// - 不変量2: closure を drop する入力の後は retained code が release される（post < pre、各 engine 内）。
+/// - 不変量3: （ネスト版・下の test）跨入力生成した内側 closure も保持列 > drop 列。
+/// - 不変量4: 保持列 - drop 列の符号が両 engine で一致する（片方だけ落ちる非対称を禁じる）。
 #[test]
 fn repl_continuation_retained_closure_charge_agrees() {
-    // 入力1 で closure 定義（live_heap 増）→ 入力2 無関係入力で保持（増減の向き一致）→
-    // 入力3 で closure を drop（live_heap 減）。各遷移の符号が両 engine で揃う。
-    assert_repl(&ReplFixture {
+    // retained 列: 入力1 で closure 定義 → 入力2 で無関係入力（closure 保持）。
+    // dropped 列: 入力1 で同じ closure 定義 → 入力2 で closure を drop（Int 再束縛）。
+    // 入力2 完了後（index 1）で retained[1] > dropped[1] を各 engine で assert（不変量 1）。
+    // dropped 列単体では input1(保持) > input2(drop 後) で release を assert（不変量 2）。
+    assert_paired_closure(&PairedClosureFixture {
         label: "REPL: retained closure の課金持続と解放",
-        inputs: &[
-            "let f = fn(x) x + 1 end\n", // 定義: 増
-            "let y = 1\n",               // 無関係入力: closure 保持
-            "f = 0\n",                   // closure を drop: 減
-        ],
-        parity: ParityMode::ChargedAndReleased,
+        retained: &["let f = fn(x) x + 1 end\n", "let y = 1\n"],
+        dropped: &["let f = fn(x) x + 1 end\n", "f = 0\n"],
+        cmp: 1,
+        release: Some((0, 1)),
     });
 }
 
@@ -733,13 +823,23 @@ fn repl_continuation_retained_closure_charge_agrees() {
 /// 外側を入力1 で定義 → 入力2 で呼んで内側を生成し保持 → 内側 retained code の課金持続。
 #[test]
 fn repl_continuation_nested_closure_charge_agrees() {
-    assert_repl(&ReplFixture {
+    // retained 列: 入力3 で無関係入力（内側 closure を保持）。
+    // dropped 列: 入力3 で g を drop（内側 closure を落とす）。
+    // 入力3 完了後（index 2）で retained[2] > dropped[2] を各 engine で assert（不変量 3）。
+    // dropped 列単体では input2(内側保持) > input3(drop 後) で release を assert（不変量 2）。
+    assert_paired_closure(&PairedClosureFixture {
         label: "REPL: ネスト closure 跨入力生成の課金",
-        inputs: &[
+        retained: &[
             "fn outer()\n  return fn(x) return x + 1 end\nend\n",
-            "let g = outer()\n", // 内側生成 + 保持: 増
-            "g = 0\n",           // 内側 drop: 減
+            "let g = outer()\n", // 内側生成 + 保持
+            "let z = 2\n",       // 無関係入力: 内側 closure 保持
         ],
-        parity: ParityMode::ChargedAndReleased,
+        dropped: &[
+            "fn outer()\n  return fn(x) return x + 1 end\nend\n",
+            "let g = outer()\n", // 内側生成 + 保持
+            "g = 0\n",           // 内側 closure を drop
+        ],
+        cmp: 2,
+        release: Some((1, 2)),
     });
 }
