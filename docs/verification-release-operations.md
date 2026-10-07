@@ -1,7 +1,7 @@
 # Tsumugi — 検証・リリース・運用設計
 
-最終更新: 2026-08-31
-設計ステータス: **実装仕様確定・未実装**
+最終更新: 2026-10-07
+設計ステータス: **実装仕様確定・部分実装**（検証ゲートの一部〔MSRV gate・all-targets Clippy、下記 VRO-AT-01/02 相当〕を実装済み。release workflow・fuzz/stress・coverage gate・drift 検査・artifact 署名・OCI image・Kubernetes manifest・運用 SLO は未実装。詳細は本文 1 節を参照）
 
 ## 1. 目的と適用範囲
 

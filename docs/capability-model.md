@@ -1,7 +1,7 @@
 # Tsumugi — Capability Model仕様
 
-最終更新: 2026-08-31
-設計ステータス: **実装仕様確定・未実装**
+最終更新: 2026-10-07
+設計ステータス: **実装仕様確定・実装進行中**（C1〜C5・C7・C8 実装済み。C6〔ModuleResolver／import 解決〕・C9／C10〔CLI safe/legacy・ambient 削除〕は未実装。詳細は [ロードマップ](roadmap.md) Phase 2 を参照）
 
 ## 1. 目的と規範範囲
 
