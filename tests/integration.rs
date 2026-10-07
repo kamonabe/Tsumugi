@@ -121,7 +121,10 @@ fn fixture_envs(name: &str, test_dir: &str) -> Vec<(String, String)> {
         "file_io" | "filesystem" | "string_utils" | "error_sandbox" => {
             envs.push(("TSUMUGI_SANDBOX".to_string(), test_dir.to_string()));
         }
-        // 無限ループを短い予算で止める
+        // 無限ループを短い予算で止める。REV-015 最終形移行 Slice 1（option B）以降、
+        // tree CLI 経路は legacy env を参照せず standard budget（total_fuel=1,000,000）で停止する
+        // ため上限値が異なる（tree=1000000 / VM=env 100）。VM は従来どおり legacy env を見るので
+        // この env を維持し、期待は `.expected_err`（tree）/ `.expected_err.vm`（VM）で分ける。
         "error_step_limit" => {
             envs.push(("TSUMUGI_MAX_STEPS".to_string(), "100".to_string()));
         }
@@ -655,6 +658,65 @@ fn user_call_depth_limit_applies_to_all_call_forms() {
             );
         }
     }
+}
+
+// =============================================================
+// REV-015 最終形移行 Slice 1: CLI 既定 budget の有限化（option B）
+// =============================================================
+
+/// option B の回帰固定: import なし CLI script は既定で有限 budget（standard の
+/// total_fuel=1,000,000）を受け取り、それを超える重いループは step 上限で停止して exit 1 に
+/// なる。legacy の unbounded/ambient 既定へ戻っていないことを subprocess で確認する。
+///
+/// この有限化は Engine API を通る tree 経路（`run_source`）にのみ効く。VM（`run_source_vm`）は
+/// legacy env 既定で別経路のため、本テストは tree（`use_vm=false`）に限定する。import あり root
+/// は `run_source_alpha`（legacy 既定）へフォールバックし option B を通らないため、import なし
+/// script に限る（設計 §3.1 / §11.2 finding 2）。30s 実時間 deadline は踏ませない（FakeClock
+/// ユニットで担保済み）。
+#[test]
+fn cli_default_budget_is_finite_for_import_less_script_tree() {
+    // 1,000,000 fuel を確実に超える import なしの重いループ。
+    let dir = TestDir::new("cli-option-b-heavy");
+    let script = dir.path.join("heavy.tsg");
+    std::fs::write(
+        &script,
+        "let i = 0\nwhile i < 100000000\n  i = i + 1\nend\n",
+    )
+    .expect("重いスクリプトの作成に失敗");
+
+    let context = "cli option-b heavy [tree-walk]";
+    let output = run_script_process(&script, false, &[], context);
+    let stdout = normalize(&String::from_utf8_lossy(&output.stdout));
+    let stderr = normalize(&String::from_utf8_lossy(&output.stderr));
+
+    assert!(
+        !output.status.success(),
+        "{context}: 既定 budget が無制限に戻っています（重いループが停止しませんでした）\n--- stderr ---\n{stderr}"
+    );
+    assert_eq!(stdout, "", "{context}: 予期しないstdout: {stdout}");
+    assert!(
+        stderr.contains("ステップ上限に達しました"),
+        "{context}: step 上限で停止していません\n--- stderr ---\n{stderr}"
+    );
+}
+
+/// option B 後も軽量な import なし script は exit 0 のまま（standard budget の範囲内）。
+#[test]
+fn cli_default_budget_allows_light_import_less_script_tree() {
+    let dir = TestDir::new("cli-option-b-light");
+    let script = dir.path.join("light.tsg");
+    std::fs::write(&script, "let a = 1\nprint(a + 2)\n").expect("軽量スクリプトの作成に失敗");
+
+    let context = "cli option-b light [tree-walk]";
+    let output = run_script_process(&script, false, &[], context);
+    let stdout = normalize(&String::from_utf8_lossy(&output.stdout));
+    let stderr = normalize(&String::from_utf8_lossy(&output.stderr));
+
+    assert!(
+        output.status.success(),
+        "{context}: 軽量 script が異常終了しました\n--- stderr ---\n{stderr}"
+    );
+    assert_eq!(stdout, "3", "{context}: 出力が一致しません");
 }
 
 // =============================================================
@@ -2915,10 +2977,13 @@ fn heap_release_recovers_across_reassignment_in_both_engines() {
 }
 
 #[test]
-fn heap_accumulation_trips_limit_in_both_engines() {
+fn heap_accumulation_trips_limit_on_vm() {
     // 対になる負のテスト: 1 つの List へ push し続けて解放しない場合は、live heap が
     // 単調増加して上限を超える。release が「なんでも通す」わけではないことを固定する。
     // iterable range(0, 1000)=32024 + 累積 push。上限 50000 は途中で必ず超える。
+    // REV-015 option B 以降、legacy env `TSUMUGI_MAX_LIVE_HEAP_BYTES` を参照するのは VM 経路の
+    // みなので、この env 駆動の累積テストは VM に限定する（tree 既定の有限性は fuel 側の
+    // `cli_default_budget_is_finite_for_import_less_script_tree` で固定）。
     let script = concat!(
         "let x = []\n",
         "for i in range(0, 1000)\n",
@@ -2930,27 +2995,29 @@ fn heap_accumulation_trips_limit_in_both_engines() {
     let path = std::path::Path::new(dir.as_str()).join("accum.tsg");
     std::fs::write(&path, script).expect("スクリプトの書き込みに失敗");
 
-    for use_vm in [false, true] {
-        let mode = if use_vm { "VM" } else { "tree" };
-        let mut cmd = Command::new(tsumugi_bin());
-        if use_vm {
-            cmd.arg("--vm");
-        }
-        cmd.arg(path.to_str().unwrap())
-            .env("TSUMUGI_MAX_LIVE_HEAP_BYTES", "50000");
-        let output = cmd.output().expect("tsumugi バイナリの実行に失敗");
-        let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
-        let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
-        // 累積で上限を超えるため "done" は出ず、heap 診断が出る。
-        assert!(
-            !normalize(&stdout).contains("done"),
-            "{mode}: 累積 push が上限を超えず完走してしまった: {stdout}"
-        );
-        assert!(
-            stderr.contains("ヒープ"),
-            "{mode}: 累積 push で heap 診断が出ない: {stderr}"
-        );
-    }
+    // REV-015 最終形移行 Slice 1（option B）以降、tree CLI 経路は legacy env
+    // `TSUMUGI_MAX_LIVE_HEAP_BYTES` を参照せず standard budget（max_live_heap_bytes=64 MiB）で
+    // 走るため、1000 要素の累積ではこの小さな env 上限を踏まない（64 MiB には遠く届かない）。
+    // したがって env で小さな heap 上限を課して「累積が上限を超える」ことを示すのは、legacy env
+    // を参照する VM 経路でのみ成立する。tree CLI 既定の有限性（standard budget が効くこと）は
+    // `cli_default_budget_is_finite_for_import_less_script_tree` が fuel 側で別途固定している。
+    // VM 経路（legacy env を参照する）で累積が env 上限を超えることを固定する。
+    let mut cmd = Command::new(tsumugi_bin());
+    cmd.arg("--vm")
+        .arg(path.to_str().unwrap())
+        .env("TSUMUGI_MAX_LIVE_HEAP_BYTES", "50000");
+    let output = cmd.output().expect("tsumugi バイナリの実行に失敗");
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
+    // 累積で上限を超えるため "done" は出ず、heap 診断が出る。
+    assert!(
+        !normalize(&stdout).contains("done"),
+        "VM: 累積 push が上限を超えず完走してしまった: {stdout}"
+    );
+    assert!(
+        stderr.contains("ヒープ"),
+        "VM: 累積 push で heap 診断が出ない: {stderr}"
+    );
 }
 
 #[test]

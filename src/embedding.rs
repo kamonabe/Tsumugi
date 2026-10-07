@@ -161,26 +161,17 @@ pub struct EngineConfig {
     pub backend: Backend,
     /// 言語 revision。
     pub language_revision: LanguageRevision,
-    /// この engine で作る [`ExecutionContext`] に適用する有限 [`BudgetConfig`]（REV-015 E11）。
-    ///
-    /// `None`（既定）のときは legacy env（`TSUMUGI_MAX_STEPS` 等）由来の既定 budget を使い、
-    /// 観測挙動を従来どおりに保つ。`Some` を設定すると fuel / heap / string / source / I-O の
-    /// 有限上限と deadline を host が明示できる。deadline を実効化するには
-    /// [`ExecutionRequest::with_deadline_clock`] で同 domain の clock を渡す。
-    ///
-    /// 仕様の最終形（[組み込みAPI仕様](../docs/embedding-api.md) 第6節）は budget を必須所有と
-    /// するが、Phase 1/2 の段階実装（同 §同・第3節「内部縦切りで段階実装できる」）として
-    /// ここでは optional にし、既定経路を壊さずに host が有限 budget を選べるようにする。
-    pub budget: Option<crate::budget::BudgetConfig>,
 }
 
 impl Default for EngineConfig {
-    /// 既定は `TreeWalk` + 現行 revision + legacy env budget（`budget: None`）。
+    /// 既定は `TreeWalk` + 現行 revision。
+    ///
+    /// budget は engine 単位ではなく [`ExecutionRequest`] が必須所有する（REV-015 最終形移行
+    /// Slice 1、[実行制御仕様](../docs/execution-control.md) §2 不変条件6 / §3）。
     fn default() -> Self {
         Self {
             backend: Backend::TreeWalk,
             language_revision: LanguageRevision::CURRENT,
-            budget: None,
         }
     }
 }
@@ -504,9 +495,9 @@ pub enum ExecutionOutcome {
     },
     /// 実行 deadline を超過して停止した（REV-015 E11、仕様第8節）。
     ///
-    /// [`ExecutionRequest::with_deadline_clock`] で渡した clock が
-    /// [`EngineConfig::budget`] の deadline に達したときに到達する catch 不能 terminal。
-    /// script からは catch できず、language-state は開始時点へ rollback される。
+    /// [`ExecutionRequest::new`] に渡した clock が、その request が所有する `budget.deadline` に
+    /// 達したときに到達する catch 不能 terminal。script からは catch できず、language-state は
+    /// 開始時点へ rollback される。
     DeadlineExceeded {
         /// terminal 時点の予算使用量 snapshot（仕様第6・12節）。
         usage: BudgetUsage,
@@ -959,56 +950,76 @@ use crate::eval::{Evaluator, RunPhase, SliceOutcome};
 
 /// 1 回の実行に対する不変の設定（仕様第6節 `ExecutionRequest`）。
 ///
-/// E3 では script 引数 snapshot だけを持つ最小の骨格。仕様の `execution_id` /
-/// frozen `CapabilitySet` / 有限 `BudgetConfig` / `CancellationToken` は Phase 2/3（E7・E11）で
+/// request は有限 [`BudgetConfig`](crate::budget::BudgetConfig) を**必須所有**し、deadline は
+/// `budget.deadline` だけに存在する（REV-015 最終形移行 Slice 1、[実行制御仕様](../docs/execution-control.md)
+/// §3 / §3.1、[組み込みAPI仕様](../docs/embedding-api.md) §6）。deadline を効かせる
+/// monotonic clock も必須所有し、`new(budget, clock)` が構築時に domain / accounting revision /
+/// deadline(>now) を検証する。仕様の `execution_id` / `CancellationToken` 必須所有は次スライスで
 /// 導入する。alpha facade（[`crate::engine::ExecutionRequest`]）とは別型。
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ExecutionRequest {
     /// `args()` が返すスクリプト引数 snapshot（binary 名・script path・CLI flag を含まない）。
     arguments: Vec<String>,
-    /// 最初の poll より前に cancel 済みか（Phase 1 の pre-run cancel、EMB-AT-12）。
-    ///
-    /// 実行前に確定した cancel を扱い、命令を1つも実行せずに [`ExecutionOutcome::Cancelled`] へ
-    /// 落とす（"pre-cancel は命令0"）。実行中の cancel は
-    /// [`ExecutionContext::cancellation_token`] 経由で行う（E11）。
-    pre_cancelled: bool,
     /// この実行に付与する frozen capability 集合（Phase 2 C1〜、deny-by-default）。
     ///
     /// 既定は [`CapabilitySet::empty`]（全 authority 拒否）。host が `with_capabilities` で
     /// 明示 grant した authority だけを許可する。実行後に評価器から clear され、reusable な
     /// context へ持ち越さない（仕様第15節 規則5・6）。
     capabilities: crate::capability::CapabilitySet,
-    /// deadline 確認に使う monotonic clock（REV-015 E11）。
+    /// この実行が所有する有限 budget（REV-015 最終形移行、必須）。
     ///
-    /// `None`（既定）なら deadline を効かせない（観測挙動は従来どおり）。`Some` のときは
-    /// [`EngineConfig::budget`] の `deadline` と同じ domain（`clock_id` 一致）でなければならず、
-    /// 実行中に `clock.now() >= deadline` に達すると [`ExecutionOutcome::DeadlineExceeded`]
-    /// terminal で停止する（script からは catch できない）。clock と deadline の domain 不一致は
-    /// [`Engine::run`] が [`ExecutionOutcome::InternalFailure`] として拒否する（host の前提条件
-    /// 違反）。
-    deadline_clock: Option<Arc<dyn crate::budget::MonotonicClock>>,
+    /// deadline は `budget.deadline` だけに存在する（別経路の optional deadline は持たない）。
+    budget: crate::budget::BudgetConfig,
+    /// `budget.deadline` を効かせる monotonic clock（必須）。
+    ///
+    /// `budget.deadline` と同じ domain（`clock_id` 一致）でなければならず、`new` が構築時に
+    /// 検証する。実行中に `clock.now() >= budget.deadline` へ達すると
+    /// [`ExecutionOutcome::DeadlineExceeded`] terminal で停止する（script からは catch できない）。
+    clock: Arc<dyn crate::budget::MonotonicClock>,
+    /// 最初の poll より前に cancel 済みか（Phase 1 の pre-run cancel、EMB-AT-12）。
+    ///
+    /// 実行前に確定した cancel を扱い、命令を1つも実行せずに [`ExecutionOutcome::Cancelled`] へ
+    /// 落とす（"pre-cancel は命令0"）。実行中の cancel は
+    /// [`ExecutionContext::cancellation_token`] 経由で行う（E11）。
+    pre_cancelled: bool,
 }
 
 impl std::fmt::Debug for ExecutionRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // 引数値や capability 本文を Debug へ出さない（secret-free）。件数・有無だけを見せる。
+        // 引数値や capability 本文・budget 値を Debug へ出さない（secret-free）。件数・有無だけを
+        // 見せる。budget は常に所有するので「有無」を出す意味はない。
         f.debug_struct("ExecutionRequest")
             .field("argument_count", &self.arguments.len())
             .field("pre_cancelled", &self.pre_cancelled)
-            .field("has_deadline_clock", &self.deadline_clock.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl ExecutionRequest {
-    /// 引数なしの実行リクエストを作る（capability は empty＝deny-by-default）。
-    pub fn new() -> Self {
-        Self {
+    /// 有限 budget と、その deadline を効かせる clock を必須で受け取って実行リクエストを作る
+    /// （REV-015 最終形移行 Slice 1、仕様第6節）。
+    ///
+    /// `clock` は `budget.deadline` を生成した clock と同じ domain（`clock_id` 一致）でなければ
+    /// ならない。構築時に [`BudgetConfig::validate`](crate::budget::BudgetConfig::validate) を
+    /// 呼び、clock domain 不一致を [`BudgetConfigError::ForeignClock`](crate::budget::ConfigError::ForeignClock)、
+    /// `heap_accounting_revision != 1` を
+    /// [`BudgetConfigError::UnsupportedAccountingRevision`](crate::budget::ConfigError::UnsupportedAccountingRevision)、
+    /// deadline が作成時点以前なら
+    /// [`BudgetConfigError::DeadlineNotInFuture`](crate::budget::ConfigError::DeadlineNotInFuture)
+    /// で弾く。capability は既定で empty（deny-by-default）、引数は空で、`with_arguments` /
+    /// `with_capabilities` で設定する。
+    pub fn new(
+        budget: crate::budget::BudgetConfig,
+        clock: Arc<dyn crate::budget::MonotonicClock>,
+    ) -> Result<Self, crate::budget::ConfigError> {
+        budget.validate(clock.as_ref())?;
+        Ok(Self {
             arguments: Vec::new(),
-            pre_cancelled: false,
             capabilities: crate::capability::CapabilitySet::empty(),
-            deadline_clock: None,
-        }
+            budget,
+            clock,
+            pre_cancelled: false,
+        })
     }
 
     /// スクリプト引数 snapshot を設定する（AUD-018、仕様第6節）。
@@ -1032,18 +1043,6 @@ impl ExecutionRequest {
     /// （第10節 規則5）、context は poison されないので再利用できる。
     pub fn pre_cancelled(mut self) -> Self {
         self.pre_cancelled = true;
-        self
-    }
-
-    /// deadline 確認に使う monotonic clock を設定する（REV-015 E11、仕様第7節）。
-    ///
-    /// [`EngineConfig::budget`] に deadline を設定したうえでこの clock を渡すと、実行中に
-    /// `clock.now() >= deadline` へ達した時点で [`ExecutionOutcome::DeadlineExceeded`] terminal
-    /// で停止する。clock は deadline と同じ domain（`clock_id` 一致）でなければならない
-    /// （通常は `BudgetConfig::standard(&clock)` を作った clock をそのまま渡す）。domain が
-    /// 一致しない場合、[`Engine::run`] は [`ExecutionOutcome::InternalFailure`] を返す。
-    pub fn with_deadline_clock(mut self, clock: Arc<dyn crate::budget::MonotonicClock>) -> Self {
-        self.deadline_clock = Some(clock);
         self
     }
 }
@@ -1100,15 +1099,13 @@ pub struct ExecutionContext {
 impl ExecutionContext {
     /// 指定した engine 用の実行コンテキストを作る（仕様第6節 `ExecutionContext::new`）。
     ///
-    /// engine の [`EngineConfig::budget`] が `Some` ならその有限 [`BudgetConfig`] を評価器へ
-    /// 適用する（REV-015 E11）。`None` なら legacy env 由来の既定 budget を使い、観測挙動を
-    /// 従来どおりに保つ。budget（fuel / heap / string / source / I-O / deadline）は context の
-    /// 評価器が保持し、この context での全 execution が共有する。
+    /// budget は [`ExecutionRequest`] が必須所有し、[`Engine::run`] が実行直前に評価器へ据え直す
+    /// （REV-015 最終形移行 Slice 1）。context 生成時点では budget を確定できないため、評価器は
+    /// bootstrap 用の既定（legacy env 由来）で作る。実際の実行で効く budget は常に request の
+    /// ものになる。cancellation token は context 寿命で持続し、`reset_budget` をまたいで有効に
+    /// 保たれる（finding 1）。
     pub fn new(engine: &Engine) -> Self {
-        let evaluator = match &engine.config().budget {
-            Some(budget) => Evaluator::with_budget(*budget),
-            None => Evaluator::new(),
-        };
+        let evaluator = Evaluator::new();
         Self {
             engine_id: engine.id(),
             evaluator,
@@ -1321,26 +1318,27 @@ impl Engine {
             panic!("injected run-boundary panic (test only)");
         }
 
+        // request は有限 budget と deadline clock を必須所有する（REV-015 最終形移行 Slice 1）。
+        // 実行直前に評価器へ据え直す。domain / accounting revision / deadline(>now) は
+        // ExecutionRequest::new が構築時に検証済みなので、ここで InternalFailure へ落ちる
+        // domain-mismatch 経路は存在しない。reset_budget は現 ledger の cancellation token を
+        // 引き継ぐため、host が run 前に取得した token を壊さない（finding 1）。pre_cancelled 判定
+        // より前に置くことで、pre-cancel で返す usage も「この request の budget」に対するものに
+        // なる。
+        context
+            .evaluator
+            .reset_budget(request.budget, request.clock);
+
         // pre-run cancel（EMB-AT-12）: 最初の poll より前に cancel 済みなら、script 命令を
         // 1つも実行せずに Cancelled terminal を返す（"pre-cancel は命令0"）。language-state は
         // 何も変更していないので rollback は自明に成立し、context は poison されない
         // （第10節 規則4・5）。
         if request.pre_cancelled {
-            // 命令0なので usage は空（begin_execution 前）。
+            // 命令0なので usage は空（reset_budget 直後・baseline 課金前。committed/reserved/live
+            // とも 0）。finding 3。
             return ExecutionOutcome::Cancelled {
                 usage: context.evaluator.budget_usage(),
             };
-        }
-
-        // deadline 用 clock を注入する（REV-015 E11）。clock と config.deadline の domain 不一致は
-        // host の前提条件違反なので InternalFailure で拒否する（`BudgetConfig::validate`）。
-        if let Some(clock) = request.deadline_clock {
-            if let Err(err) = context.evaluator.validate_budget_against(clock.as_ref()) {
-                return internal_failure(format!(
-                    "deadline clock が budget config と整合しません: {err:?}"
-                ));
-            }
-            context.evaluator.set_deadline_clock(clock);
         }
 
         // 引数 snapshot と frozen capability 集合を評価器へ注入する（AUD-018 / Phase 2 C1〜）。
@@ -1709,6 +1707,20 @@ pub(crate) mod hash {
 mod tests {
     use super::*;
 
+    /// 決定的 test 用の standard budget + 共有 clock から [`ExecutionRequest`] を作る helper。
+    ///
+    /// 単一の [`FakeClock`](crate::budget::FakeClock) を 1 個作り、`standard` budget の deadline
+    /// 生成と request への clock 注入で同一 instance を共有する（CLI の option B と同じ構成）。
+    /// deadline は `now + 30s` の遠い未来なので、FakeClock を進めない限り到達しない。
+    fn standard_request() -> ExecutionRequest {
+        let clock: Arc<dyn crate::budget::MonotonicClock> =
+            Arc::new(crate::budget::FakeClock::new());
+        let budget = crate::budget::BudgetConfig::standard(clock.as_ref())
+            .expect("standard budget の生成は成功する");
+        ExecutionRequest::new(budget, clock)
+            .expect("standard budget は自身を生成した clock と同 domain なので検証を通る")
+    }
+
     #[test]
     fn default_config_is_tree_walk_current() {
         let config = EngineConfig::default();
@@ -1736,7 +1748,6 @@ mod tests {
         let config = EngineConfig {
             backend: Backend::VmExperimental,
             language_revision: LanguageRevision::CURRENT,
-            ..EngineConfig::default()
         };
         let err = Engine::builder()
             .config(config.clone())
@@ -2039,7 +2050,7 @@ mod tests {
             .unwrap();
         let linked = engine.link(&script, LinkRequest::new()).unwrap();
         let mut ctx = ExecutionContext::new(&engine);
-        let outcome = engine.run(&linked, &mut ctx, ExecutionRequest::new());
+        let outcome = engine.run(&linked, &mut ctx, standard_request());
         assert!(matches!(outcome, ExecutionOutcome::Completed { .. }));
     }
 
@@ -2058,7 +2069,7 @@ mod tests {
             .unwrap();
         let linked = engine.link(&script, LinkRequest::new()).unwrap();
         let mut ctx = ExecutionContext::new(&engine);
-        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+        match engine.run(&linked, &mut ctx, standard_request()) {
             ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, ErrorKind::Name);
                 assert_eq!(error.line, Some(1));
@@ -2082,7 +2093,7 @@ mod tests {
             .unwrap();
         let linked = engine.link(&script, LinkRequest::new()).unwrap();
         let mut ctx = ExecutionContext::new(&engine);
-        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+        match engine.run(&linked, &mut ctx, standard_request()) {
             ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, ErrorKind::Name);
                 assert!(
@@ -2104,7 +2115,7 @@ mod tests {
             .unwrap();
         let linked = engine.link(&script, LinkRequest::new()).unwrap();
         let mut ctx = ExecutionContext::new(&engine);
-        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+        match engine.run(&linked, &mut ctx, standard_request()) {
             ExecutionOutcome::InternalFailure { fault_id, .. } => {
                 assert_ne!(fault_id, 0);
             }
@@ -2128,7 +2139,7 @@ mod tests {
         let linked = engine_a.link(&script, LinkRequest::new()).unwrap();
         let mut foreign_ctx = ExecutionContext::new(&engine_b);
         assert!(matches!(
-            engine_a.run(&linked, &mut foreign_ctx, ExecutionRequest::new()),
+            engine_a.run(&linked, &mut foreign_ctx, standard_request()),
             ExecutionOutcome::InternalFailure { .. }
         ));
     }
@@ -2149,7 +2160,7 @@ mod tests {
             .unwrap();
         let linked1 = engine.link(&first, LinkRequest::new()).unwrap();
         assert!(matches!(
-            engine.run(&linked1, &mut ctx, ExecutionRequest::new()),
+            engine.run(&linked1, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
         ));
 
@@ -2164,7 +2175,7 @@ mod tests {
             .unwrap();
         let linked2 = engine.link(&second, LinkRequest::new()).unwrap();
         assert!(matches!(
-            engine.run(&linked2, &mut ctx, ExecutionRequest::new()),
+            engine.run(&linked2, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
         ));
     }
@@ -2227,14 +2238,14 @@ mod tests {
 
         // 変数を代入した直後に未定義参照でエラー化する。rollback されれば committed は残らない。
         let linked = compile_link(&engine, "m", "let saved = 7\nlet boom = undefined_name\n");
-        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+        match engine.run(&linked, &mut ctx, standard_request()) {
             ExecutionOutcome::RuntimeError { error, .. } => assert_eq!(error.code, ErrorKind::Name),
             other => panic!("期待: RuntimeError, 実際: {other:?}"),
         }
 
         // rollback 済みなので saved は次実行から見えない（見えれば Name エラーで判別できる）。
         let probe = compile_link(&engine, "m", "let echo = saved\n");
-        match engine.run(&probe, &mut ctx, ExecutionRequest::new()) {
+        match engine.run(&probe, &mut ctx, standard_request()) {
             ExecutionOutcome::RuntimeError { error, .. } => assert_eq!(error.code, ErrorKind::Name),
             other => panic!("saved が rollback されず残った: {other:?}"),
         }
@@ -2248,13 +2259,13 @@ mod tests {
 
         let first = compile_link(&engine, "m", "let saved = 41\n");
         assert!(matches!(
-            engine.run(&first, &mut ctx, ExecutionRequest::new()),
+            engine.run(&first, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
         ));
         // commit 済みなので次実行から saved を参照できる。
         let second = compile_link(&engine, "m", "let doubled = saved + 1\n");
         assert!(matches!(
-            engine.run(&second, &mut ctx, ExecutionRequest::new()),
+            engine.run(&second, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
         ));
     }
@@ -2271,13 +2282,13 @@ mod tests {
             "let saved = 0\ntry\n  let x = undefined_name\ncatch e\n  saved = 5\nend\n",
         );
         assert!(matches!(
-            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            engine.run(&linked, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
         ));
         // catch 後に代入した saved=5 は commit され、次実行から見える。
         let probe = compile_link(&engine, "m", "let echo = saved + 1\n");
         assert!(matches!(
-            engine.run(&probe, &mut ctx, ExecutionRequest::new()),
+            engine.run(&probe, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
         ));
     }
@@ -2290,7 +2301,7 @@ mod tests {
 
         let bad = compile_link(&engine, "m", "let x = undefined_name\n");
         assert!(matches!(
-            engine.run(&bad, &mut ctx, ExecutionRequest::new()),
+            engine.run(&bad, &mut ctx, standard_request()),
             ExecutionOutcome::RuntimeError { .. }
         ));
         assert!(!ctx.is_poisoned(), "RuntimeError は poison しない");
@@ -2298,7 +2309,7 @@ mod tests {
         // そのまま再利用して正常実行できる。
         let ok = compile_link(&engine, "m", "let y = 1\n");
         assert!(matches!(
-            engine.run(&ok, &mut ctx, ExecutionRequest::new()),
+            engine.run(&ok, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
         ));
     }
@@ -2315,7 +2326,7 @@ mod tests {
             .unwrap();
         let linked = engine.link(&script, LinkRequest::new()).unwrap();
         assert!(matches!(
-            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            engine.run(&linked, &mut ctx, standard_request()),
             ExecutionOutcome::InternalFailure { .. }
         ));
         assert!(ctx.is_poisoned(), "InternalFailure は poison する");
@@ -2323,7 +2334,7 @@ mod tests {
         // poison 済み context は以後 InternalFailure を返す（正しい retained script でも）。
         let ok = compile_link(&engine, "m", "let y = 1\n");
         assert!(matches!(
-            engine.run(&ok, &mut ctx, ExecutionRequest::new()),
+            engine.run(&ok, &mut ctx, standard_request()),
             ExecutionOutcome::InternalFailure { .. }
         ));
         // 状態操作も Poisoned で拒否する。
@@ -2338,14 +2349,14 @@ mod tests {
 
         let seed = compile_link(&engine, "m", "let saved = 9\n");
         assert!(matches!(
-            engine.run(&seed, &mut ctx, ExecutionRequest::new()),
+            engine.run(&seed, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
         ));
         ctx.clear_user_state().expect("clear on idle context");
 
         // clear 後は saved が見えない（見えれば commit されている）。
         let probe = compile_link(&engine, "m", "let echo = saved\n");
-        match engine.run(&probe, &mut ctx, ExecutionRequest::new()) {
+        match engine.run(&probe, &mut ctx, standard_request()) {
             ExecutionOutcome::RuntimeError { error, .. } => assert_eq!(error.code, ErrorKind::Name),
             other => panic!("clear 後も saved が残った: {other:?}"),
         }
@@ -2370,12 +2381,12 @@ mod tests {
 
         // pre-cancel。副作用（binding）が起きれば後段の probe で検出できる。
         let linked = compile_link(&engine, "m", "let saved = 123\n");
-        let outcome = engine.run(&linked, &mut ctx, ExecutionRequest::new().pre_cancelled());
+        let outcome = engine.run(&linked, &mut ctx, standard_request().pre_cancelled());
         assert!(matches!(outcome, ExecutionOutcome::Cancelled { .. }));
 
         // 命令0なので saved は commit されない（見えれば Name エラーで判別できる）。
         let probe = compile_link(&engine, "m", "let echo = saved\n");
-        match engine.run(&probe, &mut ctx, ExecutionRequest::new()) {
+        match engine.run(&probe, &mut ctx, standard_request()) {
             ExecutionOutcome::RuntimeError { error, .. } => assert_eq!(error.code, ErrorKind::Name),
             other => panic!("pre-cancel が副作用を残した: {other:?}"),
         }
@@ -2389,7 +2400,7 @@ mod tests {
 
         let linked = compile_link(&engine, "m", "let x = 1\n");
         assert!(matches!(
-            engine.run(&linked, &mut ctx, ExecutionRequest::new().pre_cancelled()),
+            engine.run(&linked, &mut ctx, standard_request().pre_cancelled()),
             ExecutionOutcome::Cancelled { .. }
         ));
         assert!(!ctx.is_poisoned(), "Cancelled は poison しない");
@@ -2397,7 +2408,7 @@ mod tests {
         // そのまま再利用して正常実行できる。
         let ok = compile_link(&engine, "m", "let y = 2\n");
         assert!(matches!(
-            engine.run(&ok, &mut ctx, ExecutionRequest::new()),
+            engine.run(&ok, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
         ));
     }
@@ -2414,14 +2425,14 @@ mod tests {
             .unwrap();
         let linked = engine.link(&script, LinkRequest::new()).unwrap();
         assert!(matches!(
-            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            engine.run(&linked, &mut ctx, standard_request()),
             ExecutionOutcome::InternalFailure { .. }
         ));
 
         // poison 後は pre-cancel でも InternalFailure（precondition 優先、第10節 規則4）。
         let ok = compile_link(&engine, "m", "let y = 1\n");
         assert!(matches!(
-            engine.run(&ok, &mut ctx, ExecutionRequest::new().pre_cancelled()),
+            engine.run(&ok, &mut ctx, standard_request().pre_cancelled()),
             ExecutionOutcome::InternalFailure { .. }
         ));
     }
@@ -2471,8 +2482,7 @@ mod tests {
         // 実行スレッド上で評価器を panic させる注入 hook（test 専用）。
         ctx.inject_run_panic_for_test();
         let linked = compile_link(&engine, "m", "let x = 1\n");
-        let outcome =
-            with_silent_panic_hook(|| engine.run(&linked, &mut ctx, ExecutionRequest::new()));
+        let outcome = with_silent_panic_hook(|| engine.run(&linked, &mut ctx, standard_request()));
         match outcome {
             ExecutionOutcome::InternalFailure {
                 fault_id,
@@ -2489,7 +2499,7 @@ mod tests {
         // running フラグは panic 後も解除され、再入検査で誤検出しない。
         let ok = compile_link(&engine, "m", "let y = 1\n");
         assert!(matches!(
-            engine.run(&ok, &mut ctx, ExecutionRequest::new()),
+            engine.run(&ok, &mut ctx, standard_request()),
             ExecutionOutcome::InternalFailure { .. }
         ));
     }
@@ -2523,7 +2533,7 @@ mod tests {
         let outcome = engine.run(
             &linked,
             &mut ctx,
-            ExecutionRequest::new().with_capabilities(exit_granted()),
+            standard_request().with_capabilities(exit_granted()),
         );
         assert!(matches!(outcome, ExecutionOutcome::Exited { code: c, .. } if c == (7)));
     }
@@ -2538,7 +2548,7 @@ mod tests {
             let outcome = engine.run(
                 &linked,
                 &mut ctx,
-                ExecutionRequest::new().with_capabilities(exit_granted()),
+                standard_request().with_capabilities(exit_granted()),
             );
             assert!(matches!(outcome, ExecutionOutcome::Exited { code: got, .. } if got == code));
         }
@@ -2554,7 +2564,7 @@ mod tests {
             engine.run(
                 &first,
                 &mut ctx,
-                ExecutionRequest::new().with_capabilities(exit_granted())
+                standard_request().with_capabilities(exit_granted())
             ),
             ExecutionOutcome::Exited { code: 0, .. }
         ));
@@ -2564,7 +2574,7 @@ mod tests {
             engine.run(
                 &probe,
                 &mut ctx,
-                ExecutionRequest::new().with_capabilities(exit_granted())
+                standard_request().with_capabilities(exit_granted())
             ),
             ExecutionOutcome::Completed { .. }
         ));
@@ -2578,7 +2588,7 @@ mod tests {
         let mut ctx = ExecutionContext::new(&engine);
         // 既定 request は deny-by-default（capability なし）。
         let linked = compile_link(&engine, "m", "exit(0)\n");
-        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+        match engine.run(&linked, &mut ctx, standard_request()) {
             ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, crate::error::ErrorKind::Capability);
             }
@@ -2598,7 +2608,7 @@ mod tests {
         );
         // catch されれば正常完了する。
         assert!(matches!(
-            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            engine.run(&linked, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
         ));
     }
@@ -2613,7 +2623,7 @@ mod tests {
             match engine.run(
                 &linked,
                 &mut ctx,
-                ExecutionRequest::new().with_capabilities(exit_granted()),
+                standard_request().with_capabilities(exit_granted()),
             ) {
                 ExecutionOutcome::RuntimeError { error, .. } => {
                     assert_eq!(error.code, crate::error::ErrorKind::Argument);
@@ -2638,7 +2648,7 @@ mod tests {
             engine.run(
                 &linked,
                 &mut ctx,
-                ExecutionRequest::new().with_capabilities(exit_granted())
+                standard_request().with_capabilities(exit_granted())
             ),
             ExecutionOutcome::Exited { code: 3, .. }
         ));
@@ -2653,13 +2663,13 @@ mod tests {
         engine.run(
             &linked,
             &mut ctx,
-            ExecutionRequest::new().with_capabilities(exit_granted()),
+            standard_request().with_capabilities(exit_granted()),
         );
         assert!(!ctx.is_poisoned());
         // 再利用できる。
         let ok = compile_link(&engine, "m", "let x = 1\n");
         assert!(matches!(
-            engine.run(&ok, &mut ctx, ExecutionRequest::new()),
+            engine.run(&ok, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
         ));
     }
@@ -2718,7 +2728,7 @@ mod tests {
         let outcome = engine.run(
             &linked,
             &mut ctx,
-            ExecutionRequest::new().with_capabilities(env_granted(&[("CODE", "7")])),
+            standard_request().with_capabilities(env_granted(&[("CODE", "7")])),
         );
         assert!(matches!(outcome, ExecutionOutcome::Exited { code: c, .. } if c == (7)));
     }
@@ -2737,7 +2747,7 @@ mod tests {
         let outcome = engine.run(
             &linked,
             &mut ctx,
-            ExecutionRequest::new().with_capabilities(env_granted(&[("CODE", "7")])),
+            standard_request().with_capabilities(env_granted(&[("CODE", "7")])),
         );
         assert!(matches!(outcome, ExecutionOutcome::Exited { code: c, .. } if c == (5)));
     }
@@ -2750,7 +2760,7 @@ mod tests {
         let mut ctx = ExecutionContext::new(&engine);
         // 既定 request は deny-by-default（Environment なし）。
         let linked = compile_link(&engine, "m", "let x = env(\"CODE\")\n");
-        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+        match engine.run(&linked, &mut ctx, standard_request()) {
             ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, crate::error::ErrorKind::Capability);
             }
@@ -2769,7 +2779,7 @@ mod tests {
             "try\n  let x = env(\"CODE\")\ncatch e\n  let caught = e[\"type\"]\nend\n",
         );
         assert!(matches!(
-            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            engine.run(&linked, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
         ));
     }
@@ -2794,7 +2804,7 @@ mod tests {
         let outcome = engine.run(
             &linked,
             &mut ctx,
-            ExecutionRequest::new().with_capabilities(env_granted(&[("CODE", "7")])),
+            standard_request().with_capabilities(env_granted(&[("CODE", "7")])),
         );
         unsafe {
             std::env::remove_var("TSG_C3_PROBE");
@@ -2812,7 +2822,7 @@ mod tests {
         let outcome = engine.run(
             &linked,
             &mut ctx,
-            ExecutionRequest::new().with_capabilities(clock_granted(42)),
+            standard_request().with_capabilities(clock_granted(42)),
         );
         assert!(matches!(outcome, ExecutionOutcome::Exited { code: c, .. } if c == (42)));
     }
@@ -2827,7 +2837,7 @@ mod tests {
             let outcome = engine.run(
                 &linked,
                 &mut ctx,
-                ExecutionRequest::new().with_capabilities(clock_granted(100)),
+                standard_request().with_capabilities(clock_granted(100)),
             );
             assert!(matches!(outcome, ExecutionOutcome::Exited { code: c, .. } if c == (100)));
         }
@@ -2840,7 +2850,7 @@ mod tests {
         let engine = Engine::builder().build().unwrap();
         let mut ctx = ExecutionContext::new(&engine);
         let linked = compile_link(&engine, "m", "let t = now()\n");
-        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+        match engine.run(&linked, &mut ctx, standard_request()) {
             ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, crate::error::ErrorKind::Capability);
             }
@@ -2859,7 +2869,7 @@ mod tests {
             "try\n  let t = now()\ncatch e\n  let caught = e[\"type\"]\nend\n",
         );
         assert!(matches!(
-            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            engine.run(&linked, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
         ));
     }
@@ -2958,7 +2968,7 @@ mod tests {
         let outcome = engine.run(
             &linked,
             &mut ctx,
-            ExecutionRequest::new().with_capabilities(stdout_granted(sink.clone())),
+            standard_request().with_capabilities(stdout_granted(sink.clone())),
         );
         assert!(matches!(outcome, ExecutionOutcome::Completed { .. }));
         assert_eq!(sink.lock().unwrap().as_slice(), b"hello\n");
@@ -2971,7 +2981,7 @@ mod tests {
         let mut ctx = ExecutionContext::new(&engine);
         // 既定 request は deny-by-default（Stdout なし）。
         let linked = compile_link(&engine, "m", "print(\"x\")\n");
-        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+        match engine.run(&linked, &mut ctx, standard_request()) {
             ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, crate::error::ErrorKind::Capability);
             }
@@ -2990,7 +3000,7 @@ mod tests {
             "try\n  print(\"x\")\ncatch e\n  let caught = e[\"type\"]\nend\n",
         );
         assert!(matches!(
-            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            engine.run(&linked, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
         ));
     }
@@ -3007,11 +3017,7 @@ mod tests {
             .unwrap()
             .build();
         let linked = compile_link(&engine, "m", "print(\"x\")\n");
-        match engine.run(
-            &linked,
-            &mut ctx,
-            ExecutionRequest::new().with_capabilities(set),
-        ) {
+        match engine.run(&linked, &mut ctx, standard_request().with_capabilities(set)) {
             ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, crate::error::ErrorKind::Host);
             }
@@ -3028,7 +3034,7 @@ mod tests {
         let outcome = engine.run(
             &linked,
             &mut ctx,
-            ExecutionRequest::new().with_capabilities(stdin_granted(&["8"])),
+            standard_request().with_capabilities(stdin_granted(&["8"])),
         );
         assert!(matches!(outcome, ExecutionOutcome::Exited { code: c, .. } if c == (8)));
     }
@@ -3047,7 +3053,7 @@ mod tests {
         let outcome = engine.run(
             &linked,
             &mut ctx,
-            ExecutionRequest::new().with_capabilities(stdin_granted(&[])),
+            standard_request().with_capabilities(stdin_granted(&[])),
         );
         assert!(matches!(outcome, ExecutionOutcome::Exited { code: c, .. } if c == (3)));
     }
@@ -3058,7 +3064,7 @@ mod tests {
         let engine = Engine::builder().build().unwrap();
         let mut ctx = ExecutionContext::new(&engine);
         let linked = compile_link(&engine, "m", "let x = input()\n");
-        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+        match engine.run(&linked, &mut ctx, standard_request()) {
             ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, crate::error::ErrorKind::Capability);
             }
@@ -3077,7 +3083,7 @@ mod tests {
             "try\n  let x = input()\ncatch e\n  let caught = e[\"type\"]\nend\n",
         );
         assert!(matches!(
-            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            engine.run(&linked, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
         ));
     }
@@ -3087,17 +3093,28 @@ mod tests {
     //   （EMB-AT-21 の Phase 3・tree 範囲）
     // =======================================================================
 
+    use crate::budget::ConfigError as BudgetConfigError;
     use crate::budget::{BudgetConfig, CancellationToken, FakeClock};
 
-    /// 有限 budget を持つ engine を作る（deadline は clock.now()+30s の既定）。
-    fn engine_with_budget(budget: BudgetConfig) -> Engine {
-        Engine::builder()
-            .config(EngineConfig {
-                budget: Some(budget),
-                ..EngineConfig::default()
-            })
-            .build()
-            .unwrap()
+    /// budget + clock から新 API の [`ExecutionRequest`] を作る helper（REV-015 最終形移行）。
+    fn request_with(
+        budget: BudgetConfig,
+        clock: Arc<dyn crate::budget::MonotonicClock>,
+    ) -> ExecutionRequest {
+        ExecutionRequest::new(budget, clock).expect("budget は clock と同 domain なので検証を通る")
+    }
+
+    /// fuel を極小に絞った budget と、その deadline と同 domain の clock を返す helper。
+    ///
+    /// `for_legacy` の deadline は実在 clock に紐づかない（`clock_id` が合わず request 構築が
+    /// `ForeignClock` で失敗する）ため、standard budget を基に `total_fuel` だけ差し替えて
+    /// deadline domain の整合を保つ。deadline は遠い未来（now+30s）なので fuel 超過側だけを
+    /// 踏む。
+    fn small_fuel_budget(fuel: u64) -> (BudgetConfig, Arc<dyn crate::budget::MonotonicClock>) {
+        let clock: Arc<dyn crate::budget::MonotonicClock> = Arc::new(FakeClock::new());
+        let mut budget = BudgetConfig::standard(clock.as_ref()).unwrap();
+        budget.total_fuel = fuel;
+        (budget, clock)
     }
 
     /// EMB-AT-21: deadline に達すると DeadlineExceeded terminal で停止し、RuntimeError にしない。
@@ -3106,18 +3123,19 @@ mod tests {
         let clock = Arc::new(FakeClock::new());
         // 30s 先の deadline を持つ既定 budget。
         let budget = BudgetConfig::standard(clock.as_ref()).unwrap();
-        let engine = engine_with_budget(budget);
+        let engine = Engine::builder().build().unwrap();
         let mut ctx = ExecutionContext::new(&engine);
 
-        // clock を deadline ちょうどへ進めておく（charge 前 checkpoint で観測される）。
+        let request = request_with(
+            budget,
+            clock.clone() as Arc<dyn crate::budget::MonotonicClock>,
+        );
+        // clock を deadline ちょうどへ進めておく（charge 前 checkpoint で観測される）。request は
+        // 構築済みなので検証（deadline>now）は進める前に通っている。
         clock.set(budget.deadline.as_nanos());
 
         let linked = compile_link(&engine, "m", "let x = 1\nlet y = 2\n");
-        let outcome = engine.run(
-            &linked,
-            &mut ctx,
-            ExecutionRequest::new().with_deadline_clock(clock.clone()),
-        );
+        let outcome = engine.run(&linked, &mut ctx, request);
         assert!(matches!(outcome, ExecutionOutcome::DeadlineExceeded { .. }));
         // catch 不能 terminal なので poison しない・再利用できる。
         assert!(!ctx.is_poisoned());
@@ -3128,8 +3146,13 @@ mod tests {
     fn e11_deadline_is_uncatchable() {
         let clock = Arc::new(FakeClock::new());
         let budget = BudgetConfig::standard(clock.as_ref()).unwrap();
-        let engine = engine_with_budget(budget);
+        let engine = Engine::builder().build().unwrap();
         let mut ctx = ExecutionContext::new(&engine);
+
+        let request = request_with(
+            budget,
+            clock.clone() as Arc<dyn crate::budget::MonotonicClock>,
+        );
         clock.set(budget.deadline.as_nanos());
 
         // catch body で binding を作っても、deadline は catch されず terminal になる。
@@ -3138,11 +3161,7 @@ mod tests {
             "m",
             "try\n  let a = 1\ncatch e\n  let caught = 1\nend\n",
         );
-        let outcome = engine.run(
-            &linked,
-            &mut ctx,
-            ExecutionRequest::new().with_deadline_clock(clock.clone()),
-        );
+        let outcome = engine.run(&linked, &mut ctx, request);
         assert!(matches!(outcome, ExecutionOutcome::DeadlineExceeded { .. }));
     }
 
@@ -3151,37 +3170,33 @@ mod tests {
     fn e11_deadline_not_reached_completes() {
         let clock = Arc::new(FakeClock::new());
         let budget = BudgetConfig::standard(clock.as_ref()).unwrap();
-        let engine = engine_with_budget(budget);
+        let engine = Engine::builder().build().unwrap();
         let mut ctx = ExecutionContext::new(&engine);
 
         let linked = compile_link(&engine, "m", "let x = 1\nlet y = x + 2\n");
         let outcome = engine.run(
             &linked,
             &mut ctx,
-            ExecutionRequest::new().with_deadline_clock(clock.clone()),
+            request_with(
+                budget,
+                clock.clone() as Arc<dyn crate::budget::MonotonicClock>,
+            ),
         );
         assert!(matches!(outcome, ExecutionOutcome::Completed { .. }));
     }
 
-    /// clock の domain（clock_id）が budget deadline と一致しないと InternalFailure で拒否する。
+    /// clock の domain（clock_id）が budget deadline と一致しないと、request 構築時に
+    /// ForeignClock で弾かれる（run まで到達しない。REV-015 最終形移行 §11.1）。
     #[test]
-    fn e11_foreign_deadline_clock_is_internal_failure() {
+    fn e11_foreign_deadline_clock_rejected_at_build() {
         let config_clock = FakeClock::new();
         let budget = BudgetConfig::standard(&config_clock).unwrap();
-        let engine = engine_with_budget(budget);
-        let mut ctx = ExecutionContext::new(&engine);
 
-        // 別 clock（別 clock_id）を渡す。
-        let foreign = Arc::new(FakeClock::new());
-        let linked = compile_link(&engine, "m", "let x = 1\n");
-        match engine.run(
-            &linked,
-            &mut ctx,
-            ExecutionRequest::new().with_deadline_clock(foreign),
-        ) {
-            ExecutionOutcome::InternalFailure { fault_id, .. } => assert_ne!(fault_id, 0),
-            other => panic!("期待: InternalFailure, 実際: {other:?}"),
-        }
+        // 別 clock（別 clock_id）を渡すと new が ForeignClock を返す。
+        let foreign: Arc<dyn crate::budget::MonotonicClock> = Arc::new(FakeClock::new());
+        let err = ExecutionRequest::new(budget, foreign)
+            .expect_err("別 domain の clock は構築時に弾かれる");
+        assert_eq!(err, BudgetConfigError::ForeignClock);
     }
 
     /// EMB-AT-21: 実行中 cancel（別スレッド相当）は Cancelled terminal で停止する。
@@ -3197,7 +3212,9 @@ mod tests {
         assert!(token.cancel(), "最初の cancel は true を返す");
 
         let linked = compile_link(&engine, "m", "let saved = 7\nlet z = saved + 1\n");
-        let outcome = engine.run(&linked, &mut ctx, ExecutionRequest::new());
+        // request は budget を必須所有するが、run 前取得 token は reset_budget をまたいでも
+        // 有効であり続ける（finding 1 の回帰保証）。
+        let outcome = engine.run(&linked, &mut ctx, standard_request());
         assert!(matches!(outcome, ExecutionOutcome::Cancelled { .. }));
         assert!(!ctx.is_poisoned(), "Cancelled は poison しない");
 
@@ -3205,7 +3222,7 @@ mod tests {
         // 次実行のため token は new context で作り直す（同 context の token は cancel 済みのまま）。
         let mut ctx2 = ExecutionContext::new(&engine);
         let probe = compile_link(&engine, "m", "let echo = saved\n");
-        match engine.run(&probe, &mut ctx2, ExecutionRequest::new()) {
+        match engine.run(&probe, &mut ctx2, standard_request()) {
             ExecutionOutcome::RuntimeError { error, .. } => assert_eq!(error.code, ErrorKind::Name),
             other => panic!("cancel が副作用を残した: {other:?}"),
         }
@@ -3225,20 +3242,20 @@ mod tests {
             "try\n  let a = 1\ncatch e\n  let caught = 1\nend\n",
         );
         assert!(matches!(
-            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            engine.run(&linked, &mut ctx, standard_request()),
             ExecutionOutcome::Cancelled { .. }
         ));
     }
 
     /// EMB-AT-21: fuel 上限を超えると BudgetExceeded terminal になり、RuntimeError にはしない。
     ///
-    /// `for_legacy(total_fuel, collection)` で fuel を極小に絞り、ループ反復で超過させる
+    /// `small_fuel_budget` で fuel を極小に絞り、ループ反復で超過させる
     /// （単純な `let` の羅列は count_step を呼ばないためループを使う）。
     #[test]
     fn e11_budget_exceeded_is_terminal_not_runtime_error() {
         // fuel=5 の極小 budget。ループ反復で step 上限に達する。
-        let budget = BudgetConfig::for_legacy(5, 1_000_000);
-        let engine = engine_with_budget(budget);
+        let (budget, clock) = small_fuel_budget(5);
+        let engine = Engine::builder().build().unwrap();
         let mut ctx = ExecutionContext::new(&engine);
 
         let linked = compile_link(
@@ -3246,7 +3263,7 @@ mod tests {
             "m",
             "let i = 0\nwhile i < 1000\n  i = i + 1\nend\n",
         );
-        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+        match engine.run(&linked, &mut ctx, request_with(budget, clock)) {
             ExecutionOutcome::BudgetExceeded { error, .. } => {
                 // fuel 超過は StepLimit（canonical code "limit"）。
                 assert_eq!(error.code, ErrorKind::StepLimit);
@@ -3260,8 +3277,8 @@ mod tests {
     /// EMB-AT-21 / EMB-AT-10: budget 超過は try/catch で捕捉できない。
     #[test]
     fn e11_budget_exceeded_is_uncatchable() {
-        let budget = BudgetConfig::for_legacy(5, 1_000_000);
-        let engine = engine_with_budget(budget);
+        let (budget, clock) = small_fuel_budget(5);
+        let engine = Engine::builder().build().unwrap();
         let mut ctx = ExecutionContext::new(&engine);
 
         let linked = compile_link(
@@ -3269,7 +3286,7 @@ mod tests {
             "m",
             "try\n  let i = 0\n  while i < 1000\n    i = i + 1\n  end\ncatch e\n  let caught = 1\nend\n",
         );
-        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+        match engine.run(&linked, &mut ctx, request_with(budget, clock)) {
             ExecutionOutcome::BudgetExceeded { .. } => {}
             other => panic!("期待: BudgetExceeded, 実際: {other:?}"),
         }
@@ -3281,12 +3298,12 @@ mod tests {
     /// 0 より大きいことを確認する（usage が空のまま返っていないことの回帰固定）。
     #[test]
     fn e11_completed_carries_committed_usage() {
-        let budget = BudgetConfig::for_legacy(1_000_000, 1_000_000);
-        let engine = engine_with_budget(budget);
+        let (budget, clock) = small_fuel_budget(1_000_000);
+        let engine = Engine::builder().build().unwrap();
         let mut ctx = ExecutionContext::new(&engine);
 
         let linked = compile_link(&engine, "m", "let i = 0\nwhile i < 10\n  i = i + 1\nend\n");
-        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+        match engine.run(&linked, &mut ctx, request_with(budget, clock)) {
             ExecutionOutcome::Completed { usage } => {
                 assert!(
                     usage.committed.fuel > 0,
@@ -3300,8 +3317,8 @@ mod tests {
     /// budget 超過 terminal も `usage` を同梱し、peak が上限に達している（仕様第6・12節）。
     #[test]
     fn e11_budget_exceeded_carries_usage() {
-        let budget = BudgetConfig::for_legacy(5, 1_000_000);
-        let engine = engine_with_budget(budget);
+        let (budget, clock) = small_fuel_budget(5);
+        let engine = Engine::builder().build().unwrap();
         let mut ctx = ExecutionContext::new(&engine);
 
         let linked = compile_link(
@@ -3309,7 +3326,7 @@ mod tests {
             "m",
             "let i = 0\nwhile i < 1000\n  i = i + 1\nend\n",
         );
-        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+        match engine.run(&linked, &mut ctx, request_with(budget, clock)) {
             ExecutionOutcome::BudgetExceeded { usage, .. } => {
                 // fuel 上限 5 に達して停止したので、commit 済み fuel は上限以下で非ゼロ。
                 assert!(
@@ -3321,14 +3338,18 @@ mod tests {
         }
     }
 
-    /// budget を設定しない既定 engine では従来どおり Completed（観測挙動不変）。
+    /// 既定 engine + standard budget の request で、軽量 script が従来どおり Completed する。
+    ///
+    /// REV-015 最終形移行で `EngineConfig.budget` は消え、budget は request 必須所有になった。
+    /// standard budget（30s deadline + §3.1 標準上限）の request で軽量 script が通常終了する
+    /// ことを固定する。
     #[test]
-    fn e11_default_engine_budget_unchanged() {
+    fn e11_standard_budget_request_completes() {
         let engine = Engine::builder().build().unwrap();
         let mut ctx = ExecutionContext::new(&engine);
         let linked = compile_link(&engine, "m", "let a = 1\nlet b = a + 2\n");
         assert!(matches!(
-            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            engine.run(&linked, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
         ));
     }
@@ -3336,7 +3357,7 @@ mod tests {
     /// ExecutionRequest の Debug は secret（引数値・capability 本文）を出さない（EMB-AT-14）。
     #[test]
     fn e11_execution_request_debug_is_secret_free() {
-        let req = ExecutionRequest::new().with_arguments(vec!["s3cr3t-token".to_string()]);
+        let req = standard_request().with_arguments(vec!["s3cr3t-token".to_string()]);
         let dbg = format!("{req:?}");
         assert!(
             !dbg.contains("s3cr3t-token"),
@@ -3352,19 +3373,138 @@ mod tests {
     fn e11_system_clock_deadline_not_reached_completes() {
         use crate::budget::{BudgetConfig, SystemMonotonicClock};
 
-        let clock = Arc::new(SystemMonotonicClock::new());
+        let clock: Arc<dyn crate::budget::MonotonicClock> = Arc::new(SystemMonotonicClock::new());
         // 同じ clock で deadline（now + 30 s）を計算し、同じ clock を実行へ注入する（同一 domain）。
         let budget = BudgetConfig::standard(clock.as_ref()).unwrap();
-        let engine = engine_with_budget(budget);
+        let engine = Engine::builder().build().unwrap();
         let mut ctx = ExecutionContext::new(&engine);
 
         let linked = compile_link(&engine, "m", "let x = 1\nlet y = x + 2\n");
-        let outcome = engine.run(
-            &linked,
-            &mut ctx,
-            ExecutionRequest::new().with_deadline_clock(clock.clone()),
-        );
+        let outcome = engine.run(&linked, &mut ctx, request_with(budget, clock));
         assert!(matches!(outcome, ExecutionOutcome::Completed { .. }));
+    }
+
+    /// `ExecutionRequest::new` の検証: 正しい clock なら Ok（REV-015 最終形移行 §11.2）。
+    #[test]
+    fn e11_request_new_ok_with_matching_clock() {
+        let clock: Arc<dyn crate::budget::MonotonicClock> = Arc::new(FakeClock::new());
+        let budget = BudgetConfig::standard(clock.as_ref()).unwrap();
+        assert!(ExecutionRequest::new(budget, clock).is_ok());
+    }
+
+    /// `ExecutionRequest::new` の検証: 別 domain の clock は ForeignClock（§11.2）。
+    #[test]
+    fn e11_request_new_rejects_foreign_clock() {
+        let config_clock = FakeClock::new();
+        let budget = BudgetConfig::standard(&config_clock).unwrap();
+        let foreign: Arc<dyn crate::budget::MonotonicClock> = Arc::new(FakeClock::new());
+        assert_eq!(
+            ExecutionRequest::new(budget, foreign).unwrap_err(),
+            BudgetConfigError::ForeignClock
+        );
+    }
+
+    /// `ExecutionRequest::new` の検証: 未サポートの accounting revision は拒否する（§11.2）。
+    #[test]
+    fn e11_request_new_rejects_unsupported_revision() {
+        let clock: Arc<dyn crate::budget::MonotonicClock> = Arc::new(FakeClock::new());
+        let mut budget = BudgetConfig::standard(clock.as_ref()).unwrap();
+        budget.heap_accounting_revision = 2;
+        assert_eq!(
+            ExecutionRequest::new(budget, clock).unwrap_err(),
+            BudgetConfigError::UnsupportedAccountingRevision(2)
+        );
+    }
+
+    /// `ExecutionRequest::new` の検証: 過去 deadline は DeadlineNotInFuture（§11.2）。
+    #[test]
+    fn e11_request_new_rejects_past_deadline() {
+        let clock = Arc::new(FakeClock::new());
+        // now=0 のとき now+30s の deadline を作ってから、clock を deadline より先へ進める。
+        let budget = BudgetConfig::standard(clock.as_ref()).unwrap();
+        clock.set(budget.deadline.as_nanos() + 1);
+        let clock_dyn: Arc<dyn crate::budget::MonotonicClock> = clock;
+        assert_eq!(
+            ExecutionRequest::new(budget, clock_dyn).unwrap_err(),
+            BudgetConfigError::DeadlineNotInFuture
+        );
+    }
+
+    /// 同一 context で連続実行しても budget 残量が前 run に汚染されない（reset_budget が
+    /// counters を作り直す。REV-015 最終形移行 §11.2）。
+    #[test]
+    fn e11_reset_budget_isolates_fuel_between_runs() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+
+        // 1 回目: fuel をある程度消費するループ。
+        let (budget1, clock1) = small_fuel_budget(1_000_000);
+        let heavy = compile_link(&engine, "m", "let i = 0\nwhile i < 100\n  i = i + 1\nend\n");
+        assert!(matches!(
+            engine.run(&heavy, &mut ctx, request_with(budget1, clock1)),
+            ExecutionOutcome::Completed { .. }
+        ));
+
+        // 2 回目: 少量 fuel の別 budget。1 回目の残量に汚染されず、独立した上限で Completed。
+        let (budget2, clock2) = small_fuel_budget(1_000);
+        let light = compile_link(&engine, "m", "let a = 1\nlet b = a + 2\n");
+        match engine.run(&light, &mut ctx, request_with(budget2, clock2)) {
+            ExecutionOutcome::Completed { usage } => {
+                assert!(
+                    usage.committed.fuel <= 1_000,
+                    "2 回目の fuel が 1 回目に汚染された: {usage:?}"
+                );
+            }
+            other => panic!("期待: Completed, 実際: {other:?}"),
+        }
+    }
+
+    /// finding 1 回帰テスト: run の前に取得した cancellation token が reset_budget をまたいでも
+    /// 有効であり続け、cancel すると実行が Cancelled へ落ちる（§11.2・finding 1）。
+    ///
+    /// `run_inner` は冒頭で `reset_budget` を呼び ledger の config/counters を作り直すが、
+    /// cancellation token は現 ledger のものを引き継ぐ。したがって run 前に clone 取得した token
+    /// の `cancel()` が、reset 後の実行で観測される。
+    #[test]
+    fn e11_cancellation_token_survives_reset_budget() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+
+        // run の前に token の clone を取得して保持する。
+        let token: CancellationToken = ctx.cancellation_token();
+
+        // standard_request() は内部で新しい budget/clock を作り、run_inner が reset_budget を
+        // 走らせる。その reset をまたいで、保持 token の cancel が観測されることを確認する。
+        assert!(token.cancel(), "run 前取得 token の最初の cancel は true");
+
+        let linked = compile_link(
+            &engine,
+            "m",
+            "let i = 0\nwhile i < 1000\n  i = i + 1\nend\n",
+        );
+        assert!(
+            matches!(
+                engine.run(&linked, &mut ctx, standard_request()),
+                ExecutionOutcome::Cancelled { .. }
+            ),
+            "reset_budget をまたいで保持 token の cancel が観測されるべき"
+        );
+    }
+
+    /// pre-cancel が返す usage は空（reset_budget 直後・baseline 課金前。finding 3）。
+    #[test]
+    fn e11_pre_cancel_usage_is_empty() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "let a = 1\nlet b = a + 2\n");
+        match engine.run(&linked, &mut ctx, standard_request().pre_cancelled()) {
+            ExecutionOutcome::Cancelled { usage } => {
+                assert_eq!(usage.committed, crate::budget::BudgetCounters::default());
+                assert_eq!(usage.reserved, crate::budget::BudgetCounters::default());
+                assert_eq!(usage.live_heap_bytes, 0);
+            }
+            other => panic!("期待: Cancelled, 実際: {other:?}"),
+        }
     }
 
     // --- E7: host function embedding registration + grant injection ---
@@ -3468,7 +3608,7 @@ mod tests {
         let outcome = engine.run(
             &linked,
             &mut ctx,
-            ExecutionRequest::new().with_capabilities(host_fn_granted(7)),
+            standard_request().with_capabilities(host_fn_granted(7)),
         );
         assert!(matches!(outcome, ExecutionOutcome::Exited { code: 42, .. }));
     }
@@ -3482,7 +3622,7 @@ mod tests {
         let outcome = engine.run(
             &linked,
             &mut ctx,
-            ExecutionRequest::new().with_capabilities(host_fn_granted(7)),
+            standard_request().with_capabilities(host_fn_granted(7)),
         );
         assert!(matches!(outcome, ExecutionOutcome::Completed { .. }));
     }
@@ -3494,7 +3634,7 @@ mod tests {
         let mut ctx = ExecutionContext::new(&engine);
         // 既定 request は deny-by-default（capability なし）。
         let linked = compile_link(&engine, "m", "let r = lookup(1)\n");
-        match engine.run(&linked, &mut ctx, ExecutionRequest::new()) {
+        match engine.run(&linked, &mut ctx, standard_request()) {
             ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, ErrorKind::Capability);
             }
@@ -3513,7 +3653,7 @@ mod tests {
             "try\n  let r = lookup(1)\ncatch e\n  let caught = e[\"type\"]\nend\n",
         );
         assert!(matches!(
-            engine.run(&linked, &mut ctx, ExecutionRequest::new()),
+            engine.run(&linked, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
         ));
     }
@@ -3528,7 +3668,7 @@ mod tests {
         match engine.run(
             &linked,
             &mut ctx,
-            ExecutionRequest::new().with_capabilities(host_fn_granted(7)),
+            standard_request().with_capabilities(host_fn_granted(7)),
         ) {
             ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, ErrorKind::Argument);
@@ -3546,7 +3686,7 @@ mod tests {
         match engine.run(
             &linked,
             &mut ctx,
-            ExecutionRequest::new().with_capabilities(host_fn_granted(7)),
+            standard_request().with_capabilities(host_fn_granted(7)),
         ) {
             ExecutionOutcome::RuntimeError { error, .. } => {
                 assert_eq!(error.code, ErrorKind::Host);
@@ -3565,7 +3705,7 @@ mod tests {
         let outcome = engine.run(
             &linked,
             &mut ctx,
-            ExecutionRequest::new().with_capabilities(host_fn_granted(7)),
+            standard_request().with_capabilities(host_fn_granted(7)),
         );
         assert!(matches!(outcome, ExecutionOutcome::Exited { code: 99, .. }));
     }

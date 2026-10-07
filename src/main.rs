@@ -1,13 +1,14 @@
 use std::env as std_env;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::sync::Arc;
 
 use tsumugi::{
-    CapabilitySet, CompileErrors, EmbeddingContext, EmbeddingEngine, EmbeddingOutcome,
-    EmbeddingRequest, EmbeddingTraceFrame, Engine, ExecutionContext, ExecutionError, LinkError,
-    LinkRequest, Source as EmbeddingSource, SourceId, compiler::Compiler,
-    embedding::CompileOptions, error::TsumugiError, lexer::Lexer, module::ModuleLoader,
-    parser::Parser, token::Token, vm::Vm,
+    BudgetConfig, CapabilitySet, CompileErrors, EmbeddingContext, EmbeddingEngine,
+    EmbeddingOutcome, EmbeddingRequest, EmbeddingTraceFrame, Engine, ExecutionContext,
+    ExecutionError, LinkError, LinkRequest, Source as EmbeddingSource, SourceId,
+    SystemMonotonicClock, compiler::Compiler, embedding::CompileOptions, error::TsumugiError,
+    lexer::Lexer, module::ModuleLoader, parser::Parser, token::Token, vm::Vm,
 };
 
 fn main() {
@@ -237,10 +238,18 @@ fn run_source(source: &str, script_path: &str, script_args: Vec<String>) {
 
     let mut context = EmbeddingContext::new(&engine);
     context.set_script_path(script_path);
+    // REV-015 最終形移行 Slice 1（option B）: import なし CLI 経路の既定を有限 budget にする。
+    // 単一の SystemMonotonicClock を 1 個だけ作り、BudgetConfig::standard の deadline 生成と
+    // request への clock 注入で同一 instance を共有する（clock_id を一致させ ForeignClock を
+    // 避ける）。legacy の unbounded/ambient 既定へは戻さない（設計 §3 / §4）。
+    let clock: Arc<dyn tsumugi::MonotonicClock> = Arc::new(SystemMonotonicClock::new());
+    let budget = BudgetConfig::standard(clock.as_ref())
+        .expect("standard budget の生成は overflow しない限り成功する");
     // C7（REV-023）: CLI は従来どおり `exit()` を許可する。Phase 2 の CLI safe/legacy profile
     // （C9）が capability option を導入するまでは、暫定的に ProcessExit だけを明示 grant する
     // （filesystem・env・stdio は現行の process-global 経路が担う）。
-    let request = EmbeddingRequest::new()
+    let request = EmbeddingRequest::new(budget, Arc::clone(&clock))
+        .expect("standard budget は自身を生成した clock と同 domain なので検証を通る")
         .with_arguments(script_args)
         .with_capabilities(cli_transition_capabilities());
 
