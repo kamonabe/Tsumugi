@@ -420,21 +420,23 @@ impl Evaluator {
         }
     }
 
-    /// この実行に使う有限 `BudgetConfig` と deadline clock を据え直す（REV-015 最終形移行、
-    /// Slice 1）。
+    /// この実行に使う有限 `BudgetConfig`・deadline clock・cancellation token を据え直す
+    /// （REV-015 最終形移行、Slice 2）。
     ///
     /// 直前の実行の budget 残量・counters を破棄し、新しい config で [`crate::budget::BudgetLedger`]
-    /// の中身を作り直す。ただし **cancellation token は現 ledger のものを引き継ぐ**ため、host が
-    /// [`Engine::run`](crate::embedding::Engine::run) を呼ぶ前に取得した token は reset をまたいでも
-    /// 有効であり続ける（[`crate::budget::BudgetLedger::reset_config`] 参照）。clock は
-    /// `config.deadline` と同 domain を前提とする（[`crate::embedding::ExecutionRequest::new`] が
-    /// 構築時に検証済み）。
+    /// の中身を作り直す。cancellation token は **request が必須所有するものを install（継承ではなく
+    /// 置換）** する（[`crate::budget::BudgetLedger::reset_config_with_token`] 参照）。source of truth は
+    /// request-owned token であり、host が [`Engine::run`](crate::embedding::Engine::run) を呼ぶ前に
+    /// `.cancellation(token.clone())` で載せた token は、install される token と同一 `Arc` を共有する
+    /// clone なので reset をまたいでも実行中に `cancel()` が観測される。clock は `config.deadline` と
+    /// 同 domain を前提とする（[`crate::embedding::ExecutionRequest::new`] が構築時に検証済み）。
     pub fn reset_budget(
         &mut self,
         config: crate::budget::BudgetConfig,
         clock: std::sync::Arc<dyn crate::budget::MonotonicClock>,
+        cancellation: crate::budget::CancellationToken,
     ) {
-        self.budget.reset_config(config);
+        self.budget.reset_config_with_token(config, cancellation);
         self.budget.set_clock(clock);
         // heap 台帳を作り直したので、cell 課金用のハンドルを Env へ配り直す（REV-015 PR-c）。
         self.env.set_heap_ledger(self.budget.heap_handle());
@@ -2814,6 +2816,45 @@ mod tests {
             err.kind(),
             Some(crate::error::ErrorKind::Cancelled),
             "try/catch must not catch cancel terminal: {err:?}"
+        );
+    }
+
+    /// `reset_budget` で install した request-owned token を cancel すると、runtime の
+    /// charge 前・文/反復境界 checkpoint で catch 不能 terminal（Cancelled）になる
+    /// （REV-015 Slice 2 §8.2 の役割分担。token の出所を request 側へ移した後も runtime
+    /// checkpoint cancel が成立し、try/catch で catch できないことを固定する）。
+    #[test]
+    fn cancel_after_install_is_uncatchable_terminal() {
+        let src = "try\n  let a = 1\n  let b = a + 2\ncatch e\n  let x = 99\nend";
+        let program = parse_program(src);
+        let clock: std::sync::Arc<dyn crate::budget::MonotonicClock> =
+            std::sync::Arc::new(crate::budget::FakeClock::new());
+        let config = crate::budget::BudgetConfig::standard(clock.as_ref())
+            .expect("standard budget の生成は成功する");
+        let token = crate::budget::CancellationToken::new();
+
+        let mut eval = Evaluator::new();
+        // request が所有する token を install（Engine::run 相当の 3 引数 reset）。
+        eval.reset_budget(config, std::sync::Arc::clone(&clock), token.clone());
+
+        // begin_execution の後（＝実行開始後）に host 側 clone を cancel する。install token と
+        // 同一 Arc を共有するため、run_slice の charge 前・文/反復境界 checkpoint が観測する。
+        eval.begin_execution(&program, src.len() as u64, false)
+            .expect("begin_execution should succeed for import-free root");
+        token.cancel();
+        let result = loop {
+            match eval.run_slice(u64::MAX) {
+                SliceOutcome::YieldedSliceFuel
+                | SliceOutcome::YieldedHostCall { .. }
+                | SliceOutcome::YieldedExplicit => continue,
+                SliceOutcome::Terminal(result) => break result,
+            }
+        };
+        let err = result.expect_err("installed-token cancel should surface as terminal");
+        assert_eq!(
+            err.kind(),
+            Some(crate::error::ErrorKind::Cancelled),
+            "installed-token cancel should be an uncatchable Cancelled terminal: {err:?}"
         );
     }
 

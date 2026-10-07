@@ -504,11 +504,11 @@ pub enum ExecutionOutcome {
     },
     /// 実行が協調的に cancel された（REV-015 E11、仕様第7・8節）。
     ///
-    /// [`ExecutionContext::cancellation_token`] で得た token を実行中に
+    /// [`ExecutionRequest`] が所有する [`CancellationToken`](crate::budget::CancellationToken)
+    /// （[`ExecutionRequest::cancellation`] で設定）を実行中に
     /// [`CancellationToken::cancel`](crate::budget::CancellationToken::cancel) した場合、または
-    /// [`ExecutionRequest::pre_cancelled`] で最初の poll より前に cancel 済みとした場合（Phase 1
-    /// の pre-run cancel）に到達する catch 不能 terminal。language-state は開始時点へ rollback
-    /// される。
+    /// 実行前に cancel 済みの token を載せた場合（pre-run cancel、命令0）に到達する catch 不能
+    /// terminal。language-state は開始時点へ rollback される。
     Cancelled {
         /// terminal 時点の予算使用量 snapshot（仕様第6・12節）。
         usage: BudgetUsage,
@@ -954,8 +954,9 @@ use crate::eval::{Evaluator, RunPhase, SliceOutcome};
 /// `budget.deadline` だけに存在する（REV-015 最終形移行 Slice 1、[実行制御仕様](../docs/execution-control.md)
 /// §3 / §3.1、[組み込みAPI仕様](../docs/embedding-api.md) §6）。deadline を効かせる
 /// monotonic clock も必須所有し、`new(budget, clock)` が構築時に domain / accounting revision /
-/// deadline(>now) を検証する。仕様の `execution_id` / `CancellationToken` 必須所有は次スライスで
-/// 導入する。alpha facade（[`crate::engine::ExecutionRequest`]）とは別型。
+/// deadline(>now) を検証する。cancellation token も必須所有し、`.cancellation(value)` builder で
+/// 設定する（既定は未 cancel の新 token）。REV-015 最終形移行（budget + cancellation 必須所有）は
+/// 本スライスで完了する。alpha facade（[`crate::engine::ExecutionRequest`]）とは別型。
 #[derive(Clone)]
 pub struct ExecutionRequest {
     /// `args()` が返すスクリプト引数 snapshot（binary 名・script path・CLI flag を含まない）。
@@ -976,21 +977,24 @@ pub struct ExecutionRequest {
     /// 検証する。実行中に `clock.now() >= budget.deadline` へ達すると
     /// [`ExecutionOutcome::DeadlineExceeded`] terminal で停止する（script からは catch できない）。
     clock: Arc<dyn crate::budget::MonotonicClock>,
-    /// 最初の poll より前に cancel 済みか（Phase 1 の pre-run cancel、EMB-AT-12）。
+    /// この実行が所有する協調的 cancel token（REV-015 最終形移行、必須）。
     ///
-    /// 実行前に確定した cancel を扱い、命令を1つも実行せずに [`ExecutionOutcome::Cancelled`] へ
-    /// 落とす（"pre-cancel は命令0"）。実行中の cancel は
-    /// [`ExecutionContext::cancellation_token`] 経由で行う（E11）。
-    pre_cancelled: bool,
+    /// cancel は request が所有するこの token 経由で行う（`.cancellation(..)` で設定）。host は
+    /// この token の clone を別スレッドで握り、[`CancellationToken::cancel`](crate::budget::CancellationToken::cancel)
+    /// を呼ぶことで実行中の script を協調停止できる。実行前に cancel 済みの token を渡せば
+    /// 命令を1つも実行せず [`ExecutionOutcome::Cancelled`] になる（pre-cancel は命令0、EMB-AT-12）。
+    /// 既定（`.cancellation(..)` 未指定）は未 cancel の新 token。
+    cancellation: crate::budget::CancellationToken,
 }
 
 impl std::fmt::Debug for ExecutionRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // 引数値や capability 本文・budget 値を Debug へ出さない（secret-free）。件数・有無だけを
-        // 見せる。budget は常に所有するので「有無」を出す意味はない。
+        // 見せる。budget は常に所有するので「有無」を出す意味はない。cancel 済みか否かの真偽は
+        // 秘密ではないので is_cancelled として出す。
         f.debug_struct("ExecutionRequest")
             .field("argument_count", &self.arguments.len())
-            .field("pre_cancelled", &self.pre_cancelled)
+            .field("is_cancelled", &self.cancellation.is_cancelled())
             .finish_non_exhaustive()
     }
 }
@@ -1018,7 +1022,7 @@ impl ExecutionRequest {
             capabilities: crate::capability::CapabilitySet::empty(),
             budget,
             clock,
-            pre_cancelled: false,
+            cancellation: crate::budget::CancellationToken::new(),
         })
     }
 
@@ -1036,13 +1040,20 @@ impl ExecutionRequest {
         self
     }
 
-    /// 最初の poll より前に cancel 済みとしてこのリクエストを印付ける（EMB-AT-12）。
+    /// この実行の cancellation token を設定する（REV-015 最終形移行 Slice 2、仕様第3節/第7節）。
     ///
-    /// このリクエストで [`Engine::run`] を呼ぶと、script 命令を1つも実行せずに
-    /// [`ExecutionOutcome::Cancelled`] を返す。language-state は開始時点へ rollback され
-    /// （第10節 規則5）、context は poison されないので再利用できる。
-    pub fn pre_cancelled(mut self) -> Self {
-        self.pre_cancelled = true;
+    /// host はこの token の clone を別スレッドで握り、[`CancellationToken::cancel`](crate::budget::CancellationToken::cancel)
+    /// を呼ぶことで実行中の script を協調停止できる。[`Engine::run`] は実行直前にこの token を
+    /// 評価器へ install するので、host clone と install token は同一 `Arc` を共有する。
+    ///
+    /// 実行前に cancel 済みの token を渡せば、script 命令を1つも実行せずに
+    /// [`ExecutionOutcome::Cancelled`] を返す（pre-cancel は命令0、EMB-AT-12）。この場合
+    /// language-state は開始時点へ rollback され（第10節 規則5）、context は poison されないので
+    /// 再利用できる。
+    ///
+    /// 設定しなければ既定の未 cancel token が使われ、決して cancel されない。
+    pub fn cancellation(mut self, value: crate::budget::CancellationToken) -> Self {
+        self.cancellation = value;
         self
     }
 }
@@ -1102,8 +1113,10 @@ impl ExecutionContext {
     /// budget は [`ExecutionRequest`] が必須所有し、[`Engine::run`] が実行直前に評価器へ据え直す
     /// （REV-015 最終形移行 Slice 1）。context 生成時点では budget を確定できないため、評価器は
     /// bootstrap 用の既定（legacy env 由来）で作る。実際の実行で効く budget は常に request の
-    /// ものになる。cancellation token は context 寿命で持続し、`reset_budget` をまたいで有効に
-    /// 保たれる（finding 1）。
+    /// ものになる。cancellation token も [`ExecutionRequest`] が必須所有し、[`Engine::run`] が
+    /// 実行直前に評価器へ install する（REV-015 最終形移行 Slice 2）。context 生成時点の評価器
+    /// token は次 run が install するまでの bootstrap 値で、実際の実行で効く token は常に request
+    /// のものになる。
     pub fn new(engine: &Engine) -> Self {
         let evaluator = Evaluator::new();
         Self {
@@ -1164,24 +1177,6 @@ impl ExecutionContext {
     /// 現在の予算使用量 snapshot を返す（仕様第6節 `BudgetUsage`）。
     pub fn budget_usage(&self) -> BudgetUsage {
         self.evaluator.budget_usage()
-    }
-
-    /// この context の実行を協調的に cancel するための token の clone を返す（仕様第7節、
-    /// REV-015 E11）。
-    ///
-    /// 返る [`CancellationToken`](crate::budget::CancellationToken) は `Send + Sync` な
-    /// `Arc<AtomicBool>` の clone で、別スレッドへ渡せる。host は [`Engine::run`] を呼ぶ前に
-    /// この token を取得しておき、別スレッドから [`CancellationToken::cancel`](crate::budget::CancellationToken::cancel)
-    /// を呼ぶことで実行中の script を協調的に停止できる（§8）。cancel は各 fuel charge 前と
-    /// 文/反復境界の checkpoint で観測され、実行は [`ExecutionOutcome::Cancelled`] terminal で
-    /// 終わって全 language-state を rollback する（script からは catch できない）。
-    ///
-    /// token は context の評価器に紐づき、同 context の複数 execution で共有される（ledger が
-    /// context 寿命で持続するため）。1 つの execution だけを cancel したい場合は、その
-    /// execution の前に一度だけこの token を取得し、terminal 後は cancel しても outcome は
-    /// 変わらない（§8「commit 後の cancel は結果を変えない」）。
-    pub fn cancellation_token(&self) -> crate::budget::CancellationToken {
-        self.evaluator.cancellation_token()
     }
 }
 
@@ -1318,22 +1313,24 @@ impl Engine {
             panic!("injected run-boundary panic (test only)");
         }
 
-        // request は有限 budget と deadline clock を必須所有する（REV-015 最終形移行 Slice 1）。
-        // 実行直前に評価器へ据え直す。domain / accounting revision / deadline(>now) は
-        // ExecutionRequest::new が構築時に検証済みなので、ここで InternalFailure へ落ちる
-        // domain-mismatch 経路は存在しない。reset_budget は現 ledger の cancellation token を
-        // 引き継ぐため、host が run 前に取得した token を壊さない（finding 1）。pre_cancelled 判定
-        // より前に置くことで、pre-cancel で返す usage も「この request の budget」に対するものに
-        // なる。
+        // request は有限 budget・deadline clock・cancellation token を必須所有する
+        // （REV-015 最終形移行 Slice 2）。実行直前に 3 つとも評価器へ install する。
+        // domain / accounting revision / deadline(>now) は ExecutionRequest::new が構築時に
+        // 検証済みなので、ここで InternalFailure へ落ちる domain-mismatch 経路は存在しない。
+        // reset_budget は request が所有する token を ledger へ install（継承ではなく置換）する
+        // ため、host が run 前に `.cancellation(token.clone())` で載せた token は同一 Arc を共有し、
+        // reset をまたいでも実行中に cancel が観測される（finding 1）。pre-run cancel 判定より前に
+        // 置くことで、pre-cancel で返す usage も「この request の budget」に対するものになる。
         context
             .evaluator
-            .reset_budget(request.budget, request.clock);
+            .reset_budget(request.budget, request.clock, request.cancellation.clone());
 
-        // pre-run cancel（EMB-AT-12）: 最初の poll より前に cancel 済みなら、script 命令を
-        // 1つも実行せずに Cancelled terminal を返す（"pre-cancel は命令0"）。language-state は
-        // 何も変更していないので rollback は自明に成立し、context は poison されない
-        // （第10節 規則4・5）。
-        if request.pre_cancelled {
+        // pre-run cancel（EMB-AT-12）: install 済み token が最初の poll より前に cancel 済みなら、
+        // script 命令を1つも実行せずに Cancelled terminal を返す（"pre-cancel は命令0"）。
+        // language-state は何も変更していないので rollback は自明に成立し、context は poison
+        // されない（第10節 規則4・5）。判定は install 直後・baseline 課金前の順序を保つことで、
+        // install した token の cancel 状態を見る。
+        if request.cancellation.is_cancelled() {
             // 命令0なので usage は空（reset_budget 直後・baseline 課金前。committed/reserved/live
             // とも 0）。finding 3。
             return ExecutionOutcome::Cancelled {
@@ -1719,6 +1716,14 @@ mod tests {
             .expect("standard budget の生成は成功する");
         ExecutionRequest::new(budget, clock)
             .expect("standard budget は自身を生成した clock と同 domain なので検証を通る")
+    }
+
+    /// `standard_request()` に実行前 cancel 済みの token を載せた [`ExecutionRequest`] を作る
+    /// helper（pre-cancel 系テスト用、REV-015 Slice 2）。`.cancellation(..)` 経由で表現する。
+    fn standard_request_cancelled() -> ExecutionRequest {
+        let token = crate::budget::CancellationToken::new();
+        token.cancel();
+        standard_request().cancellation(token)
     }
 
     #[test]
@@ -2381,7 +2386,7 @@ mod tests {
 
         // pre-cancel。副作用（binding）が起きれば後段の probe で検出できる。
         let linked = compile_link(&engine, "m", "let saved = 123\n");
-        let outcome = engine.run(&linked, &mut ctx, standard_request().pre_cancelled());
+        let outcome = engine.run(&linked, &mut ctx, standard_request_cancelled());
         assert!(matches!(outcome, ExecutionOutcome::Cancelled { .. }));
 
         // 命令0なので saved は commit されない（見えれば Name エラーで判別できる）。
@@ -2400,7 +2405,7 @@ mod tests {
 
         let linked = compile_link(&engine, "m", "let x = 1\n");
         assert!(matches!(
-            engine.run(&linked, &mut ctx, standard_request().pre_cancelled()),
+            engine.run(&linked, &mut ctx, standard_request_cancelled()),
             ExecutionOutcome::Cancelled { .. }
         ));
         assert!(!ctx.is_poisoned(), "Cancelled は poison しない");
@@ -2432,7 +2437,7 @@ mod tests {
         // poison 後は pre-cancel でも InternalFailure（precondition 優先、第10節 規則4）。
         let ok = compile_link(&engine, "m", "let y = 1\n");
         assert!(matches!(
-            engine.run(&ok, &mut ctx, standard_request().pre_cancelled()),
+            engine.run(&ok, &mut ctx, standard_request_cancelled()),
             ExecutionOutcome::InternalFailure { .. }
         ));
     }
@@ -3199,41 +3204,45 @@ mod tests {
         assert_eq!(err, BudgetConfigError::ForeignClock);
     }
 
-    /// EMB-AT-21: 実行中 cancel（別スレッド相当）は Cancelled terminal で停止する。
+    /// EMB-AT-21: request が所有する cancel 済み token の実行は Cancelled terminal で停止する。
     ///
-    /// context の token を run 前に取得し、cancel 済みにしてから実行する。最初の charge 前
-    /// checkpoint で観測され、命令実行前に Cancelled になる（§8）。
+    /// host は token を作って run 前に cancel し、`.cancellation(..)` で request に載せる。
+    /// install 直後の pre-run 分岐で命令実行前に Cancelled になる（§8、§8.2 の役割分担で
+    /// embedding 層は pre-run 分岐の固定に専念し、runtime checkpoint の catch 不能性は eval.rs の
+    /// `cancel_after_install_is_uncatchable_terminal` が担保する）。
     #[test]
     fn e11_runtime_cancel_is_terminal() {
         let engine = Engine::builder().build().unwrap();
         let mut ctx = ExecutionContext::new(&engine);
 
-        let token: CancellationToken = ctx.cancellation_token();
+        let token = CancellationToken::new();
         assert!(token.cancel(), "最初の cancel は true を返す");
 
         let linked = compile_link(&engine, "m", "let saved = 7\nlet z = saved + 1\n");
-        // request は budget を必須所有するが、run 前取得 token は reset_budget をまたいでも
-        // 有効であり続ける（finding 1 の回帰保証）。
-        let outcome = engine.run(&linked, &mut ctx, standard_request());
+        // host が握る token の clone を request に載せる。Engine::run が install するので、
+        // host clone と install token は同一 Arc を共有する（finding 1 の回帰保証）。
+        let outcome = engine.run(
+            &linked,
+            &mut ctx,
+            standard_request().cancellation(token.clone()),
+        );
         assert!(matches!(outcome, ExecutionOutcome::Cancelled { .. }));
         assert!(!ctx.is_poisoned(), "Cancelled は poison しない");
 
         // cancel された実行は language-state を rollback する（saved は残らない）。
-        // 次実行のため token は new context で作り直す（同 context の token は cancel 済みのまま）。
-        let mut ctx2 = ExecutionContext::new(&engine);
         let probe = compile_link(&engine, "m", "let echo = saved\n");
-        match engine.run(&probe, &mut ctx2, standard_request()) {
+        match engine.run(&probe, &mut ctx, standard_request()) {
             ExecutionOutcome::RuntimeError { error, .. } => assert_eq!(error.code, ErrorKind::Name),
             other => panic!("cancel が副作用を残した: {other:?}"),
         }
     }
 
-    /// EMB-AT-10: runtime cancel は try/catch で捕捉できない。
+    /// EMB-AT-10: request が所有する cancel 済み token は try/catch で捕捉できない。
     #[test]
     fn e11_runtime_cancel_is_uncatchable() {
         let engine = Engine::builder().build().unwrap();
         let mut ctx = ExecutionContext::new(&engine);
-        let token = ctx.cancellation_token();
+        let token = CancellationToken::new();
         token.cancel();
 
         let linked = compile_link(
@@ -3242,7 +3251,7 @@ mod tests {
             "try\n  let a = 1\ncatch e\n  let caught = 1\nend\n",
         );
         assert!(matches!(
-            engine.run(&linked, &mut ctx, standard_request()),
+            engine.run(&linked, &mut ctx, standard_request().cancellation(token)),
             ExecutionOutcome::Cancelled { .. }
         ));
     }
@@ -3364,6 +3373,8 @@ mod tests {
             "Debug に引数値を出さない: {dbg}"
         );
         assert!(dbg.contains("argument_count"));
+        // cancel 済みか否かの真偽は秘密ではないので出す（field 名は is_cancelled）。
+        assert!(dbg.contains("is_cancelled"));
     }
 
     /// 本番 clock（SystemMonotonicClock）で有限 budget + 未来 deadline を設定した実行が
@@ -3459,23 +3470,28 @@ mod tests {
         }
     }
 
-    /// finding 1 回帰テスト: run の前に取得した cancellation token が reset_budget をまたいでも
-    /// 有効であり続け、cancel すると実行が Cancelled へ落ちる（§11.2・finding 1）。
+    /// finding 1 回帰テスト: request が所有する cancellation token が reset_budget をまたいでも
+    /// 有効であり続け、cancel すると実行が Cancelled へ落ちる（§3.2・finding 1）。
     ///
-    /// `run_inner` は冒頭で `reset_budget` を呼び ledger の config/counters を作り直すが、
-    /// cancellation token は現 ledger のものを引き継ぐ。したがって run 前に clone 取得した token
-    /// の `cancel()` が、reset 後の実行で観測される。
+    /// host は run の前に token を作り `.cancellation(token.clone())` で request に載せる。
+    /// `run_inner` は冒頭で `reset_budget` を呼び、request の token を ledger へ install
+    /// （継承ではなく置換）する。host clone と install token は同一 `Arc` を共有するので、
+    /// run 前に握った token の `cancel()` が reset をまたいで実行で観測される。
     #[test]
     fn e11_cancellation_token_survives_reset_budget() {
         let engine = Engine::builder().build().unwrap();
         let mut ctx = ExecutionContext::new(&engine);
 
-        // run の前に token の clone を取得して保持する。
-        let token: CancellationToken = ctx.cancellation_token();
+        // run の前に token を作り、clone を保持しつつ request に載せる。
+        let token = CancellationToken::new();
 
-        // standard_request() は内部で新しい budget/clock を作り、run_inner が reset_budget を
-        // 走らせる。その reset をまたいで、保持 token の cancel が観測されることを確認する。
-        assert!(token.cancel(), "run 前取得 token の最初の cancel は true");
+        // standard_request() は内部で新しい budget/clock を作り、run_inner が reset_budget で
+        // request token を install する。その install（reset）をまたいで、保持 token の cancel が
+        // 観測されることを確認する。
+        assert!(
+            token.cancel(),
+            "run 前に握った token の最初の cancel は true"
+        );
 
         let linked = compile_link(
             &engine,
@@ -3484,10 +3500,14 @@ mod tests {
         );
         assert!(
             matches!(
-                engine.run(&linked, &mut ctx, standard_request()),
+                engine.run(
+                    &linked,
+                    &mut ctx,
+                    standard_request().cancellation(token.clone()),
+                ),
                 ExecutionOutcome::Cancelled { .. }
             ),
-            "reset_budget をまたいで保持 token の cancel が観測されるべき"
+            "reset_budget をまたいで request-owned token の cancel が観測されるべき"
         );
     }
 
@@ -3497,7 +3517,7 @@ mod tests {
         let engine = Engine::builder().build().unwrap();
         let mut ctx = ExecutionContext::new(&engine);
         let linked = compile_link(&engine, "m", "let a = 1\nlet b = a + 2\n");
-        match engine.run(&linked, &mut ctx, standard_request().pre_cancelled()) {
+        match engine.run(&linked, &mut ctx, standard_request_cancelled()) {
             ExecutionOutcome::Cancelled { usage } => {
                 assert_eq!(usage.committed, crate::budget::BudgetCounters::default());
                 assert_eq!(usage.reserved, crate::budget::BudgetCounters::default());
@@ -3505,6 +3525,76 @@ mod tests {
             }
             other => panic!("期待: Cancelled, 実際: {other:?}"),
         }
+    }
+
+    // =======================================================================
+    // スライス S2: request が CancellationToken を必須所有する（REV-015 最終形移行）
+    // =======================================================================
+
+    /// `ExecutionRequest::new` の既定 cancellation token は未 cancel で、通常の script は
+    /// Completed する（`.cancellation(..)` 未指定の既定挙動、設計 §5.1）。
+    #[test]
+    fn s2_request_owns_cancellation_default_is_not_cancelled() {
+        let request = standard_request();
+        assert!(
+            !format!("{request:?}").contains("is_cancelled: true"),
+            "既定 token は未 cancel"
+        );
+
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "let a = 1\nlet b = a + 2\n");
+        assert!(matches!(
+            engine.run(&linked, &mut ctx, request),
+            ExecutionOutcome::Completed { .. }
+        ));
+    }
+
+    /// `.cancellation(token)` で載せた token の clone を host が cancel すると、pre-run で
+    /// Cancelled になる（命令0、EMB-AT-12）。host が握る clone と ledger install token が同一
+    /// `Arc` を共有することを「host 側 clone を cancel すると run が止まる」で固定する（設計 §8.3）。
+    #[test]
+    fn s2_cancellation_builder_sets_token() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+
+        // host は token を作り、clone を request に載せ、自分の clone を cancel する。
+        let token = CancellationToken::new();
+        let request = standard_request().cancellation(token.clone());
+        token.cancel();
+
+        let linked = compile_link(&engine, "m", "let saved = 7\nlet z = saved + 1\n");
+        assert!(matches!(
+            engine.run(&linked, &mut ctx, request),
+            ExecutionOutcome::Cancelled { .. }
+        ));
+        assert!(!ctx.is_poisoned(), "Cancelled は poison しない");
+
+        // 命令0なので saved は commit されない（見えれば Name エラーで判別できる）。
+        let probe = compile_link(&engine, "m", "let echo = saved\n");
+        match engine.run(&probe, &mut ctx, standard_request()) {
+            ExecutionOutcome::RuntimeError { error, .. } => assert_eq!(error.code, ErrorKind::Name),
+            other => panic!("pre-cancel が副作用を残した: {other:?}"),
+        }
+    }
+
+    /// request の Debug は引数値・budget 値・token 内部を出さず、`argument_count` と
+    /// `is_cancelled` の真偽だけを出す（EMB-AT-14 系、設計 §8.3）。
+    #[test]
+    fn s2_request_debug_is_secret_free() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let request = standard_request()
+            .with_arguments(vec!["s3cr3t".to_string()])
+            .cancellation(token);
+        let dbg = format!("{request:?}");
+
+        assert!(!dbg.contains("s3cr3t"), "引数値を出さない: {dbg}");
+        assert!(dbg.contains("argument_count"));
+        assert!(
+            dbg.contains("is_cancelled: true"),
+            "cancel 済みの真偽を出す: {dbg}"
+        );
     }
 
     // --- E7: host function embedding registration + grant injection ---
