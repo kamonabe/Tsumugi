@@ -1563,3 +1563,49 @@ fn nonterminal_drop_rolls_back_and_closes_without_blocking_host_pending() {
         completer.complete(Ok(Value::Int(0)));
     }
 }
+
+/// REV-015 最終形移行 Slice 1: embedding Engine API で、request が必須所有する standard budget
+/// （30s deadline + §3.1 標準上限）を持って import なし script を実行すると Completed になる
+/// （EMB-AT-21 の成功側）。公開 API だけで有限 budget 経路を組めることを integration で固定する。
+///
+/// 決定的な deadline 到達は FakeClock を進める embedding ユニットで担保済みなので、ここでは
+/// deadline 未達の成功側だけを置く（SystemMonotonicClock の 30s は実時間なので踏ませない）。
+#[test]
+fn embedding_standard_budget_request_completes_import_less_script() {
+    use std::sync::Arc;
+    use tsumugi::{
+        BudgetConfig, EmbeddingContext, EmbeddingEngine, EmbeddingOutcome, EmbeddingRequest,
+        LinkRequest, MonotonicClock, Source, SourceId, SystemMonotonicClock,
+        embedding::CompileOptions,
+    };
+
+    let engine = EmbeddingEngine::builder()
+        .build()
+        .expect("既定 backend の Engine build は失敗しない");
+    let source_id = SourceId::new("m").expect("valid source id");
+    let script = engine
+        .compile(
+            Source::new(source_id, "let a = 1\nlet b = a + 2\n"),
+            &CompileOptions {
+                retain_source: true,
+            },
+        )
+        .expect("import なし script の compile は成功する");
+    let linked = engine
+        .link(&script, LinkRequest::new())
+        .expect("import なし root は link できる");
+
+    let mut context = EmbeddingContext::new(&engine);
+
+    // 単一 clock を standard budget の deadline 生成と request 注入で共有する（CLI の option B
+    // と同じ構成）。clock_id が一致するため ForeignClock にならない。
+    let clock: Arc<dyn MonotonicClock> = Arc::new(SystemMonotonicClock::new());
+    let budget = BudgetConfig::standard(clock.as_ref()).expect("standard budget");
+    let request = EmbeddingRequest::new(budget, Arc::clone(&clock))
+        .expect("standard budget は自身を生成した clock と同 domain なので検証を通る");
+
+    assert!(matches!(
+        engine.run(&linked, &mut context, request),
+        EmbeddingOutcome::Completed { .. }
+    ));
+}

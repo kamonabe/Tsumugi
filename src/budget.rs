@@ -132,7 +132,7 @@ impl MonotonicClock for FakeClock {
 /// OS の単調増加時計に基づく本番用 [`MonotonicClock`]（REV-015 E11）。
 ///
 /// deadline を実運用で効かせるための clock で、埋め込み host が
-/// [`crate::embedding::ExecutionRequest::with_deadline_clock`] へ `Arc` で渡す。
+/// [`crate::embedding::ExecutionRequest::new`] へ `budget` と一緒に `Arc` で渡す。
 /// [`std::time::Instant`] を backing にし、生成時点を基準（ns=0）とする 0 始まりの
 /// 単調増加 tick を返す。`Instant` は wall-clock ではなく単調時計なので、system time の
 /// 巻き戻しに影響されない（§3 の「単調増加」契約に一致）。
@@ -997,6 +997,21 @@ impl BudgetLedger {
     /// cancellation token を共有せず、単体で使う台帳を作る（テスト補助）。
     pub fn with_config(config: BudgetConfig) -> Self {
         Self::new(config, CancellationToken::new())
+    }
+
+    /// 実行単位で budget config を据え直す（REV-015 最終形移行、Slice 1）。
+    ///
+    /// 現 ledger の [`CancellationToken`] を `clone()` で引き継ぎ、config / counters / heap
+    /// ledger だけを新しい config で作り直す。これにより、host が [`Engine::run`](crate::embedding::Engine::run)
+    /// を呼ぶ前に [`Self::cancellation_token`] で取得した token は reset をまたいでも有効であり
+    /// 続ける（同じ cancel 状態を共有する clone なので、run 前取得 token の `cancel()` が実行中に
+    /// 観測される）。[`Self::with_config`] は毎回新しい token を立てるため、この用途では使わない。
+    ///
+    /// `clock` フィールドは [`Self::new`] により `None` へ戻るので、deadline を効かせる場合は
+    /// 呼び出し側が [`Self::set_clock`] で据え直す。
+    pub fn reset_config(&mut self, config: BudgetConfig) {
+        let cancellation = self.cancellation.clone();
+        *self = Self::new(config, cancellation);
     }
 
     /// deadline 確認用の clock を注入する（REV-015 Slice 4）。

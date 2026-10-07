@@ -83,10 +83,10 @@ pub use host_pending::{
 // `Send + Sync` な `Arc<AtomicBool>` ハンドル。
 pub use budget::CancellationToken;
 
-// 実行予算・deadline の公開型（REV-015 E11、実行制御仕様 §3 / §7）。埋め込み host が
-// `EngineConfig.budget` に有限 budget を設定し、`EmbeddingRequest::with_deadline_clock` に
-// monotonic clock を渡して deadline を実効化するために使う。`FakeClock` は決定的な
-// test / host utility 向けの clock 実装。
+// 実行予算・deadline の公開型（REV-015 最終形移行 Slice 1、実行制御仕様 §3 / §7）。埋め込み
+// host は `EmbeddingRequest::new(budget, clock)` で有限 budget と deadline clock を必須所有させ、
+// deadline（`budget.deadline`）を実効化する。`FakeClock` は決定的な test / host utility 向けの
+// clock 実装。
 pub use budget::{
     BudgetConfig, BudgetCounters, BudgetPeaks, BudgetUsage, FakeClock, MonotonicClock,
     MonotonicInstant, SystemMonotonicClock,

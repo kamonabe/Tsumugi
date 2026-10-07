@@ -420,6 +420,26 @@ impl Evaluator {
         }
     }
 
+    /// この実行に使う有限 `BudgetConfig` と deadline clock を据え直す（REV-015 最終形移行、
+    /// Slice 1）。
+    ///
+    /// 直前の実行の budget 残量・counters を破棄し、新しい config で [`crate::budget::BudgetLedger`]
+    /// の中身を作り直す。ただし **cancellation token は現 ledger のものを引き継ぐ**ため、host が
+    /// [`Engine::run`](crate::embedding::Engine::run) を呼ぶ前に取得した token は reset をまたいでも
+    /// 有効であり続ける（[`crate::budget::BudgetLedger::reset_config`] 参照）。clock は
+    /// `config.deadline` と同 domain を前提とする（[`crate::embedding::ExecutionRequest::new`] が
+    /// 構築時に検証済み）。
+    pub fn reset_budget(
+        &mut self,
+        config: crate::budget::BudgetConfig,
+        clock: std::sync::Arc<dyn crate::budget::MonotonicClock>,
+    ) {
+        self.budget.reset_config(config);
+        self.budget.set_clock(clock);
+        // heap 台帳を作り直したので、cell 課金用のハンドルを Env へ配り直す（REV-015 PR-c）。
+        self.env.set_heap_ledger(self.budget.heap_handle());
+    }
+
     /// deadline 確認用の clock を注入する（REV-015 Slice 4）。
     ///
     /// 注入した clock が `config.deadline` に達すると、charge 前と文/反復境界で
