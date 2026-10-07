@@ -78,9 +78,10 @@ pub use host_pending::{
     new_ticket,
 };
 
-// 協調的 cancel token（REV-015 Slice 4、実行制御仕様 §8）。`ExecutionHandle::cancellation_token`
-// / `EmbeddingContext::cancellation_token` の戻り値型として公開する。別スレッドへ渡せる
-// `Send + Sync` な `Arc<AtomicBool>` ハンドル。
+// 協調的 cancel token（REV-015 Slice 4、実行制御仕様 §8）。alpha facade の
+// `ExecutionHandle::cancellation_token` の戻り値型、および `EmbeddingRequest::cancellation(..)` で
+// request に載せる協調 cancel token（REV-015 最終形移行 Slice 2）として公開する。別スレッドへ
+// 渡せる `Send + Sync` な `Arc<AtomicBool>` ハンドル。
 pub use budget::CancellationToken;
 
 // 実行予算・deadline の公開型（REV-015 最終形移行 Slice 1、実行制御仕様 §3 / §7）。埋め込み

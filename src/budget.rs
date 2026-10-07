@@ -999,18 +999,23 @@ impl BudgetLedger {
         Self::new(config, CancellationToken::new())
     }
 
-    /// 実行単位で budget config を据え直す（REV-015 最終形移行、Slice 1）。
+    /// 実行単位で budget config と cancellation token を据え直す（REV-015 最終形移行、Slice 2）。
     ///
-    /// 現 ledger の [`CancellationToken`] を `clone()` で引き継ぎ、config / counters / heap
-    /// ledger だけを新しい config で作り直す。これにより、host が [`Engine::run`](crate::embedding::Engine::run)
-    /// を呼ぶ前に [`Self::cancellation_token`] で取得した token は reset をまたいでも有効であり
-    /// 続ける（同じ cancel 状態を共有する clone なので、run 前取得 token の `cancel()` が実行中に
-    /// 観測される）。[`Self::with_config`] は毎回新しい token を立てるため、この用途では使わない。
+    /// request が必須所有する [`CancellationToken`] を ledger へ install（継承ではなく置換）し、
+    /// config / counters / heap ledger をその token と新しい config で作り直す。source of truth は
+    /// request-owned token であり、[`Engine::run`](crate::embedding::Engine::run) が実行直前に
+    /// この経路で install する。host が run 前に `.cancellation(token.clone())` で載せた token は、
+    /// install される token と同一 `Arc` を共有する clone なので、reset をまたいでも実行中に
+    /// `cancel()` が観測される（finding 1 の不変量）。[`Self::with_config`] は毎回新しい token を
+    /// 立てるため、この用途では使わない。
     ///
     /// `clock` フィールドは [`Self::new`] により `None` へ戻るので、deadline を効かせる場合は
     /// 呼び出し側が [`Self::set_clock`] で据え直す。
-    pub fn reset_config(&mut self, config: BudgetConfig) {
-        let cancellation = self.cancellation.clone();
+    pub fn reset_config_with_token(
+        &mut self,
+        config: BudgetConfig,
+        cancellation: CancellationToken,
+    ) {
         *self = Self::new(config, cancellation);
     }
 
