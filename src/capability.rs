@@ -1719,6 +1719,37 @@ mod os_secure {
         Ok(())
     }
 
+    /// rename の src / dst が reparse point（symlink / junction / mount point 等）なら拒否する。
+    ///
+    /// `reject_if_unsafe_reparse` は「reparse かつ非 symlink」だけを落とすため、junction を
+    /// `is_symlink()==true` と報告する環境（実機 Windows で観測。std / OS バージョンにより
+    /// junction の symlink 報告が揺れる）では junction をすり抜ける。rename には open/list の
+    /// ような symlink policy の第二検査が無いため、ここをすり抜けると root 外を指すリンクの
+    /// rename が成立してしまう（root 脱出）。rename はリンクを辿らず・リンク自体も動かさない
+    /// 契約（契約6）なので、`is_symlink()` の値に依存せず **reparse 属性が立つか symlink なら
+    /// 一律拒否** して fail-closed にする。通常の file / directory だけが rename 対象になる。
+    #[cfg(unix)]
+    fn reject_if_rename_reparse(_path: &Path, meta: &fs::Metadata) -> Result<(), AdapterError> {
+        // unix に reparse 概念は無い。symlink 自体を src/dst にした rename は link エントリを
+        // 動かすだけで実体（root 外）は動かないが、契約6 を一貫させるため symlink も拒否する。
+        if meta.file_type().is_symlink() {
+            return Err(host_err("rename on symlink denied"));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn reject_if_rename_reparse(_path: &Path, meta: &fs::Metadata) -> Result<(), AdapterError> {
+        use std::os::windows::fs::MetadataExt;
+        let is_reparse = meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        // junction が is_symlink()==true/false どちらを返す環境でも確実に落とすため、
+        // reparse 属性ビットと is_symlink() の論理和で判定する（is_symlink() 非依存）。
+        if is_reparse || meta.file_type().is_symlink() {
+            return Err(host_err("rename on reparse point denied"));
+        }
+        Ok(())
+    }
+
     /// 解決結果の host path と、その parent directory（rename/remove 等が使う）。
     pub(super) struct Resolved {
         /// final entry の host path（base 配下）。
@@ -2005,18 +2036,20 @@ mod os_secure {
     ) -> Result<(), AdapterError> {
         let src = resolve(from_handle, from)?.path;
         let dst = resolve(to_handle, to)?.path;
-        // src final が junction / mount point なら rename を許さない（§4.3 rename 段落・
-        // Finding 1）。resolve は final を lstat しないため、ここで明示検査する。
+        // src final が reparse point（symlink / junction / mount point）なら rename を許さない。
+        // junction を is_symlink()==true と報告する環境では reject_if_unsafe_reparse がすり抜ける
+        // ため、rename では is_symlink() 非依存の reject_if_rename_reparse で一律拒否する
+        // （root 脱出防止、契約6）。resolve は final を lstat しないためここで明示検査する。
         let src_meta =
             fs::symlink_metadata(&src).map_err(|_| host_err("rename source not accessible"))?;
-        reject_if_unsafe_reparse(&src, &src_meta)?;
+        reject_if_rename_reparse(&src, &src_meta)?;
         if !replace && dst.exists() {
             return Err(host_err("destination exists"));
         }
-        // 既存 dst を上書きする場合（replace=true）は dst final も検査する。junction を上書き先
-        // として受理しない。dst 非存在の新規作成は final lstat 不要（reparse も存在しない）。
+        // 既存 dst を上書きする場合（replace=true）は dst final も検査する。reparse point を
+        // 上書き先として受理しない。dst 非存在の新規作成は final lstat 不要（reparse も存在しない）。
         if let Ok(dst_meta) = fs::symlink_metadata(&dst) {
-            reject_if_unsafe_reparse(&dst, &dst_meta)?;
+            reject_if_rename_reparse(&dst, &dst_meta)?;
         }
         fs::rename(&src, &dst).map_err(|_| host_err("rename failed"))
     }
@@ -2919,6 +2952,25 @@ mod tests {
 
         #[cfg(unix)]
         #[test]
+        fn rename_src_symlink_is_rejected() {
+            // 契約6: symlink を rename の src にできない（reject_if_rename_reparse）。
+            // Windows の junction（is_symlink()==true 報告）と同じ穴を Unix の symlink でも塞ぐ。
+            let root = TempRoot::new();
+            let outside = TempRoot::new();
+            fs::write(outside.path.join("secret.txt"), b"x").expect("write outside");
+            // root 内から root 外を指す symlink。これを rename src にして root 外を動かせない。
+            std::os::unix::fs::symlink(outside.path.join("secret.txt"), root.path.join("link.txt"))
+                .expect("symlink");
+            let h = handle(&root, SymlinkPolicy::OperateOnFinalEntry);
+            let res = h.rename(&rel(&["link.txt"]), &h, &rel(&["moved.txt"]), false);
+            assert!(
+                matches!(res, Err(AdapterError::Host(_))),
+                "symlink rename src must be denied"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
         fn deny_all_rejects_final_symlink_open() {
             // 契約4: DenyAll は final symlink の read を拒否する（O_NOFOLLOW）。
             let root = TempRoot::new();
@@ -3136,38 +3188,19 @@ mod tests {
         #[cfg(windows)]
         #[test]
         fn windows_junction_rename_src_is_rejected() {
-            // AC-3: junction を rename の src にできない。
-            use std::os::windows::fs::MetadataExt;
+            // AC-3: junction を rename の src にできない。実機 Windows では junction が
+            // is_symlink()==true を返すため、rename は is_symlink() 非依存の
+            // reject_if_rename_reparse（reparse 属性で一律拒否）で封じる。
             let root = TempRoot::new();
             let outside = TempRoot::new();
-            let link = root.path.join("jct");
-            if !make_junction(&link, &outside.path) {
+            if !make_junction(&root.path.join("jct"), &outside.path) {
                 return;
             }
-            // 診断: junction の実属性と resolve 結果を観測する（実機 Windows でのみ取れる値）。
-            let direct_meta = std::fs::symlink_metadata(&link).expect("symlink_metadata on link");
-            let direct_attrs = direct_meta.file_attributes();
-            let direct_is_symlink = direct_meta.file_type().is_symlink();
             let h = handle(&root, SymlinkPolicy::OperateOnFinalEntry);
-            let resolved = os_secure::resolve(&h, &rel(&["jct"]));
-            let resolved_desc = match &resolved {
-                Ok(r) => {
-                    let m = std::fs::symlink_metadata(&r.path);
-                    match m {
-                        Ok(m) => format!(
-                            "Ok(path_attrs={:#x}, path_is_symlink={})",
-                            m.file_attributes(),
-                            m.file_type().is_symlink()
-                        ),
-                        Err(e) => format!("Ok(path, meta_err={e})"),
-                    }
-                }
-                Err(e) => format!("Err({e:?})"),
-            };
             let res = h.rename(&rel(&["jct"]), &h, &rel(&["moved"]), false);
             assert!(
                 matches!(res, Err(AdapterError::Host(_))),
-                "junction rename src must be denied. DIAG: direct_attrs={direct_attrs:#x} direct_is_symlink={direct_is_symlink} resolved={resolved_desc} rename_res={res:?}"
+                "junction rename src must be denied"
             );
         }
 
