@@ -2786,6 +2786,29 @@ mod tests {
         }
     }
 
+    /// OS ポータブルな一意の一時 path を作る（host path）。
+    ///
+    /// Windows の `/tmp` 不在・パス区切り差を避けるため、`std::env::temp_dir()` を基点にする。
+    /// 返す path は実在する temp dir 配下なので、`ambient_test_capabilities()` の legacy
+    /// translator（default mount = volume root）が lexical prefix 一致で route できる。
+    fn unique_temp_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("tsg-eval-{}-{}-{}", tag, std::process::id(), n));
+        path
+    }
+
+    /// host path を Tsumugi スクリプト文字列リテラルへ埋め込める形へ正規化する。
+    ///
+    /// Windows の `\`（例 `C:\Users\...\Temp`）はスクリプト文字列リテラルのエスケープを壊すため
+    /// `/` へ置換する。legacy translator は `Path::new` 経由で `/` 区切りも受理するので route は
+    /// 成立する。
+    fn script_path(path: &std::path::Path) -> String {
+        path.to_str().expect("UTF-8 path").replace('\\', "/")
+    }
+
     fn run_program(input: &str) -> Result<(), TsumugiError> {
         let tokens = Lexer::new(input).tokenize();
         let program = Parser::new(tokens)
@@ -3407,37 +3430,45 @@ mod tests {
 
     #[test]
     fn builtin_write_and_read_file() {
-        run_program(
-            "write_file(\"/tmp/tsumugi_unit_test.txt\", \"hello\")\nlet c = read_file(\"/tmp/tsumugi_unit_test.txt\")\nprint(c)",
-        )
+        let p = unique_temp_path("write_read");
+        let sp = script_path(&p);
+        run_program(&format!(
+            "write_file(\"{sp}\", \"hello\")\nlet c = read_file(\"{sp}\")\nprint(c)"
+        ))
         .unwrap();
         // cleanup
-        std::fs::remove_file("/tmp/tsumugi_unit_test.txt").ok();
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn builtin_read_lines() {
-        run_program(
-            "write_file(\"/tmp/tsumugi_lines_test.txt\", \"a\\nb\\nc\")\nlet lines = read_lines(\"/tmp/tsumugi_lines_test.txt\")\nprint(len(lines))",
-        )
+        let p = unique_temp_path("read_lines");
+        let sp = script_path(&p);
+        run_program(&format!(
+            "write_file(\"{sp}\", \"a\\nb\\nc\")\nlet lines = read_lines(\"{sp}\")\nprint(len(lines))"
+        ))
         .unwrap();
-        std::fs::remove_file("/tmp/tsumugi_lines_test.txt").ok();
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn builtin_append_file() {
-        run_program(
-            "write_file(\"/tmp/tsumugi_append_test.txt\", \"a\")\nappend_file(\"/tmp/tsumugi_append_test.txt\", \"b\")\nlet c = read_file(\"/tmp/tsumugi_append_test.txt\")\nprint(c)",
-        )
+        let p = unique_temp_path("append");
+        let sp = script_path(&p);
+        run_program(&format!(
+            "write_file(\"{sp}\", \"a\")\nappend_file(\"{sp}\", \"b\")\nlet c = read_file(\"{sp}\")\nprint(c)"
+        ))
         .unwrap();
-        std::fs::remove_file("/tmp/tsumugi_append_test.txt").ok();
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn builtin_read_file_missing() {
         // C10: capability 経路では存在しない file の read は catch 可能な `host` error になる
         // （ambient 時代の `null` 返しは廃止）。未捕捉なら実行は error で終わる。
-        let result = run_program("let x = read_file(\"/tmp/no_such_file_xyz_tsg.txt\")\nprint(x)");
+        let p = unique_temp_path("missing");
+        let sp = script_path(&p);
+        let result = run_program(&format!("let x = read_file(\"{sp}\")\nprint(x)"));
         assert!(
             result.is_err(),
             "存在しない file の read は host error になる（null へ畳まない）"
@@ -3473,12 +3504,14 @@ mod tests {
 
     #[test]
     fn builtin_path_exists() {
-        run_program("print(path_exists(\"/tmp\"))").unwrap();
+        let sp = script_path(&std::env::temp_dir());
+        run_program(&format!("print(path_exists(\"{sp}\"))")).unwrap();
     }
 
     #[test]
     fn builtin_path_exists_missing() {
-        run_program("print(path_exists(\"/no_such_dir_xyz\"))").unwrap();
+        let sp = script_path(&unique_temp_path("missing_dir"));
+        run_program(&format!("print(path_exists(\"{sp}\"))")).unwrap();
     }
 
     #[test]
@@ -3488,48 +3521,61 @@ mod tests {
 
     #[test]
     fn builtin_mkdir_and_remove_dir() {
-        run_program(
-            "mkdir(\"/tmp/tsg_test_mkdir\")\nprint(path_exists(\"/tmp/tsg_test_mkdir\"))\nremove_dir(\"/tmp/tsg_test_mkdir\")\nprint(path_exists(\"/tmp/tsg_test_mkdir\"))",
-        )
+        let p = unique_temp_path("mkdir");
+        std::fs::remove_dir_all(&p).ok();
+        let sp = script_path(&p);
+        run_program(&format!(
+            "mkdir(\"{sp}\")\nprint(path_exists(\"{sp}\"))\nremove_dir(\"{sp}\")\nprint(path_exists(\"{sp}\"))"
+        ))
         .unwrap();
+        std::fs::remove_dir_all(&p).ok();
     }
 
     #[test]
     fn builtin_rename() {
-        run_program(
-            "write_file(\"/tmp/tsg_rename_src.txt\", \"x\")\nrename(\"/tmp/tsg_rename_src.txt\", \"/tmp/tsg_rename_dst.txt\")\nprint(path_exists(\"/tmp/tsg_rename_dst.txt\"))",
-        )
+        let src = unique_temp_path("rename_src");
+        let dst = unique_temp_path("rename_dst");
+        let src_sp = script_path(&src);
+        let dst_sp = script_path(&dst);
+        run_program(&format!(
+            "write_file(\"{src_sp}\", \"x\")\nrename(\"{src_sp}\", \"{dst_sp}\")\nprint(path_exists(\"{dst_sp}\"))"
+        ))
         .unwrap();
-        std::fs::remove_file("/tmp/tsg_rename_dst.txt").ok();
+        std::fs::remove_file(&dst).ok();
     }
 
     #[test]
     fn builtin_list_dir() {
         // C10: capability 経路の mkdir は `create_dir`（1 階層・親既存前提）。既存 dir があると
         // host error になるため、事前に掃除してから走らせる（legacy translator 経由 / 絶対パス）。
-        let base = "/tmp/tsg_list_test_tsg";
-        std::fs::remove_dir_all(base).ok();
+        let base = unique_temp_path("list_dir");
+        std::fs::remove_dir_all(&base).ok();
+        let sp = script_path(&base);
         run_program(&format!(
-            "mkdir(\"{base}\")\nwrite_file(\"{base}/a.txt\", \"\")\nlet entries = list_dir(\"{base}\")\nprint(len(entries))\nremove_tree(\"{base}\")"
+            "mkdir(\"{sp}\")\nwrite_file(\"{sp}/a.txt\", \"\")\nlet entries = list_dir(\"{sp}\")\nprint(len(entries))\nremove_tree(\"{sp}\")"
         ))
         .unwrap();
-        std::fs::remove_dir_all(base).ok();
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
     fn builtin_file_size() {
-        run_program(
-            "write_file(\"/tmp/tsg_size_test.txt\", \"hello\")\nlet s = file_size(\"/tmp/tsg_size_test.txt\")\nprint(s)",
-        )
+        let p = unique_temp_path("file_size");
+        let sp = script_path(&p);
+        run_program(&format!(
+            "write_file(\"{sp}\", \"hello\")\nlet s = file_size(\"{sp}\")\nprint(s)"
+        ))
         .unwrap();
-        std::fs::remove_file("/tmp/tsg_size_test.txt").ok();
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn builtin_remove_file() {
-        run_program(
-            "write_file(\"/tmp/tsg_remove_test.txt\", \"x\")\nprint(remove(\"/tmp/tsg_remove_test.txt\"))\nprint(path_exists(\"/tmp/tsg_remove_test.txt\"))",
-        )
+        let p = unique_temp_path("remove");
+        let sp = script_path(&p);
+        run_program(&format!(
+            "write_file(\"{sp}\", \"x\")\nprint(remove(\"{sp}\"))\nprint(path_exists(\"{sp}\"))"
+        ))
         .unwrap();
     }
 
@@ -3585,7 +3631,11 @@ mod tests {
 
     #[test]
     fn builtin_is_file_is_dir() {
-        run_program("print(is_dir(\"/tmp\"))\nprint(is_file(\"/tmp\"))").unwrap();
+        let sp = script_path(&std::env::temp_dir());
+        run_program(&format!(
+            "print(is_dir(\"{sp}\"))\nprint(is_file(\"{sp}\"))"
+        ))
+        .unwrap();
     }
 
     #[test]
