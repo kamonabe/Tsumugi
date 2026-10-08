@@ -160,6 +160,10 @@ fn empty_env_allow_emits_single_warning() {
     }
 }
 
+// legacy の実 fs route 成功は Unix でのみ検証する。非 Unix は OS filesystem の secure
+// resolution 非対応で fail closed するため成功を assert できない（capability-model §8.3 契約3、
+// 既存の legacy_symlink_* テストと同じ #[cfg(unix)] 規約）。
+#[cfg(unix)]
 #[test]
 fn sandbox_routes_old_absolute_path() {
     for use_vm in [false, true] {
