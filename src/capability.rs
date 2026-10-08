@@ -230,10 +230,10 @@ pub trait Clock: Send + Sync + 'static {
     fn now_utc(&self) -> SystemTime;
 }
 
-/// OS の system clock を使う [`Clock`]（ambient 互換経路と CLI legacy profile 用）。
+/// OS の system clock を使う [`Clock`]（CLI safe/legacy profile builder 用）。
 ///
-/// [`CapabilitySet::ambient_compat`] が使う既定 clock。埋め込み host は自前の
-/// [`Clock`] 実装を grant できる。
+/// CLI の safe/legacy profile builder が `--allow-clock`（safe）/ legacy 既定で grant する
+/// 既定 clock。埋め込み host は自前の [`Clock`] 実装を grant できる。
 pub struct SystemClock {
     policy_id: NonZeroU128,
 }
@@ -445,10 +445,10 @@ pub trait Output: Send + Sync + 'static {
     fn flush(&self) -> Result<(), AdapterError>;
 }
 
-/// OS の標準入力を読む [`Input`]（ambient 互換経路と CLI legacy profile 用）。
+/// OS の標準入力を読む [`Input`]（CLI safe/legacy profile builder 用）。
 ///
-/// [`CapabilitySet::ambient_compat`] が使う既定 stdin。従来 `input()` が直接読んでいた
-/// `std::io::stdin()` をこの adapter 内へ集約する。
+/// CLI の safe/legacy profile builder が `--allow-script-stdin`（safe）/ legacy 既定で grant
+/// する既定 stdin。従来 `input()` が直接読んでいた `std::io::stdin()` をこの adapter 内へ集約する。
 pub struct SystemInput {
     policy_id: NonZeroU128,
 }
@@ -484,10 +484,11 @@ impl Input for SystemInput {
     }
 }
 
-/// OS の標準出力へ書き出す [`Output`]（ambient 互換経路と CLI legacy profile 用）。
+/// OS の標準出力へ書き出す [`Output`]（CLI safe/legacy profile builder 用）。
 ///
-/// [`CapabilitySet::ambient_compat`] が使う既定 stdout。broken pipe でも panic せず
-/// [`AdapterError::Host`] へ写す（従来 `write_stdout_line` が持っていた挙動、AUD-035）。
+/// CLI の safe profile は既定で（`--deny-stdout` が無ければ）この stdout を grant する。broken
+/// pipe でも panic せず [`AdapterError::Host`] へ写す（従来 `write_stdout_line` が持っていた
+/// 挙動、AUD-035）。
 pub struct SystemOutput {
     policy_id: NonZeroU128,
 }
@@ -755,14 +756,61 @@ impl std::fmt::Debug for FilesystemRoot {
 #[derive(Clone)]
 pub struct FilesystemCapability {
     roots: Arc<[FilesystemRoot]>,
+    /// legacy profile 専用の host path 翻訳表（CLI legacy builder だけが設定する、§4.2/§5）。
+    ///
+    /// `Some` のとき、fs builtin dispatch は script が渡す **host path（絶対/相対）** を
+    /// 登録 root から最長一致で選んで mount 相対 [`FilesystemTarget`] へ翻訳する。`None`（safe /
+    /// 埋め込み host）は従来どおり [`FilesystemTarget::parse`]（`@mount/...` 構文）を使い、絶対
+    /// パスは [`PathError::Absolute`] で拒否する。
+    legacy: Option<Arc<LegacyFsTranslator>>,
 }
 
 impl FilesystemCapability {
     /// root 集合から作る。空・mount 重複は configuration error。
     ///
     /// 同じ policy ID は、同じ adapter Arc・operations・symlink policy へ別 mount alias を
-    /// 付ける場合だけ許可する（仕様第8.1節）。
+    /// 付ける場合だけ許可する（仕様第8.1節）。safe profile / 埋め込み host 用（legacy translator
+    /// なし）。
     pub fn new(roots: impl IntoIterator<Item = FilesystemRoot>) -> Result<Self, ConfigError> {
+        Self::new_inner(roots, None)
+    }
+
+    /// legacy profile 用に、host path 翻訳表付きの filesystem capability を作る（§4.2/§5）。
+    ///
+    /// `translation_roots` は各 mount の root を **CWD 基準で絶対化した lexical path**（symlink
+    /// 非追従、canonicalize しない、Finding 3）で与える。script の host path はこの表から最長
+    /// component 一致で mount へ route される。2 つの root が同一絶対 path を持つ場合は曖昧として
+    /// configuration error（CLI は exit 1、§7.4）。
+    pub fn new_legacy(
+        roots: impl IntoIterator<Item = FilesystemRoot>,
+        translation_roots: impl IntoIterator<Item = (MountName, std::path::PathBuf)>,
+    ) -> Result<Self, ConfigError> {
+        let mut entries: Vec<(MountName, std::path::PathBuf)> =
+            translation_roots.into_iter().collect();
+        // 同一絶対 path を持つ root が複数あると最長一致が曖昧になる（§4.2/§7.4）。
+        let mut seen_paths = std::collections::HashSet::new();
+        for (_, path) in &entries {
+            if !seen_paths.insert(path.clone()) {
+                return Err(ConfigError::InvalidFilesystemPolicy {
+                    code: "ambiguous_legacy_root",
+                });
+            }
+        }
+        // 長い root を先に試すため component 数降順に並べる（最長一致）。
+        entries.sort_by(|a, b| {
+            b.1.components()
+                .count()
+                .cmp(&a.1.components().count())
+                .then_with(|| b.1.as_os_str().len().cmp(&a.1.as_os_str().len()))
+        });
+        let translator = LegacyFsTranslator { entries };
+        Self::new_inner(roots, Some(Arc::new(translator)))
+    }
+
+    fn new_inner(
+        roots: impl IntoIterator<Item = FilesystemRoot>,
+        legacy: Option<Arc<LegacyFsTranslator>>,
+    ) -> Result<Self, ConfigError> {
         let roots: Vec<FilesystemRoot> = roots.into_iter().collect();
         if roots.is_empty() {
             return Err(ConfigError::InvalidFilesystemPolicy { code: "no_roots" });
@@ -777,6 +825,7 @@ impl FilesystemCapability {
         }
         Ok(Self {
             roots: roots.into(),
+            legacy,
         })
     }
 
@@ -784,6 +833,96 @@ impl FilesystemCapability {
     pub fn roots(&self) -> impl Iterator<Item = &FilesystemRoot> {
         self.roots.iter()
     }
+
+    /// legacy translator を返す（crate 内部限定。fs dispatch が host path 翻訳に使う）。
+    pub(crate) fn legacy_translator(&self) -> Option<&LegacyFsTranslator> {
+        self.legacy.as_deref()
+    }
+}
+
+/// legacy profile の host path → mount 相対 path 翻訳表（§4.2/§5）。
+///
+/// `entries` は component 数降順（最長一致を先に試す）に並んだ `(mount, 絶対 lexical root)`。
+pub(crate) struct LegacyFsTranslator {
+    entries: Vec<(MountName, std::path::PathBuf)>,
+}
+
+impl LegacyFsTranslator {
+    /// script の host path（絶対/相対）を mount 相対 [`FilesystemTarget`] へ翻訳する。
+    ///
+    /// CWD 基準で lexical 絶対化（symlink 非追従・canonicalize しない、Finding 3）し、登録 root の
+    /// うち component 数最長で prefix 一致する root を選ぶ。該当 root が無ければ `None`（route 先
+    /// 無し → dispatch 側で sandbox deny）。NUL・空は [`PathError`]。
+    pub(crate) fn translate(
+        &self,
+        script_path: &str,
+    ) -> Result<Option<FilesystemTarget>, PathError> {
+        if script_path.is_empty() {
+            return Err(PathError::Empty);
+        }
+        if script_path.contains('\0') {
+            return Err(PathError::ContainsNul);
+        }
+        let abs = absolutize_lexical(std::path::Path::new(script_path));
+        let abs_components: Vec<String> = abs
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        for (mount, root) in &self.entries {
+            let root_components: Vec<String> = root
+                .components()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect();
+            // root の normal component 列が abs の prefix なら、残りが mount 相対 path。
+            // Windows の prefix/root（C:, /）は normal component に含まれないため、component 列の
+            // 一致だけで prefix 判定する（lexical・symlink 非追従）。
+            if abs.starts_with(root) || root_components.is_empty() && abs.is_absolute() {
+                if root_components.len() > abs_components.len() {
+                    continue;
+                }
+                if abs_components[..root_components.len()] != root_components[..] {
+                    continue;
+                }
+                let rel: Vec<String> = abs_components[root_components.len()..].to_vec();
+                return Ok(Some(FilesystemTarget {
+                    mount: mount.clone(),
+                    path: RelativePath {
+                        components: rel.into(),
+                    },
+                }));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// path を CWD 基準で lexical に絶対化する（symlink 非追従・canonicalize しない、Finding 3）。
+fn absolutize_lexical(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let base = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+            .join(path)
+    };
+    let mut out = std::path::PathBuf::new();
+    for comp in base.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 impl std::fmt::Debug for FilesystemCapability {
@@ -1077,42 +1216,6 @@ impl CapabilitySet {
         CapabilitySetBuilder::new()
     }
 
-    /// ambient 互換の既定 set（Phase 2 移行用）。
-    ///
-    /// alpha facade / CLI / REPL / VM 経路は Phase 2 の CLI profile（C9）が入るまで、
-    /// 従来どおりの挙動へ到達できる必要がある。そのため次を grant した set を既定にする。
-    ///
-    /// - **ProcessExit**（C7）: `exit()` を structured `Exited` terminal にする。
-    /// - **Environment**（C3）: `env()` 用の snapshot。process env を 1 度だけ読み、legacy の
-    ///   allow-list（`TSUMUGI_ENV_ALLOW`）と `TSUMUGI_` 保護を適用した visible key だけを載せる。
-    ///   ambient 経路の唯一の process env 読み取りをこの構築時点へ集約し、`env()` builtin 側は
-    ///   snapshot だけを読む（core builtin の ambient read 0）。
-    /// - **Clock**（C3）: OS system clock（[`SystemClock`]）。`now()` が使う。
-    /// - **Stdin**（C4）: OS 標準入力（[`SystemInput`]）。`input()` が使う。
-    /// - **Stdout**（C4）: OS 標準出力（[`SystemOutput`]）。`print` が使う。
-    ///
-    /// filesystem 等は従来の process-global 経路（sandbox）が引き続き担うため、この set
-    /// には載せない（C5/C10 で置換する）。
-    ///
-    /// deny-by-default の唯一の library 既定値は [`Self::empty`] であり、埋め込み host は
-    /// そちらから明示 grant する。本 set は移行期の内部利用に限る。
-    pub fn ambient_compat() -> Self {
-        // ambient 経路は policy 相関 ID を区別しないため固定の非ゼロ policy_id を使う。
-        let policy_id = NonZeroU128::new(1).expect("non-zero");
-        CapabilitySetBuilder::new()
-            .process_exit(ProcessExit::new(policy_id))
-            .expect("single grant never duplicates")
-            .environment(crate::builtin_core::ambient_environment_snapshot())
-            .expect("single grant never duplicates")
-            .clock(Arc::new(SystemClock::new(policy_id)))
-            .expect("single grant never duplicates")
-            .stdin(Arc::new(SystemInput::new(policy_id)))
-            .expect("single grant never duplicates")
-            .stdout(Arc::new(SystemOutput::new(policy_id)))
-            .expect("single grant never duplicates")
-            .build()
-    }
-
     /// policy 相関 ID。
     pub fn id(&self) -> CapabilitySetId {
         self.0.id
@@ -1395,6 +1498,20 @@ fn compute_id(b: &CapabilitySetBuilder) -> CapabilitySetId {
     }
 
     CapabilitySetId(crate::embedding::hash::sha256(&buf))
+}
+
+/// 構成内容を表す安定 bytes から決定的な非ゼロ `policy_id` を導出する（C9、設計 §3 末尾）。
+///
+/// SHA-256 の先頭 16 bytes を big-endian で `u128` にし、0 のときだけ 1 へ補正して非ゼロを保証
+/// する。pointer address は使わない。同一構成は常に同一 `policy_id`（→ 同一 `CapabilitySetId`）を
+/// 生むため、CLI safe/legacy profile builder の policy_id 採番がプロセス起動ごとにブレず、
+/// CAP-AT-25/28 golden を決定的に固定できる。
+pub fn derive_policy_id(bytes: &[u8]) -> NonZeroU128 {
+    let digest = crate::embedding::hash::sha256(bytes);
+    let mut head = [0u8; 16];
+    head.copy_from_slice(&digest[..16]);
+    let value = u128::from_be_bytes(head);
+    NonZeroU128::new(value).unwrap_or(NonZeroU128::MIN)
 }
 
 /// policy ID を 16 byte big-endian で書く（仕様第3.1節）。
