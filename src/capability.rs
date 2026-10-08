@@ -2696,6 +2696,42 @@ mod tests {
     }
 
     #[test]
+    fn fs_target_parse_rejects_colon_component_ads() {
+        // §5.5 / AC-5: component 内 ASCII `:`（Windows ADS / stream 指定）を lexical 拒否する。
+        // lexical なので OS 非依存に検証できる（全 OS で走る）。
+        assert_eq!(
+            FilesystemTarget::parse("@mount/foo.txt:stream"),
+            Err(PathError::ColonInComponent)
+        );
+        assert_eq!(
+            FilesystemTarget::parse("foo.txt:stream"),
+            Err(PathError::ColonInComponent)
+        );
+        assert_eq!(
+            FilesystemTarget::parse("@data/sub/a:b"),
+            Err(PathError::ColonInComponent)
+        );
+        // drive prefix（先頭 `X:`）は ColonInComponent ではなく Absolute のまま（別概念）。
+        assert_eq!(FilesystemTarget::parse("C:/x"), Err(PathError::Absolute));
+    }
+
+    #[test]
+    fn legacy_translate_rejects_colon_component_ads() {
+        // §5.5 / Finding 7 / AC-5: legacy translator も Component::Normal 内の `:` を拒否する。
+        // drive prefix（Component::Prefix）は collect 前に除外されるため ADS の `:` だけが落ちる。
+        // route 対象の root は不要（`:` 検査は root ループより前で行う）。
+        let translator = LegacyFsTranslator {
+            entries: Vec::new(),
+        };
+        assert_eq!(
+            translator.translate("/base/foo.txt:stream"),
+            Err(PathError::ColonInComponent)
+        );
+        // `:` を含まない path は（route 先が無いので）None を返し、拒否はされない。
+        assert_eq!(translator.translate("/base/foo.txt"), Ok(None));
+    }
+
+    #[test]
     fn fs_capability_root_lookup_is_exact_match() {
         // CAP-AT-29: mount は完全一致で引く（prefix 一致や登録順 fallback をしない）。
         let mut ops = BTreeSet::new();
@@ -3035,6 +3071,154 @@ mod tests {
                 !dbg.contains(&root.path.to_string_lossy().to_string()),
                 "host path leaked: {dbg}"
             );
+        }
+
+        // --- Windows 専用: reparse / junction / `\\?\` verbatim（design §7.3）---
+        //
+        // symlink / junction の生成は Windows で既定で管理者権限 / Developer Mode を要する。
+        // CI runner で生成できない場合は early return で skip する（緩和ではなく、前提を作れない
+        // 環境での skip）。生成できたら Unix と同じく root 内追従 / root 外・junction 拒否を検証する。
+
+        /// junction を生成する（std に API が無いため `cmd /c mklink /J`）。成功時 true。
+        #[cfg(windows)]
+        fn make_junction(link: &std::path::Path, target: &std::path::Path) -> bool {
+            std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_junction_intermediate_is_rejected() {
+            // AC-3: junction を含む中間 component は reject_if_unsafe_reparse で拒否される。
+            let root = TempRoot::new();
+            let outside = TempRoot::new();
+            fs::create_dir(outside.path.join("sub")).expect("mkdir outside sub");
+            fs::write(outside.path.join("sub").join("secret.txt"), b"x").expect("write");
+            if !make_junction(&root.path.join("jct"), &outside.path) {
+                return; // junction を作れない環境は skip。
+            }
+            let h = handle(&root, SymlinkPolicy::FollowWithinRoot);
+            let res = h.open_file(
+                &rel(&["jct", "sub", "secret.txt"]),
+                OpenFileRequest::ReadExisting,
+            );
+            assert!(
+                matches!(res, Err(AdapterError::Host(_))),
+                "junction intermediate must be denied"
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_junction_final_metadata_is_rejected() {
+            // AC-3: final が junction の metadata / list も拒否される。
+            let root = TempRoot::new();
+            let outside = TempRoot::new();
+            if !make_junction(&root.path.join("jct"), &outside.path) {
+                return;
+            }
+            let h = handle(&root, SymlinkPolicy::OperateOnFinalEntry);
+            assert!(
+                matches!(h.metadata(&rel(&["jct"]), true), Err(AdapterError::Host(_))),
+                "junction metadata must be denied"
+            );
+            assert!(
+                matches!(h.list(&rel(&["jct"]), None), Err(AdapterError::Host(_))),
+                "junction list must be denied"
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_junction_rename_src_is_rejected() {
+            // AC-3: junction を rename の src にできない。
+            let root = TempRoot::new();
+            let outside = TempRoot::new();
+            if !make_junction(&root.path.join("jct"), &outside.path) {
+                return;
+            }
+            let h = handle(&root, SymlinkPolicy::OperateOnFinalEntry);
+            let res = h.rename(&rel(&["jct"]), &h, &rel(&["moved"]), false);
+            assert!(
+                matches!(res, Err(AdapterError::Host(_))),
+                "junction rename src must be denied"
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_dir_symlink_and_junction_remove_use_remove_dir() {
+            // AC-5b: dir symlink / junction の remove は remove_dir 経路で成功する。
+            let root = TempRoot::new();
+            // dir symlink（作成に権限が要る場合は skip）。
+            fs::create_dir(root.path.join("realdir")).expect("mkdir realdir");
+            if std::os::windows::fs::symlink_dir(root.path.join("realdir"), root.path.join("dlink"))
+                .is_ok()
+            {
+                let h = handle(&root, SymlinkPolicy::OperateOnFinalEntry);
+                h.remove(&rel(&["dlink"]), RemoveKind::FileOrSymlink)
+                    .expect("remove dir symlink via remove_dir");
+                assert!(!root.path.join("dlink").exists());
+                // 対象 directory は残る（link のみ削除）。
+                assert!(root.path.join("realdir").exists());
+            }
+            // junction（内部的に別 temp を指す。作れない環境は検証を飛ばす）。
+            let jtarget = TempRoot::new();
+            if make_junction(&root.path.join("jct"), &jtarget.path) {
+                let h = handle(&root, SymlinkPolicy::OperateOnFinalEntry);
+                h.remove(&rel(&["jct"]), RemoveKind::FileOrSymlink)
+                    .expect("remove junction via remove_dir");
+                assert!(!root.path.join("jct").exists());
+            }
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_file_symlink_remove_uses_remove_file() {
+            // AC-5b: file symlink の remove は remove_file 経路。
+            let root = TempRoot::new();
+            fs::write(root.path.join("real.txt"), b"d").expect("write");
+            if std::os::windows::fs::symlink_file(
+                root.path.join("real.txt"),
+                root.path.join("flink.txt"),
+            )
+            .is_ok()
+            {
+                let h = handle(&root, SymlinkPolicy::OperateOnFinalEntry);
+                h.remove(&rel(&["flink.txt"]), RemoveKind::FileOrSymlink)
+                    .expect("remove file symlink via remove_file");
+                assert!(!root.path.join("flink.txt").exists());
+                assert!(root.path.join("real.txt").exists());
+            }
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_verbatim_prefix_within_base_allows_root_internal() {
+            // §5.3 / AC-4: canonicalize が `\\?\` verbatim prefix を返しても root 内 file の
+            // read が成功する（base も canonicalize するため前方一致が成立する）。
+            let root = TempRoot::new();
+            let h = handle(&root, SymlinkPolicy::FollowWithinRoot);
+            {
+                let mut f = h
+                    .open_file(
+                        &rel(&["v.txt"]),
+                        OpenFileRequest::Upsert {
+                            mode: WriteMode::Truncate,
+                        },
+                    )
+                    .expect("open write");
+                f.write_all(b"vp").expect("write");
+            }
+            let mut f = h
+                .open_file(&rel(&["v.txt"]), OpenFileRequest::ReadExisting)
+                .expect("open read under verbatim-canonicalized base");
+            assert_eq!(f.read_to_end(None).expect("read"), b"vp");
         }
     }
 }
