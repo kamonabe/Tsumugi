@@ -1,8 +1,14 @@
+mod cli_capability;
+
 use std::env as std_env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
+use cli_capability::{
+    Backend, CliInvocation, CliOutcome, Profile, Source, USAGE, build_legacy_capabilities,
+    build_safe_capabilities, parse_cli,
+};
 use tsumugi::{
     BudgetConfig, CapabilitySet, CompileErrors, EmbeddingContext, EmbeddingEngine,
     EmbeddingOutcome, EmbeddingRequest, EmbeddingTraceFrame, Engine, ExecutionContext,
@@ -56,81 +62,6 @@ fn read_stdin_line(line: &mut String) -> usize {
     }
 }
 
-/// 実行 backend（ツリーウォーク / VM）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Backend {
-    Tree,
-    Vm,
-}
-
-/// script source の取得元（AUD-018）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Source {
-    /// 引数なし → REPL
-    Repl,
-    /// `-` → 標準入力から source 全体を読む
-    Stdin,
-    /// 通常の positional → ファイルパス
-    File(String),
-}
-
-/// CLI 起動の確定結果（AUD-018, semantic-decisions §6.4 の E8a subset）。
-///
-/// capability profile / options（`--profile` / `--allow-*` / `--fs-*`）は Phase 2 (E8b)
-/// で追加するため、ここでは扱わない。
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CliInvocation {
-    backend: Backend,
-    source: Source,
-    script_args: Vec<String>,
-}
-
-/// argv（program 名を除く）を CLI grammar に従って解析する（AUD-018）。
-///
-/// grammar（E8a subset）:
-///
-/// ```text
-/// tsumugi [--vm] [SCRIPT [ARGS...]]
-/// SCRIPT が `-` なら stdin から source を読む。`--` は option 解析を終了する。
-/// ```
-///
-/// option 解析中の最初の positional を SCRIPT とし、それ以後の token は既知 option・
-/// 未知 option・`--` を含めて一切再解釈せず、そのまま script args とする。`--vm` は
-/// SCRIPT より前でのみ backend option として解釈する（複数回指定は idempotent）。
-fn parse_cli(argv: &[String]) -> CliInvocation {
-    let mut backend = Backend::Tree;
-    let mut iter = argv.iter();
-
-    // option 解析フェーズ: SCRIPT が確定するまで既知 option を処理する。
-    let source = loop {
-        match iter.next() {
-            None => break Source::Repl,
-            Some(token) if token == "--vm" => {
-                backend = Backend::Vm;
-            }
-            Some(token) if token == "--" => {
-                // option 解析を終了。次の token があれば SCRIPT。
-                match iter.next() {
-                    None => break Source::Repl,
-                    Some(script) if script == "-" => break Source::Stdin,
-                    Some(script) => break Source::File(script.clone()),
-                }
-            }
-            Some(token) if token == "-" => break Source::Stdin,
-            Some(token) => break Source::File(token.clone()),
-        }
-    };
-
-    // SCRIPT 確定後の残り token はすべて verbatim に script args とする。
-    let script_args: Vec<String> = iter.cloned().collect();
-
-    CliInvocation {
-        backend,
-        source,
-        script_args,
-    }
-}
-
 fn run() {
     // 非UTF-8のargvでもpanicさせず、診断して終了する（AUD-018 / AUD-035）
     let argv: Vec<String> = match std_env::args_os()
@@ -145,27 +76,74 @@ fn run() {
         }
     };
 
-    let invocation = parse_cli(&argv);
+    let invocation = match parse_cli(&argv) {
+        Ok(CliOutcome::Run(inv)) => inv,
+        Ok(CliOutcome::Help) => {
+            write_stdout(USAGE);
+            write_stdout("\n");
+            std::process::exit(0);
+        }
+        Ok(CliOutcome::Version) => {
+            write_stdout(&format!("tsumugi {}\n", env!("CARGO_PKG_VERSION")));
+            std::process::exit(0);
+        }
+        Err(error) => {
+            eprintln!("{}", error);
+            eprintln!("{}", USAGE);
+            std::process::exit(1);
+        }
+    };
+
+    // profile / options から frozen capability set を構築する（§3/§4）。構築 error（legacy の
+    // secure handle 不能・root 選択曖昧など）は usage error 相当で exit 1。
+    let frozen = build_capabilities(&invocation);
 
     match invocation.source {
         Source::Repl => match invocation.backend {
-            Backend::Tree => run_repl(),
-            Backend::Vm => run_repl_vm(),
+            Backend::Tree => run_repl(frozen),
+            Backend::Vm => run_repl_vm(frozen),
         },
         Source::Stdin => {
             let source = read_stdin_source();
             match invocation.backend {
-                Backend::Tree => run_source(&source, "<stdin>", invocation.script_args),
-                Backend::Vm => run_source_vm(&source, "<stdin>", invocation.script_args),
+                Backend::Tree => run_source(&source, "<stdin>", invocation.script_args, frozen),
+                Backend::Vm => run_source_vm(&source, "<stdin>", invocation.script_args, frozen),
             }
         }
         Source::File(ref path) => {
             let source = read_source_file(path);
             match invocation.backend {
-                Backend::Tree => run_source(&source, path, invocation.script_args),
-                Backend::Vm => run_source_vm(&source, path, invocation.script_args),
+                Backend::Tree => run_source(&source, path, invocation.script_args, frozen),
+                Backend::Vm => run_source_vm(&source, path, invocation.script_args, frozen),
             }
         }
+    }
+}
+
+/// profile と options から frozen `CapabilitySet` を構築する。legacy は warning を stderr へ出す。
+///
+/// 構築に失敗した場合（legacy の secure handle 不能など）は診断を stderr へ出して exit 1。
+fn build_capabilities(invocation: &CliInvocation) -> CapabilitySet {
+    match invocation.profile {
+        Profile::Safe => match build_safe_capabilities(&invocation.capability_options) {
+            Ok(set) => set,
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(1);
+            }
+        },
+        Profile::Legacy => match build_legacy_capabilities() {
+            Ok(build) => {
+                for warning in &build.warnings {
+                    eprintln!("{}", warning);
+                }
+                build.capabilities
+            }
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(1);
+            }
+        },
     }
 }
 
@@ -198,7 +176,7 @@ fn read_stdin_source() -> String {
 /// 経由）へフォールバックする。この import ありの Engine API 統合は E7 で行う。
 ///
 /// どちらの経路も同じ診断表示・exit code 契約（[組み込みAPI仕様] 第12節）を満たす。
-fn run_source(source: &str, script_path: &str, script_args: Vec<String>) {
+fn run_source(source: &str, script_path: &str, script_args: Vec<String>, frozen: CapabilitySet) {
     let engine = EmbeddingEngine::builder()
         .build()
         .expect("既定 backend の Engine build は失敗しない");
@@ -225,7 +203,7 @@ fn run_source(source: &str, script_path: &str, script_args: Vec<String>) {
         Err(LinkError::FeatureUnavailable {
             feature: "module_resolver",
         }) => {
-            run_source_alpha(source, script_path, script_args);
+            run_source_alpha(source, script_path, script_args, frozen);
             return;
         }
         Err(error) => {
@@ -245,13 +223,12 @@ fn run_source(source: &str, script_path: &str, script_args: Vec<String>) {
     let clock: Arc<dyn tsumugi::MonotonicClock> = Arc::new(SystemMonotonicClock::new());
     let budget = BudgetConfig::standard(clock.as_ref())
         .expect("standard budget の生成は overflow しない限り成功する");
-    // C7（REV-023）: CLI は従来どおり `exit()` を許可する。Phase 2 の CLI safe/legacy profile
-    // （C9）が capability option を導入するまでは、暫定的に ProcessExit だけを明示 grant する
-    // （filesystem・env・stdio は現行の process-global 経路が担う）。
+    // C9/C10: CLI が profile（safe/legacy）から組んだ frozen capability set を注入する。
+    // import なし tree 経路は embedding Engine API（ExecutionRequest 経由）で注入する。
     let request = EmbeddingRequest::new(budget, Arc::clone(&clock))
         .expect("standard budget は自身を生成した clock と同 domain なので検証を通る")
         .with_arguments(script_args)
-        .with_capabilities(cli_transition_capabilities());
+        .with_capabilities(frozen);
 
     let exit_code = exit_code_for_outcome(engine.run(&linked, &mut context, request));
     if exit_code != 0 {
@@ -259,25 +236,23 @@ fn run_source(source: &str, script_path: &str, script_args: Vec<String>) {
     }
 }
 
-/// Phase 2 移行期の CLI capability 集合（C9 の safe/legacy profile が入るまでの暫定）。
-///
-/// 現状は `exit()` を structured terminal（`Exited`）へ写すために ProcessExit だけを grant する。
-/// その他 authority（filesystem・env・stdio）は C3〜C5/C10 で置換するまで現行の process-global
-/// 経路（sandbox / env allow-list）が担うため、この set には載せない。
-fn cli_transition_capabilities() -> CapabilitySet {
-    CapabilitySet::ambient_compat()
-}
-
 /// import を含む root を alpha facade（`ModuleLoader` 経由）で実行するフォールバック（E8a）。
 ///
 /// Phase 1 の embedding `link` は import 解決を持たないため、import ありの tree 実行は現行の
 /// alpha facade を使う。import ありでも Engine API へ統合するのは E7（Phase 2、capability /
-/// import resolver）の作業である。
-fn run_source_alpha(source: &str, script_path: &str, script_args: Vec<String>) {
+/// import resolver）の作業である。C9/C10: frozen set は既存の
+/// `ExecutionContext::set_capabilities`（engine.rs、Evaluator へ委譲）で注入する。
+fn run_source_alpha(
+    source: &str,
+    script_path: &str,
+    script_args: Vec<String>,
+    frozen: CapabilitySet,
+) {
     let engine = Engine::new();
     let mut context = ExecutionContext::new();
     context.set_script_path(script_path);
     context.set_script_args(script_args);
+    context.set_capabilities(frozen);
 
     if let Err(errors) = execute(&engine, source, &mut context) {
         // C7（REV-023）: exit() は structured terminal。error 表示せず、context に記録された
@@ -394,10 +369,16 @@ fn print_link_error(error: &LinkError) {
 /// では現行の alpha facade（`ModuleLoader` を持つ評価器）を使う。embedding Engine API は
 /// import なし root の一括実行のみを提供する（状態継続・import 解決は Phase 2/E7）。REPL の
 /// Engine API 統合は E7 で行う（E8a の Phase 1 範囲外）。
-fn run_repl() {
-    write_stdout("Tsumugi v0.1.0 — 終了するには Ctrl+D\n");
+fn run_repl(frozen: CapabilitySet) {
+    write_stdout(&format!(
+        "Tsumugi v{} — 終了するには Ctrl+D\n",
+        env!("CARGO_PKG_VERSION")
+    ));
     let engine = Engine::new();
     let mut context = ExecutionContext::new();
+    // C9/C10: session 開始時に frozen set を 1 回注入する。各 submission は同じ frozen set を
+    // 共有し（§1(f)）、REPL は clear_capabilities を呼ばないので持ち越される。
+    context.set_capabilities(frozen);
     let mut input = String::new();
 
     loop {
@@ -530,8 +511,8 @@ fn finish_repl_at_eof(buffer: &str) -> ! {
 // =============================================
 
 /// VMモードで source を実行する（ファイル / stdin 共通）。
-fn run_source_vm(source: &str, script_path: &str, script_args: Vec<String>) {
-    match execute_vm_with_path(source, script_path, script_args) {
+fn run_source_vm(source: &str, script_path: &str, script_args: Vec<String>, frozen: CapabilitySet) {
+    match execute_vm_with_path(source, script_path, script_args, frozen) {
         Ok(0) => {}
         // C7（REV-023）: VM の exit() は structured terminal。CLI 境界で実際の exit code へ写す。
         Ok(code) => std::process::exit(code),
@@ -545,11 +526,16 @@ fn run_source_vm(source: &str, script_path: &str, script_args: Vec<String>) {
 }
 
 /// VMモードのREPL
-fn run_repl_vm() {
-    write_stdout("Tsumugi v0.1.0 [VM mode] — 終了するには Ctrl+D\n");
+fn run_repl_vm(frozen: CapabilitySet) {
+    write_stdout(&format!(
+        "Tsumugi v{} [VM mode] — 終了するには Ctrl+D\n",
+        env!("CARGO_PKG_VERSION")
+    ));
     let mut input = String::new();
     let mut compiler = Compiler::new();
     let mut vm = Vm::new_repl();
+    // C9/C10: session 開始時に frozen set を 1 回注入する（§1(f)）。
+    vm.set_capabilities(frozen);
     let mut loader = ModuleLoader::new();
 
     loop {
@@ -652,6 +638,7 @@ fn execute_vm_with_path(
     source: &str,
     path: &str,
     script_args: Vec<String>,
+    frozen: CapabilitySet,
 ) -> Result<i32, Vec<TsumugiError>> {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize();
@@ -668,6 +655,8 @@ fn execute_vm_with_path(
     let compiler = Compiler::new();
     let chunk = compiler.compile(linked_program).map_err(|e| vec![e])?;
     let mut vm = Vm::new(chunk);
+    // C9/C10: VM 経路へ frozen set を注入する（Vm::set_capabilities）。
+    vm.set_capabilities(frozen);
     vm.set_script_args(script_args);
     // source/import 予算を Link フェーズで課金する（REV-015 Slice 2）。
     // imported module record token（REV-015 PR-d）は loader へ登録し、実行のあいだ
@@ -695,77 +684,8 @@ fn execute_vm_with_path(
 mod cli_tests {
     use super::*;
 
-    fn strs(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn no_args_starts_tree_repl() {
-        let inv = parse_cli(&[]);
-        assert_eq!(inv.backend, Backend::Tree);
-        assert_eq!(inv.source, Source::Repl);
-        assert!(inv.script_args.is_empty());
-    }
-
-    #[test]
-    fn vm_flag_before_script_selects_vm_backend() {
-        // tsumugi --vm app.tsg a --vm  → VMで実行、args() == ["a", "--vm"]
-        let inv = parse_cli(&strs(&["--vm", "app.tsg", "a", "--vm"]));
-        assert_eq!(inv.backend, Backend::Vm);
-        assert_eq!(inv.source, Source::File("app.tsg".to_string()));
-        assert_eq!(inv.script_args, strs(&["a", "--vm"]));
-    }
-
-    #[test]
-    fn double_dash_ends_option_parsing() {
-        // tsumugi -- app.tsg --help  → treeで実行、args() == ["--help"]
-        let inv = parse_cli(&strs(&["--", "app.tsg", "--help"]));
-        assert_eq!(inv.backend, Backend::Tree);
-        assert_eq!(inv.source, Source::File("app.tsg".to_string()));
-        assert_eq!(inv.script_args, strs(&["--help"]));
-    }
-
-    #[test]
-    fn dash_reads_stdin_source() {
-        // tsumugi - a b  → stdin script、args() == ["a", "b"]
-        let inv = parse_cli(&strs(&["-", "a", "b"]));
-        assert_eq!(inv.backend, Backend::Tree);
-        assert_eq!(inv.source, Source::Stdin);
-        assert_eq!(inv.script_args, strs(&["a", "b"]));
-    }
-
-    #[test]
-    fn double_dash_only_starts_repl() {
-        // tsumugi --  → SCRIPTなしなのでREPL
-        let inv = parse_cli(&strs(&["--"]));
-        assert_eq!(inv.source, Source::Repl);
-        assert!(inv.script_args.is_empty());
-    }
-
-    #[test]
-    fn script_after_double_dash_may_be_dash_stdin() {
-        // `--` の後の `-` は stdin script として扱う
-        let inv = parse_cli(&strs(&["--", "-", "x"]));
-        assert_eq!(inv.source, Source::Stdin);
-        assert_eq!(inv.script_args, strs(&["x"]));
-    }
-
-    #[test]
-    fn tokens_after_script_are_verbatim() {
-        // script 確定後の --vm は backend option ではなく script arg
-        let inv = parse_cli(&strs(&["app.tsg", "--vm", "--", "-"]));
-        assert_eq!(inv.backend, Backend::Tree);
-        assert_eq!(inv.source, Source::File("app.tsg".to_string()));
-        assert_eq!(inv.script_args, strs(&["--vm", "--", "-"]));
-    }
-
-    #[test]
-    fn vm_flag_is_idempotent() {
-        let inv = parse_cli(&strs(&["--vm", "--vm", "app.tsg"]));
-        assert_eq!(inv.backend, Backend::Vm);
-        assert_eq!(inv.source, Source::File("app.tsg".to_string()));
-        assert!(inv.script_args.is_empty());
-    }
+    // parse_cli / CLI grammar の単体テストは cli_capability モジュール（§9）が持つ。
+    // ここでは E8a の embedding outcome → CLI 診断・exit code 写像だけを固定する。
 
     // --- E8a: embedding outcome → CLI 診断・exit code の写像 ---
 

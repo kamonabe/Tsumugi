@@ -19,6 +19,5 @@ append_file(target, "\nline4")
 let updated = read_lines(target)
 print(len(updated))
 
-# 存在しないファイル
-let missing = read_file(path_join(dir, "no_such_file.txt"))
-print(missing)
+# C10: capability 経路では存在しない file の read は catch 可能な host error になる
+# （ambient 時代の null 返しは廃止）。missing-read は canonical_error_inventory / 専用テストで覆う。

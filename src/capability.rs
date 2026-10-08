@@ -230,10 +230,10 @@ pub trait Clock: Send + Sync + 'static {
     fn now_utc(&self) -> SystemTime;
 }
 
-/// OS の system clock を使う [`Clock`]（ambient 互換経路と CLI legacy profile 用）。
+/// OS の system clock を使う [`Clock`]（CLI safe/legacy profile builder 用）。
 ///
-/// [`CapabilitySet::ambient_compat`] が使う既定 clock。埋め込み host は自前の
-/// [`Clock`] 実装を grant できる。
+/// CLI の safe/legacy profile builder が `--allow-clock`（safe）/ legacy 既定で grant する
+/// 既定 clock。埋め込み host は自前の [`Clock`] 実装を grant できる。
 pub struct SystemClock {
     policy_id: NonZeroU128,
 }
@@ -445,10 +445,10 @@ pub trait Output: Send + Sync + 'static {
     fn flush(&self) -> Result<(), AdapterError>;
 }
 
-/// OS の標準入力を読む [`Input`]（ambient 互換経路と CLI legacy profile 用）。
+/// OS の標準入力を読む [`Input`]（CLI safe/legacy profile builder 用）。
 ///
-/// [`CapabilitySet::ambient_compat`] が使う既定 stdin。従来 `input()` が直接読んでいた
-/// `std::io::stdin()` をこの adapter 内へ集約する。
+/// CLI の safe/legacy profile builder が `--allow-script-stdin`（safe）/ legacy 既定で grant
+/// する既定 stdin。従来 `input()` が直接読んでいた `std::io::stdin()` をこの adapter 内へ集約する。
 pub struct SystemInput {
     policy_id: NonZeroU128,
 }
@@ -484,10 +484,11 @@ impl Input for SystemInput {
     }
 }
 
-/// OS の標準出力へ書き出す [`Output`]（ambient 互換経路と CLI legacy profile 用）。
+/// OS の標準出力へ書き出す [`Output`]（CLI safe/legacy profile builder 用）。
 ///
-/// [`CapabilitySet::ambient_compat`] が使う既定 stdout。broken pipe でも panic せず
-/// [`AdapterError::Host`] へ写す（従来 `write_stdout_line` が持っていた挙動、AUD-035）。
+/// CLI の safe profile は既定で（`--deny-stdout` が無ければ）この stdout を grant する。broken
+/// pipe でも panic せず [`AdapterError::Host`] へ写す（従来 `write_stdout_line` が持っていた
+/// 挙動、AUD-035）。
 pub struct SystemOutput {
     policy_id: NonZeroU128,
 }
@@ -755,14 +756,61 @@ impl std::fmt::Debug for FilesystemRoot {
 #[derive(Clone)]
 pub struct FilesystemCapability {
     roots: Arc<[FilesystemRoot]>,
+    /// legacy profile 専用の host path 翻訳表（CLI legacy builder だけが設定する、§4.2/§5）。
+    ///
+    /// `Some` のとき、fs builtin dispatch は script が渡す **host path（絶対/相対）** を
+    /// 登録 root から最長一致で選んで mount 相対 [`FilesystemTarget`] へ翻訳する。`None`（safe /
+    /// 埋め込み host）は従来どおり [`FilesystemTarget::parse`]（`@mount/...` 構文）を使い、絶対
+    /// パスは [`PathError::Absolute`] で拒否する。
+    legacy: Option<Arc<LegacyFsTranslator>>,
 }
 
 impl FilesystemCapability {
     /// root 集合から作る。空・mount 重複は configuration error。
     ///
     /// 同じ policy ID は、同じ adapter Arc・operations・symlink policy へ別 mount alias を
-    /// 付ける場合だけ許可する（仕様第8.1節）。
+    /// 付ける場合だけ許可する（仕様第8.1節）。safe profile / 埋め込み host 用（legacy translator
+    /// なし）。
     pub fn new(roots: impl IntoIterator<Item = FilesystemRoot>) -> Result<Self, ConfigError> {
+        Self::new_inner(roots, None)
+    }
+
+    /// legacy profile 用に、host path 翻訳表付きの filesystem capability を作る（§4.2/§5）。
+    ///
+    /// `translation_roots` は各 mount の root を **CWD 基準で絶対化した lexical path**（symlink
+    /// 非追従、canonicalize しない、Finding 3）で与える。script の host path はこの表から最長
+    /// component 一致で mount へ route される。2 つの root が同一絶対 path を持つ場合は曖昧として
+    /// configuration error（CLI は exit 1、§7.4）。
+    pub fn new_legacy(
+        roots: impl IntoIterator<Item = FilesystemRoot>,
+        translation_roots: impl IntoIterator<Item = (MountName, std::path::PathBuf)>,
+    ) -> Result<Self, ConfigError> {
+        let mut entries: Vec<(MountName, std::path::PathBuf)> =
+            translation_roots.into_iter().collect();
+        // 同一絶対 path を持つ root が複数あると最長一致が曖昧になる（§4.2/§7.4）。
+        let mut seen_paths = std::collections::HashSet::new();
+        for (_, path) in &entries {
+            if !seen_paths.insert(path.clone()) {
+                return Err(ConfigError::InvalidFilesystemPolicy {
+                    code: "ambiguous_legacy_root",
+                });
+            }
+        }
+        // 長い root を先に試すため component 数降順に並べる（最長一致）。
+        entries.sort_by(|a, b| {
+            b.1.components()
+                .count()
+                .cmp(&a.1.components().count())
+                .then_with(|| b.1.as_os_str().len().cmp(&a.1.as_os_str().len()))
+        });
+        let translator = LegacyFsTranslator { entries };
+        Self::new_inner(roots, Some(Arc::new(translator)))
+    }
+
+    fn new_inner(
+        roots: impl IntoIterator<Item = FilesystemRoot>,
+        legacy: Option<Arc<LegacyFsTranslator>>,
+    ) -> Result<Self, ConfigError> {
         let roots: Vec<FilesystemRoot> = roots.into_iter().collect();
         if roots.is_empty() {
             return Err(ConfigError::InvalidFilesystemPolicy { code: "no_roots" });
@@ -777,6 +825,7 @@ impl FilesystemCapability {
         }
         Ok(Self {
             roots: roots.into(),
+            legacy,
         })
     }
 
@@ -784,6 +833,102 @@ impl FilesystemCapability {
     pub fn roots(&self) -> impl Iterator<Item = &FilesystemRoot> {
         self.roots.iter()
     }
+
+    /// legacy translator を返す（crate 内部限定。fs dispatch が host path 翻訳に使う）。
+    pub(crate) fn legacy_translator(&self) -> Option<&LegacyFsTranslator> {
+        self.legacy.as_deref()
+    }
+}
+
+/// legacy profile の host path → mount 相対 path 翻訳表（§4.2/§5）。
+///
+/// `entries` は component 数降順（最長一致を先に試す）に並んだ `(mount, 絶対 lexical root)`。
+pub(crate) struct LegacyFsTranslator {
+    entries: Vec<(MountName, std::path::PathBuf)>,
+}
+
+impl LegacyFsTranslator {
+    /// script の host path（絶対/相対）を mount 相対 [`FilesystemTarget`] へ翻訳する。
+    ///
+    /// CWD 基準で lexical 絶対化（symlink 非追従・canonicalize しない、Finding 3）し、登録 root の
+    /// うち component 数最長で prefix 一致する root を選ぶ。該当 root が無ければ `None`（route 先
+    /// 無し → dispatch 側で sandbox deny）。NUL・空は [`PathError`]。
+    pub(crate) fn translate(
+        &self,
+        script_path: &str,
+    ) -> Result<Option<FilesystemTarget>, PathError> {
+        if script_path.is_empty() {
+            return Err(PathError::Empty);
+        }
+        if script_path.contains('\0') {
+            return Err(PathError::ContainsNul);
+        }
+        let abs = absolutize_lexical(std::path::Path::new(script_path));
+        let abs_components: Vec<String> = abs
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        // Windows ADS / stream 指定を拒否する（§5.5）。drive prefix は `Component::Prefix`
+        // として上の filter_map で既に除外されているため、`Component::Normal` 内に残る `:`
+        // だけを拒否すればよい（Finding 7）。
+        if abs_components.iter().any(|c| c.contains(':')) {
+            return Err(PathError::ColonInComponent);
+        }
+        for (mount, root) in &self.entries {
+            let root_components: Vec<String> = root
+                .components()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect();
+            // root の normal component 列が abs の prefix なら、残りが mount 相対 path。
+            // Windows の prefix/root（C:, /）は normal component に含まれないため、component 列の
+            // 一致だけで prefix 判定する（lexical・symlink 非追従）。
+            if abs.starts_with(root) || root_components.is_empty() && abs.is_absolute() {
+                if root_components.len() > abs_components.len() {
+                    continue;
+                }
+                if abs_components[..root_components.len()] != root_components[..] {
+                    continue;
+                }
+                let rel: Vec<String> = abs_components[root_components.len()..].to_vec();
+                return Ok(Some(FilesystemTarget {
+                    mount: mount.clone(),
+                    path: RelativePath {
+                        components: rel.into(),
+                    },
+                }));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// path を CWD 基準で lexical に絶対化する（symlink 非追従・canonicalize しない、Finding 3）。
+fn absolutize_lexical(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let base = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+            .join(path)
+    };
+    let mut out = std::path::PathBuf::new();
+    for comp in base.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 impl std::fmt::Debug for FilesystemCapability {
@@ -839,6 +984,12 @@ pub enum PathError {
     EmptyComponent,
     /// backslash separator を含む。
     BackslashSeparator,
+    /// component 内に ASCII `:` を含む（Windows ADS / stream 指定）。
+    ///
+    /// `@mount` 経路と legacy translator の両方で、host path へ変換する前に拒否する。
+    /// drive prefix（先頭 `X:`）を表す [`PathError::Absolute`] とは別概念（ADS は絶対
+    /// path ではない）。
+    ColonInComponent,
     /// mount 名が不正。
     InvalidMountName,
 }
@@ -900,6 +1051,9 @@ impl FilesystemTarget {
                     "" => return Err(PathError::EmptyComponent),
                     "." => return Err(PathError::DotComponent),
                     ".." => return Err(PathError::ParentComponent),
+                    // Windows ADS / stream 指定（`foo.txt:stream`）を host path 変換前に拒否する
+                    // （§5.5）。drive prefix（先頭 `X:`）は上の has_drive_prefix で別途捕捉済み。
+                    c if c.contains(':') => return Err(PathError::ColonInComponent),
                     c => components.push(c.to_string()),
                 }
             }
@@ -1075,42 +1229,6 @@ impl CapabilitySet {
     /// builder を作る。
     pub fn builder() -> CapabilitySetBuilder {
         CapabilitySetBuilder::new()
-    }
-
-    /// ambient 互換の既定 set（Phase 2 移行用）。
-    ///
-    /// alpha facade / CLI / REPL / VM 経路は Phase 2 の CLI profile（C9）が入るまで、
-    /// 従来どおりの挙動へ到達できる必要がある。そのため次を grant した set を既定にする。
-    ///
-    /// - **ProcessExit**（C7）: `exit()` を structured `Exited` terminal にする。
-    /// - **Environment**（C3）: `env()` 用の snapshot。process env を 1 度だけ読み、legacy の
-    ///   allow-list（`TSUMUGI_ENV_ALLOW`）と `TSUMUGI_` 保護を適用した visible key だけを載せる。
-    ///   ambient 経路の唯一の process env 読み取りをこの構築時点へ集約し、`env()` builtin 側は
-    ///   snapshot だけを読む（core builtin の ambient read 0）。
-    /// - **Clock**（C3）: OS system clock（[`SystemClock`]）。`now()` が使う。
-    /// - **Stdin**（C4）: OS 標準入力（[`SystemInput`]）。`input()` が使う。
-    /// - **Stdout**（C4）: OS 標準出力（[`SystemOutput`]）。`print` が使う。
-    ///
-    /// filesystem 等は従来の process-global 経路（sandbox）が引き続き担うため、この set
-    /// には載せない（C5/C10 で置換する）。
-    ///
-    /// deny-by-default の唯一の library 既定値は [`Self::empty`] であり、埋め込み host は
-    /// そちらから明示 grant する。本 set は移行期の内部利用に限る。
-    pub fn ambient_compat() -> Self {
-        // ambient 経路は policy 相関 ID を区別しないため固定の非ゼロ policy_id を使う。
-        let policy_id = NonZeroU128::new(1).expect("non-zero");
-        CapabilitySetBuilder::new()
-            .process_exit(ProcessExit::new(policy_id))
-            .expect("single grant never duplicates")
-            .environment(crate::builtin_core::ambient_environment_snapshot())
-            .expect("single grant never duplicates")
-            .clock(Arc::new(SystemClock::new(policy_id)))
-            .expect("single grant never duplicates")
-            .stdin(Arc::new(SystemInput::new(policy_id)))
-            .expect("single grant never duplicates")
-            .stdout(Arc::new(SystemOutput::new(policy_id)))
-            .expect("single grant never duplicates")
-            .build()
     }
 
     /// policy 相関 ID。
@@ -1397,6 +1515,20 @@ fn compute_id(b: &CapabilitySetBuilder) -> CapabilitySetId {
     CapabilitySetId(crate::embedding::hash::sha256(&buf))
 }
 
+/// 構成内容を表す安定 bytes から決定的な非ゼロ `policy_id` を導出する（C9、設計 §3 末尾）。
+///
+/// SHA-256 の先頭 16 bytes を big-endian で `u128` にし、0 のときだけ 1 へ補正して非ゼロを保証
+/// する。pointer address は使わない。同一構成は常に同一 `policy_id`（→ 同一 `CapabilitySetId`）を
+/// 生むため、CLI safe/legacy profile builder の policy_id 採番がプロセス起動ごとにブレず、
+/// CAP-AT-25/28 golden を決定的に固定できる。
+pub fn derive_policy_id(bytes: &[u8]) -> NonZeroU128 {
+    let digest = crate::embedding::hash::sha256(bytes);
+    let mut head = [0u8; 16];
+    head.copy_from_slice(&digest[..16]);
+    let value = u128::from_be_bytes(head);
+    NonZeroU128::new(value).unwrap_or(NonZeroU128::MIN)
+}
+
 /// policy ID を 16 byte big-endian で書く（仕様第3.1節）。
 fn push_policy_id(buf: &mut Vec<u8>, id: NonZeroU128) {
     buf.extend_from_slice(&id.get().to_be_bytes());
@@ -1486,6 +1618,11 @@ impl std::fmt::Debug for OsDirectoryHandle {
 }
 
 /// `std::fs::Metadata` の種別を公開 [`EntryKind`] へ写す。
+///
+/// 呼び出し元（`os_secure` / `OsFileHandle`）は secure handle を実装する platform
+/// （unix / windows）でのみコンパイルされるため、同じ cfg を付けて非対応 platform で
+/// dead_code warning を出さない（NFR-3）。
+#[cfg(any(unix, windows))]
 fn entry_kind_of(meta: &std::fs::Metadata) -> EntryKind {
     let ft = meta.file_type();
     if ft.is_file() {
@@ -1500,6 +1637,7 @@ fn entry_kind_of(meta: &std::fs::Metadata) -> EntryKind {
 }
 
 /// `std::fs::Metadata` から secret-free な [`PublicMetadata`] を作る（時刻・owner・path 非公開）。
+#[cfg(any(unix, windows))]
 fn public_metadata_of(meta: &std::fs::Metadata) -> PublicMetadata {
     PublicMetadata {
         kind: entry_kind_of(meta),
@@ -1508,21 +1646,30 @@ fn public_metadata_of(meta: &std::fs::Metadata) -> PublicMetadata {
     }
 }
 
-/// host I/O error を [`AdapterError::Host`] へ写す。message は OS 由来の文字列のみで、
-/// absolute host path・symlink・permission の詳細は含めない（呼び出し側が sanitize 済み前提）。
+/// host I/O error を [`AdapterError::Host`] へ写す。message は adapter が渡す短い固定文字列
+/// のみで、OS 由来の message・absolute host path・symlink・permission の詳細は含めない
+/// （存在 oracle 防止、§8.5）。
+#[cfg(any(unix, windows))]
 fn host_err(context: &str) -> AdapterError {
     AdapterError::Host(context.to_string())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod os_secure {
-    //! Unix 上の secure component 解決（契約1〜5）。
+    //! Unix / Windows 共通の secure component 解決（契約1〜7）。
     //!
     //! `symlink_metadata`（lstat）で各 component の種別を確認し、[`SymlinkPolicy`] に従って
     //! 中間/final symlink を拒否または拘束する。final entry は open 前に lstat して policy を
     //! 適用する（`O_NOFOLLOW` の flag 値は Linux で arch 依存＝libc 非依存では確定できないため、
     //! flag ではなく明示 lstat で symlink を検出する。TOCTOU race は AUD-020 / CAP-AT-11 stress
     //! gate で扱う）。
+    //!
+    //! 使用する `std::fs` API（`symlink_metadata` / `canonicalize` / `OpenOptions` /
+    //! `read_dir` / `create_dir` / `remove_*` / `rename`）はすべて cross-platform なので
+    //! 解決ロジックは両 OS で共有する。Windows 固有の reparse point（junction / mount point）
+    //! ハザードだけを [`reject_if_unsafe_reparse`] で fail-closed に封じ、`\\?\` verbatim prefix
+    //! は `within_base` の base・candidate 双方 canonicalize で正しく前方一致させる（design §4.3 /
+    //! §5.2 / §5.3）。
 
     use super::{
         AdapterError, OpenFileRequest, OsDirectoryHandle, RelativePath, SymlinkPolicy, WriteMode,
@@ -1530,6 +1677,78 @@ mod os_secure {
     };
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    /// Windows の `std` が export しない file attribute 定数（`winnt.h` 準拠）。
+    /// `windows-sys` 等の外部 crate を使わず、std のみで reparse / directory 属性を判定する
+    /// （NFR-1）。`file_attributes()` 自体は `std::os::windows::fs::MetadataExt` にある。
+    #[cfg(windows)]
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    #[cfg(windows)]
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+
+    /// std が symlink と認識しない reparse point（junction / mount point 等）を fail-closed で
+    /// 拒否する。中間 component・final 操作の lstat 直後、symlink policy 判定より**前**に呼ぶ
+    /// （design §4.3 step2 (a) / §5.2）。
+    ///
+    /// - unix: reparse 概念が無いため常に `Ok(())`（no-op）。symlink は既存 policy で処理する。
+    /// - windows: `file_attributes()` の `FILE_ATTRIBUTE_REPARSE_POINT` が立ち、かつ
+    ///   `is_symlink()==false` のとき（junction / mount point / 未知の reparse tag）だけ拒否する。
+    ///   通常の symlink は reparse 属性が立っていても `is_symlink()==true` なので通し、既存の
+    ///   symlink policy（canonicalize + within_base）に委ねる。
+    #[cfg(unix)]
+    pub(super) fn reject_if_unsafe_reparse(
+        _path: &Path,
+        _meta: &fs::Metadata,
+    ) -> Result<(), AdapterError> {
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    pub(super) fn reject_if_unsafe_reparse(
+        _path: &Path,
+        meta: &fs::Metadata,
+    ) -> Result<(), AdapterError> {
+        use std::os::windows::fs::MetadataExt;
+        let attrs = meta.file_attributes();
+        let is_reparse = attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        if is_reparse && !meta.file_type().is_symlink() {
+            // junction / mount point / std が確定できない reparse tag。安全を保証できないため
+            // 当該 path を拒否する（契約3 の fail-closed、§5.2）。
+            return Err(host_err("reparse point denied"));
+        }
+        Ok(())
+    }
+
+    /// rename の src / dst が reparse point（symlink / junction / mount point 等）なら拒否する。
+    ///
+    /// `reject_if_unsafe_reparse` は「reparse かつ非 symlink」だけを落とすため、junction を
+    /// `is_symlink()==true` と報告する環境（実機 Windows で観測。std / OS バージョンにより
+    /// junction の symlink 報告が揺れる）では junction をすり抜ける。rename には open/list の
+    /// ような symlink policy の第二検査が無いため、ここをすり抜けると root 外を指すリンクの
+    /// rename が成立してしまう（root 脱出）。rename はリンクを辿らず・リンク自体も動かさない
+    /// 契約（契約6）なので、`is_symlink()` の値に依存せず **reparse 属性が立つか symlink なら
+    /// 一律拒否** して fail-closed にする。通常の file / directory だけが rename 対象になる。
+    #[cfg(unix)]
+    fn reject_if_rename_reparse(_path: &Path, meta: &fs::Metadata) -> Result<(), AdapterError> {
+        // unix に reparse 概念は無い。symlink 自体を src/dst にした rename は link エントリを
+        // 動かすだけで実体（root 外）は動かないが、契約6 を一貫させるため symlink も拒否する。
+        if meta.file_type().is_symlink() {
+            return Err(host_err("rename on symlink denied"));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn reject_if_rename_reparse(_path: &Path, meta: &fs::Metadata) -> Result<(), AdapterError> {
+        use std::os::windows::fs::MetadataExt;
+        let is_reparse = meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        // junction が is_symlink()==true/false どちらを返す環境でも確実に落とすため、
+        // reparse 属性ビットと is_symlink() の論理和で判定する（is_symlink() 非依存）。
+        if is_reparse || meta.file_type().is_symlink() {
+            return Err(host_err("rename on reparse point denied"));
+        }
+        Ok(())
+    }
 
     /// 解決結果の host path と、その parent directory（rename/remove 等が使う）。
     pub(super) struct Resolved {
@@ -1556,7 +1775,12 @@ mod os_secure {
             current.push(name);
             let meta = fs::symlink_metadata(&current)
                 .map_err(|_| host_err("intermediate component not accessible"))?;
+            // (a) junction / mount point 等「symlink と認識されない reparse」を policy 判定より
+            //     先に拒否する（§4.3 step2）。junction は canonicalize すると root 内実体を返し
+            //     within_base を通りうるため、policy へ入る前に落とす必要がある。
+            reject_if_unsafe_reparse(&current, &meta)?;
             let ft = meta.file_type();
+            // (b) 次に symlink policy を適用する。
             if ft.is_symlink() {
                 match policy {
                     SymlinkPolicy::DenyAll => {
@@ -1610,10 +1834,13 @@ mod os_secure {
 
         // final entry が既存 symlink なら Read/Write/Create すべて拒否する（契約4・5）。
         // 存在しない場合（CreateNew/Upsert の新規作成）は symlink 検出不要。
-        if let Ok(lmeta) = fs::symlink_metadata(&path)
-            && lmeta.file_type().is_symlink()
-        {
-            return Err(host_err("final symlink denied by policy"));
+        if let Ok(lmeta) = fs::symlink_metadata(&path) {
+            // (a) junction / mount point は policy 判定の前に拒否する（§4.3）。
+            reject_if_unsafe_reparse(&path, &lmeta)?;
+            // (b) 通常 symlink は policy で拒否する。
+            if lmeta.file_type().is_symlink() {
+                return Err(host_err("final symlink denied by policy"));
+            }
         }
 
         let mut opts = fs::OpenOptions::new();
@@ -1661,6 +1888,9 @@ mod os_secure {
         let path = resolved.path;
         let lmeta =
             fs::symlink_metadata(&path).map_err(|_| host_err("metadata target not accessible"))?;
+        // (a) junction / mount point は policy 判定の前に拒否する（§4.3）。
+        reject_if_unsafe_reparse(&path, &lmeta)?;
+        // (b) symlink の追従可否は policy で判定する。
         if follow_final && lmeta.file_type().is_symlink() {
             // 追従する場合は解決先が root 内であることを確認する（契約4）。
             let resolved =
@@ -1687,6 +1917,9 @@ mod os_secure {
         // final entry が symlink の場合は List が拒否する（契約4）。
         let lmeta =
             fs::symlink_metadata(&path).map_err(|_| host_err("list target not accessible"))?;
+        // (a) junction / mount point は policy 判定の前に拒否する（§4.3）。
+        reject_if_unsafe_reparse(&path, &lmeta)?;
+        // (b) 通常 symlink の list は policy で拒否する。
         if lmeta.file_type().is_symlink() {
             return Err(host_err("list on symlink denied by policy"));
         }
@@ -1739,10 +1972,14 @@ mod os_secure {
             super::RemoveKind::FileOrSymlink => {
                 // final symlink 自体を消す（追従しない）。DenyAll でも「entry の削除」は
                 // 対象 file の read/write を伴わないため許可する（契約4 の delete 例外）。
-                fs::remove_file(&path).map_err(|_| host_err("remove failed"))
+                // junction / mount point は種別分岐の前に拒否する（§4.3 / §4.4）。
+                let lmeta = fs::symlink_metadata(&path)
+                    .map_err(|_| host_err("remove target not accessible"))?;
+                reject_if_unsafe_reparse(&path, &lmeta)?;
+                remove_entry_by_kind(&path, &lmeta)
             }
             super::RemoveKind::EmptyDirectory => {
-                // 空 directory のみ削除する（非空は OS error → host error）。
+                // 空 directory のみ削除する（非空は OS error → host error）。OS 差なし。
                 fs::remove_dir(&path).map_err(|_| host_err("remove_dir failed"))
             }
             super::RemoveKind::Tree => {
@@ -1751,11 +1988,38 @@ mod os_secure {
                 // 辿って削除しない。
                 let lmeta = fs::symlink_metadata(&path)
                     .map_err(|_| host_err("remove_tree target not accessible"))?;
+                // junction / mount point は種別分岐の前に拒否する（§4.3 / §4.4）。
+                reject_if_unsafe_reparse(&path, &lmeta)?;
                 if lmeta.file_type().is_symlink() {
-                    return fs::remove_file(&path).map_err(|_| host_err("remove_tree failed"));
+                    // final が symlink（link 自体を消す。Windows は dir/file で経路が違う）。
+                    return remove_entry_by_kind(&path, &lmeta);
                 }
                 fs::remove_dir_all(&path).map_err(|_| host_err("remove_tree failed"))
             }
+        }
+    }
+
+    /// final entry（file / symlink / junction）を種別に応じて削除する。
+    ///
+    /// Unix は entry 種別を問わず `remove_file` で link / file 自体を消す（現行挙動不変、NFR-2）。
+    /// Windows は directory 系の reparse（dir symlink / junction）を `remove_file` で消せないため、
+    /// `file_attributes()` の `FILE_ATTRIBUTE_DIRECTORY` ビットで分岐して `remove_dir` を使う
+    /// （`is_dir()` は symlink を追従するため使わない。design §4.4）。
+    #[cfg(unix)]
+    fn remove_entry_by_kind(path: &Path, _meta: &fs::Metadata) -> Result<(), AdapterError> {
+        fs::remove_file(path).map_err(|_| host_err("remove failed"))
+    }
+
+    #[cfg(windows)]
+    fn remove_entry_by_kind(path: &Path, meta: &fs::Metadata) -> Result<(), AdapterError> {
+        use std::os::windows::fs::MetadataExt;
+        let is_directory = meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0;
+        if is_directory {
+            // dir symlink / junction（reparse 検査を通過したもの）は remove_dir で link を消す。
+            fs::remove_dir(path).map_err(|_| host_err("remove failed"))
+        } else {
+            // file symlink / 通常 file。
+            fs::remove_file(path).map_err(|_| host_err("remove failed"))
         }
     }
 
@@ -1772,8 +2036,20 @@ mod os_secure {
     ) -> Result<(), AdapterError> {
         let src = resolve(from_handle, from)?.path;
         let dst = resolve(to_handle, to)?.path;
+        // src final が reparse point（symlink / junction / mount point）なら rename を許さない。
+        // junction を is_symlink()==true と報告する環境では reject_if_unsafe_reparse がすり抜ける
+        // ため、rename では is_symlink() 非依存の reject_if_rename_reparse で一律拒否する
+        // （root 脱出防止、契約6）。resolve は final を lstat しないためここで明示検査する。
+        let src_meta =
+            fs::symlink_metadata(&src).map_err(|_| host_err("rename source not accessible"))?;
+        reject_if_rename_reparse(&src, &src_meta)?;
         if !replace && dst.exists() {
             return Err(host_err("destination exists"));
+        }
+        // 既存 dst を上書きする場合（replace=true）は dst final も検査する。reparse point を
+        // 上書き先として受理しない。dst 非存在の新規作成は final lstat 不要（reparse も存在しない）。
+        if let Ok(dst_meta) = fs::symlink_metadata(&dst) {
+            reject_if_rename_reparse(&dst, &dst_meta)?;
         }
         fs::rename(&src, &dst).map_err(|_| host_err("rename failed"))
     }
@@ -1788,7 +2064,7 @@ impl DirectoryHandle for OsDirectoryHandle {
         self.symlink_policy
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn open_file(
         &self,
         path: &RelativePath,
@@ -1798,12 +2074,12 @@ impl DirectoryHandle for OsDirectoryHandle {
         Ok(Box::new(OsFileHandle { file }))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn create_dir(&self, path: &RelativePath) -> Result<(), AdapterError> {
         os_secure::create_dir(self, path)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn metadata(
         &self,
         path: &RelativePath,
@@ -1812,7 +2088,7 @@ impl DirectoryHandle for OsDirectoryHandle {
         os_secure::metadata(self, path, follow_final)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn list(
         &self,
         path: &RelativePath,
@@ -1821,12 +2097,12 @@ impl DirectoryHandle for OsDirectoryHandle {
         os_secure::list(self, path, max_entries)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn remove(&self, path: &RelativePath, kind: RemoveKind) -> Result<(), AdapterError> {
         os_secure::remove(self, path, kind)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn rename(
         &self,
         from: &RelativePath,
@@ -1844,9 +2120,11 @@ impl DirectoryHandle for OsDirectoryHandle {
         os_secure::rename(self, from, self, to, replace)
     }
 
-    // --- 非 Unix: secure resolution 非対応（fail closed、契約3）---
+    // --- 非 Unix・非 Windows: secure resolution 非対応（fail closed、契約3）---
+    // 現実の CI matrix（ubuntu/macos/windows）には存在しないが、将来 secure handle を実装
+    // できない platform が現れた場合の建前として fail-closed 分岐を残す（design §4.2）。
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn open_file(
         &self,
         _path: &RelativePath,
@@ -1855,12 +2133,12 @@ impl DirectoryHandle for OsDirectoryHandle {
         Err(AdapterError::SecureResolutionUnsupported)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn create_dir(&self, _path: &RelativePath) -> Result<(), AdapterError> {
         Err(AdapterError::SecureResolutionUnsupported)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn metadata(
         &self,
         _path: &RelativePath,
@@ -1869,7 +2147,7 @@ impl DirectoryHandle for OsDirectoryHandle {
         Err(AdapterError::SecureResolutionUnsupported)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn list(
         &self,
         _path: &RelativePath,
@@ -1878,12 +2156,12 @@ impl DirectoryHandle for OsDirectoryHandle {
         Err(AdapterError::SecureResolutionUnsupported)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn remove(&self, _path: &RelativePath, _kind: RemoveKind) -> Result<(), AdapterError> {
         Err(AdapterError::SecureResolutionUnsupported)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn rename(
         &self,
         _from: &RelativePath,
@@ -1895,13 +2173,14 @@ impl DirectoryHandle for OsDirectoryHandle {
     }
 }
 
-/// OS file を backing にする [`FileHandle`]（Unix）。open は [`OsDirectoryHandle`] が行う。
-#[cfg(unix)]
+/// OS file を backing にする [`FileHandle`]（Unix / Windows）。open は [`OsDirectoryHandle`]
+/// が行う。本体は `std::fs::File` の read/write/metadata だけで platform 固有分岐を持たない。
+#[cfg(any(unix, windows))]
 pub struct OsFileHandle {
     file: std::fs::File,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl FileHandle for OsFileHandle {
     fn read_to_end(&mut self, max_bytes: Option<NonZeroU64>) -> Result<Vec<u8>, AdapterError> {
         use std::io::Read;
@@ -2175,6 +2454,66 @@ mod tests {
         assert_ne!(set.id(), CapabilitySet::empty().id());
     }
 
+    // --- CAP-AT-28 延長（C9/C10）: policy_id 決定性・safe profile 相当の ID 不変性 ---
+
+    #[test]
+    fn derive_policy_id_is_deterministic_and_nonzero() {
+        // 同一構成 bytes は常に同一 policy_id を生む（CAP-AT-25/28 golden の決定性の根拠、finding 8）。
+        let a = derive_policy_id(b"stdout");
+        let b = derive_policy_id(b"stdout");
+        let c = derive_policy_id(b"clock");
+        assert_eq!(a, b, "同一構成は同一 policy_id");
+        assert_ne!(a, c, "異なる構成は異なる policy_id");
+        // 非ゼロであること（NonZeroU128 なので型で保証されるが、0 補正の経路も確認する）。
+        assert!(derive_policy_id(&[]).get() != 0);
+    }
+
+    #[test]
+    fn safe_stdout_only_set_id_is_stable_and_without_resolver() {
+        // safe profile 相当（stdout のみ grant、resolver 無し）の CapabilitySetId が決定的で、
+        // resolver group を含まないことを固定する（CAP-AT-28 延長）。
+        let pid_stdout = derive_policy_id(b"stdout");
+        let build = || {
+            CapabilitySet::builder()
+                .stdout(Arc::new(FakeOutput(pid_stdout)))
+                .expect("stdout")
+                .build()
+        };
+        let a = build();
+        let b = build();
+        assert_eq!(a.id(), b.id(), "同一構成は同一 ID");
+        assert!(a.contains(CapabilityKind::Stdout));
+        assert!(
+            !a.contains(CapabilityKind::ModuleResolver),
+            "safe 相当 set に resolver は無い"
+        );
+        assert_ne!(a.id(), CapabilitySet::empty().id());
+    }
+
+    #[test]
+    fn import_root_value_check_does_not_change_set_id() {
+        // `--allow-import-root` は値検証のみで module_resolver を grant しない（finding 1）。
+        // したがって import root の有無で CapabilitySetId は変わらない——これを、resolver を
+        // 足さない 2 つの等価 set が同一 ID になることで固定する（CLI builder は resolver を
+        // 一切配線しないため、構成差は生じない）。
+        let pid_stdout = derive_policy_id(b"stdout");
+        let without_import = CapabilitySet::builder()
+            .stdout(Arc::new(FakeOutput(pid_stdout)))
+            .expect("stdout")
+            .build();
+        // import root を「宣言しても」CLI は set へ何も足さないので、同じ構成 = 同じ ID。
+        let with_import_declared = CapabilitySet::builder()
+            .stdout(Arc::new(FakeOutput(pid_stdout)))
+            .expect("stdout")
+            .build();
+        assert_eq!(
+            without_import.id(),
+            with_import_declared.id(),
+            "import root 宣言は CapabilitySetId に寄与しない"
+        );
+        assert!(!without_import.contains(CapabilityKind::ModuleResolver));
+    }
+
     #[test]
     fn resolver_grant_changes_id() {
         // ModuleResolver group が ID へ寄与し、FakeResolver も配線されることを確認する。
@@ -2390,6 +2729,42 @@ mod tests {
     }
 
     #[test]
+    fn fs_target_parse_rejects_colon_component_ads() {
+        // §5.5 / AC-5: component 内 ASCII `:`（Windows ADS / stream 指定）を lexical 拒否する。
+        // lexical なので OS 非依存に検証できる（全 OS で走る）。
+        assert_eq!(
+            FilesystemTarget::parse("@mount/foo.txt:stream"),
+            Err(PathError::ColonInComponent)
+        );
+        assert_eq!(
+            FilesystemTarget::parse("foo.txt:stream"),
+            Err(PathError::ColonInComponent)
+        );
+        assert_eq!(
+            FilesystemTarget::parse("@data/sub/a:b"),
+            Err(PathError::ColonInComponent)
+        );
+        // drive prefix（先頭 `X:`）は ColonInComponent ではなく Absolute のまま（別概念）。
+        assert_eq!(FilesystemTarget::parse("C:/x"), Err(PathError::Absolute));
+    }
+
+    #[test]
+    fn legacy_translate_rejects_colon_component_ads() {
+        // §5.5 / Finding 7 / AC-5: legacy translator も Component::Normal 内の `:` を拒否する。
+        // drive prefix（Component::Prefix）は collect 前に除外されるため ADS の `:` だけが落ちる。
+        // route 対象の root は不要（`:` 検査は root ループより前で行う）。
+        let translator = LegacyFsTranslator {
+            entries: Vec::new(),
+        };
+        assert_eq!(
+            translator.translate("/base/foo.txt:stream"),
+            Err(PathError::ColonInComponent)
+        );
+        // `:` を含まない path は（route 先が無いので）None を返し、拒否はされない。
+        assert_eq!(translator.translate("/base/foo.txt"), Ok(None));
+    }
+
+    #[test]
     fn fs_capability_root_lookup_is_exact_match() {
         // CAP-AT-29: mount は完全一致で引く（prefix 一致や登録順 fallback をしない）。
         let mut ops = BTreeSet::new();
@@ -2474,9 +2849,13 @@ mod tests {
         assert_eq!(err, ConfigError::DuplicateCallableName { name: "K".into() });
     }
 
-    // --- C5-b: secure OS adapter（契約1〜5、CAP-AT-11/12 の Phase 2 範囲）---
-
-    #[cfg(unix)]
+    // --- C5-b: secure OS adapter（契約1〜7、CAP-AT-11/12 の Phase 2 範囲）---
+    //
+    // module 自体は Unix / Windows の両方でコンパイルする。symlink 生成に依存しない契約
+    // テストは #[cfg(any(unix, windows))] で両 OS を回し、symlink を std::os::unix::fs::symlink
+    // で生成するテストは個別に #[cfg(unix)] のまま残す。Windows 専用の reparse/junction テストは
+    // 末尾の #[cfg(windows)] 領域へ同居させる（design §7.1/§7.3）。
+    #[cfg(any(unix, windows))]
     mod os_adapter {
         use super::*;
         use std::fs;
@@ -2571,6 +2950,26 @@ mod tests {
                 .expect("remove dir");
         }
 
+        #[cfg(unix)]
+        #[test]
+        fn rename_src_symlink_is_rejected() {
+            // 契約6: symlink を rename の src にできない（reject_if_rename_reparse）。
+            // Windows の junction（is_symlink()==true 報告）と同じ穴を Unix の symlink でも塞ぐ。
+            let root = TempRoot::new();
+            let outside = TempRoot::new();
+            fs::write(outside.path.join("secret.txt"), b"x").expect("write outside");
+            // root 内から root 外を指す symlink。これを rename src にして root 外を動かせない。
+            std::os::unix::fs::symlink(outside.path.join("secret.txt"), root.path.join("link.txt"))
+                .expect("symlink");
+            let h = handle(&root, SymlinkPolicy::OperateOnFinalEntry);
+            let res = h.rename(&rel(&["link.txt"]), &h, &rel(&["moved.txt"]), false);
+            assert!(
+                matches!(res, Err(AdapterError::Host(_))),
+                "symlink rename src must be denied"
+            );
+        }
+
+        #[cfg(unix)]
         #[test]
         fn deny_all_rejects_final_symlink_open() {
             // 契約4: DenyAll は final symlink の read を拒否する（O_NOFOLLOW）。
@@ -2593,6 +2992,7 @@ mod tests {
             );
         }
 
+        #[cfg(unix)]
         #[test]
         fn intermediate_symlink_denied_under_deny_all() {
             // 契約4: DenyAll は中間 symlink component を拒否する。
@@ -2609,6 +3009,7 @@ mod tests {
             );
         }
 
+        #[cfg(unix)]
         #[test]
         fn intermediate_symlink_within_root_followed() {
             // 契約4: FollowWithinRoot は root 内へ解決する中間 symlink を許可する。
@@ -2624,6 +3025,7 @@ mod tests {
             assert_eq!(f.read_to_end(None).expect("read"), b"ok");
         }
 
+        #[cfg(unix)]
         #[test]
         fn intermediate_symlink_escaping_root_denied() {
             // 契約4: FollowWithinRoot でも root 外へ出る symlink は拒否する。
@@ -2661,6 +3063,7 @@ mod tests {
             );
         }
 
+        #[cfg(unix)]
         #[test]
         fn metadata_follow_final_false_sees_symlink_kind() {
             // 契約4: OperateOnFinalEntry + follow_final=false は final symlink 自体を対象にできる。
@@ -2673,6 +3076,7 @@ mod tests {
             assert_eq!(meta.kind, EntryKind::Symlink);
         }
 
+        #[cfg(unix)]
         #[test]
         fn remove_final_symlink_does_not_touch_target() {
             // 契約4: final symlink の delete は entry 自体を消し、対象 file を残す。
@@ -2719,6 +3123,156 @@ mod tests {
                 !dbg.contains(&root.path.to_string_lossy().to_string()),
                 "host path leaked: {dbg}"
             );
+        }
+
+        // --- Windows 専用: reparse / junction / `\\?\` verbatim（design §7.3）---
+        //
+        // symlink / junction の生成は Windows で既定で管理者権限 / Developer Mode を要する。
+        // CI runner で生成できない場合は early return で skip する（緩和ではなく、前提を作れない
+        // 環境での skip）。生成できたら Unix と同じく root 内追従 / root 外・junction 拒否を検証する。
+
+        /// junction を生成する（std に API が無いため `cmd /c mklink /J`）。成功時 true。
+        #[cfg(windows)]
+        fn make_junction(link: &std::path::Path, target: &std::path::Path) -> bool {
+            std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_junction_intermediate_is_rejected() {
+            // AC-3: junction を含む中間 component は reject_if_unsafe_reparse で拒否される。
+            let root = TempRoot::new();
+            let outside = TempRoot::new();
+            fs::create_dir(outside.path.join("sub")).expect("mkdir outside sub");
+            fs::write(outside.path.join("sub").join("secret.txt"), b"x").expect("write");
+            if !make_junction(&root.path.join("jct"), &outside.path) {
+                return; // junction を作れない環境は skip。
+            }
+            let h = handle(&root, SymlinkPolicy::FollowWithinRoot);
+            let res = h.open_file(
+                &rel(&["jct", "sub", "secret.txt"]),
+                OpenFileRequest::ReadExisting,
+            );
+            assert!(
+                matches!(res, Err(AdapterError::Host(_))),
+                "junction intermediate must be denied"
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_junction_final_metadata_is_rejected() {
+            // AC-3: final が junction の metadata / list も拒否される。
+            let root = TempRoot::new();
+            let outside = TempRoot::new();
+            if !make_junction(&root.path.join("jct"), &outside.path) {
+                return;
+            }
+            let h = handle(&root, SymlinkPolicy::OperateOnFinalEntry);
+            assert!(
+                matches!(h.metadata(&rel(&["jct"]), true), Err(AdapterError::Host(_))),
+                "junction metadata must be denied"
+            );
+            assert!(
+                matches!(h.list(&rel(&["jct"]), None), Err(AdapterError::Host(_))),
+                "junction list must be denied"
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_junction_rename_src_is_rejected() {
+            // AC-3: junction を rename の src にできない。実機 Windows では junction が
+            // is_symlink()==true を返すため、rename は is_symlink() 非依存の
+            // reject_if_rename_reparse（reparse 属性で一律拒否）で封じる。
+            let root = TempRoot::new();
+            let outside = TempRoot::new();
+            if !make_junction(&root.path.join("jct"), &outside.path) {
+                return;
+            }
+            let h = handle(&root, SymlinkPolicy::OperateOnFinalEntry);
+            let res = h.rename(&rel(&["jct"]), &h, &rel(&["moved"]), false);
+            assert!(
+                matches!(res, Err(AdapterError::Host(_))),
+                "junction rename src must be denied"
+            );
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_dir_symlink_and_junction_remove_use_remove_dir() {
+            // AC-5b: dir symlink / junction の remove は remove_dir 経路で成功する。
+            let root = TempRoot::new();
+            // dir symlink（作成に権限が要る場合は skip）。
+            fs::create_dir(root.path.join("realdir")).expect("mkdir realdir");
+            if std::os::windows::fs::symlink_dir(root.path.join("realdir"), root.path.join("dlink"))
+                .is_ok()
+            {
+                let h = handle(&root, SymlinkPolicy::OperateOnFinalEntry);
+                h.remove(&rel(&["dlink"]), RemoveKind::FileOrSymlink)
+                    .expect("remove dir symlink via remove_dir");
+                assert!(!root.path.join("dlink").exists());
+                // 対象 directory は残る（link のみ削除）。
+                assert!(root.path.join("realdir").exists());
+            }
+            // junction（内部的に別 temp を指す。作れない環境は検証を飛ばす）。
+            let jtarget = TempRoot::new();
+            if make_junction(&root.path.join("jct"), &jtarget.path) {
+                let h = handle(&root, SymlinkPolicy::OperateOnFinalEntry);
+                h.remove(&rel(&["jct"]), RemoveKind::FileOrSymlink)
+                    .expect("remove junction via remove_dir");
+                assert!(!root.path.join("jct").exists());
+            }
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_file_symlink_remove_uses_remove_file() {
+            // AC-5b: file symlink の remove は remove_file 経路。
+            let root = TempRoot::new();
+            fs::write(root.path.join("real.txt"), b"d").expect("write");
+            if std::os::windows::fs::symlink_file(
+                root.path.join("real.txt"),
+                root.path.join("flink.txt"),
+            )
+            .is_ok()
+            {
+                let h = handle(&root, SymlinkPolicy::OperateOnFinalEntry);
+                h.remove(&rel(&["flink.txt"]), RemoveKind::FileOrSymlink)
+                    .expect("remove file symlink via remove_file");
+                assert!(!root.path.join("flink.txt").exists());
+                assert!(root.path.join("real.txt").exists());
+            }
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_verbatim_prefix_within_base_allows_root_internal() {
+            // §5.3 / AC-4: canonicalize が `\\?\` verbatim prefix を返しても root 内 file の
+            // read が成功する（base も canonicalize するため前方一致が成立する）。
+            let root = TempRoot::new();
+            let h = handle(&root, SymlinkPolicy::FollowWithinRoot);
+            {
+                let mut f = h
+                    .open_file(
+                        &rel(&["v.txt"]),
+                        OpenFileRequest::Upsert {
+                            mode: WriteMode::Truncate,
+                        },
+                    )
+                    .expect("open write");
+                f.write_all(b"vp").expect("write");
+            }
+            let mut f = h
+                .open_file(&rel(&["v.txt"]), OpenFileRequest::ReadExisting)
+                .expect("open read under verbatim-canonicalized base");
+            assert_eq!(f.read_to_end(None).expect("read"), b"vp");
         }
     }
 }

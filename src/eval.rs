@@ -404,9 +404,9 @@ impl Evaluator {
             slice_fuel_used: 0,
             slice_fuel_limit: None,
             session: None,
-            // alpha facade / CLI / REPL / VM 経路の既定は ambient 互換（ProcessExit を grant）。
-            // 埋め込み Engine::run は set_capabilities で deny-by-default の frozen set へ差し替える。
-            capabilities: crate::capability::CapabilitySet::ambient_compat(),
+            // C10: library 既定は deny-by-default（empty）。CLI は safe/legacy profile builder が
+            // 組んだ frozen set を各経路で set_capabilities で注入し、埋め込み Engine::run も同様。
+            capabilities: crate::capability::CapabilitySet::empty(),
             pending_exit: None,
             // 既定は空 registry（host function なし）。埋め込み host が set_host_registry で注入する。
             host_registry: std::sync::Arc::new(crate::host_function::HostFunctionRegistry::empty()),
@@ -501,9 +501,12 @@ impl Evaluator {
         self.capabilities = capabilities;
     }
 
-    /// capability 集合を ambient 互換の既定へ戻す（実行後・再利用前）。
+    /// capability 集合を deny-by-default の既定（empty）へ戻す（実行後・再利用前）。
+    ///
+    /// C10: 旧 `ambient_compat` 既定を廃し、reusable context の次 request が明示 grant しない限り
+    /// 全 authority を拒否する（embedding §15 規則 5、deny-by-default）。
     pub fn clear_capabilities(&mut self) {
-        self.capabilities = crate::capability::CapabilitySet::ambient_compat();
+        self.capabilities = crate::capability::CapabilitySet::empty();
     }
 
     /// この実行の capability 集合を参照する（builtin dispatch から consult する）。
@@ -2679,12 +2682,149 @@ mod tests {
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 
+    /// 既存の言語挙動ユニットテスト用の capability 集合（C10 後の ambient 相当）。
+    ///
+    /// C10 で library 既定が deny-by-default（empty）になったため、`print`/`env`/`now`/`input`/
+    /// `exit` と絶対パス fs を使う既存テストは明示 grant が要る。本 helper は CLI legacy profile
+    /// 相当——stdout/clock/stdin/exit を grant、`TSUMUGI_` 以外の env を snapshot、root `/`（Unix）/
+    /// CWD volume root（Windows）に `default` mount を `FollowWithinRoot` + legacy translator で
+    /// 割り当てる——を組む。これにより絶対 host path（`/tmp/...`）が translator 経由で route され、
+    /// 従来の観測挙動が保たれる。safe profile の `@mount/...` 必須挙動とは別経路。
+    fn ambient_test_capabilities() -> crate::capability::CapabilitySet {
+        use std::collections::BTreeSet;
+        use std::num::NonZeroU128;
+        use std::sync::Arc;
+
+        use crate::capability::{
+            CapabilitySet, DataClassification, EnvironmentSnapshot, EnvironmentValue,
+            FilesystemCapability, FilesystemRoot, FsOperation, MountName, OsDirectoryHandle,
+            ProcessExit, SymlinkPolicy, SystemClock, SystemInput, SystemOutput,
+        };
+
+        let pid = NonZeroU128::new(1).expect("non-zero");
+
+        // env snapshot: TSUMUGI_ 以外を全 snapshot（legacy の allow-list 未設定相当）。
+        let entries = std::env::vars().filter_map(|(key, value)| {
+            if key.starts_with("TSUMUGI_") {
+                return None;
+            }
+            if key.is_empty() || key.len() > 256 || key.as_bytes().contains(&0) {
+                return None;
+            }
+            EnvironmentValue::new(value, DataClassification::Public)
+                .ok()
+                .map(|v| (key, v))
+        });
+        let env_snapshot = EnvironmentSnapshot::from_entries(entries)
+            .unwrap_or_else(|_| EnvironmentSnapshot::empty());
+
+        // root `/`（Unix）/ CWD volume root（Windows）へ default mount を割り当てる。
+        let root_path = fs_root_path_for_test();
+        let ops: BTreeSet<FsOperation> = [
+            FsOperation::Read,
+            FsOperation::Write,
+            FsOperation::Create,
+            FsOperation::Delete,
+            FsOperation::Metadata,
+            FsOperation::List,
+            FsOperation::RecursiveDelete,
+        ]
+        .into_iter()
+        .collect();
+        let mount = MountName::new("default").expect("mount");
+        let handle =
+            OsDirectoryHandle::new(root_path.clone(), pid, SymlinkPolicy::FollowWithinRoot);
+        let root = FilesystemRoot::new(
+            mount.clone(),
+            pid,
+            ops,
+            SymlinkPolicy::FollowWithinRoot,
+            Arc::new(handle),
+        )
+        .expect("root");
+        let fs = FilesystemCapability::new_legacy(vec![root], vec![(mount, root_path)])
+            .expect("legacy fs");
+
+        CapabilitySet::builder()
+            .stdout(Arc::new(SystemOutput::new(pid)))
+            .expect("stdout")
+            .clock(Arc::new(SystemClock::new(pid)))
+            .expect("clock")
+            .stdin(Arc::new(SystemInput::new(pid)))
+            .expect("stdin")
+            .process_exit(ProcessExit::new(pid))
+            .expect("exit")
+            .environment(env_snapshot)
+            .expect("env")
+            .filesystem(fs)
+            .expect("fs")
+            .build()
+    }
+
+    /// test 用 filesystem root path（Unix は `/`、Windows は `temp_dir()` の volume root）。
+    ///
+    /// Windows では default mount を **`std::env::temp_dir()` の volume root**から導出する。
+    /// builtin test が渡す host path は `unique_temp_path()`（= `temp_dir()` 基点）なので、
+    /// default mount の volume を temp_dir() の volume に揃えておくと、runner の TEMP/CWD volume
+    /// 構成に依存せず legacy translator が最長 prefix 一致で route できる（design §4.6 方式 (a)・
+    /// AC-10b）。CWD の volume root を使うと TEMP が別 volume のとき route が外れて別原因で
+    /// Windows が落ちうるため採らない。
+    fn fs_root_path_for_test() -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            use std::path::Component;
+            let temp = std::env::temp_dir();
+            let mut root = std::path::PathBuf::new();
+            for comp in temp.components() {
+                match comp {
+                    Component::Prefix(_) | Component::RootDir => root.push(comp.as_os_str()),
+                    _ => break,
+                }
+            }
+            if root.as_os_str().is_empty() {
+                std::path::PathBuf::from("C:\\")
+            } else {
+                root
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            std::path::PathBuf::from("/")
+        }
+    }
+
+    /// OS ポータブルな一意の一時 path を作る（host path）。
+    ///
+    /// Windows の `/tmp` 不在・パス区切り差を避けるため、`std::env::temp_dir()` を基点にする。
+    /// 返す path は実在する temp dir 配下なので、`ambient_test_capabilities()` の legacy
+    /// translator（default mount = `fs_root_path_for_test()` が返す volume root）が lexical
+    /// prefix 一致で route できる。Windows secure resolution 対応後は fs builtin スモークが
+    /// 全 OS で走るため、このヘルパーも cfg なしで常時提供する。
+    fn unique_temp_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("tsg-eval-{}-{}-{}", tag, std::process::id(), n));
+        path
+    }
+
+    /// host path を Tsumugi スクリプト文字列リテラルへ埋め込める形へ正規化する。
+    ///
+    /// Windows の `\`（例 `C:\Users\...\Temp`）はスクリプト文字列リテラルのエスケープを壊すため
+    /// `/` へ置換する。legacy translator は `Path::new` 経由で `/` 区切りも受理するので route は
+    /// 成立する。Windows secure resolution 対応後は利用側が全 OS で走るため cfg なしで提供する。
+    fn script_path(path: &std::path::Path) -> String {
+        path.to_str().expect("UTF-8 path").replace('\\', "/")
+    }
+
     fn run_program(input: &str) -> Result<(), TsumugiError> {
         let tokens = Lexer::new(input).tokenize();
         let program = Parser::new(tokens)
             .parse()
             .map_err(|errors| errors.into_iter().next().unwrap())?;
         let mut eval = Evaluator::new();
+        eval.set_capabilities(ambient_test_capabilities());
         eval.run(&program, input.len() as u64)
     }
 
@@ -3297,37 +3437,56 @@ mod tests {
         run_program("for i in range(1, 4)\n  print(i)\nend").unwrap();
     }
 
+    // C5-b/C10: OS filesystem の secure resolution は Unix / Windows の両方で実装される
+    // （capability-model §14.3・§8.3 契約3）。そのため実 fs capability 操作を伴う builtin
+    // スモークは全 OS で走らせる。Windows は junction / mount point を fail-closed 拒否する
+    // が、通常 file/dir 操作は Unix と同じく成功する。
     #[test]
     fn builtin_write_and_read_file() {
-        run_program(
-            "write_file(\"/tmp/tsumugi_unit_test.txt\", \"hello\")\nlet c = read_file(\"/tmp/tsumugi_unit_test.txt\")\nprint(c)",
-        )
+        let p = unique_temp_path("write_read");
+        let sp = script_path(&p);
+        run_program(&format!(
+            "write_file(\"{sp}\", \"hello\")\nlet c = read_file(\"{sp}\")\nprint(c)"
+        ))
         .unwrap();
         // cleanup
-        std::fs::remove_file("/tmp/tsumugi_unit_test.txt").ok();
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn builtin_read_lines() {
-        run_program(
-            "write_file(\"/tmp/tsumugi_lines_test.txt\", \"a\\nb\\nc\")\nlet lines = read_lines(\"/tmp/tsumugi_lines_test.txt\")\nprint(len(lines))",
-        )
+        let p = unique_temp_path("read_lines");
+        let sp = script_path(&p);
+        run_program(&format!(
+            "write_file(\"{sp}\", \"a\\nb\\nc\")\nlet lines = read_lines(\"{sp}\")\nprint(len(lines))"
+        ))
         .unwrap();
-        std::fs::remove_file("/tmp/tsumugi_lines_test.txt").ok();
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn builtin_append_file() {
-        run_program(
-            "write_file(\"/tmp/tsumugi_append_test.txt\", \"a\")\nappend_file(\"/tmp/tsumugi_append_test.txt\", \"b\")\nlet c = read_file(\"/tmp/tsumugi_append_test.txt\")\nprint(c)",
-        )
+        let p = unique_temp_path("append");
+        let sp = script_path(&p);
+        run_program(&format!(
+            "write_file(\"{sp}\", \"a\")\nappend_file(\"{sp}\", \"b\")\nlet c = read_file(\"{sp}\")\nprint(c)"
+        ))
         .unwrap();
-        std::fs::remove_file("/tmp/tsumugi_append_test.txt").ok();
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn builtin_read_file_missing() {
-        run_program("let x = read_file(\"/tmp/no_such_file_xyz.txt\")\nprint(x)").unwrap();
+        // C10: capability 経路では存在しない file の read は catch 可能な `host` error になる
+        // （ambient 時代の `null` 返しは廃止）。未捕捉なら実行は error で終わる。Unix / Windows
+        // とも secure resolution で missing file を host error へ写すため全 OS で検証する。
+        let p = unique_temp_path("missing");
+        let sp = script_path(&p);
+        let result = run_program(&format!("let x = read_file(\"{sp}\")\nprint(x)"));
+        assert!(
+            result.is_err(),
+            "存在しない file の read は host error になる（null へ畳まない）"
+        );
     }
 
     #[test]
@@ -3359,12 +3518,14 @@ mod tests {
 
     #[test]
     fn builtin_path_exists() {
-        run_program("print(path_exists(\"/tmp\"))").unwrap();
+        let sp = script_path(&std::env::temp_dir());
+        run_program(&format!("print(path_exists(\"{sp}\"))")).unwrap();
     }
 
     #[test]
     fn builtin_path_exists_missing() {
-        run_program("print(path_exists(\"/no_such_dir_xyz\"))").unwrap();
+        let sp = script_path(&unique_temp_path("missing_dir"));
+        run_program(&format!("print(path_exists(\"{sp}\"))")).unwrap();
     }
 
     #[test]
@@ -3374,43 +3535,61 @@ mod tests {
 
     #[test]
     fn builtin_mkdir_and_remove_dir() {
-        run_program(
-            "mkdir(\"/tmp/tsg_test_mkdir\")\nprint(path_exists(\"/tmp/tsg_test_mkdir\"))\nremove_dir(\"/tmp/tsg_test_mkdir\")\nprint(path_exists(\"/tmp/tsg_test_mkdir\"))",
-        )
+        let p = unique_temp_path("mkdir");
+        std::fs::remove_dir_all(&p).ok();
+        let sp = script_path(&p);
+        run_program(&format!(
+            "mkdir(\"{sp}\")\nprint(path_exists(\"{sp}\"))\nremove_dir(\"{sp}\")\nprint(path_exists(\"{sp}\"))"
+        ))
         .unwrap();
+        std::fs::remove_dir_all(&p).ok();
     }
 
     #[test]
     fn builtin_rename() {
-        run_program(
-            "write_file(\"/tmp/tsg_rename_src.txt\", \"x\")\nrename(\"/tmp/tsg_rename_src.txt\", \"/tmp/tsg_rename_dst.txt\")\nprint(path_exists(\"/tmp/tsg_rename_dst.txt\"))",
-        )
+        let src = unique_temp_path("rename_src");
+        let dst = unique_temp_path("rename_dst");
+        let src_sp = script_path(&src);
+        let dst_sp = script_path(&dst);
+        run_program(&format!(
+            "write_file(\"{src_sp}\", \"x\")\nrename(\"{src_sp}\", \"{dst_sp}\")\nprint(path_exists(\"{dst_sp}\"))"
+        ))
         .unwrap();
-        std::fs::remove_file("/tmp/tsg_rename_dst.txt").ok();
+        std::fs::remove_file(&dst).ok();
     }
 
     #[test]
     fn builtin_list_dir() {
-        run_program(
-            "mkdir(\"/tmp/tsg_list_test\")\nwrite_file(\"/tmp/tsg_list_test/a.txt\", \"\")\nlet entries = list_dir(\"/tmp/tsg_list_test\")\nprint(len(entries))\nremove_dir(\"/tmp/tsg_list_test\")",
-        )
+        // C10: capability 経路の mkdir は `create_dir`（1 階層・親既存前提）。既存 dir があると
+        // host error になるため、事前に掃除してから走らせる（legacy translator 経由 / 絶対パス）。
+        let base = unique_temp_path("list_dir");
+        std::fs::remove_dir_all(&base).ok();
+        let sp = script_path(&base);
+        run_program(&format!(
+            "mkdir(\"{sp}\")\nwrite_file(\"{sp}/a.txt\", \"\")\nlet entries = list_dir(\"{sp}\")\nprint(len(entries))\nremove_tree(\"{sp}\")"
+        ))
         .unwrap();
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
     fn builtin_file_size() {
-        run_program(
-            "write_file(\"/tmp/tsg_size_test.txt\", \"hello\")\nlet s = file_size(\"/tmp/tsg_size_test.txt\")\nprint(s)",
-        )
+        let p = unique_temp_path("file_size");
+        let sp = script_path(&p);
+        run_program(&format!(
+            "write_file(\"{sp}\", \"hello\")\nlet s = file_size(\"{sp}\")\nprint(s)"
+        ))
         .unwrap();
-        std::fs::remove_file("/tmp/tsg_size_test.txt").ok();
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn builtin_remove_file() {
-        run_program(
-            "write_file(\"/tmp/tsg_remove_test.txt\", \"x\")\nprint(remove(\"/tmp/tsg_remove_test.txt\"))\nprint(path_exists(\"/tmp/tsg_remove_test.txt\"))",
-        )
+        let p = unique_temp_path("remove");
+        let sp = script_path(&p);
+        run_program(&format!(
+            "write_file(\"{sp}\", \"x\")\nprint(remove(\"{sp}\"))\nprint(path_exists(\"{sp}\"))"
+        ))
         .unwrap();
     }
 
@@ -3466,7 +3645,11 @@ mod tests {
 
     #[test]
     fn builtin_is_file_is_dir() {
-        run_program("print(is_dir(\"/tmp\"))\nprint(is_file(\"/tmp\"))").unwrap();
+        let sp = script_path(&std::env::temp_dir());
+        run_program(&format!(
+            "print(is_dir(\"{sp}\"))\nprint(is_file(\"{sp}\"))"
+        ))
+        .unwrap();
     }
 
     #[test]

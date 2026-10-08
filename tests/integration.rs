@@ -115,12 +115,20 @@ impl Drop for TestDir {
 /// fixture 固有の追加環境変数。fixture 名からここだけで決める。
 fn fixture_envs(name: &str, test_dir: &str) -> Vec<(String, String)> {
     let mut envs = vec![(TEST_DIR_ENV.to_string(), test_dir.to_string())];
+    // legacy profile で実行する fixture は、空 env-allow の stderr 警告が golden の「stderr 空」
+    // 判定を壊すため、TSUMUGI_ENV_ALLOW を設定して env 警告を抑止する（C10）。
+    if fixture_needs_legacy(name) {
+        envs.push(("TSUMUGI_ENV_ALLOW".to_string(), "*".to_string()));
+    }
     match name {
         // ファイルI/O系はテスト専用ディレクトリだけを許可する。
         // error_sandbox はその範囲外（/etc/hostname）への読み取りを拒否させる。
         "file_io" | "filesystem" | "string_utils" | "error_sandbox" => {
             envs.push(("TSUMUGI_SANDBOX".to_string(), test_dir.to_string()));
         }
+        // local_utils は任意の絶対パスの path_exists（範囲外は false）を検証するため、
+        // sandbox を設定せず unrestricted（/ 全体を default mount）で実行する。空 sandbox 警告が
+        // stderr に 1 件出るのは許容する（run_fixture の golden stderr 判定が legacy 警告を許す）。
         // 無限ループを短い予算で止める。REV-015 最終形移行 Slice 1（option B）以降、
         // tree CLI 経路は legacy env を参照せず standard budget（total_fuel=1,000,000）で停止する
         // ため上限値が異なる（tree=1000000 / VM=env 100）。VM は従来どおり legacy env を見るので
@@ -203,6 +211,16 @@ fn matches_expected(actual: &str, expected: &str) -> bool {
     true
 }
 
+/// C10 後、ambient の env / clock / filesystem に依存する fixture は safe 既定では動かない。
+/// これらは `--profile legacy`（env/clock/stdin/stdout/exit grant + TSUMUGI_SANDBOX 翻訳 fs）で
+/// 実行する。純粋な言語挙動 fixture は safe 既定（stdout のみ）のまま。
+fn fixture_needs_legacy(name: &str) -> bool {
+    matches!(
+        name,
+        "file_io" | "filesystem" | "string_utils" | "local_utils" | "error_sandbox"
+    )
+}
+
 /// fixture を1つ実行して stdout / stderr / 終了コードを検証する
 fn run_fixture(name: &str, kind: FixtureKind, use_vm: bool) {
     let mode = if use_vm { "VM" } else { "tree-walk" };
@@ -214,6 +232,9 @@ fn run_fixture(name: &str, kind: FixtureKind, use_vm: bool) {
     let mut command = Command::new(tsumugi_bin());
     if use_vm {
         command.arg("--vm");
+    }
+    if fixture_needs_legacy(name) {
+        command.arg("--profile").arg("legacy");
     }
     command
         .arg(&script)
@@ -244,9 +265,17 @@ fn run_fixture(name: &str, kind: FixtureKind, use_vm: bool) {
                 output.status.success(),
                 "{context}: 正常系が異常終了しました\n--- stderr ---\n{stderr}"
             );
-            assert_eq!(
-                stderr, "",
-                "{context}: 正常系で診断が出力されました\n--- stderr ---\n{stderr}"
+            // C10: legacy profile fixture は空 sandbox の security warning が stderr に 1 件
+            // 出得る（env 警告は TSUMUGI_ENV_ALLOW で抑止済み）。既知の legacy 警告だけは許容し、
+            // それ以外の診断は従来どおり failure とする。
+            let stderr_ok = stderr.is_empty()
+                || (fixture_needs_legacy(name)
+                    && stderr
+                        .lines()
+                        .all(|l| l.starts_with("警告: TSUMUGI_SANDBOX")));
+            assert!(
+                stderr_ok,
+                "{context}: 正常系で想定外の診断が出力されました\n--- stderr ---\n{stderr}"
             );
             assert!(
                 matches_expected(&stdout, &expected),
@@ -868,17 +897,19 @@ fn env_allow_list() {
     let dir = fixtures_dir();
     let script = dir.join("env_allow.tsg");
 
-    // テスト側で制御可能な環境変数を設定して検証
-    let output = run_script_process(
-        &script,
-        false,
-        &[
-            ("TSUMUGI_ENV_ALLOW", "TSG_TEST_ALLOWED,TSUMUGI_*"),
-            ("TSG_TEST_ALLOWED", "visible_value"),
-            ("SECRET_DB_PASS", "hunter2"),
-        ],
-        "env allow list",
-    );
+    // C10: TSUMUGI_ENV_ALLOW は legacy profile でのみ適用される（safe は旧 env を無視）。
+    // テスト側で制御可能な環境変数を設定して legacy の allow-list 挙動を検証する。
+    let mut cmd = Command::new(tsumugi_bin());
+    cmd.arg("--profile")
+        .arg("legacy")
+        .arg(&script)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env("TSUMUGI_ENV_ALLOW", "TSG_TEST_ALLOWED,TSUMUGI_*")
+        .env("TSG_TEST_ALLOWED", "visible_value")
+        .env("SECRET_DB_PASS", "hunter2");
+    let child = cmd.spawn().expect("tsumugi バイナリの起動に失敗");
+    let output = wait_with_timeout(child, DEFAULT_TIMEOUT, "env allow list");
 
     let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
     assert!(
@@ -915,7 +946,10 @@ fn run_windows_protected_env_keys(use_vm: bool) {
         if use_vm {
             cmd.arg("--vm");
         }
-        cmd.arg(script.to_str().unwrap())
+        // C10: TSUMUGI_SANDBOX / TSUMUGI_ENV_ALLOW は legacy profile でのみ適用される。
+        cmd.arg("--profile")
+            .arg("legacy")
+            .arg(script.to_str().unwrap())
             .env("TSUMUGI_SANDBOX", &dir);
 
         for key in [

@@ -1,7 +1,7 @@
 # Tsumugi — Capability Model仕様
 
 最終更新: 2026-10-07
-設計ステータス: **実装仕様確定・実装進行中**（C1〜C5・C7・C8 実装済み。C6〔ModuleResolver／import 解決〕・C9／C10〔CLI safe/legacy・ambient 削除〕は未実装。詳細は [ロードマップ](roadmap.md) Phase 2 を参照）
+設計ステータス: **実装仕様確定・実装進行中**（C1〜C5・C7・C8・C9／C10〔CLI safe/legacy profile・ambient OS access 削除〕実装済み。C6〔ModuleResolver／import 解決〕は未実装。詳細は [ロードマップ](roadmap.md) Phase 2 を参照）
 
 ## 1. 目的と規範範囲
 
@@ -317,6 +317,7 @@ pub enum PathError {
     ParentComponent,
     EmptyComponent,
     BackslashSeparator,
+    ColonInComponent,
     InvalidMountName,
 }
 
@@ -333,7 +334,7 @@ impl FilesystemTarget {
 
 規範syntaxは`@MOUNT/component/component`。unqualified `component/component`はmount名`default`へparseする。mountは完全一致し、prefix一致や登録順fallbackをしない。
 
-relative componentはUTF-8、1 byte以上、NULなし。`/`だけをseparatorとし、absolute `/`、`.`、`..`、空component、backslash、drive prefix、UNCを拒否する。host platform pathへ変換する前に検証する。`PathError`はcapabilityの有無を調べる前にcatch可能な`RuntimeErrorCode::Argument`へ変換するため、malformed pathとauthority不足のchannelは混在しない。parse後に該当mountがない場合はadapter/OS call 0で内部`Denial { code: ResourceNotGranted }`を生成し、script filesystem operationならcatch可能なcanonical `sandbox` errorへ変換する。
+relative componentはUTF-8、1 byte以上、NULなし。`/`だけをseparatorとし、absolute `/`、`.`、`..`、空component、backslash、drive prefix、UNCを拒否する。あわせてcomponent内のASCII `:`（Windows ADS / stream指定）を`PathError::ColonInComponent`で拒否する。`@mount`経路（`FilesystemTarget::parse`）とlegacy translator（`LegacyFsTranslator::translate`のComponent::Normal）の両方で適用する。これは先頭drive prefix（`X:`）を表す`PathError::Absolute`とは別概念である（ADSは絶対pathではない）。host platform pathへ変換する前に検証する。`PathError`はcapabilityの有無を調べる前にcatch可能な`RuntimeErrorCode::Argument`へ変換するため、malformed pathとauthority不足のchannelは混在しない。parse後に該当mountがない場合はadapter/OS call 0で内部`Denial { code: ResourceNotGranted }`を生成し、script filesystem operationならcatch可能なcanonical `sandbox` errorへ変換する。
 
 ### 8.3 Portable path-handle契約
 
@@ -433,11 +434,11 @@ adapter契約:
 
 1. root内判定と利用を同じdirectory/file handleへbindする。`canonicalize`でcheck後に元pathを`std::fs`へ渡す実装は禁止。
 2. Unix `openat`だけに依存しない。Windows handle、capability filesystem、in-memory adapter等で同じ契約を実現できる。
-3. platformがroot拘束とsymlink policyを保証できなければ`SecureResolutionUnsupported`。文字列prefix checkへfallbackしない。script filesystem操作ではcanonical `host` error（code `secure_resolution_unsupported`）へ変換してcatch可能とし、未捕捉なら`RuntimeError`となる。link中のresolverで発生してscript handlerが存在しない場合だけterminal `HostError`へ変換する。対象fileのread/write/deleteは行わない。
+3. platformがroot拘束とsymlink policyを保証できなければ`SecureResolutionUnsupported`。文字列prefix checkへfallbackしない。script filesystem操作ではcanonical `host` error（code `secure_resolution_unsupported`）へ変換してcatch可能とし、未捕捉なら`RuntimeError`となる。link中のresolverで発生してscript handlerが存在しない場合だけterminal `HostError`へ変換する。対象fileのread/write/deleteは行わない。UnixとWindowsはsecure handleを実装する。Windowsではjunction / mount point等「stdがsymlinkと認識しないreparse point」を含むpathをfail closed（拒否、`AdapterError::Host("reparse point denied")`）し、安全を保証できる通常file/dir/symlinkのみ操作する。この拒否はsymlink policy判定より先に、中間component・open_file（finalが既存のとき）/ metadata / list / remove / renameのsrc・既存dstのいずれでも行う（将来、厳密なreparse tag判定でroot内junction許可を検討）。
 4. `DenyAll`は途中/final symlinkを拒否。`FollowWithinRoot`は解決先を同じroot handleへ拘束。`OperateOnFinalEntry`は中間symlinkをroot内へ拘束し、delete/renameおよび`follow_final=false`のmetadataだけがfinal symlink entry自体を扱える。Read/Write/Create/Listはfinal symlinkを拒否する。
 5. create/write/appendはdangling final symlinkを追従しない。targetをsecureにbindできなければ拒否。
 6. renameはsource `Delete`、destination `Create`、replace時はdestination `Delete`も必要。両handle認可後、単一rename call。
-7. case/Unicode aliasはadapterがfilesystem規則でroot内拘束する。
+7. case/Unicode aliasはadapterがfilesystem規則でroot内拘束する。Windowsのcase-insensitive aliasと8.3 short nameは`canonicalize`による実体収束でroot内拘束される（別名表記はroot脱出に使えない）。
 
 ### 8.4 Operation matrix
 
@@ -716,7 +717,7 @@ OPTIONS:
 - `NAME`はMountName grammar。`OP`は`read|write|create|delete|metadata|list`。`import`は`--fs-op`では受理せずresolver optionだけで付与する。
 - `--fs-root NAME=PATH`と`--fs-op NAME=...`は1対1必須。CLIはroot directory handleをexecution作成前に開き、safe profileのsymlink policyを常に`DenyAll`とする。
 - scriptは`@NAME/...`でrootを選ぶ。unqualified pathにはNAME `default`が必要である。
-- `--allow-import-root NAME=PATH`はspecifier `@NAME/...`だけを解決するfilesystem `ModuleResolver`を作り、runtime filesystemをgrantしない。
+- `--allow-import-root NAME=PATH`は本revision（C9/C10）では**grammar受理・値検証（NAME/PATH）のみ**を行い、`module_resolver`をgrantせずCapabilitySetIdにも寄与しない。`@NAME/...`を解決するfilesystem `ModuleResolver`化・link配線（`@NAME/...`実効化）はC6/E7で行う。本revisionの実観測挙動として、`--allow-import-root foo=...`を渡しても`import "@foo/..."`はalpha `ModuleLoader`がリテラル相対パスとして解決し未解決import errorになる（従来の相対パスimportだけが動く）。
 - capability optionはsafe profileだけで受理し、legacyとの同時指定はusage error 1とする。
 - `--allow-env KEY`はCLI execution作成時にprocess envのOS上のkey同一性で完全一致する値をsnapshotする。不存在はsnapshotへ入れずwarningなし。protected runtime keyは第5節のOS-aware判定でusage error 1とする。
 - `--allow-clock`はsystem clock、`--allow-script-stdin`はscript Input、`--allow-exit`はProcessExitをprofile builderへ明示grantする。
@@ -737,7 +738,7 @@ OPTIONS:
 - sandbox設定あり: comma-separated host rootsをstart時CWD基準でabsolute化してdirectory handleとして開き、`legacy0`, `legacy1`, ... mountへ順序固定する。rootが1つなら`default` aliasも同じhandle/policy IDへ付ける。旧absolute pathはOS lexical componentで各rootへのrelative candidateを作り、含むrootのうちcomponent数が最長のものを選ぶ。同じ長さの候補が複数ならprofile構築error。旧relative pathはsnapshot CWDを含む最長rootへrouteし、該当rootがなければadapter/OS call 0の内部`Denial`からcatch可能なcanonical `sandbox` errorへ変換する。候補選択後の解決とI/Oはroot handleだけを使う。
 - sandbox未設定/空: legacy専用`LegacyFilesystemTranslator`へunrestricted filesystem namespace authorityを明示grantしsecurity warningをstderrへ1件出す。Unixは`/`とsnapshot CWD handle、Windowsは要求されたvolume rootとsnapshot CWD handleへ安全なhandle操作を使う。authority自体がunrestrictedなだけでcheck/use文字列fallbackは使わない。
 - env allow設定あり: comma-separated exact keyまたは末尾`*` prefixだけsnapshot。未設定/空は`TSUMUGI_`以外を全snapshotしwarning 1件。
-- translatorは旧absolute pathをnamespace root handle、旧relative pathをstart時CWD handleへ変換する。symlink操作はhandle adapter契約に従う。secure handleを実装できないplatformではfilesystem capability構築を拒否。
+- translatorは旧absolute pathをnamespace root handle、旧relative pathをstart時CWD handleへ変換する。legacy filesystemは`OsDirectoryHandle` + `SymlinkPolicy::FollowWithinRoot`で構築し、旧`sandbox.rs`のcanonicalizeベースsymlink解決をroot拘束handle追従へ具体化する（symlink追従自体は互換維持。中間component symlinkはroot内へ拘束して追従し、root外へ逃げるものと final entry symlinkはhandle契約どおり拒否する）。safe profileは常に`DenyAll`、legacy profileは`FollowWithinRoot`とsymlink policyが異なる。root選択（candidate生成・component数比較）はCWD基準で絶対化したlexical path（symlink非追従）で行いcanonicalizeしない。Unix / Windowsはsecure handleを実装済みで、Windowsは§8.3契約3のreparse fail-closed（junction / mount point拒否）を伴う。secure handleを実装できないplatform（非Unix・非Windows）ではfilesystem capability構築を拒否。
 - legacy authorityは`ExecutionStarted.capability_policy_hash`と通常のcanonical decision/host-call eventで観測する。warning専用の別audit eventを追加しない。Phase 2完了条件はstderr warning、Phase 6では同じ8 event schemaとfail-closedを使う。
 
 ### 14.4 Release移行
@@ -749,6 +750,8 @@ OPTIONS:
 | N+1 | safe | coreから直接参照削除済み。legacy adapter継続可否は別判断 |
 
 `OnceLock` process-global policyをper-execution capabilityへ再利用しない。
+
+**本revision（C9/C10一体実装）の採択**: ambient読みをcoreから全除去したうえでCLIを構築するため、N-1（旧envをcore/CLIが既定で読む段階）には戻れない。Tsumugiはalphaで後方互換を保証しないため、N-1を飛ばして**safe既定（N相当）**を採る。legacyは`--profile legacy`指定時のみCLI adapterが旧envをその場で1回読む（process-global OnceLock不使用）。この結果、CAP-AT-25のgoldenはrelease間default差ではなく「無指定=safe」vs「`--profile legacy`」の**profile選択差2点**に縮退する（N-1不在のため）。
 
 ## 15. Clone、revoke、context再利用
 
@@ -819,10 +822,10 @@ C1→C2、C3/C4/C5/C7を並行、C6はstream後、C8はBuiltinSpec衝突検査�
 | CAP-AT-20 | 2 | catalog/tree/VM/compiler/generated docsの名前・arity・metadata完全一致、重複build error |
 | CAP-AT-21 | 2/3 | callback success/catch可能host error/panicを分離。Phase 3でresult N+1 BudgetExceeded。link前host failureはterminal HostError |
 | CAP-AT-22 | 2/6 | Omit/TypeOnly/LengthOnly serializerにfake secret本文0。Phase 6でsink eventも同じ |
-| CAP-AT-23 | 2 | safe profileでroot source読込みとprofile builderが明示grantしたstdout以外ambient call 0。`--deny-stdout`時はstdout call 0で、全option mapping一致 |
-| CAP-AT-24 | 2/6 | legacy互換、empty sandbox/env allowはstderr warning各1。Phase 6でも別eventを追加せずcanonical schemaとfail-closedを維持 |
-| CAP-AT-25 | N-1/N | default profile差とwarningをgolden固定 |
-| CAP-AT-26 | 2 | safeで旧環境変数変更がset ID/挙動へ影響0 |
+| CAP-AT-23 | 2 | safe profileでroot source読込みとprofile builderが明示grantしたstdout以外ambient call 0。`--deny-stdout`時はstdout call 0。`--fs-op`は6トークン対応操作のみmapping一致（RecursiveDelete/ImportはCLI非対象で`remove_tree`は常にdeny）。`--allow-import-root`はset ID不変で`@NAME/...`は未解決 |
+| CAP-AT-24 | 2/6 | legacy互換、empty sandbox/env allowはstderr warning各1。legacy symlinkは`FollowWithinRoot`、root選択曖昧はprofile構築error（exit 1）。Phase 6でも別eventを追加せずcanonical schemaとfail-closedを維持 |
+| CAP-AT-25 | N | 本revisionはN-1を飛ばしsafe既定（N相当）を採るため、golden は「無指定=safe」vs「`--profile legacy`」のprofile選択差2点へ縮退して固定する |
+| CAP-AT-26 | 2 | safeで旧環境変数変更がset ID/挙動へ影響0。射程はruntime fs/env/clock/stdin/exit/stdoutのcapability経路に限り、import解決（C6の`sandbox.rs`/`TSUMUGI_SANDBOX`依存を継続）は対象外（fixtureにimportを含めない） |
 | CAP-AT-27 | 2 | adapter/CLI以外のprocess env、runtime fs、stdio、process exit、ambient clock直接利用0 |
 | CAP-AT-28 | 2 | CapabilitySetId/filesystem encodingのgolden bytes/hash固定 |
 | CAP-AT-29 | 2 | 複数mount qualified/default/missing/duplicateのroutingを完全一致検証 |
@@ -832,7 +835,7 @@ C1→C2、C3/C4/C5/C7を並行、C6はstream後、C8はBuiltinSpec衝突検査�
 
 - **Phase 0:** security boundaryではないこと、OS責任、residual riskは[脅威モデル](threat-model.md)。
 - **Phase 1:** `CapabilitySet`は[実行予算・協調実行仕様](execution-control.md)のfinite `ExecutionRequest`へmoveし、terminal outcomeは[組み込みAPI仕様](embedding-api.md)、catch規則は[次期意味論・実装決定](semantic-decisions.md)に従う。
-- **Phase 2:** C1〜C10とPhase 2のCAP-ATを完了条件とする。環境変数allow-listや現行sandboxだけでは完了でない。
+- **Phase 2:** C1〜C10とPhase 2のCAP-ATを完了条件とする。環境変数allow-listや現行sandboxだけでは完了でない。C10でruntime fs builtinはcapability経路へ全面移行し、`sandbox.rs`はimport解決（C6）専用に縮退した（runtime fsのambient `std::fs`直呼びはcore/builtinから0）。budget env（`from_legacy_env`、`TSUMUGI_MAX_*`）はC9/C10対象外（Phase 3/REV-015）でCAP-AT-27の静的auditの除外リストに入る。
 - **Phase 3/4:** finite budget/controlとcooperative `Pending`は[実行予算・協調実行仕様](execution-control.md)を正本とし、Phase 2同期traitを置換しない。
 - **Phase 6:** event enum、redaction、bounded journal、sink failureは[決定性・実行時監査仕様](determinism-and-audit.md)を正本とし、`FailClosed`以外や別event名を追加しない。
 - **AUD-020:** canonicalize/check/useをportable path-handleへ置換し、dangling symlink、TOCTOU、存在oracleをCAP-AT-10〜14で検証。

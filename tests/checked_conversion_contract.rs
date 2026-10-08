@@ -12,11 +12,20 @@
 //! - `ceil`:   正の無限大方向
 //! - `round`:  最も近い整数、中間は 0 から遠い側
 
-use tsumugi::builtin_core::{
-    builtin_ceil, builtin_file_size, builtin_floor, builtin_round, builtin_to_int,
-};
+use tsumugi::builtin_core::{builtin_ceil, builtin_floor, builtin_round, builtin_to_int};
 use tsumugi::error::ErrorKind;
 use tsumugi::value::Value;
+
+// capability 経路の fs テスト（file_size）は Unix / Windows の両方で secure resolution が
+// 実装されるため全 OS で走らせる（§8.3 契約3）。関連 import とヘルパーも全 OS で使う。
+// `ErrorKind` は Float 変換テストでも使うため従来どおり常時 import する。
+use std::collections::BTreeSet;
+use std::num::NonZeroU128;
+use std::sync::Arc;
+use tsumugi::builtin_core::dispatch_filesystem_capability;
+use tsumugi::{
+    FilesystemCapability, FilesystemRoot, FsOperation, MountName, OsDirectoryHandle, SymlinkPolicy,
+};
 
 type Handler = fn(&[Value], usize) -> Result<Value, tsumugi::error::TsumugiError>;
 
@@ -209,31 +218,72 @@ fn large_magnitude_values_are_out_of_range() {
 }
 
 // -----------------------------------------------------------------------------
-// file_size: u64 → i64 境界
+// file_size: u64 → i64 境界（C10 後は capability 経路で検証する）
 // -----------------------------------------------------------------------------
 
+/// 一時 dir を root に Metadata を grant した filesystem capability を作る。
+fn metadata_fs(base: &std::path::Path) -> FilesystemCapability {
+    let pid = NonZeroU128::new(1).expect("non-zero");
+    let mut ops = BTreeSet::new();
+    ops.insert(FsOperation::Metadata);
+    let mount = MountName::new("data").expect("mount");
+    let handle = OsDirectoryHandle::new(base.to_path_buf(), pid, SymlinkPolicy::DenyAll);
+    let root = FilesystemRoot::new(mount, pid, ops, SymlinkPolicy::DenyAll, Arc::new(handle))
+        .expect("root");
+    FilesystemCapability::new(vec![root]).expect("fs")
+}
+
+/// 一意な一時 dir を作る。
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut path = std::env::temp_dir();
+    path.push(format!("tsg-aud036-{}-{}-{}", tag, std::process::id(), n));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).expect("create temp dir");
+    path
+}
+
+// C10/C5-b: capability 経路の実 fs 解決は Unix / Windows の両方で提供される
+// （capability-model §14.3・§8.3 契約3）。success/missing の意味的検証は両 OS で成立する
+// ため全 OS で走らせる。Windows は junction / mount point を fail-closed 拒否するが、通常
+// file の metadata は Unix と同じく成功する。
 #[test]
 fn file_size_of_real_file_is_positive_int() {
-    let path = std::env::temp_dir().join("tsg_aud036_file_size.txt");
-    std::fs::write(&path, b"hello").expect("一時ファイル作成");
-    let path_str = path.to_string_lossy().to_string();
+    // C10: capability 経路（@mount/rel 構文）で file_size を検証する。
+    let base = temp_dir("file_size");
+    std::fs::write(base.join("f.txt"), b"hello").expect("一時ファイル作成");
+    let fs = metadata_fs(&base);
 
-    // sandbox 未設定時は allow-all（fail-open）なので読める。
-    match builtin_file_size(&[Value::str_constant(path_str)], 1) {
+    match dispatch_filesystem_capability(
+        "file_size",
+        &[Value::str_constant("@data/f.txt".to_string())],
+        &fs,
+        1024,
+        1,
+    ) {
         Ok(Value::Int(n)) => assert_eq!(n, 5, "file_size はバイト数を返す"),
         other => panic!("Int が返るはず: {other:?}"),
     }
 
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]
-fn missing_file_returns_null() {
-    let path = std::env::temp_dir().join("tsg_aud036_missing_file_xyz.txt");
-    let _ = std::fs::remove_file(&path);
-    let path_str = path.to_string_lossy().to_string();
-    match builtin_file_size(&[Value::str_constant(path_str)], 1) {
-        Ok(Value::Null) => {}
-        other => panic!("存在しないファイルは Null: {other:?}"),
-    }
+fn missing_file_is_host_error() {
+    // C10: capability 経路の file_size は、許可 root 内でも missing file を `host` error（catch
+    // 可能）へ写す（ambient 時代の Null 返しは廃止。存在 oracle 防止は route/認可で担保済み）。
+    let base = temp_dir("missing");
+    let fs = metadata_fs(&base);
+    let result = dispatch_filesystem_capability(
+        "file_size",
+        &[Value::str_constant("@data/no_such.txt".to_string())],
+        &fs,
+        1024,
+        1,
+    );
+    let error = result.expect_err("存在しない file の file_size は host error");
+    assert_eq!(error.kind(), Some(ErrorKind::Host));
+    let _ = std::fs::remove_dir_all(&base);
 }

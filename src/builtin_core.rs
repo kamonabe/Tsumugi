@@ -965,200 +965,28 @@ pub fn host_call_response_bytes(name: &str, result: &Value) -> u64 {
     }
 }
 
-pub fn builtin_read_file(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    check_arity("read_file", args, 1, line)?;
-    if let Value::Str(path) = &args[0] {
-        let safe_path = crate::sandbox::check_path(std::path::Path::new(path.as_str()), line)?;
-        match std::fs::read_to_string(&safe_path) {
-            Ok(content) => Ok(Value::str_constant(content)),
-            Err(_) => Ok(Value::Null),
-        }
-    } else {
-        Err(TsumugiError::builtin_arg_type(
-            line,
-            "read_file",
-            1,
-            "Str",
-            &args[0],
-        ))
-    }
-}
-
-pub fn builtin_read_lines(
-    args: &[Value],
-    max_collection: u64,
-    line: usize,
-) -> Result<Value, TsumugiError> {
-    check_arity("read_lines", args, 1, line)?;
-    if let Value::Str(path) = &args[0] {
-        let safe_path = crate::sandbox::check_path(std::path::Path::new(path.as_str()), line)?;
-        match std::fs::read_to_string(&safe_path) {
-            Ok(content) => {
-                let mut lines = Vec::new();
-                for content_line in content.lines() {
-                    check_collection_size(lines.len().saturating_add(1), max_collection, line)?;
-                    lines.push(Value::str_constant(content_line.to_string()));
-                }
-                Ok(Value::List(Tracked::constant(lines)))
-            }
-            Err(_) => Ok(Value::Null),
-        }
-    } else {
-        Err(TsumugiError::builtin_arg_type(
-            line,
-            "read_lines",
-            1,
-            "Str",
-            &args[0],
-        ))
-    }
-}
-
-pub fn builtin_write_file(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    check_arity("write_file", args, 2, line)?;
-    if let Value::Str(path) = &args[0] {
-        let safe_path = crate::sandbox::check_path(std::path::Path::new(path.as_str()), line)?;
-        let content = match &args[1] {
-            Value::Str(s) => s.to_string(),
-            other => other.to_string(),
-        };
-        Ok(Value::Bool(std::fs::write(&safe_path, &content).is_ok()))
-    } else {
-        Err(TsumugiError::builtin_arg_type(
-            line,
-            "write_file",
-            1,
-            "Str",
-            &args[0],
-        ))
-    }
-}
-
-pub fn builtin_append_file(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    check_arity("append_file", args, 2, line)?;
-    if let Value::Str(path) = &args[0] {
-        let safe_path = crate::sandbox::check_path(std::path::Path::new(path.as_str()), line)?;
-        let content = match &args[1] {
-            Value::Str(s) => s.to_string(),
-            other => other.to_string(),
-        };
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        let result = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&safe_path)
-            .and_then(|mut f| f.write_all(content.as_bytes()));
-        Ok(Value::Bool(result.is_ok()))
-    } else {
-        Err(TsumugiError::builtin_arg_type(
-            line,
-            "append_file",
-            1,
-            "Str",
-            &args[0],
-        ))
-    }
-}
+// C10: ambient fs builtin（read_file/read_lines/write_file/append_file ほか 14 名）の
+// `sandbox::check_path` + 生 `std::fs` 実装は削除した。fs builtin は tree/VM の dispatch 境界で
+// 必ず capability 経路（[`dispatch_fs`] → [`dispatch_filesystem_capability`]）を通る。
 
 // =============================================================================
 // 環境系
 // =============================================================================
 
-/// 環境変数アクセス許可リスト（`TSUMUGI_ENV_ALLOW` で制御）
-/// 未設定 → 全キー許可、設定 → リスト内のキーのみ許可
-static ENV_ALLOW: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+// C10: `ENV_ALLOW` OnceLock / `env_allowed_keys` / `is_env_key_allowed` /
+// `ambient_environment_snapshot` / `is_protected_env_key` は削除した。process env の走査・
+// allow-list 適用（`TSUMUGI_ENV_ALLOW`）と `TSUMUGI_` 保護は CLI の safe/legacy profile builder
+// （binary crate 側 `cli_capability`）がその場で 1 回行い、frozen `EnvironmentSnapshot` として
+// 注入する。`env()` builtin（`resolve_env`）は snapshot だけを読む。
+//
+// `normalize_ambient_env_key` は `resolve_env` の lookup 正規化が参照するため残す。
 
-fn env_allowed_keys() -> &'static Option<Vec<String>> {
-    ENV_ALLOW.get_or_init(|| {
-        let val = std::env::var("TSUMUGI_ENV_ALLOW").ok()?;
-        if val.is_empty() {
-            return None;
-        }
-        let keys: Vec<String> = val
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        Some(keys)
-    })
-}
-
-fn is_env_key_allowed(key: &str) -> bool {
-    let Some(allowed) = env_allowed_keys() else {
-        // 許可リスト未設定 → 全キー許可
-        return true;
-    };
-    for pattern in allowed {
-        if pattern.ends_with('*') {
-            // プレフィックスマッチ（例: "TSUMUGI_*"）
-            let prefix = &pattern[..pattern.len() - 1];
-            if key.starts_with(prefix) {
-                return true;
-            }
-        } else if pattern == key {
-            return true;
-        }
-    }
-    false
-}
-
-fn is_protected_env_key(key: &str) -> bool {
-    const PREFIX: &str = "TSUMUGI_";
-
-    #[cfg(windows)]
-    {
-        // Windowsのcase-insensitive lookupでASCII名へ別名解決され得る
-        // Unicode文字（long s、dotless i等）も保護側へ倒す。
-        key.to_uppercase().starts_with(PREFIX)
-    }
-
-    #[cfg(not(windows))]
-    {
-        key.starts_with(PREFIX)
-    }
-}
-
-/// ambient 互換経路（[`crate::capability::CapabilitySet::ambient_compat`]）用の
-/// 環境変数 snapshot を作る（Phase 2 C3）。
-///
-/// ambient 経路の唯一の process env 読み取りをここへ集約する。process env を 1 度だけ走査し、
-/// legacy の allow-list（`TSUMUGI_ENV_ALLOW`）と `TSUMUGI_` 保護を適用した visible key だけを
-/// [`EnvironmentSnapshot`] に載せる。これにより `env()` builtin 自体は snapshot だけを読み、
-/// core builtin からの ambient read を 0 にする（CAP-AT-27）。
-///
-/// snapshot key は UTF-8・1..=256 bytes・NUL なしが要件のため、これを満たさない key は
-/// 従来の live-read でも `env()` へ渡せない（key は script 由来の Str）ので落として問題ない。
-/// value 側の分類は ambient 互換なので [`DataClassification::Public`] とする。
-pub fn ambient_environment_snapshot() -> crate::capability::EnvironmentSnapshot {
-    use crate::capability::{DataClassification, EnvironmentSnapshot, EnvironmentValue};
-
-    let entries = std::env::vars().filter_map(|(key, value)| {
-        if is_protected_env_key(&key) || !is_env_key_allowed(&key) {
-            return None;
-        }
-        // Windows の process env lookup は case-insensitive で、legacy の `env()` は
-        // `std::env::var` 経由で `env("PATH")` から OS の `Path` を引けた。exact-match の
-        // snapshot でこの ambient 挙動を保つため、Windows では key を大文字へ正規化する
-        // （script 側の key も後段で同様に正規化する）。他 OS は case-sensitive のまま。
-        let key = normalize_ambient_env_key(&key);
-        // key/value 検証（長さ・NUL）を満たさないものは snapshot から落とす。
-        if key.is_empty() || key.len() > 256 || key.as_bytes().contains(&0) {
-            return None;
-        }
-        let value = EnvironmentValue::new(value, DataClassification::Public).ok()?;
-        Some((key, value))
-    });
-    // from_entries は重複 key で error になるが、process env の key は一意なので握り潰す。
-    EnvironmentSnapshot::from_entries(entries).unwrap_or_else(|_| EnvironmentSnapshot::empty())
-}
-
-/// ambient 経路の環境変数 key を OS 規則で正規化する。
+/// 環境変数 key を OS 規則で正規化する（`resolve_env` lookup 用）。
 ///
 /// Windows の process env lookup は case-insensitive なので、snapshot 構築時・lookup 時とも
 /// key を大文字化してこの ambient 挙動を保つ（legacy の `std::env::var` 相当）。他 OS は
 /// case-sensitive なのでそのまま返す。`is_protected_env_key` の Windows 大文字化と整合する。
-fn normalize_ambient_env_key(key: &str) -> String {
+pub(crate) fn normalize_ambient_env_key(key: &str) -> String {
     #[cfg(windows)]
     {
         key.to_uppercase()
@@ -1301,6 +1129,27 @@ pub fn is_filesystem_builtin(name: &str) -> bool {
             | "is_file"
             | "is_dir"
     )
+}
+
+/// filesystem builtin を frozen [`FilesystemCapability`] 経由で dispatch する薄い wrapper
+/// （C10、tree/VM 共通）。
+///
+/// `filesystem` が `Some`（Filesystem authority grant 済み）なら
+/// [`dispatch_filesystem_capability`] へ委譲する。`None`（未 grant）なら adapter/OS call を
+/// 一切行わず、単一の catch 可能な `sandbox` denial（[`TsumugiError::filesystem_denied`]）を
+/// 返す。これにより fs builtin は grant 有無に関わらず常に capability 経路を通り、ambient
+/// `std::fs` fallback へは決して落ちない（CAP-AT-27）。
+pub fn dispatch_fs(
+    name: &str,
+    args: &[Value],
+    filesystem: Option<&crate::capability::FilesystemCapability>,
+    max_collection: u64,
+    line: usize,
+) -> Result<Value, TsumugiError> {
+    match filesystem {
+        Some(fs) => dispatch_filesystem_capability(name, args, fs, max_collection, line),
+        None => Err(TsumugiError::filesystem_denied(line)),
+    }
 }
 
 /// filesystem builtin を frozen [`FilesystemCapability`] 経由で実行する（C5-c、案 B の grant 経路）。
@@ -1552,15 +1401,32 @@ fn fs_route<'a>(
     TsumugiError,
 > {
     let _ = name;
-    // lexical 検証を capability lookup より先に行う（PathError は catch 可能な argument error。
-    // authority channel と分離する、第8.5節）。message に host path を含めない。
-    let target = crate::capability::FilesystemTarget::parse(path).map_err(|_| {
-        TsumugiError::runtime_with_kind(
-            line,
-            crate::error::ErrorKind::Argument,
-            "ファイルパスの形式が不正です",
-        )
-    })?;
+    // legacy profile は host path（絶対/相対）を登録 root 最長一致で mount 相対へ翻訳する
+    // （§4.2/§5）。safe / 埋め込み host（translator なし）は従来どおり `@mount/...` 構文を
+    // `FilesystemTarget::parse` で解釈し、絶対パスは `PathError::Absolute` で拒否する。
+    let target = match filesystem.legacy_translator() {
+        Some(translator) => match translator.translate(path) {
+            // route 先 root 無し（sandbox 範囲外）は単一の sandbox denial（存在 oracle 防止）。
+            Ok(None) => return Err(TsumugiError::filesystem_denied(line)),
+            Ok(Some(target)) => target,
+            Err(_) => {
+                return Err(TsumugiError::runtime_with_kind(
+                    line,
+                    crate::error::ErrorKind::Argument,
+                    "ファイルパスの形式が不正です",
+                ));
+            }
+        },
+        None => crate::capability::FilesystemTarget::parse(path).map_err(|_| {
+            // lexical 検証を capability lookup より先に行う（PathError は catch 可能な argument
+            // error。authority channel と分離する、第8.5節）。message に host path を含めない。
+            TsumugiError::runtime_with_kind(
+                line,
+                crate::error::ErrorKind::Argument,
+                "ファイルパスの形式が不正です",
+            )
+        })?,
+    };
     // mount 完全一致で root を引く。未登録は単一の sandbox denial（存在 oracle 防止）。
     let Some(root) = filesystem.root(&target.mount) else {
         return Err(TsumugiError::filesystem_denied(line));
@@ -1627,22 +1493,6 @@ fn fs_metadata_kind(
 // パス・ファイルシステム系
 // =============================================================================
 
-pub fn builtin_path_exists(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    check_arity("path_exists", args, 1, line)?;
-    if let Value::Str(path) = &args[0] {
-        let safe_path = crate::sandbox::check_path(std::path::Path::new(path.as_str()), line)?;
-        Ok(Value::Bool(safe_path.exists()))
-    } else {
-        Err(TsumugiError::builtin_arg_type(
-            line,
-            "path_exists",
-            1,
-            "Str",
-            &args[0],
-        ))
-    }
-}
-
 pub fn builtin_path_join(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     // 全引数を左から右へ Str として検査し、非 Str を1つでも見つけたら結合を開始しない。
     // 非 Str を無言で欠落させない（AUD-034, semantic-decisions.md §9）。
@@ -1666,182 +1516,10 @@ pub fn builtin_path_join(args: &[Value], line: usize) -> Result<Value, TsumugiEr
     Ok(Value::str_constant(path.to_string_lossy().to_string()))
 }
 
-pub fn builtin_mkdir(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    check_arity("mkdir", args, 1, line)?;
-    if let Value::Str(path) = &args[0] {
-        let safe_path = crate::sandbox::check_path(std::path::Path::new(path.as_str()), line)?;
-        Ok(Value::Bool(std::fs::create_dir_all(&safe_path).is_ok()))
-    } else {
-        Err(TsumugiError::builtin_arg_type(
-            line, "mkdir", 1, "Str", &args[0],
-        ))
-    }
-}
-
-fn remove_symlink_entry(path: &std::path::Path) -> std::io::Result<()> {
-    // Unixではremove_file、Windowsのdirectory symlink/junctionではremove_dirが必要な場合がある。
-    // どちらもfinal entry pathへ適用し、link targetは操作しない。
-    std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path))
-}
-
-pub fn builtin_remove(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    check_arity("remove", args, 1, line)?;
-    if let Value::Str(path) = &args[0] {
-        let safe_path =
-            crate::sandbox::check_entry_path(std::path::Path::new(path.as_str()), line)?;
-        let result = match std::fs::symlink_metadata(&safe_path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => remove_symlink_entry(&safe_path),
-            Ok(metadata) if metadata.is_dir() => std::fs::remove_dir(&safe_path),
-            _ => std::fs::remove_file(&safe_path),
-        };
-        Ok(Value::Bool(result.is_ok()))
-    } else {
-        Err(TsumugiError::builtin_arg_type(
-            line, "remove", 1, "Str", &args[0],
-        ))
-    }
-}
-
-/// `remove_dir(path)`: **空 directory のみ**を削除する（REV-021 §17.6）。
-///
-/// 非空 directory は削除しない（従来の再帰削除は `remove_tree` へ分離した）。symlink の削除は
-/// `remove`（`FileOrSymlink`）の責務で、`remove_dir` は扱わない。ambient（legacy）経路では
-/// 従来どおり成否を `Bool` で返す（非空・不存在は `false`）。capability 経路は
-/// `EmptyDirectory` を要求し、非空は catch 可能な `host` error（category `directory_not_empty`）
-/// へ写す（[`dispatch_filesystem_capability`]）。
-pub fn builtin_remove_dir(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    check_arity("remove_dir", args, 1, line)?;
-    if let Value::Str(path) = &args[0] {
-        let safe_path =
-            crate::sandbox::check_entry_path(std::path::Path::new(path.as_str()), line)?;
-        // 空 directory のみ削除する（非空は OS error → false）。
-        Ok(Value::Bool(std::fs::remove_dir(&safe_path).is_ok()))
-    } else {
-        Err(TsumugiError::builtin_arg_type(
-            line,
-            "remove_dir",
-            1,
-            "Str",
-            &args[0],
-        ))
-    }
-}
-
-/// `remove_tree(path)`: directory を**再帰削除**する（REV-021 §17.6 で `remove_dir` から分離）。
-///
-/// final entry が symlink ならリンク自体を削除し、リンク先を辿って再帰削除しない。ambient
-/// （legacy）経路では成否を `Bool` で返す。capability 経路は専用 capability `RecursiveDelete`
-/// を要求する（`EmptyDirectory` から暗黙昇格させない）。budget / cancel / audit は Phase 3/4/6。
-pub fn builtin_remove_tree(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    check_arity("remove_tree", args, 1, line)?;
-    if let Value::Str(path) = &args[0] {
-        let safe_path =
-            crate::sandbox::check_entry_path(std::path::Path::new(path.as_str()), line)?;
-        let result = match std::fs::symlink_metadata(&safe_path) {
-            // final symlink はリンク自体を削除する（リンク先を辿らない）。
-            Ok(metadata) if metadata.file_type().is_symlink() => remove_symlink_entry(&safe_path),
-            _ => std::fs::remove_dir_all(&safe_path),
-        };
-        Ok(Value::Bool(result.is_ok()))
-    } else {
-        Err(TsumugiError::builtin_arg_type(
-            line,
-            "remove_tree",
-            1,
-            "Str",
-            &args[0],
-        ))
-    }
-}
-
-pub fn builtin_rename(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    check_arity("rename", args, 2, line)?;
-    let from = require_str(&args[0], "rename", 1, line)?;
-    let to = require_str(&args[1], "rename", 2, line)?;
-    let safe_from = crate::sandbox::check_entry_path(std::path::Path::new(from), line)?;
-    let safe_to = crate::sandbox::check_entry_path(std::path::Path::new(to), line)?;
-    Ok(Value::Bool(std::fs::rename(&safe_from, &safe_to).is_ok()))
-}
-
-/// `list_dir(path)`: ambient（legacy）経路の directory 列挙。
-///
-/// REV-009 §17.4 の **safe** 挙動（個別 entry 取得失敗→`directory_read` host error、非 UTF-8 名
-/// →`invalid_encoding` host error、部分結果を成功 List にしない）は capability 経路
-/// （[`dispatch_filesystem_capability`]）で提供する。この ambient 経路は legacy 互換のまま——
-/// 個別 entry 失敗は skip（`flatten`）、非 UTF-8 名は lossy 変換、`read_dir` 失敗は `null`。
-/// capability denial は sandbox 側で処理し `null` へ畳まない。
-pub fn builtin_list_dir(
-    args: &[Value],
-    max_collection: u64,
-    line: usize,
-) -> Result<Value, TsumugiError> {
-    check_arity("list_dir", args, 1, line)?;
-    if let Value::Str(path) = &args[0] {
-        let safe_path = crate::sandbox::check_path(std::path::Path::new(path.as_str()), line)?;
-        match std::fs::read_dir(&safe_path) {
-            Ok(entries) => {
-                let mut names = Vec::new();
-                // legacy: 個別 entry 失敗は skip（safe 経路は directory_read へ写す、REV-009）。
-                for entry in entries.flatten() {
-                    check_collection_size(names.len().saturating_add(1), max_collection, line)?;
-                    names.push(Value::str_constant(
-                        entry.file_name().to_string_lossy().to_string(),
-                    ));
-                }
-                names.sort_by_key(|v| v.to_string());
-                Ok(Value::List(Tracked::constant(names)))
-            }
-            Err(_) => Ok(Value::Null),
-        }
-    } else {
-        Err(TsumugiError::builtin_arg_type(
-            line, "list_dir", 1, "Str", &args[0],
-        ))
-    }
-}
-
-pub fn builtin_file_size(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    check_arity("file_size", args, 1, line)?;
-    if let Value::Str(path) = &args[0] {
-        let safe_path = crate::sandbox::check_path(std::path::Path::new(path.as_str()), line)?;
-        match std::fs::metadata(&safe_path) {
-            Ok(meta) => Ok(Value::Int(checked_file_size_to_i64(meta.len(), line)?)),
-            Err(_) => Ok(Value::Null),
-        }
-    } else {
-        Err(TsumugiError::builtin_arg_type(
-            line,
-            "file_size",
-            1,
-            "Str",
-            &args[0],
-        ))
-    }
-}
-
-pub fn builtin_is_file(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    check_arity("is_file", args, 1, line)?;
-    if let Value::Str(path) = &args[0] {
-        let safe_path = crate::sandbox::check_path(std::path::Path::new(path.as_str()), line)?;
-        Ok(Value::Bool(safe_path.is_file()))
-    } else {
-        Err(TsumugiError::builtin_arg_type(
-            line, "is_file", 1, "Str", &args[0],
-        ))
-    }
-}
-
-pub fn builtin_is_dir(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    check_arity("is_dir", args, 1, line)?;
-    if let Value::Str(path) = &args[0] {
-        let safe_path = crate::sandbox::check_path(std::path::Path::new(path.as_str()), line)?;
-        Ok(Value::Bool(safe_path.is_dir()))
-    } else {
-        Err(TsumugiError::builtin_arg_type(
-            line, "is_dir", 1, "Str", &args[0],
-        ))
-    }
-}
+// C10: ambient fs builtin（mkdir/remove/remove_dir/remove_tree/rename/list_dir/file_size/
+// is_file/is_dir と remove_symlink_entry helper）の `sandbox::check_*` + 生 `std::fs` 実装は
+// 削除した。これらは tree/VM の dispatch 境界で必ず capability 経路（[`dispatch_fs`] →
+// [`dispatch_filesystem_capability`]）を通る。`path_join` は純関数なので残す。
 
 // =============================================================================
 // ディスパッチ関数
@@ -1890,21 +1568,10 @@ pub fn dispatch(
         "ceil" => builtin_ceil(args, line)?,
         "round" => builtin_round(args, line)?,
         "format_time" => builtin_format_time(args, line)?,
-        "read_file" => builtin_read_file(args, line)?,
-        "read_lines" => builtin_read_lines(args, max_collection, line)?,
-        "write_file" => builtin_write_file(args, line)?,
-        "append_file" => builtin_append_file(args, line)?,
-        "path_exists" => builtin_path_exists(args, line)?,
+        // C10: fs builtin（read_file/.../is_dir の 14 名）は dispatch へ来ない。tree/VM の
+        // 境界が `is_filesystem_builtin` で intercept し capability 経路（dispatch_fs）へ回す。
+        // `path_join` は純関数なので dispatch に残す。
         "path_join" => builtin_path_join(args, line)?,
-        "mkdir" => builtin_mkdir(args, line)?,
-        "remove" => builtin_remove(args, line)?,
-        "remove_dir" => builtin_remove_dir(args, line)?,
-        "remove_tree" => builtin_remove_tree(args, line)?,
-        "rename" => builtin_rename(args, line)?,
-        "list_dir" => builtin_list_dir(args, max_collection, line)?,
-        "file_size" => builtin_file_size(args, line)?,
-        "is_file" => builtin_is_file(args, line)?,
-        "is_dir" => builtin_is_dir(args, line)?,
         _ => return Ok(None),
     };
     Ok(Some(result))

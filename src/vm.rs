@@ -174,7 +174,9 @@ impl Vm {
             retain_token_table: HashMap::new(),
             next_function_id: 0,
             script_args: Vec::new(),
-            capabilities: crate::capability::CapabilitySet::ambient_compat(),
+            // C10: library 既定は deny-by-default（empty）。CLI の VM 経路が set_capabilities で
+            // frozen set を注入する。
+            capabilities: crate::capability::CapabilitySet::empty(),
             pending_exit: None,
         }
     }
@@ -193,7 +195,9 @@ impl Vm {
             retain_token_table: HashMap::new(),
             next_function_id: 0,
             script_args: Vec::new(),
-            capabilities: crate::capability::CapabilitySet::ambient_compat(),
+            // C10: library 既定は deny-by-default（empty）。CLI の VM REPL 経路が set_capabilities
+            // で frozen set を注入する。
+            capabilities: crate::capability::CapabilitySet::empty(),
             pending_exit: None,
         }
     }
@@ -201,6 +205,13 @@ impl Vm {
     /// `args()` が返すスクリプト引数の snapshot を設定する（AUD-018）。
     pub fn set_script_args(&mut self, args: Vec<String>) {
         self.script_args = args;
+    }
+
+    /// この実行の capability 集合を設定する（Phase 2 C9/C10）。CLI の VM 経路
+    /// （`execute_vm_with_path` / `run_repl_vm`）が frozen set を注入する。`Evaluator::set_capabilities`
+    /// と対称。
+    pub fn set_capabilities(&mut self, capabilities: crate::capability::CapabilitySet) {
+        self.capabilities = capabilities;
     }
 
     /// terminal で記録済み `exit` コードを取り出す（C7、REV-023）。CLI が実際の exit code へ写す。
@@ -1973,16 +1984,14 @@ impl Vm {
         }
         // まず共通モジュールで処理を試みる
         let max_collection = self.budget.max_collection_elements();
-        // C5-c（案 B）: filesystem builtin かつ Filesystem authority が grant 済みなら frozen
-        // CapabilitySet 経由で実行する（tree engine と同じ論理位置・同じ共有ロジック）。未 grant
-        // （ambient）は従来の dispatch＝process-global sandbox のまま。
-        let fs_capability_result = if crate::builtin_core::is_filesystem_builtin(name)
-            && let Some(fs) = self.capabilities.filesystem()
-        {
-            Some(crate::builtin_core::dispatch_filesystem_capability(
+        // C10: filesystem builtin は grant 有無に関わらず常に capability 経路を通す（tree engine
+        // と同じ論理位置・同じ共有ロジック）。未 grant（filesystem() が None）なら dispatch_fs が
+        // adapter/OS call 0 で単一の sandbox denial を返す。ambient std::fs fallback へは落ちない。
+        let fs_capability_result = if crate::builtin_core::is_filesystem_builtin(name) {
+            Some(crate::builtin_core::dispatch_fs(
                 name,
                 &args,
-                fs,
+                self.capabilities.filesystem(),
                 max_collection,
                 line,
             )?)
