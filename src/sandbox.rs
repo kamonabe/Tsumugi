@@ -1,8 +1,12 @@
-//! ファイルI/Oサンドボックス
+//! import 解決サンドボックス（C6 専用に縮退）
 //!
-//! 環境変数 `TSUMUGI_SANDBOX` が設定されている場合、
-//! ファイル操作の対象パスが許可リスト内に収まっているか検証する。
-//! 未設定の場合はサンドボックス無効（全パス許可）。
+//! 環境変数 `TSUMUGI_SANDBOX` が設定されている場合、import 解決（`module.rs::ModuleLoader`）の
+//! 対象パスが許可リスト内に収まっているか検証する。未設定の場合はサンドボックス無効（全パス許可）。
+//!
+//! C10 で runtime fs builtin（`read_file` 等）の ambient 経路は capability 経路へ全面移行した
+//! ため、本モジュールの `check_path` / `check_entry_path` を呼ぶのは **import 解決
+//! （`module.rs`、C6）だけ** になった。import resolver が capability（`ModuleResolver`、C6/E7）
+//! 化されたら本モジュールごと撤去する。
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

@@ -176,16 +176,14 @@ impl Evaluator {
                         &mut self.budget,
                         line,
                     )?)
-                } else if crate::builtin_core::is_filesystem_builtin(name)
-                    && let Some(fs) = self.capabilities().filesystem()
-                {
-                    // C5-c（案 B）: filesystem builtin かつ Filesystem authority が grant 済みなら
-                    // frozen CapabilitySet 経由で実行する。未 grant（ambient）は従来の dispatch
-                    // ＝process-global sandbox のまま。
-                    Some(crate::builtin_core::dispatch_filesystem_capability(
+                } else if crate::builtin_core::is_filesystem_builtin(name) {
+                    // C10: filesystem builtin は grant 有無に関わらず常に capability 経路を通す。
+                    // 未 grant（filesystem() が None）なら dispatch_fs が adapter/OS call 0 で
+                    // 単一の sandbox denial を返す。ambient std::fs fallback へは落ちない。
+                    Some(crate::builtin_core::dispatch_fs(
                         name,
                         &evaluated,
-                        fs,
+                        self.capabilities().filesystem(),
                         max_collection,
                         line,
                     )?)

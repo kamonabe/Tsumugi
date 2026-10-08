@@ -404,9 +404,9 @@ impl Evaluator {
             slice_fuel_used: 0,
             slice_fuel_limit: None,
             session: None,
-            // alpha facade / CLI / REPL / VM 経路の既定は ambient 互換（ProcessExit を grant）。
-            // 埋め込み Engine::run は set_capabilities で deny-by-default の frozen set へ差し替える。
-            capabilities: crate::capability::CapabilitySet::ambient_compat(),
+            // C10: library 既定は deny-by-default（empty）。CLI は safe/legacy profile builder が
+            // 組んだ frozen set を各経路で set_capabilities で注入し、埋め込み Engine::run も同様。
+            capabilities: crate::capability::CapabilitySet::empty(),
             pending_exit: None,
             // 既定は空 registry（host function なし）。埋め込み host が set_host_registry で注入する。
             host_registry: std::sync::Arc::new(crate::host_function::HostFunctionRegistry::empty()),
@@ -501,9 +501,12 @@ impl Evaluator {
         self.capabilities = capabilities;
     }
 
-    /// capability 集合を ambient 互換の既定へ戻す（実行後・再利用前）。
+    /// capability 集合を deny-by-default の既定（empty）へ戻す（実行後・再利用前）。
+    ///
+    /// C10: 旧 `ambient_compat` 既定を廃し、reusable context の次 request が明示 grant しない限り
+    /// 全 authority を拒否する（embedding §15 規則 5、deny-by-default）。
     pub fn clear_capabilities(&mut self) {
-        self.capabilities = crate::capability::CapabilitySet::ambient_compat();
+        self.capabilities = crate::capability::CapabilitySet::empty();
     }
 
     /// この実行の capability 集合を参照する（builtin dispatch から consult する）。
@@ -2679,12 +2682,117 @@ mod tests {
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 
+    /// 既存の言語挙動ユニットテスト用の capability 集合（C10 後の ambient 相当）。
+    ///
+    /// C10 で library 既定が deny-by-default（empty）になったため、`print`/`env`/`now`/`input`/
+    /// `exit` と絶対パス fs を使う既存テストは明示 grant が要る。本 helper は CLI legacy profile
+    /// 相当——stdout/clock/stdin/exit を grant、`TSUMUGI_` 以外の env を snapshot、root `/`（Unix）/
+    /// CWD volume root（Windows）に `default` mount を `FollowWithinRoot` + legacy translator で
+    /// 割り当てる——を組む。これにより絶対 host path（`/tmp/...`）が translator 経由で route され、
+    /// 従来の観測挙動が保たれる。safe profile の `@mount/...` 必須挙動とは別経路。
+    fn ambient_test_capabilities() -> crate::capability::CapabilitySet {
+        use std::collections::BTreeSet;
+        use std::num::NonZeroU128;
+        use std::sync::Arc;
+
+        use crate::capability::{
+            CapabilitySet, DataClassification, EnvironmentSnapshot, EnvironmentValue,
+            FilesystemCapability, FilesystemRoot, FsOperation, MountName, OsDirectoryHandle,
+            ProcessExit, SymlinkPolicy, SystemClock, SystemInput, SystemOutput,
+        };
+
+        let pid = NonZeroU128::new(1).expect("non-zero");
+
+        // env snapshot: TSUMUGI_ 以外を全 snapshot（legacy の allow-list 未設定相当）。
+        let entries = std::env::vars().filter_map(|(key, value)| {
+            if key.starts_with("TSUMUGI_") {
+                return None;
+            }
+            if key.is_empty() || key.len() > 256 || key.as_bytes().contains(&0) {
+                return None;
+            }
+            EnvironmentValue::new(value, DataClassification::Public)
+                .ok()
+                .map(|v| (key, v))
+        });
+        let env_snapshot = EnvironmentSnapshot::from_entries(entries)
+            .unwrap_or_else(|_| EnvironmentSnapshot::empty());
+
+        // root `/`（Unix）/ CWD volume root（Windows）へ default mount を割り当てる。
+        let root_path = fs_root_path_for_test();
+        let ops: BTreeSet<FsOperation> = [
+            FsOperation::Read,
+            FsOperation::Write,
+            FsOperation::Create,
+            FsOperation::Delete,
+            FsOperation::Metadata,
+            FsOperation::List,
+            FsOperation::RecursiveDelete,
+        ]
+        .into_iter()
+        .collect();
+        let mount = MountName::new("default").expect("mount");
+        let handle =
+            OsDirectoryHandle::new(root_path.clone(), pid, SymlinkPolicy::FollowWithinRoot);
+        let root = FilesystemRoot::new(
+            mount.clone(),
+            pid,
+            ops,
+            SymlinkPolicy::FollowWithinRoot,
+            Arc::new(handle),
+        )
+        .expect("root");
+        let fs = FilesystemCapability::new_legacy(vec![root], vec![(mount, root_path)])
+            .expect("legacy fs");
+
+        CapabilitySet::builder()
+            .stdout(Arc::new(SystemOutput::new(pid)))
+            .expect("stdout")
+            .clock(Arc::new(SystemClock::new(pid)))
+            .expect("clock")
+            .stdin(Arc::new(SystemInput::new(pid)))
+            .expect("stdin")
+            .process_exit(ProcessExit::new(pid))
+            .expect("exit")
+            .environment(env_snapshot)
+            .expect("env")
+            .filesystem(fs)
+            .expect("fs")
+            .build()
+    }
+
+    /// test 用 filesystem root path（Unix は `/`、Windows は CWD の volume root）。
+    fn fs_root_path_for_test() -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            use std::path::Component;
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("C:\\"));
+            let mut root = std::path::PathBuf::new();
+            for comp in cwd.components() {
+                match comp {
+                    Component::Prefix(_) | Component::RootDir => root.push(comp.as_os_str()),
+                    _ => break,
+                }
+            }
+            if root.as_os_str().is_empty() {
+                std::path::PathBuf::from("C:\\")
+            } else {
+                root
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            std::path::PathBuf::from("/")
+        }
+    }
+
     fn run_program(input: &str) -> Result<(), TsumugiError> {
         let tokens = Lexer::new(input).tokenize();
         let program = Parser::new(tokens)
             .parse()
             .map_err(|errors| errors.into_iter().next().unwrap())?;
         let mut eval = Evaluator::new();
+        eval.set_capabilities(ambient_test_capabilities());
         eval.run(&program, input.len() as u64)
     }
 
@@ -3327,7 +3435,13 @@ mod tests {
 
     #[test]
     fn builtin_read_file_missing() {
-        run_program("let x = read_file(\"/tmp/no_such_file_xyz.txt\")\nprint(x)").unwrap();
+        // C10: capability 経路では存在しない file の read は catch 可能な `host` error になる
+        // （ambient 時代の `null` 返しは廃止）。未捕捉なら実行は error で終わる。
+        let result = run_program("let x = read_file(\"/tmp/no_such_file_xyz_tsg.txt\")\nprint(x)");
+        assert!(
+            result.is_err(),
+            "存在しない file の read は host error になる（null へ畳まない）"
+        );
     }
 
     #[test]
@@ -3391,10 +3505,15 @@ mod tests {
 
     #[test]
     fn builtin_list_dir() {
-        run_program(
-            "mkdir(\"/tmp/tsg_list_test\")\nwrite_file(\"/tmp/tsg_list_test/a.txt\", \"\")\nlet entries = list_dir(\"/tmp/tsg_list_test\")\nprint(len(entries))\nremove_dir(\"/tmp/tsg_list_test\")",
-        )
+        // C10: capability 経路の mkdir は `create_dir`（1 階層・親既存前提）。既存 dir があると
+        // host error になるため、事前に掃除してから走らせる（legacy translator 経由 / 絶対パス）。
+        let base = "/tmp/tsg_list_test_tsg";
+        std::fs::remove_dir_all(base).ok();
+        run_program(&format!(
+            "mkdir(\"{base}\")\nwrite_file(\"{base}/a.txt\", \"\")\nlet entries = list_dir(\"{base}\")\nprint(len(entries))\nremove_tree(\"{base}\")"
+        ))
         .unwrap();
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[test]
