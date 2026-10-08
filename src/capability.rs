@@ -871,6 +871,12 @@ impl LegacyFsTranslator {
                 _ => None,
             })
             .collect();
+        // Windows ADS / stream 指定を拒否する（§5.5）。drive prefix は `Component::Prefix`
+        // として上の filter_map で既に除外されているため、`Component::Normal` 内に残る `:`
+        // だけを拒否すればよい（Finding 7）。
+        if abs_components.iter().any(|c| c.contains(':')) {
+            return Err(PathError::ColonInComponent);
+        }
         for (mount, root) in &self.entries {
             let root_components: Vec<String> = root
                 .components()
@@ -978,6 +984,12 @@ pub enum PathError {
     EmptyComponent,
     /// backslash separator を含む。
     BackslashSeparator,
+    /// component 内に ASCII `:` を含む（Windows ADS / stream 指定）。
+    ///
+    /// `@mount` 経路と legacy translator の両方で、host path へ変換する前に拒否する。
+    /// drive prefix（先頭 `X:`）を表す [`PathError::Absolute`] とは別概念（ADS は絶対
+    /// path ではない）。
+    ColonInComponent,
     /// mount 名が不正。
     InvalidMountName,
 }
@@ -1039,6 +1051,9 @@ impl FilesystemTarget {
                     "" => return Err(PathError::EmptyComponent),
                     "." => return Err(PathError::DotComponent),
                     ".." => return Err(PathError::ParentComponent),
+                    // Windows ADS / stream 指定（`foo.txt:stream`）を host path 変換前に拒否する
+                    // （§5.5）。drive prefix（先頭 `X:`）は上の has_drive_prefix で別途捕捉済み。
+                    c if c.contains(':') => return Err(PathError::ColonInComponent),
                     c => components.push(c.to_string()),
                 }
             }
