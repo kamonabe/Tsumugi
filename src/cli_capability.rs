@@ -859,3 +859,257 @@ fn fs_root_path() -> std::path::PathBuf {
         std::path::PathBuf::from("/")
     }
 }
+
+// ---------------------------------------------------------------------------
+// §9 parse_cli 単体テスト（副作用前・exit 1、2 フェーズ順序、固定優先順位）
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    fn strs(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn parse(items: &[&str]) -> Result<CliOutcome, CliUsageError> {
+        parse_cli(&strs(items))
+    }
+
+    fn run(items: &[&str]) -> CliInvocation {
+        match parse(items).expect("Run を期待") {
+            CliOutcome::Run(inv) => inv,
+            other => panic!("Run を期待したが {:?}", other),
+        }
+    }
+
+    fn err_msg(items: &[&str]) -> String {
+        match parse(items) {
+            Err(e) => e.to_string(),
+            Ok(o) => panic!("usage error を期待したが {:?}", o),
+        }
+    }
+
+    // --- 既存 grammar（backend / source / args）の回帰 ---
+
+    #[test]
+    fn no_args_starts_tree_repl_safe() {
+        let inv = run(&[]);
+        assert_eq!(inv.backend, Backend::Tree);
+        assert_eq!(inv.source, Source::Repl);
+        assert_eq!(inv.profile, Profile::Safe);
+        assert!(inv.script_args.is_empty());
+    }
+
+    #[test]
+    fn vm_flag_before_script_selects_vm() {
+        let inv = run(&["--vm", "app.tsg", "a", "--vm"]);
+        assert_eq!(inv.backend, Backend::Vm);
+        assert_eq!(inv.source, Source::File("app.tsg".to_string()));
+        assert_eq!(inv.script_args, strs(&["a", "--vm"]));
+    }
+
+    #[test]
+    fn double_dash_ends_option_parsing() {
+        let inv = run(&["--", "app.tsg", "--help"]);
+        assert_eq!(inv.source, Source::File("app.tsg".to_string()));
+        assert_eq!(inv.script_args, strs(&["--help"]));
+    }
+
+    #[test]
+    fn dash_reads_stdin_source() {
+        let inv = run(&["-", "a", "b"]);
+        assert_eq!(inv.source, Source::Stdin);
+        assert_eq!(inv.script_args, strs(&["a", "b"]));
+    }
+
+    #[test]
+    fn tokens_after_script_are_verbatim() {
+        let inv = run(&["app.tsg", "--vm", "--profile", "legacy"]);
+        assert_eq!(inv.backend, Backend::Tree);
+        assert_eq!(inv.source, Source::File("app.tsg".to_string()));
+        assert_eq!(inv.script_args, strs(&["--vm", "--profile", "legacy"]));
+        // script 確定後の --profile は再解釈されないので profile は既定 safe のまま。
+        assert_eq!(inv.profile, Profile::Safe);
+    }
+
+    #[test]
+    fn vm_flag_is_idempotent() {
+        let inv = run(&["--vm", "--vm", "app.tsg"]);
+        assert_eq!(inv.backend, Backend::Vm);
+    }
+
+    #[test]
+    fn help_and_version_are_terminal() {
+        assert_eq!(parse(&["--help"]).unwrap(), CliOutcome::Help);
+        assert_eq!(parse(&["--version"]).unwrap(), CliOutcome::Version);
+        // SCRIPT 後の --help は arg（terminal にしない）。
+        let inv = run(&["app.tsg", "--help"]);
+        assert_eq!(inv.script_args, strs(&["--help"]));
+    }
+
+    // --- profile ---
+
+    #[test]
+    fn profile_values_and_errors() {
+        assert_eq!(run(&["--profile", "safe"]).profile, Profile::Safe);
+        assert_eq!(run(&["--profile", "legacy"]).profile, Profile::Legacy);
+        assert!(err_msg(&["--profile", "weird"]).contains("--profile の値は safe か legacy"));
+        assert!(err_msg(&["--profile", "safe", "--profile", "safe"]).contains("1 回だけ"));
+        assert!(err_msg(&["--profile"]).contains("値が必要"));
+    }
+
+    // --- capability options（safe） ---
+
+    #[test]
+    fn boolean_options_parse_and_reject_duplicates() {
+        let inv = run(&["--allow-clock", "--allow-script-stdin", "--allow-exit"]);
+        assert!(inv.capability_options.allow_clock);
+        assert!(inv.capability_options.allow_script_stdin);
+        assert!(inv.capability_options.allow_exit);
+        assert!(err_msg(&["--allow-clock", "--allow-clock"]).contains("1 回だけ"));
+        assert!(err_msg(&["--deny-stdout", "--deny-stdout"]).contains("1 回だけ"));
+    }
+
+    #[test]
+    fn unknown_option_is_usage_error() {
+        assert!(err_msg(&["--nope"]).contains("不明なオプションです"));
+    }
+
+    #[test]
+    fn fs_root_and_fs_op_pairing() {
+        let inv = run(&["--fs-root", "data=/tmp/x", "--fs-op", "data=read,write"]);
+        assert_eq!(
+            inv.capability_options.fs_roots,
+            vec![("data".to_string(), "/tmp/x".to_string())]
+        );
+        assert_eq!(
+            inv.capability_options.fs_ops,
+            vec![(
+                "data".to_string(),
+                vec![FsOperation::Read, FsOperation::Write]
+            )]
+        );
+    }
+
+    #[test]
+    fn fs_root_without_fs_op_is_error() {
+        assert!(err_msg(&["--fs-root", "data=/tmp/x"]).contains("同じ名前で対にします"));
+    }
+
+    #[test]
+    fn fs_op_without_fs_root_is_error() {
+        assert!(err_msg(&["--fs-op", "data=read"]).contains("同じ名前で対にします"));
+    }
+
+    #[test]
+    fn fs_op_rejects_import_and_unknown_tokens() {
+        assert!(
+            err_msg(&["--fs-root", "d=/tmp", "--fs-op", "d=import"]).contains("操作が不正です")
+        );
+        assert!(
+            err_msg(&["--fs-root", "d=/tmp", "--fs-op", "d=recurse"]).contains("操作が不正です")
+        );
+    }
+
+    #[test]
+    fn fs_op_accepts_all_six_tokens() {
+        let inv = run(&[
+            "--fs-root",
+            "d=/tmp",
+            "--fs-op",
+            "d=read,write,create,delete,metadata,list",
+        ]);
+        let ops = &inv.capability_options.fs_ops[0].1;
+        assert_eq!(
+            ops,
+            &vec![
+                FsOperation::Read,
+                FsOperation::Write,
+                FsOperation::Create,
+                FsOperation::Delete,
+                FsOperation::Metadata,
+                FsOperation::List,
+            ]
+        );
+    }
+
+    #[test]
+    fn fs_root_name_validation_and_duplicate() {
+        assert!(err_msg(&["--fs-root", "1bad=/tmp"]).contains("名前が不正"));
+        assert!(
+            err_msg(&[
+                "--fs-root",
+                "d=/a",
+                "--fs-root",
+                "d=/b",
+                "--fs-op",
+                "d=read"
+            ])
+            .contains("名前が重複")
+        );
+    }
+
+    #[test]
+    fn allow_env_duplicate_and_protected() {
+        let inv = run(&["--allow-env", "HOME", "--allow-env", "PATH"]);
+        assert_eq!(inv.capability_options.allow_env, strs(&["HOME", "PATH"]));
+        assert!(err_msg(&["--allow-env", "HOME", "--allow-env", "HOME"]).contains("重複"));
+        assert!(err_msg(&["--allow-env", "TSUMUGI_X"]).contains("保護されたキー"));
+    }
+
+    #[test]
+    fn allow_env_protected_before_duplicate() {
+        // 固定順（値形式 > protected > 重複）: TSUMUGI_X 2 回は protected を先に報告（finding 6）。
+        assert!(
+            err_msg(&["--allow-env", "TSUMUGI_X", "--allow-env", "TSUMUGI_X"])
+                .contains("保護されたキー")
+        );
+    }
+
+    #[test]
+    fn allow_import_root_is_value_checked_only() {
+        let inv = run(&["--allow-import-root", "foo=/some/path"]);
+        assert_eq!(
+            inv.capability_options.import_roots,
+            vec![("foo".to_string(), "/some/path".to_string())]
+        );
+        assert!(err_msg(&["--allow-import-root", "1bad=/x"]).contains("名前が不正"));
+    }
+
+    // --- profile × capability 整合（フェーズ 2） ---
+
+    #[test]
+    fn legacy_with_capability_option_is_error() {
+        assert!(
+            err_msg(&["--profile", "legacy", "--allow-clock"])
+                .contains("capability オプションは safe profile でのみ")
+        );
+    }
+
+    // --- 2 フェーズ順序の決定性（finding 5） ---
+
+    #[test]
+    fn phase1_profile_duplicate_before_phase2_mismatch() {
+        // --profile legacy --allow-env FOO --profile safe:
+        // フェーズ 1 の --profile 重複が先に報告され、legacy+capability 不整合（フェーズ 2）へ進まない。
+        assert!(
+            err_msg(&[
+                "--profile",
+                "legacy",
+                "--allow-env",
+                "FOO",
+                "--profile",
+                "safe"
+            ])
+            .contains("--profile は 1 回だけ")
+        );
+    }
+
+    #[test]
+    fn phase2_mismatch_before_fs_pairing() {
+        // legacy + capability 不整合（フェーズ 2 ①）が --fs-root/--fs-op 1:1（②）より先。
+        let msg = err_msg(&["--profile", "legacy", "--fs-root", "d=/tmp"]);
+        assert!(msg.contains("capability オプションは safe profile でのみ"));
+    }
+}

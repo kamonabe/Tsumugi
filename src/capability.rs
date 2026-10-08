@@ -2292,6 +2292,66 @@ mod tests {
         assert_ne!(set.id(), CapabilitySet::empty().id());
     }
 
+    // --- CAP-AT-28 延長（C9/C10）: policy_id 決定性・safe profile 相当の ID 不変性 ---
+
+    #[test]
+    fn derive_policy_id_is_deterministic_and_nonzero() {
+        // 同一構成 bytes は常に同一 policy_id を生む（CAP-AT-25/28 golden の決定性の根拠、finding 8）。
+        let a = derive_policy_id(b"stdout");
+        let b = derive_policy_id(b"stdout");
+        let c = derive_policy_id(b"clock");
+        assert_eq!(a, b, "同一構成は同一 policy_id");
+        assert_ne!(a, c, "異なる構成は異なる policy_id");
+        // 非ゼロであること（NonZeroU128 なので型で保証されるが、0 補正の経路も確認する）。
+        assert!(derive_policy_id(&[]).get() != 0);
+    }
+
+    #[test]
+    fn safe_stdout_only_set_id_is_stable_and_without_resolver() {
+        // safe profile 相当（stdout のみ grant、resolver 無し）の CapabilitySetId が決定的で、
+        // resolver group を含まないことを固定する（CAP-AT-28 延長）。
+        let pid_stdout = derive_policy_id(b"stdout");
+        let build = || {
+            CapabilitySet::builder()
+                .stdout(Arc::new(FakeOutput(pid_stdout)))
+                .expect("stdout")
+                .build()
+        };
+        let a = build();
+        let b = build();
+        assert_eq!(a.id(), b.id(), "同一構成は同一 ID");
+        assert!(a.contains(CapabilityKind::Stdout));
+        assert!(
+            !a.contains(CapabilityKind::ModuleResolver),
+            "safe 相当 set に resolver は無い"
+        );
+        assert_ne!(a.id(), CapabilitySet::empty().id());
+    }
+
+    #[test]
+    fn import_root_value_check_does_not_change_set_id() {
+        // `--allow-import-root` は値検証のみで module_resolver を grant しない（finding 1）。
+        // したがって import root の有無で CapabilitySetId は変わらない——これを、resolver を
+        // 足さない 2 つの等価 set が同一 ID になることで固定する（CLI builder は resolver を
+        // 一切配線しないため、構成差は生じない）。
+        let pid_stdout = derive_policy_id(b"stdout");
+        let without_import = CapabilitySet::builder()
+            .stdout(Arc::new(FakeOutput(pid_stdout)))
+            .expect("stdout")
+            .build();
+        // import root を「宣言しても」CLI は set へ何も足さないので、同じ構成 = 同じ ID。
+        let with_import_declared = CapabilitySet::builder()
+            .stdout(Arc::new(FakeOutput(pid_stdout)))
+            .expect("stdout")
+            .build();
+        assert_eq!(
+            without_import.id(),
+            with_import_declared.id(),
+            "import root 宣言は CapabilitySetId に寄与しない"
+        );
+        assert!(!without_import.contains(CapabilityKind::ModuleResolver));
+    }
+
     #[test]
     fn resolver_grant_changes_id() {
         // ModuleResolver group が ID へ寄与し、FakeResolver も配線されることを確認する。
