@@ -136,8 +136,8 @@ Phase 0〜2の受入完了時、次を保証する。
 | ID | Attack / failure | Mitigation | Residual risk | Phase | 受入 |
 |---|---|---|---|---|---|
 | TM-001 | scriptがprocess env、cwd、argv、stdio、clockへambient accessする | `CapabilitySet::empty()`を既定とし、全外部builtinをdispatcher経由へ移す | legacy CLI profileは明示的に広い権限を持つ | 2 | TM-AT-01, CAP-AT-01 |
-| TM-002 | `..`、absolute path、separator差、case aliasでfilesystem rootを脱出する | normalized relative pathのみ受理し、root-bound handle adapter内で認可とopenを一体化 | OS/filesystem固有alias。secure adapter未対応時は拒否 | 2 | TM-AT-02, CAP-AT-10 |
-| TM-003 | check/use間のsymlink差替え、dangling final symlinkで許可外へcreate/writeする | path文字列のcanonicalize→I/Oを廃止。directory/file handleに束縛し、symlink policyをadapterが原子的に強制 | malicious filesystem、契約違反adapter | 2/OS | TM-AT-03, CAP-AT-11 |
+| TM-002 | `..`、absolute path、separator差、case alias、Windows ADS（`:`）でfilesystem rootを脱出する | normalized relative pathのみ受理し、root-bound handle adapter内で認可とopenを一体化。component内`:`はlexical拒否（`ColonInComponent`） | OS/filesystem固有alias。secure adapter未対応platform（非Unix・非Windows）は拒否。Windowsのjunction / mount pointはfail-closed拒否で安全策とする | 2 | TM-AT-02, CAP-AT-10 |
+| TM-003 | check/use間のsymlink差替え、dangling final symlink、Windows junction/reparseで許可外へcreate/writeする | path文字列のcanonicalize→I/Oを廃止。directory/file handleに束縛し、symlink policyをadapterが原子的に強制。Windowsのreparse(junction/mount point)はsecure handleでroot拘束し、stdが確定できないreparse種別は拒否する | malicious filesystem、契約違反adapter。TOCTOU反復raceはAUD-020 / CAP-AT-11 stress（本slice対象外） | 2/OS | TM-AT-03, CAP-AT-11 |
 | TM-004 | canonicalize、metadata、import error差で許可外pathの存在をoracle化する | capability/grant/rootの拒否をresolver/OS操作前に同一のsanitized denialとして生成し、script操作ではcanonical error、link/control-planeでは`Denied`へ写像する。許可外pathをcanonicalizeしない | 許可済みroot内の存在情報は操作仕様上観測可能 | 2 | TM-AT-04 |
 | TM-005 | loop、callback、host call連打でCPUを占有する | fuel hookを全評価・callback経路へ置き、host call costを事前課金 | Phase 2時点のstepは包括的でない。hard CPU limitはOS責任 | 3/OS | TM-AT-05 |
 | TM-006 | 巨大文字列、総collection、input/host resultでOOMまたはallocator abortを起こす | 入出力・host resultのbyte上限、将来の総heap budget、上限超過前の拒否 | Rust allocation failureは同一process回復不能の場合がある | 3/OS | TM-AT-06 |
