@@ -505,6 +505,7 @@ tsumugi [OPTIONS] [SCRIPT [ARGS...]]
 - `args()`はbinary名、script path、CLI flagを含めない。
 - 非UTF-8、unknown option、option値欠落、profile/capability usage errorはscript開始前にstderrへ診断しexit 1とする。help/versionだけstdout・0である。
 - profile/capability optionの値検証とgrant構築は[Capability Model仕様](capability-model.md)第14節に従う。safe profileのstdout既定はbuilderによる明示`Stdout` grantでありambient accessではない。
+- **C9/C10時点のcapability注入経路**: E7（import/REPLのEngine API統合）が未配線のため、CLIはprofileから組んだfrozen `CapabilitySet`を経路別に注入する——importなしtree file/stdinはEngine API（`ExecutionRequest::with_capabilities`）、importありtreeとREPLはalpha facade（`ExecutionContext::set_capabilities`）へ直接、全VM経路は`Vm::set_capabilities`。REPLはsession開始時に1回注入し全submissionへ持ち越す。import/REPLのEngine API統合はE7残。
 
 | 結果 | file/stdin mode | REPL |
 |---|---:|---|
