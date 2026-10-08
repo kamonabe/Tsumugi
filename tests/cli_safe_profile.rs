@@ -173,10 +173,9 @@ fn allow_env_grants_requested_key_only() {
     }
 }
 
-// safe profile の fs grant 成功（read/metadata）は Unix でのみ検証する。非 Unix は OS
-// filesystem の secure resolution 非対応で fail closed するため成功を assert できない
-// （capability-model §8.3 契約3）。option mapping・adjacent deny の網羅検証も Unix 側で行う。
-#[cfg(unix)]
+// safe profile の fs grant 成功（read/metadata）は Unix / Windows の両方で検証する。両 OS
+// とも secure resolution を実装するため成功を assert できる（capability-model §8.3 契約3）。
+// option mapping・adjacent deny の網羅検証も全 OS で走らせる。
 #[test]
 fn fs_op_mapping_and_adjacent_deny() {
     for use_vm in [false, true] {
@@ -249,8 +248,8 @@ fn remove_tree_is_never_granted_in_safe() {
     }
 }
 
-// default mount の unqualified 解決成功は実 fs read を伴うため Unix 限定（§8.3 契約3）。
-#[cfg(unix)]
+// default mount の unqualified 解決成功は実 fs read を伴う。Unix / Windows とも secure
+// resolution を実装するため全 OS で走らせる（§8.3 契約3）。
 #[test]
 fn unqualified_path_requires_default_mount() {
     for use_vm in [false, true] {

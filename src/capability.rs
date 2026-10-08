@@ -2780,9 +2780,13 @@ mod tests {
         assert_eq!(err, ConfigError::DuplicateCallableName { name: "K".into() });
     }
 
-    // --- C5-b: secure OS adapter（契約1〜5、CAP-AT-11/12 の Phase 2 範囲）---
-
-    #[cfg(unix)]
+    // --- C5-b: secure OS adapter（契約1〜7、CAP-AT-11/12 の Phase 2 範囲）---
+    //
+    // module 自体は Unix / Windows の両方でコンパイルする。symlink 生成に依存しない契約
+    // テストは #[cfg(any(unix, windows))] で両 OS を回し、symlink を std::os::unix::fs::symlink
+    // で生成するテストは個別に #[cfg(unix)] のまま残す。Windows 専用の reparse/junction テストは
+    // 末尾の #[cfg(windows)] 領域へ同居させる（design §7.1/§7.3）。
+    #[cfg(any(unix, windows))]
     mod os_adapter {
         use super::*;
         use std::fs;
@@ -2877,6 +2881,7 @@ mod tests {
                 .expect("remove dir");
         }
 
+        #[cfg(unix)]
         #[test]
         fn deny_all_rejects_final_symlink_open() {
             // 契約4: DenyAll は final symlink の read を拒否する（O_NOFOLLOW）。
@@ -2899,6 +2904,7 @@ mod tests {
             );
         }
 
+        #[cfg(unix)]
         #[test]
         fn intermediate_symlink_denied_under_deny_all() {
             // 契約4: DenyAll は中間 symlink component を拒否する。
@@ -2915,6 +2921,7 @@ mod tests {
             );
         }
 
+        #[cfg(unix)]
         #[test]
         fn intermediate_symlink_within_root_followed() {
             // 契約4: FollowWithinRoot は root 内へ解決する中間 symlink を許可する。
@@ -2930,6 +2937,7 @@ mod tests {
             assert_eq!(f.read_to_end(None).expect("read"), b"ok");
         }
 
+        #[cfg(unix)]
         #[test]
         fn intermediate_symlink_escaping_root_denied() {
             // 契約4: FollowWithinRoot でも root 外へ出る symlink は拒否する。
@@ -2967,6 +2975,7 @@ mod tests {
             );
         }
 
+        #[cfg(unix)]
         #[test]
         fn metadata_follow_final_false_sees_symlink_kind() {
             // 契約4: OperateOnFinalEntry + follow_final=false は final symlink 自体を対象にできる。
@@ -2979,6 +2988,7 @@ mod tests {
             assert_eq!(meta.kind, EntryKind::Symlink);
         }
 
+        #[cfg(unix)]
         #[test]
         fn remove_final_symlink_does_not_touch_target() {
             // 契約4: final symlink の delete は entry 自体を消し、対象 file を残す。

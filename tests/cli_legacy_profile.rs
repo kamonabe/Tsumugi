@@ -160,10 +160,9 @@ fn empty_env_allow_emits_single_warning() {
     }
 }
 
-// legacy の実 fs route 成功は Unix でのみ検証する。非 Unix は OS filesystem の secure
-// resolution 非対応で fail closed するため成功を assert できない（capability-model §8.3 契約3、
-// 既存の legacy_symlink_* テストと同じ #[cfg(unix)] 規約）。
-#[cfg(unix)]
+// legacy の実 fs route 成功は Unix / Windows の両方で検証する。両 OS とも secure resolution
+// を実装するため成功を assert できる（capability-model §8.3 契約3）。symlink 生成に依存する
+// legacy_symlink_* は std::os::unix::fs::symlink を使うため #[cfg(unix)] のまま残す。
 #[test]
 fn sandbox_routes_old_absolute_path() {
     for use_vm in [false, true] {

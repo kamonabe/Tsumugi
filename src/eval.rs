@@ -2761,14 +2761,21 @@ mod tests {
             .build()
     }
 
-    /// test 用 filesystem root path（Unix は `/`、Windows は CWD の volume root）。
+    /// test 用 filesystem root path（Unix は `/`、Windows は `temp_dir()` の volume root）。
+    ///
+    /// Windows では default mount を **`std::env::temp_dir()` の volume root**から導出する。
+    /// builtin test が渡す host path は `unique_temp_path()`（= `temp_dir()` 基点）なので、
+    /// default mount の volume を temp_dir() の volume に揃えておくと、runner の TEMP/CWD volume
+    /// 構成に依存せず legacy translator が最長 prefix 一致で route できる（design §4.6 方式 (a)・
+    /// AC-10b）。CWD の volume root を使うと TEMP が別 volume のとき route が外れて別原因で
+    /// Windows が落ちうるため採らない。
     fn fs_root_path_for_test() -> std::path::PathBuf {
         #[cfg(windows)]
         {
             use std::path::Component;
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("C:\\"));
+            let temp = std::env::temp_dir();
             let mut root = std::path::PathBuf::new();
-            for comp in cwd.components() {
+            for comp in temp.components() {
                 match comp {
                     Component::Prefix(_) | Component::RootDir => root.push(comp.as_os_str()),
                     _ => break,
@@ -2790,11 +2797,9 @@ mod tests {
     ///
     /// Windows の `/tmp` 不在・パス区切り差を避けるため、`std::env::temp_dir()` を基点にする。
     /// 返す path は実在する temp dir 配下なので、`ambient_test_capabilities()` の legacy
-    /// translator（default mount = volume root）が lexical prefix 一致で route できる。
-    ///
-    /// 利用側の fs builtin スモークは `#[cfg(unix)]` のため、ヘルパーも Unix 限定にする
-    /// （非 Unix で未使用 warning になるのを避ける）。
-    #[cfg(unix)]
+    /// translator（default mount = `fs_root_path_for_test()` が返す volume root）が lexical
+    /// prefix 一致で route できる。Windows secure resolution 対応後は fs builtin スモークが
+    /// 全 OS で走るため、このヘルパーも cfg なしで常時提供する。
     fn unique_temp_path(tag: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2808,8 +2813,7 @@ mod tests {
     ///
     /// Windows の `\`（例 `C:\Users\...\Temp`）はスクリプト文字列リテラルのエスケープを壊すため
     /// `/` へ置換する。legacy translator は `Path::new` 経由で `/` 区切りも受理するので route は
-    /// 成立する。利用側が `#[cfg(unix)]` のためヘルパーも Unix 限定にする。
-    #[cfg(unix)]
+    /// 成立する。Windows secure resolution 対応後は利用側が全 OS で走るため cfg なしで提供する。
     fn script_path(path: &std::path::Path) -> String {
         path.to_str().expect("UTF-8 path").replace('\\', "/")
     }
@@ -3433,12 +3437,10 @@ mod tests {
         run_program("for i in range(1, 4)\n  print(i)\nend").unwrap();
     }
 
-    // C5-b/C10: OS filesystem の secure resolution は Unix でのみ実装され、非 Unix は
-    // `SecureResolutionUnsupported` で fail closed する（capability-model §14.3・§8.3 契約3）。
-    // そのため実 fs capability 操作を伴う builtin スモークは Unix 限定にする（既存の C5-b
-    // 実動作テスト・cli_legacy_profile の実 fs テストと同じ #[cfg(unix)] 規約）。Windows の
-    // fail-closed 挙動は capability.rs の非 Unix adapter と統合テストで担保する。
-    #[cfg(unix)]
+    // C5-b/C10: OS filesystem の secure resolution は Unix / Windows の両方で実装される
+    // （capability-model §14.3・§8.3 契約3）。そのため実 fs capability 操作を伴う builtin
+    // スモークは全 OS で走らせる。Windows は junction / mount point を fail-closed 拒否する
+    // が、通常 file/dir 操作は Unix と同じく成功する。
     #[test]
     fn builtin_write_and_read_file() {
         let p = unique_temp_path("write_read");
@@ -3451,7 +3453,6 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    #[cfg(unix)]
     #[test]
     fn builtin_read_lines() {
         let p = unique_temp_path("read_lines");
@@ -3463,7 +3464,6 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    #[cfg(unix)]
     #[test]
     fn builtin_append_file() {
         let p = unique_temp_path("append");
@@ -3475,13 +3475,11 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    #[cfg(unix)]
     #[test]
     fn builtin_read_file_missing() {
         // C10: capability 経路では存在しない file の read は catch 可能な `host` error になる
-        // （ambient 時代の `null` 返しは廃止）。未捕捉なら実行は error で終わる。
-        // 非 Unix では missing でなくても fail closed で host error になり検証意図が変わるため
-        // Unix 限定（§8.3 契約3）。
+        // （ambient 時代の `null` 返しは廃止）。未捕捉なら実行は error で終わる。Unix / Windows
+        // とも secure resolution で missing file を host error へ写すため全 OS で検証する。
         let p = unique_temp_path("missing");
         let sp = script_path(&p);
         let result = run_program(&format!("let x = read_file(\"{sp}\")\nprint(x)"));
@@ -3518,14 +3516,12 @@ mod tests {
         run_program("let s = format_time(1767225600, \"%Y-%m-%d\")\nprint(s)").unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn builtin_path_exists() {
         let sp = script_path(&std::env::temp_dir());
         run_program(&format!("print(path_exists(\"{sp}\"))")).unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn builtin_path_exists_missing() {
         let sp = script_path(&unique_temp_path("missing_dir"));
@@ -3537,7 +3533,6 @@ mod tests {
         run_program("let p = path_join(\"/home\", \"user\", \"file.txt\")\nprint(p)").unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn builtin_mkdir_and_remove_dir() {
         let p = unique_temp_path("mkdir");
@@ -3550,7 +3545,6 @@ mod tests {
         std::fs::remove_dir_all(&p).ok();
     }
 
-    #[cfg(unix)]
     #[test]
     fn builtin_rename() {
         let src = unique_temp_path("rename_src");
@@ -3564,7 +3558,6 @@ mod tests {
         std::fs::remove_file(&dst).ok();
     }
 
-    #[cfg(unix)]
     #[test]
     fn builtin_list_dir() {
         // C10: capability 経路の mkdir は `create_dir`（1 階層・親既存前提）。既存 dir があると
@@ -3579,7 +3572,6 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
-    #[cfg(unix)]
     #[test]
     fn builtin_file_size() {
         let p = unique_temp_path("file_size");
@@ -3591,7 +3583,6 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    #[cfg(unix)]
     #[test]
     fn builtin_remove_file() {
         let p = unique_temp_path("remove");
@@ -3652,7 +3643,6 @@ mod tests {
         run_program("print(reverse([1, 2, 3]))\nprint(reverse(\"abc\"))").unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn builtin_is_file_is_dir() {
         let sp = script_path(&std::env::temp_dir());
