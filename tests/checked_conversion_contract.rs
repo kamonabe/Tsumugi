@@ -12,15 +12,23 @@
 //! - `ceil`:   正の無限大方向
 //! - `round`:  最も近い整数、中間は 0 から遠い側
 
-use std::collections::BTreeSet;
-use std::num::NonZeroU128;
-use std::sync::Arc;
-
-use tsumugi::builtin_core::{
-    builtin_ceil, builtin_floor, builtin_round, builtin_to_int, dispatch_filesystem_capability,
-};
-use tsumugi::error::ErrorKind;
+use tsumugi::builtin_core::{builtin_ceil, builtin_floor, builtin_round, builtin_to_int};
 use tsumugi::value::Value;
+
+// capability 経路の fs テスト（file_size）は Unix 限定（§8.3 契約3の fail-closed）。
+// 関連 import とヘルパーも Unix でのみ使うため同じ cfg でガードし、非 Unix の未使用 import
+// warning（clippy -D warnings）を避ける。
+#[cfg(unix)]
+use std::collections::BTreeSet;
+#[cfg(unix)]
+use std::num::NonZeroU128;
+#[cfg(unix)]
+use std::sync::Arc;
+#[cfg(unix)]
+use tsumugi::builtin_core::dispatch_filesystem_capability;
+#[cfg(unix)]
+use tsumugi::error::ErrorKind;
+#[cfg(unix)]
 use tsumugi::{
     FilesystemCapability, FilesystemRoot, FsOperation, MountName, OsDirectoryHandle, SymlinkPolicy,
 };
@@ -220,6 +228,7 @@ fn large_magnitude_values_are_out_of_range() {
 // -----------------------------------------------------------------------------
 
 /// 一時 dir を root に Metadata を grant した filesystem capability を作る。
+#[cfg(unix)]
 fn metadata_fs(base: &std::path::Path) -> FilesystemCapability {
     let pid = NonZeroU128::new(1).expect("non-zero");
     let mut ops = BTreeSet::new();
@@ -232,6 +241,7 @@ fn metadata_fs(base: &std::path::Path) -> FilesystemCapability {
 }
 
 /// 一意な一時 dir を作る。
+#[cfg(unix)]
 fn temp_dir(tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -243,6 +253,12 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
     path
 }
 
+// C10/C5-b: capability 経路の実 fs 解決は Unix でのみ提供し、非 Unix は
+// SecureResolutionUnsupported で fail closed する（capability-model §14.3・§8.3 契約3）。
+// success/missing の意味的検証は Unix でのみ成立するため Unix 限定にする（非 Unix では
+// どちらも fail closed で区別がつかず、意図と違う理由でグリーンになるのを避ける）。
+// 非 Unix の fail-closed 挙動は capability.rs の非 Unix adapter が担保する。
+#[cfg(unix)]
 #[test]
 fn file_size_of_real_file_is_positive_int() {
     // C10: capability 経路（@mount/rel 構文）で file_size を検証する。
@@ -264,6 +280,7 @@ fn file_size_of_real_file_is_positive_int() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+#[cfg(unix)]
 #[test]
 fn missing_file_is_host_error() {
     // C10: capability 経路の file_size は、許可 root 内でも missing file を `host` error（catch
