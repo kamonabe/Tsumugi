@@ -77,6 +77,9 @@
 
 use std::process::Command;
 
+use std::num::NonZeroU128;
+use std::sync::Arc;
+
 use tsumugi::budget::{BudgetConfig, BudgetUsage};
 use tsumugi::compiler::Compiler;
 use tsumugi::error::TsumugiError;
@@ -84,6 +87,18 @@ use tsumugi::eval::Evaluator;
 use tsumugi::lexer::Lexer;
 use tsumugi::parser::Parser;
 use tsumugi::vm::Vm;
+use tsumugi::{CapabilitySet, SystemOutput};
+
+/// 差分 fixture は `print` と算術のみを使う。C10 後の deny-by-default（empty）既定では `print` が
+/// 拒否されるため、stdout だけを grant した capability set を両 engine へ注入して従来の観測挙動を
+/// 保つ（他 authority は使わないので grant しない）。
+fn print_capabilities() -> CapabilitySet {
+    let pid = NonZeroU128::new(1).expect("non-zero");
+    CapabilitySet::builder()
+        .stdout(Arc::new(SystemOutput::new(pid)))
+        .expect("stdout grant")
+        .build()
+}
 
 // =============================================================================
 // 上限の宣言
@@ -141,6 +156,7 @@ fn run_tree_single(source: &str, limits: Limits) -> (BudgetUsage, Result<(), Tsu
         // VM の `from_legacy_env` 既定 collection 上限（1_000_000）に合わせる。
         Limits::Fuel(fuel) => Evaluator::with_budget(BudgetConfig::for_legacy(fuel, 1_000_000)),
     };
+    evaluator.set_capabilities(print_capabilities());
     let result = evaluator.run(&program, source.len() as u64);
     (evaluator.budget_usage(), result)
 }
@@ -162,6 +178,7 @@ fn run_vm_single(source: &str, limits: Limits) -> (BudgetUsage, Result<(), Tsumu
         }
     };
     let mut vm = Vm::new(chunk);
+    vm.set_capabilities(print_capabilities());
     if let Limits::Fuel(fuel) = limits {
         vm.set_max_steps(fuel);
     }
@@ -303,6 +320,7 @@ struct ReplFixture {
 /// `closure_retain.rs` の `tree_live_heap_per_input` を全 usage snapshot へ一般化したもの。
 fn tree_usage_per_input(inputs: &[&str]) -> Vec<BudgetUsage> {
     let mut evaluator = Evaluator::new();
+    evaluator.set_capabilities(print_capabilities());
     let mut snapshots = Vec::with_capacity(inputs.len());
     for input in inputs {
         let tokens = Lexer::new(input).tokenize();
@@ -323,6 +341,7 @@ fn tree_usage_per_input(inputs: &[&str]) -> Vec<BudgetUsage> {
 fn vm_usage_per_input(inputs: &[&str]) -> Vec<BudgetUsage> {
     let mut compiler = Compiler::new();
     let mut vm = Vm::new_repl();
+    vm.set_capabilities(print_capabilities());
     let mut snapshots = Vec::with_capacity(inputs.len());
     for input in inputs {
         let tokens = Lexer::new(input).tokenize();

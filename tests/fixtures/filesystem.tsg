@@ -7,6 +7,9 @@ let b = path_join(sub, "b.txt")
 let moved = path_join(old, "a.txt")
 
 # ディレクトリ作成
+# C10: capability 経路の mkdir は create_dir（1 階層・親既存前提）。親 root を先に作る
+# （TSG_TEST_DIR は既存）。従来の ambient mkdir（create_dir_all）とは異なる。
+mkdir(root)
 print(mkdir(sub))
 print(path_exists(sub))
 
