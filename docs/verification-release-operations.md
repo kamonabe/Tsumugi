@@ -126,6 +126,19 @@ PRと`main` pushでは次を必須checkとする。release tag workflowは同じ
 
 `coverage`はline coverage **80%以上**をrelease gateとする。過去のスナップショット値をbaselineとして固定せず、同じcommandの当該commit結果を判定する。生成物、third-party code、fuzz corpusはcoverage対象外にできるが、手書きのproduction moduleを除外してはならない。coverage低下を回避するための到達不能コード追加や`cfg`除外は禁止する。
 
+### 4.1.1 Windowsの保証レベル（開発フェーズとPhase 7の区別）
+
+Tsumugiは最終的にOSへ依存しない言語を目指すが、その**機能完全性の保証はrelease（Phase 7）の対象**とする。開発フェーズ（alpha、Phase 1〜6）では次の原則で運用する。
+
+- **開発フェーズではWindowsの機能完全性を必須としない。** OS境界に触れる機能（filesystem、secure resolution等）はUnixとWindowsで実装負荷の差が大きく、Windows固有の罠（reparse point / junction、`\\?\` verbatim prefix、case-insensitive FS、ADS）への完全対応を各sliceの完了条件に含めると、言語中核の開発が停滞する。機能完全性の引き上げはPhase 7のrelease gateで行う。
+- **ただし次の2つは開発フェーズでも維持する。**
+  1. **退行検出:** `test` jobのWindows行（Ubuntu, macOS, Windows / stable、`fail-fast: false`）は止めない。OS非依存の言語中核（型・計算・制御フロー・VM等）の退行はWindowsでも即検出する。これらはOS差がほぼ無く維持コストが低い。
+  2. **セキュリティ境界の健全性:** capabilityモデル・secure resolution・sandboxに関わるWindowsテストはgreenを優先する。OS固有のセキュリティホール（例: junction / reparse pointによるroot脱出）はWindowsでのみ露出し、Tsumugiの中核価値であるcapability境界を直接脅かす。これらを「releaseまで未検出」にすると、崩れた前提の上に後続Phaseの設計が積み上がる。
+- **重いOS固有対応の先送りの作法:** OS境界機能でWindows対応が重く、当該sliceのスコープを超える場合は、該当する個別テストを**削除せず** `#[ignore]`（または `#[cfg(unix)]`）＋理由コメント＋[ロードマップ](roadmap.md)のPhase 7 TODO化で可視化を保つ。テストを消して「都合よくgreen」にしない。先送りの事実と返済先を常に追跡可能にする。
+- **release（Phase 7）での引き上げ:** release gate（§4.1の全job + §6 matrix）でWindowsを含む全対象OSの機能完全性を検証する。`#[ignore]` / `#[cfg(unix)]` で先送りしたOS境界テストは、Phase 7で解除・実装し、全対象OSでgreenにすることをreleaseの前提とする。
+
+この区別は[ロードマップ](roadmap.md)のPhase 7完了gateに紐づく。開発フェーズのWindows CIは「機能の完全性保証」ではなく「退行検出とセキュリティ境界の番人」として位置づける。
+
 ### 4.2 docs linkとdrift
 
 `docs` jobは最低限次を検証する。
