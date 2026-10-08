@@ -1603,6 +1603,11 @@ impl std::fmt::Debug for OsDirectoryHandle {
 }
 
 /// `std::fs::Metadata` の種別を公開 [`EntryKind`] へ写す。
+///
+/// 呼び出し元（`os_secure` / `OsFileHandle`）は secure handle を実装する platform
+/// （unix / windows）でのみコンパイルされるため、同じ cfg を付けて非対応 platform で
+/// dead_code warning を出さない（NFR-3）。
+#[cfg(any(unix, windows))]
 fn entry_kind_of(meta: &std::fs::Metadata) -> EntryKind {
     let ft = meta.file_type();
     if ft.is_file() {
@@ -1617,6 +1622,7 @@ fn entry_kind_of(meta: &std::fs::Metadata) -> EntryKind {
 }
 
 /// `std::fs::Metadata` から secret-free な [`PublicMetadata`] を作る（時刻・owner・path 非公開）。
+#[cfg(any(unix, windows))]
 fn public_metadata_of(meta: &std::fs::Metadata) -> PublicMetadata {
     PublicMetadata {
         kind: entry_kind_of(meta),
@@ -1625,21 +1631,30 @@ fn public_metadata_of(meta: &std::fs::Metadata) -> PublicMetadata {
     }
 }
 
-/// host I/O error を [`AdapterError::Host`] へ写す。message は OS 由来の文字列のみで、
-/// absolute host path・symlink・permission の詳細は含めない（呼び出し側が sanitize 済み前提）。
+/// host I/O error を [`AdapterError::Host`] へ写す。message は adapter が渡す短い固定文字列
+/// のみで、OS 由来の message・absolute host path・symlink・permission の詳細は含めない
+/// （存在 oracle 防止、§8.5）。
+#[cfg(any(unix, windows))]
 fn host_err(context: &str) -> AdapterError {
     AdapterError::Host(context.to_string())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod os_secure {
-    //! Unix 上の secure component 解決（契約1〜5）。
+    //! Unix / Windows 共通の secure component 解決（契約1〜7）。
     //!
     //! `symlink_metadata`（lstat）で各 component の種別を確認し、[`SymlinkPolicy`] に従って
     //! 中間/final symlink を拒否または拘束する。final entry は open 前に lstat して policy を
     //! 適用する（`O_NOFOLLOW` の flag 値は Linux で arch 依存＝libc 非依存では確定できないため、
     //! flag ではなく明示 lstat で symlink を検出する。TOCTOU race は AUD-020 / CAP-AT-11 stress
     //! gate で扱う）。
+    //!
+    //! 使用する `std::fs` API（`symlink_metadata` / `canonicalize` / `OpenOptions` /
+    //! `read_dir` / `create_dir` / `remove_*` / `rename`）はすべて cross-platform なので
+    //! 解決ロジックは両 OS で共有する。Windows 固有の reparse point（junction / mount point）
+    //! ハザードだけを [`reject_if_unsafe_reparse`] で fail-closed に封じ、`\\?\` verbatim prefix
+    //! は `within_base` の base・candidate 双方 canonicalize で正しく前方一致させる（design §4.3 /
+    //! §5.2 / §5.3）。
 
     use super::{
         AdapterError, OpenFileRequest, OsDirectoryHandle, RelativePath, SymlinkPolicy, WriteMode,
@@ -1647,6 +1662,47 @@ mod os_secure {
     };
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    /// Windows の `std` が export しない file attribute 定数（`winnt.h` 準拠）。
+    /// `windows-sys` 等の外部 crate を使わず、std のみで reparse / directory 属性を判定する
+    /// （NFR-1）。`file_attributes()` 自体は `std::os::windows::fs::MetadataExt` にある。
+    #[cfg(windows)]
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    #[cfg(windows)]
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+
+    /// std が symlink と認識しない reparse point（junction / mount point 等）を fail-closed で
+    /// 拒否する。中間 component・final 操作の lstat 直後、symlink policy 判定より**前**に呼ぶ
+    /// （design §4.3 step2 (a) / §5.2）。
+    ///
+    /// - unix: reparse 概念が無いため常に `Ok(())`（no-op）。symlink は既存 policy で処理する。
+    /// - windows: `file_attributes()` の `FILE_ATTRIBUTE_REPARSE_POINT` が立ち、かつ
+    ///   `is_symlink()==false` のとき（junction / mount point / 未知の reparse tag）だけ拒否する。
+    ///   通常の symlink は reparse 属性が立っていても `is_symlink()==true` なので通し、既存の
+    ///   symlink policy（canonicalize + within_base）に委ねる。
+    #[cfg(unix)]
+    pub(super) fn reject_if_unsafe_reparse(
+        _path: &Path,
+        _meta: &fs::Metadata,
+    ) -> Result<(), AdapterError> {
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    pub(super) fn reject_if_unsafe_reparse(
+        _path: &Path,
+        meta: &fs::Metadata,
+    ) -> Result<(), AdapterError> {
+        use std::os::windows::fs::MetadataExt;
+        let attrs = meta.file_attributes();
+        let is_reparse = attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        if is_reparse && !meta.file_type().is_symlink() {
+            // junction / mount point / std が確定できない reparse tag。安全を保証できないため
+            // 当該 path を拒否する（契約3 の fail-closed、§5.2）。
+            return Err(host_err("reparse point denied"));
+        }
+        Ok(())
+    }
 
     /// 解決結果の host path と、その parent directory（rename/remove 等が使う）。
     pub(super) struct Resolved {
@@ -1673,7 +1729,12 @@ mod os_secure {
             current.push(name);
             let meta = fs::symlink_metadata(&current)
                 .map_err(|_| host_err("intermediate component not accessible"))?;
+            // (a) junction / mount point 等「symlink と認識されない reparse」を policy 判定より
+            //     先に拒否する（§4.3 step2）。junction は canonicalize すると root 内実体を返し
+            //     within_base を通りうるため、policy へ入る前に落とす必要がある。
+            reject_if_unsafe_reparse(&current, &meta)?;
             let ft = meta.file_type();
+            // (b) 次に symlink policy を適用する。
             if ft.is_symlink() {
                 match policy {
                     SymlinkPolicy::DenyAll => {
@@ -1727,10 +1788,13 @@ mod os_secure {
 
         // final entry が既存 symlink なら Read/Write/Create すべて拒否する（契約4・5）。
         // 存在しない場合（CreateNew/Upsert の新規作成）は symlink 検出不要。
-        if let Ok(lmeta) = fs::symlink_metadata(&path)
-            && lmeta.file_type().is_symlink()
-        {
-            return Err(host_err("final symlink denied by policy"));
+        if let Ok(lmeta) = fs::symlink_metadata(&path) {
+            // (a) junction / mount point は policy 判定の前に拒否する（§4.3）。
+            reject_if_unsafe_reparse(&path, &lmeta)?;
+            // (b) 通常 symlink は policy で拒否する。
+            if lmeta.file_type().is_symlink() {
+                return Err(host_err("final symlink denied by policy"));
+            }
         }
 
         let mut opts = fs::OpenOptions::new();
@@ -1778,6 +1842,9 @@ mod os_secure {
         let path = resolved.path;
         let lmeta =
             fs::symlink_metadata(&path).map_err(|_| host_err("metadata target not accessible"))?;
+        // (a) junction / mount point は policy 判定の前に拒否する（§4.3）。
+        reject_if_unsafe_reparse(&path, &lmeta)?;
+        // (b) symlink の追従可否は policy で判定する。
         if follow_final && lmeta.file_type().is_symlink() {
             // 追従する場合は解決先が root 内であることを確認する（契約4）。
             let resolved =
@@ -1804,6 +1871,9 @@ mod os_secure {
         // final entry が symlink の場合は List が拒否する（契約4）。
         let lmeta =
             fs::symlink_metadata(&path).map_err(|_| host_err("list target not accessible"))?;
+        // (a) junction / mount point は policy 判定の前に拒否する（§4.3）。
+        reject_if_unsafe_reparse(&path, &lmeta)?;
+        // (b) 通常 symlink の list は policy で拒否する。
         if lmeta.file_type().is_symlink() {
             return Err(host_err("list on symlink denied by policy"));
         }
@@ -1856,10 +1926,14 @@ mod os_secure {
             super::RemoveKind::FileOrSymlink => {
                 // final symlink 自体を消す（追従しない）。DenyAll でも「entry の削除」は
                 // 対象 file の read/write を伴わないため許可する（契約4 の delete 例外）。
-                fs::remove_file(&path).map_err(|_| host_err("remove failed"))
+                // junction / mount point は種別分岐の前に拒否する（§4.3 / §4.4）。
+                let lmeta = fs::symlink_metadata(&path)
+                    .map_err(|_| host_err("remove target not accessible"))?;
+                reject_if_unsafe_reparse(&path, &lmeta)?;
+                remove_entry_by_kind(&path, &lmeta)
             }
             super::RemoveKind::EmptyDirectory => {
-                // 空 directory のみ削除する（非空は OS error → host error）。
+                // 空 directory のみ削除する（非空は OS error → host error）。OS 差なし。
                 fs::remove_dir(&path).map_err(|_| host_err("remove_dir failed"))
             }
             super::RemoveKind::Tree => {
@@ -1868,11 +1942,38 @@ mod os_secure {
                 // 辿って削除しない。
                 let lmeta = fs::symlink_metadata(&path)
                     .map_err(|_| host_err("remove_tree target not accessible"))?;
+                // junction / mount point は種別分岐の前に拒否する（§4.3 / §4.4）。
+                reject_if_unsafe_reparse(&path, &lmeta)?;
                 if lmeta.file_type().is_symlink() {
-                    return fs::remove_file(&path).map_err(|_| host_err("remove_tree failed"));
+                    // final が symlink（link 自体を消す。Windows は dir/file で経路が違う）。
+                    return remove_entry_by_kind(&path, &lmeta);
                 }
                 fs::remove_dir_all(&path).map_err(|_| host_err("remove_tree failed"))
             }
+        }
+    }
+
+    /// final entry（file / symlink / junction）を種別に応じて削除する。
+    ///
+    /// Unix は entry 種別を問わず `remove_file` で link / file 自体を消す（現行挙動不変、NFR-2）。
+    /// Windows は directory 系の reparse（dir symlink / junction）を `remove_file` で消せないため、
+    /// `file_attributes()` の `FILE_ATTRIBUTE_DIRECTORY` ビットで分岐して `remove_dir` を使う
+    /// （`is_dir()` は symlink を追従するため使わない。design §4.4）。
+    #[cfg(unix)]
+    fn remove_entry_by_kind(path: &Path, _meta: &fs::Metadata) -> Result<(), AdapterError> {
+        fs::remove_file(path).map_err(|_| host_err("remove failed"))
+    }
+
+    #[cfg(windows)]
+    fn remove_entry_by_kind(path: &Path, meta: &fs::Metadata) -> Result<(), AdapterError> {
+        use std::os::windows::fs::MetadataExt;
+        let is_directory = meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0;
+        if is_directory {
+            // dir symlink / junction（reparse 検査を通過したもの）は remove_dir で link を消す。
+            fs::remove_dir(path).map_err(|_| host_err("remove failed"))
+        } else {
+            // file symlink / 通常 file。
+            fs::remove_file(path).map_err(|_| host_err("remove failed"))
         }
     }
 
@@ -1889,8 +1990,18 @@ mod os_secure {
     ) -> Result<(), AdapterError> {
         let src = resolve(from_handle, from)?.path;
         let dst = resolve(to_handle, to)?.path;
+        // src final が junction / mount point なら rename を許さない（§4.3 rename 段落・
+        // Finding 1）。resolve は final を lstat しないため、ここで明示検査する。
+        let src_meta =
+            fs::symlink_metadata(&src).map_err(|_| host_err("rename source not accessible"))?;
+        reject_if_unsafe_reparse(&src, &src_meta)?;
         if !replace && dst.exists() {
             return Err(host_err("destination exists"));
+        }
+        // 既存 dst を上書きする場合（replace=true）は dst final も検査する。junction を上書き先
+        // として受理しない。dst 非存在の新規作成は final lstat 不要（reparse も存在しない）。
+        if let Ok(dst_meta) = fs::symlink_metadata(&dst) {
+            reject_if_unsafe_reparse(&dst, &dst_meta)?;
         }
         fs::rename(&src, &dst).map_err(|_| host_err("rename failed"))
     }
@@ -1905,7 +2016,7 @@ impl DirectoryHandle for OsDirectoryHandle {
         self.symlink_policy
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn open_file(
         &self,
         path: &RelativePath,
@@ -1915,12 +2026,12 @@ impl DirectoryHandle for OsDirectoryHandle {
         Ok(Box::new(OsFileHandle { file }))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn create_dir(&self, path: &RelativePath) -> Result<(), AdapterError> {
         os_secure::create_dir(self, path)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn metadata(
         &self,
         path: &RelativePath,
@@ -1929,7 +2040,7 @@ impl DirectoryHandle for OsDirectoryHandle {
         os_secure::metadata(self, path, follow_final)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn list(
         &self,
         path: &RelativePath,
@@ -1938,12 +2049,12 @@ impl DirectoryHandle for OsDirectoryHandle {
         os_secure::list(self, path, max_entries)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn remove(&self, path: &RelativePath, kind: RemoveKind) -> Result<(), AdapterError> {
         os_secure::remove(self, path, kind)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn rename(
         &self,
         from: &RelativePath,
@@ -1961,9 +2072,11 @@ impl DirectoryHandle for OsDirectoryHandle {
         os_secure::rename(self, from, self, to, replace)
     }
 
-    // --- 非 Unix: secure resolution 非対応（fail closed、契約3）---
+    // --- 非 Unix・非 Windows: secure resolution 非対応（fail closed、契約3）---
+    // 現実の CI matrix（ubuntu/macos/windows）には存在しないが、将来 secure handle を実装
+    // できない platform が現れた場合の建前として fail-closed 分岐を残す（design §4.2）。
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn open_file(
         &self,
         _path: &RelativePath,
@@ -1972,12 +2085,12 @@ impl DirectoryHandle for OsDirectoryHandle {
         Err(AdapterError::SecureResolutionUnsupported)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn create_dir(&self, _path: &RelativePath) -> Result<(), AdapterError> {
         Err(AdapterError::SecureResolutionUnsupported)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn metadata(
         &self,
         _path: &RelativePath,
@@ -1986,7 +2099,7 @@ impl DirectoryHandle for OsDirectoryHandle {
         Err(AdapterError::SecureResolutionUnsupported)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn list(
         &self,
         _path: &RelativePath,
@@ -1995,12 +2108,12 @@ impl DirectoryHandle for OsDirectoryHandle {
         Err(AdapterError::SecureResolutionUnsupported)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn remove(&self, _path: &RelativePath, _kind: RemoveKind) -> Result<(), AdapterError> {
         Err(AdapterError::SecureResolutionUnsupported)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn rename(
         &self,
         _from: &RelativePath,
@@ -2012,13 +2125,14 @@ impl DirectoryHandle for OsDirectoryHandle {
     }
 }
 
-/// OS file を backing にする [`FileHandle`]（Unix）。open は [`OsDirectoryHandle`] が行う。
-#[cfg(unix)]
+/// OS file を backing にする [`FileHandle`]（Unix / Windows）。open は [`OsDirectoryHandle`]
+/// が行う。本体は `std::fs::File` の read/write/metadata だけで platform 固有分岐を持たない。
+#[cfg(any(unix, windows))]
 pub struct OsFileHandle {
     file: std::fs::File,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl FileHandle for OsFileHandle {
     fn read_to_end(&mut self, max_bytes: Option<NonZeroU64>) -> Result<Vec<u8>, AdapterError> {
         use std::io::Read;
