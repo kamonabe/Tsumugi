@@ -13,11 +13,13 @@
 //! - `round`:  最も近い整数、中間は 0 から遠い側
 
 use tsumugi::builtin_core::{builtin_ceil, builtin_floor, builtin_round, builtin_to_int};
+use tsumugi::error::ErrorKind;
 use tsumugi::value::Value;
 
 // capability 経路の fs テスト（file_size）は Unix 限定（§8.3 契約3の fail-closed）。
 // 関連 import とヘルパーも Unix でのみ使うため同じ cfg でガードし、非 Unix の未使用 import
-// warning（clippy -D warnings）を避ける。
+// warning（clippy -D warnings）を避ける。`ErrorKind` は Float 変換テスト（非 Unix でも走る）
+// でも使うため常時 import する。
 #[cfg(unix)]
 use std::collections::BTreeSet;
 #[cfg(unix)]
@@ -26,8 +28,6 @@ use std::num::NonZeroU128;
 use std::sync::Arc;
 #[cfg(unix)]
 use tsumugi::builtin_core::dispatch_filesystem_capability;
-#[cfg(unix)]
-use tsumugi::error::ErrorKind;
 #[cfg(unix)]
 use tsumugi::{
     FilesystemCapability, FilesystemRoot, FsOperation, MountName, OsDirectoryHandle, SymlinkPolicy,
