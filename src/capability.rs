@@ -3137,16 +3137,37 @@ mod tests {
         #[test]
         fn windows_junction_rename_src_is_rejected() {
             // AC-3: junction を rename の src にできない。
+            use std::os::windows::fs::MetadataExt;
             let root = TempRoot::new();
             let outside = TempRoot::new();
-            if !make_junction(&root.path.join("jct"), &outside.path) {
+            let link = root.path.join("jct");
+            if !make_junction(&link, &outside.path) {
                 return;
             }
+            // 診断: junction の実属性と resolve 結果を観測する（実機 Windows でのみ取れる値）。
+            let direct_meta = std::fs::symlink_metadata(&link).expect("symlink_metadata on link");
+            let direct_attrs = direct_meta.file_attributes();
+            let direct_is_symlink = direct_meta.file_type().is_symlink();
             let h = handle(&root, SymlinkPolicy::OperateOnFinalEntry);
+            let resolved = os_secure::resolve(&h, &rel(&["jct"]));
+            let resolved_desc = match &resolved {
+                Ok(r) => {
+                    let m = std::fs::symlink_metadata(&r.path);
+                    match m {
+                        Ok(m) => format!(
+                            "Ok(path_attrs={:#x}, path_is_symlink={})",
+                            m.file_attributes(),
+                            m.file_type().is_symlink()
+                        ),
+                        Err(e) => format!("Ok(path, meta_err={e})"),
+                    }
+                }
+                Err(e) => format!("Err({e:?})"),
+            };
             let res = h.rename(&rel(&["jct"]), &h, &rel(&["moved"]), false);
             assert!(
                 matches!(res, Err(AdapterError::Host(_))),
-                "junction rename src must be denied"
+                "junction rename src must be denied. DIAG: direct_attrs={direct_attrs:#x} direct_is_symlink={direct_is_symlink} resolved={resolved_desc} rename_res={res:?}"
             );
         }
 
