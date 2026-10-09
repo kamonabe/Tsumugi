@@ -169,6 +169,6 @@ pub use audit::{
     AuditAck, AuditBudget, AuditConfigError, AuditEnvelope, AuditError, AuditErrorPayload,
     AuditEvent, AuditFailure, AuditFrame, AuditJournal, AuditSink, AuditSinkError, AuditSubmit,
     AuditTicket, AuditWaker, BudgetChargeReason, CapabilityDecisionKind, EffectStatus,
-    ExecutionMode, HostCallOutcome, HostTimestamp, InMemoryAuditSink, SyncAuditSink,
-    TerminalOutcome,
+    ExecutionMode, HostCallOutcome, HostTimestamp, InMemoryAuditSink, ScriptedAuditSink,
+    ScriptedResponse, SyncAuditSink, TerminalOutcome,
 };

@@ -9,7 +9,8 @@ use std::sync::Arc;
 use tsumugi::{
     AuditEvent, AuditSink, AuditedOutcome, BudgetConfig, CompileOptions, EmbeddingContext,
     EmbeddingEngine, EmbeddingOutcome, EmbeddingRequest, ExecutionId, FakeClock, InMemoryAuditSink,
-    LinkRequest, MonotonicClock, Source, SourceId, TerminalOutcome,
+    LinkRequest, MonotonicClock, ScriptedAuditSink, ScriptedResponse, Source, SourceId,
+    TerminalOutcome,
 };
 
 /// 決定的テスト用の standard budget + 共有 clock から request を作る（監査 execution_id 付き）。
@@ -234,13 +235,115 @@ fn failing_sink_is_fail_closed_and_not_success() {
     assert!(!audited.is_audited_ok(), "fail-closed なら監査成立ではない");
     match audited {
         AuditedOutcome::AuditFailed { withheld, .. } => {
-            // 監査が成立していれば Completed だったはず（参考情報）。
-            assert_eq!(withheld, TerminalOutcome::Completed);
+            // script は 1 命令も走っていないので「保留 terminal」は無く、監査失敗自体を載せる。
+            assert_eq!(withheld, TerminalOutcome::AuditFailure);
         }
         other => panic!("fail-closed のはずが: {other:?}"),
     }
     // failing sink は何も記録しない（submit が常に Failed）。
     assert!(sink.is_empty());
+}
+
+#[test]
+fn terminal_submit_failure_is_fail_closed_and_not_success() {
+    // Started は Ack、Terminal で Failed を返す sink。script は走り切るが、Terminal の配送に
+    // 失敗するので監査は成立せず、結果は success ではない（§10.1、二度目失敗の fail-closed）。
+    let sink = Arc::new(ScriptedAuditSink::new([
+        ScriptedResponse::AckCorrect, // Started
+        ScriptedResponse::Fail,       // Terminal
+    ]));
+    let engine = EmbeddingEngine::builder()
+        .audit_sink(sink.clone() as Arc<dyn AuditSink>)
+        .build()
+        .expect("build");
+    let script = link_source(&engine, "m", "let x = 1\nlet y = x + 2\n");
+    let linked = engine.link(&script, LinkRequest::new()).expect("link");
+    let mut ctx = EmbeddingContext::new(&engine);
+
+    let audited = engine.run_audited(&linked, &mut ctx, request_with_id(11));
+
+    assert!(
+        !audited.is_audited_ok(),
+        "Terminal 配送失敗なら監査成立ではない"
+    );
+    match audited {
+        AuditedOutcome::AuditFailed { withheld, .. } => {
+            // Terminal 配送失敗時は、本来報告されたはずの terminal（Completed）を withheld に残す。
+            assert_eq!(withheld, TerminalOutcome::Completed);
+        }
+        other => panic!("Terminal fail-closed のはずが: {other:?}"),
+    }
+    // Started は記録済み（Ack 時に記録）、Terminal は Fail なので記録されない。
+    let envelopes = sink.snapshot();
+    assert_eq!(envelopes.len(), 1, "記録は Started のみ");
+    assert!(matches!(
+        envelopes[0].event,
+        AuditEvent::ExecutionStarted { .. }
+    ));
+}
+
+#[test]
+fn started_wrong_id_ack_is_fail_closed_before_script_work() {
+    // Started の ack が別 execution の id を指す（§10 protocol 違反）→ script work せず fail-closed。
+    let sink = Arc::new(ScriptedAuditSink::new([ScriptedResponse::AckWrongId]));
+    let engine = EmbeddingEngine::builder()
+        .audit_sink(sink.clone() as Arc<dyn AuditSink>)
+        .build()
+        .expect("build");
+    // side-effect probe: completion すれば ctx に x が束縛されるが、ここでは走ってはならない。
+    let script = link_source(&engine, "m", "let x = 1\nlet y = x + 2\n");
+    let linked = engine.link(&script, LinkRequest::new()).expect("link");
+    let mut ctx = EmbeddingContext::new(&engine);
+
+    let audited = engine.run_audited(&linked, &mut ctx, request_with_id(21));
+    assert!(!audited.is_audited_ok(), "不正 ack は監査成立ではない");
+    assert!(matches!(audited, AuditedOutcome::AuditFailed { .. }));
+    // Started は submit されたが ack が不正だったので gate は開かない。
+    // Terminal(AuditFailure) の submit は AckCorrect（tail）で記録されるため、
+    // 「Started を試みた記録 + emergency Terminal」で 2 件になり得る。重要なのは Terminal が
+    // AuditFailure であること（script work しないので Completed Terminal は出ない）。
+    let envelopes = sink.snapshot();
+    assert!(
+        envelopes.iter().all(|e| !matches!(
+            &e.event,
+            AuditEvent::Terminal {
+                outcome: TerminalOutcome::Completed,
+                ..
+            }
+        )),
+        "script work は起きないので Completed Terminal は出ない"
+    );
+}
+
+#[test]
+fn started_wrong_sequence_ack_is_fail_closed_before_script_work() {
+    // Started の ack が未送信 sequence を指す（§10 protocol 違反）→ fail-closed。
+    let sink = Arc::new(ScriptedAuditSink::new([ScriptedResponse::AckWrongSequence]));
+    let engine = EmbeddingEngine::builder()
+        .audit_sink(sink.clone() as Arc<dyn AuditSink>)
+        .build()
+        .expect("build");
+    let script = link_source(&engine, "m", "let x = 1\nlet y = x + 2\n");
+    let linked = engine.link(&script, LinkRequest::new()).expect("link");
+    let mut ctx = EmbeddingContext::new(&engine);
+
+    let audited = engine.run_audited(&linked, &mut ctx, request_with_id(22));
+    assert!(
+        !audited.is_audited_ok(),
+        "不正 sequence ack は監査成立ではない"
+    );
+    assert!(matches!(audited, AuditedOutcome::AuditFailed { .. }));
+    let envelopes = sink.snapshot();
+    assert!(
+        envelopes.iter().all(|e| !matches!(
+            &e.event,
+            AuditEvent::Terminal {
+                outcome: TerminalOutcome::Completed,
+                ..
+            }
+        )),
+        "script work は起きないので Completed Terminal は出ない"
+    );
 }
 
 #[test]

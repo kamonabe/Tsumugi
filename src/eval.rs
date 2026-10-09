@@ -330,6 +330,13 @@ pub struct Evaluator {
     /// `Some(code)` を載せ、`ProcessExit` 信号を伝播する。`run_slice` が terminal で読み取り
     /// `ExecutionOutcome::Exited` へ写す。
     pending_exit: Option<u8>,
+    /// 直近に `BudgetExceeded` の `ControlStop` を error へ写した際の、超過した
+    /// [`crate::budget::BudgetResource`]（Phase 6 A-1 監査）。`control_stop_to_error` は
+    /// 細粒度の resource を粗い [`crate::error::ErrorKind`] へ畳むため、監査 Terminal が
+    /// §7.2 どおりの resource を載せられるよう、畳む前の値をここへ退避する。
+    /// `Cell` なのは tree 側の `control_stop_to_error(&self, ..)` が `&self` のため。
+    /// 監査経路（`Engine::run_audited`）だけが読み、`take_pending_budget_resource` で取り出す。
+    last_budget_resource: std::cell::Cell<Option<crate::budget::BudgetResource>>,
     /// 登録 host function の registry（Phase 2 C8）。登録と grant は別で、実行可否は
     /// `capabilities` の `HostFunction` authority が決める。既定は空（host function なし）。
     /// 埋め込み host が実行単位で注入する（`set_host_registry`）。call site は user binding /
@@ -408,6 +415,8 @@ impl Evaluator {
             // 組んだ frozen set を各経路で set_capabilities で注入し、埋め込み Engine::run も同様。
             capabilities: crate::capability::CapabilitySet::empty(),
             pending_exit: None,
+            // 監査用: 直近 BudgetExceeded の細粒度 resource 退避（既定なし）。
+            last_budget_resource: std::cell::Cell::new(None),
             // 既定は空 registry（host function なし）。埋め込み host が set_host_registry で注入する。
             host_registry: std::sync::Arc::new(crate::host_function::HostFunctionRegistry::empty()),
             // host-call pending は実行開始時には無い（REV-015 Slice 5）。
@@ -438,6 +447,8 @@ impl Evaluator {
     ) {
         self.budget.reset_config_with_token(config, cancellation);
         self.budget.set_clock(clock);
+        // 監査用の退避 resource も実行開始でクリアする（前実行の残骸を持ち越さない）。
+        self.last_budget_resource.set(None);
         // heap 台帳を作り直したので、cell 課金用のハンドルを Env へ配り直す（REV-015 PR-c）。
         self.env.set_heap_ledger(self.budget.heap_handle());
     }
@@ -535,6 +546,14 @@ impl Evaluator {
     pub(crate) fn record_exit(&mut self, code: u8, line: usize) -> TsumugiError {
         self.pending_exit = Some(code);
         TsumugiError::process_exit_signal(line)
+    }
+
+    /// 直近に写した `BudgetExceeded` の細粒度 resource を取り出す（Phase 6 A-1 監査、§7.2）。
+    ///
+    /// 監査経路（`Engine::run_audited`）が `BudgetExceeded` terminal の Terminal event を組む際、
+    /// `ExecutionOutcome` に畳まれていない原本 resource を得るために使う。読み取ると消費する。
+    pub(crate) fn take_pending_budget_resource(&self) -> Option<crate::budget::BudgetResource> {
+        self.last_budget_resource.take()
     }
 
     /// terminal で記録済み `exit` コードを取り出す（埋め込み層が Exited outcome へ写す）。
@@ -657,6 +676,11 @@ impl Evaluator {
     /// deadline（REV-015 Slice 4）は catch 不能な `Cancelled` / `DeadlineExceeded` terminal
     /// 信号へ写す。
     fn control_stop_to_error(&self, stop: ControlStop, line: usize) -> TsumugiError {
+        // 監査（§7.2）: 畳む前の細粒度 resource を退避する。`control_stop_to_error` が複数の
+        // resource を 1 つの `ErrorKind` へ縮約するため、ここで原本を保持しておく。
+        if let ControlStop::BudgetExceeded(exceeded) = &stop {
+            self.last_budget_resource.set(Some(exceeded.resource));
+        }
         let err =
             crate::budget::control_stop_to_error(stop, self.budget.usage().committed.fuel, line);
         if !self.call_stack.is_empty() {

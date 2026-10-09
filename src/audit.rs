@@ -397,21 +397,24 @@ pub enum TerminalOutcome {
 
 /// `ExecutionOutcome` を §7.2 の対応表どおり [`TerminalOutcome`] へ写す（1:1）。
 ///
-/// `BudgetExceeded` は `ExecutionError` の `ErrorKind` を [`BudgetResource`] へ訳す。
-/// 対応表に無い `ErrorKind`（想定外）は `Fuel` にフォールバックせず
-/// [`TerminalOutcome::RuntimeError`] と区別するため、保守的に `BudgetResource::Fuel` を使う
-/// のではなく、ErrorKind から導けない場合は呼び出し側の outcome 種別（BudgetExceeded）に忠実に
-/// `BudgetResource::Fuel` を返す……のではなく、下記 [`budget_resource_from_error_kind`] が
-/// `None` を返した場合は仕様の既定優先 resource である `Fuel` を使う（§7.2 の 1:1 を total に
-/// 保つための明示フォールバック）。
-pub fn terminal_outcome_from(outcome: &ExecutionOutcome) -> TerminalOutcome {
+/// `BudgetExceeded` の resource は、まず `exceeded_resource` 引数（engine が畳む前に退避した
+/// 原本。§7.2 の細粒度 resource）を使う。`None`（原本を取れない）ときだけ
+/// `ExecutionError` の `ErrorKind` から [`budget_resource_from_error_kind`] で粗く復元し、
+/// それも `None` なら仕様の既定優先 resource である `Fuel` を使う（§7.2 の 1:1 を total に保つ
+/// 明示フォールバック）。監査経路では原本を渡すので、`control_stop_to_error` の縮約で失われる
+/// String/Source/I-O 系の細分 resource も正しく載る。
+pub fn terminal_outcome_from(
+    outcome: &ExecutionOutcome,
+    exceeded_resource: Option<BudgetResource>,
+) -> TerminalOutcome {
     match outcome {
         ExecutionOutcome::Completed { .. } => TerminalOutcome::Completed,
         ExecutionOutcome::Exited { code, .. } => TerminalOutcome::Exited(*code),
         ExecutionOutcome::RuntimeError { .. } => TerminalOutcome::RuntimeError,
         ExecutionOutcome::BudgetExceeded { error, .. } => {
-            let resource =
-                budget_resource_from_error_kind(error.code).unwrap_or(BudgetResource::Fuel);
+            let resource = exceeded_resource
+                .or_else(|| budget_resource_from_error_kind(error.code))
+                .unwrap_or(BudgetResource::Fuel);
             TerminalOutcome::BudgetExceeded(resource)
         }
         ExecutionOutcome::DeadlineExceeded { .. } => TerminalOutcome::DeadlineExceeded,
@@ -422,8 +425,11 @@ pub fn terminal_outcome_from(outcome: &ExecutionOutcome) -> TerminalOutcome {
 
 /// `BudgetExceeded` terminal の `ErrorKind` を [`BudgetResource`] へ訳す（§7.2 / D5）。
 ///
-/// この写像は total ではない。予算超過を表さない `ErrorKind` は `None` を返す。呼び出し側は
-/// §7.2 の 1:1 対応を保つため明示フォールバックする。
+/// この写像は total ではなく、かつ **粗い**。`control_stop_to_error` が複数の細粒度 resource を
+/// 1 つの `ErrorKind` へ縮約するため、ここで得られるのは各 family の代表値だけである（例:
+/// `StringLimit → StringBytes`）。原本の細粒度 resource が必要な監査経路は
+/// [`terminal_outcome_from`] の `exceeded_resource` 引数で原本を渡す。予算超過を表さない
+/// `ErrorKind` は `None` を返す。
 pub fn budget_resource_from_error_kind(kind: crate::error::ErrorKind) -> Option<BudgetResource> {
     use crate::error::ErrorKind;
     match kind {
@@ -974,6 +980,110 @@ impl AuditSink for InMemoryAuditSink {
     }
 }
 
+/// submit ごとに応答を切り替えられるテスト用 sink（§10 の ack 規則・fail-closed 検証用）。
+///
+/// `plan` の先頭から 1 submit につき 1 つ [`ScriptedResponse`] を消費する。`plan` を使い切った
+/// 以降は末尾の挙動（既定は `Ack`）を繰り返す。received envelope は記録する。
+///
+/// 用途:
+/// - Started を Ack し Terminal を Fail させる（二度目失敗の fail-closed）。
+/// - Started に別 execution の ack / 不正 sequence を返す（§10 protocol 違反）。
+pub struct ScriptedAuditSink {
+    plan: Mutex<std::collections::VecDeque<ScriptedResponse>>,
+    tail: ScriptedResponse,
+    envelopes: Mutex<Vec<AuditEnvelope>>,
+}
+
+/// [`ScriptedAuditSink`] の 1 submit あたりの応答指示。
+#[derive(Clone, Copy, Debug)]
+pub enum ScriptedResponse {
+    /// 正しい（batch 末尾の execution_id / sequence を指す）Ack を返す。
+    AckCorrect,
+    /// `Failed(Permanent)` を返す。
+    Fail,
+    /// batch とは別の execution_id で Ack を返す（protocol 違反）。
+    AckWrongId,
+    /// batch 末尾 +1 の sequence で Ack を返す（未送信 sequence の ack、protocol 違反）。
+    AckWrongSequence,
+}
+
+impl ScriptedAuditSink {
+    /// 応答計画を与えて作る。計画消費後は `AckCorrect` を繰り返す。
+    pub fn new(plan: impl IntoIterator<Item = ScriptedResponse>) -> Self {
+        Self {
+            plan: Mutex::new(plan.into_iter().collect()),
+            tail: ScriptedResponse::AckCorrect,
+            envelopes: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// 収集済み envelope の snapshot。
+    pub fn snapshot(&self) -> Vec<AuditEnvelope> {
+        self.envelopes.lock().expect("audit sink poisoned").clone()
+    }
+
+    /// 収集済み envelope 数。
+    pub fn len(&self) -> usize {
+        self.envelopes.lock().expect("audit sink poisoned").len()
+    }
+
+    /// 収集済み envelope が空か。
+    pub fn is_empty(&self) -> bool {
+        self.envelopes
+            .lock()
+            .expect("audit sink poisoned")
+            .is_empty()
+    }
+}
+
+impl AuditSink for ScriptedAuditSink {
+    fn submit(&self, batch: Arc<[AuditEnvelope]>, _waker: AuditWaker) -> AuditSubmit {
+        let response = self
+            .plan
+            .lock()
+            .expect("audit sink poisoned")
+            .pop_front()
+            .unwrap_or(self.tail);
+        let last = match batch.last() {
+            Some(last) => (last.execution_id, last.sequence),
+            None => return AuditSubmit::Failed(AuditSinkError::Protocol),
+        };
+        // 記録は Fail 以外で行う（Fail は配送なしとして扱い、何も残さない）。
+        if !matches!(response, ScriptedResponse::Fail) {
+            self.envelopes
+                .lock()
+                .expect("audit sink poisoned")
+                .extend(batch.iter().cloned());
+        }
+        match response {
+            ScriptedResponse::Fail => AuditSubmit::Failed(AuditSinkError::Permanent),
+            ScriptedResponse::AckCorrect => AuditSubmit::Ack(AuditAck {
+                execution_id: last.0,
+                through_sequence: last.1,
+            }),
+            ScriptedResponse::AckWrongId => AuditSubmit::Ack(AuditAck {
+                // 必ず batch の id と異なる値（nonzero 保証のため wrapping_add(1) を使う）。
+                execution_id: wrong_execution_id(last.0),
+                through_sequence: last.1,
+            }),
+            ScriptedResponse::AckWrongSequence => AuditSubmit::Ack(AuditAck {
+                execution_id: last.0,
+                through_sequence: last.1.wrapping_add(1),
+            }),
+        }
+    }
+}
+
+/// batch の execution_id と必ず異なる id を作る（protocol 違反テスト用）。
+fn wrong_execution_id(id: ExecutionId) -> ExecutionId {
+    let raw = id.get().get();
+    // 1 を足して衝突しない別値にする（u128::MAX のときは 1 へ回り込ませて 0 を避ける）。
+    let bumped = raw.wrapping_add(1);
+    let nonzero = std::num::NonZeroU128::new(bumped)
+        .unwrap_or(std::num::NonZeroU128::new(1).expect("1 is nonzero"));
+    ExecutionId::new(nonzero)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,49 +1154,95 @@ mod tests {
     fn terminal_outcome_maps_every_execution_outcome_variant() {
         let usage = BudgetUsage::default();
         assert_eq!(
-            terminal_outcome_from(&ExecutionOutcome::Completed { usage }),
+            terminal_outcome_from(&ExecutionOutcome::Completed { usage }, None),
             TerminalOutcome::Completed
         );
         assert_eq!(
-            terminal_outcome_from(&ExecutionOutcome::Exited { code: 7, usage }),
+            terminal_outcome_from(&ExecutionOutcome::Exited { code: 7, usage }, None),
             TerminalOutcome::Exited(7)
         );
         assert_eq!(
-            terminal_outcome_from(&ExecutionOutcome::RuntimeError {
-                error: exec_error(ErrorKind::Name),
-                usage,
-            }),
+            terminal_outcome_from(
+                &ExecutionOutcome::RuntimeError {
+                    error: exec_error(ErrorKind::Name),
+                    usage,
+                },
+                None
+            ),
             TerminalOutcome::RuntimeError
         );
+        // 原本 resource が無いときは ErrorKind から粗く復元する（family 代表値）。
         assert_eq!(
-            terminal_outcome_from(&ExecutionOutcome::BudgetExceeded {
-                error: exec_error(ErrorKind::StepLimit),
-                usage,
-            }),
+            terminal_outcome_from(
+                &ExecutionOutcome::BudgetExceeded {
+                    error: exec_error(ErrorKind::StepLimit),
+                    usage,
+                },
+                None
+            ),
             TerminalOutcome::BudgetExceeded(BudgetResource::Fuel)
         );
         assert_eq!(
-            terminal_outcome_from(&ExecutionOutcome::BudgetExceeded {
-                error: exec_error(ErrorKind::HeapLimit),
-                usage,
-            }),
+            terminal_outcome_from(
+                &ExecutionOutcome::BudgetExceeded {
+                    error: exec_error(ErrorKind::HeapLimit),
+                    usage,
+                },
+                None
+            ),
             TerminalOutcome::BudgetExceeded(BudgetResource::HeapBytes)
         );
         assert_eq!(
-            terminal_outcome_from(&ExecutionOutcome::DeadlineExceeded { usage }),
+            terminal_outcome_from(&ExecutionOutcome::DeadlineExceeded { usage }, None),
             TerminalOutcome::DeadlineExceeded
         );
         assert_eq!(
-            terminal_outcome_from(&ExecutionOutcome::Cancelled { usage }),
+            terminal_outcome_from(&ExecutionOutcome::Cancelled { usage }, None),
             TerminalOutcome::Cancelled
         );
         assert_eq!(
-            terminal_outcome_from(&ExecutionOutcome::InternalFailure {
-                fault_id: 1,
-                safe_message: "x".to_string(),
-                usage,
-            }),
+            terminal_outcome_from(
+                &ExecutionOutcome::InternalFailure {
+                    fault_id: 1,
+                    safe_message: "x".to_string(),
+                    usage,
+                },
+                None
+            ),
             TerminalOutcome::InternalFailure
+        );
+    }
+
+    #[test]
+    fn terminal_outcome_prefers_original_budget_resource() {
+        // control_stop_to_error が ErrorKind::IoLimit へ畳む細分 resource（例 OutputBytes）は、
+        // 原本を渡せば §7.2 どおり正しく載る。ErrorKind だけなら代表値 InputCalls に化ける。
+        let usage = BudgetUsage::default();
+        let outcome = ExecutionOutcome::BudgetExceeded {
+            error: exec_error(ErrorKind::IoLimit),
+            usage,
+        };
+        assert_eq!(
+            terminal_outcome_from(&outcome, Some(BudgetResource::OutputBytes)),
+            TerminalOutcome::BudgetExceeded(BudgetResource::OutputBytes)
+        );
+        // String family: 原本 StringAllocations は ErrorKind だけだと StringBytes になる。
+        let outcome = ExecutionOutcome::BudgetExceeded {
+            error: exec_error(ErrorKind::StringLimit),
+            usage,
+        };
+        assert_eq!(
+            terminal_outcome_from(&outcome, Some(BudgetResource::StringAllocations)),
+            TerminalOutcome::BudgetExceeded(BudgetResource::StringAllocations)
+        );
+        // Source family: 原本 ImportBytes は ErrorKind だけだと SourceBytes になる。
+        let outcome = ExecutionOutcome::BudgetExceeded {
+            error: exec_error(ErrorKind::SourceLimit),
+            usage,
+        };
+        assert_eq!(
+            terminal_outcome_from(&outcome, Some(BudgetResource::ImportBytes)),
+            TerminalOutcome::BudgetExceeded(BudgetResource::ImportBytes)
         );
     }
 

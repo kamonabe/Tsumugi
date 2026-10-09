@@ -785,11 +785,24 @@ Slice 5 の最小縦切り（A-1）を tree engine にのみ実装した時点�
   と `Terminal`（各 terminal commit 点で 1 件、最後の event）だけ。`CapabilityDecision` /
   `HostCallStarted` / `HostCallFinished` / `BudgetCharged` / `Yielded` / `Resumed` は schema 型
   としては定義済みだが emission 配線を持たない。
-- **fail-closed（§10.1）**: Started が ack されるまで script/import work を開始しない。sink が
-  `Failed`（および A-1 では起きない `Pending`）を返すと emergency slot へ `Terminal(AuditFailure)`
-  を append し、監査付き入口 `Engine::run_audited` は success ではない `AuditedOutcome::AuditFailed`
-  を返す。既存の `ExecutionOutcome` enum は変更せず、`AuditFailure` を `InternalFailure` へ畳まない
+- **fail-closed（§10.1）**: Started が ack されるまで script/import work を開始しない。ack は
+  §10 の規則どおり、submit した exact な `execution_id` と連続 `sequence`（Started なら 0）を指す
+  ものだけを受理し、別 execution の ack / gap / 未送信 sequence の ack は protocol 違反として
+  fail-closed にする。Started の ack 失敗（`Failed` / 不正 ack / A-1 では起きない `Pending`）では
+  emergency slot へ `Terminal(AuditFailure)` を append し、script work を一切行わない。実行後の
+  `Terminal` の配送失敗（`Failed` / 不正 ack）も fail-closed にし、journal 上の Terminal は確定
+  済み（§8 規則10）でも監査は成立していないため success な outcome を返さない。いずれの場合も
+  監査付き入口 `Engine::run_audited` は success ではない `AuditedOutcome::AuditFailed` を返す。
+  既存の `ExecutionOutcome` enum は変更せず、`AuditFailure` を `InternalFailure` へ畳まない
   （監査失敗は追加型 `AuditedOutcome` でのみ surface する）。
+- **timestamp は monotonic tick（§7.1 の簡略）**: A-1 では envelope の `timestamp.unix_nanoseconds`
+  に、注入された wall/unix `AuditClock` ではなく request の monotonic clock（`request.clock.now()`）の
+  ns を流用する。順序の正本は `sequence` であり `timestamp` は非正本（§7.1）なので影響は限定的だが、
+  値は unix 時刻ではなく monotonic tick である。専用 `AuditClock` の注入は後続スライスへ延期する。
+- **BudgetExceeded resource は原本を保持（§7.2）**: `control_stop_to_error` が細粒度の
+  `BudgetResource` を粗い `ErrorKind` へ縮約するため、監査付き経路では評価器が縮約前に退避した
+  原本 resource を `Terminal(BudgetExceeded(resource))` に載せる（原本が無い場合のみ `ErrorKind`
+  から粗く復元する）。これにより String/Source/I-O 系の細分 resource も §7.2 どおり記録される。
 - **未実装（A-1 では意図的に含めない）**: `AuditBackpressure` の yield 配線（§10.2）と
   `engine.rs::YieldReason` 変種、redaction policy 本体（§9）、strict deterministic CBOR（§9.2、
   A-1 の `encoded_bytes` は naive 推定で後で差し替え可能に隔離）、record/replay（§6）、VM の変更。

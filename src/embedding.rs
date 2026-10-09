@@ -1292,6 +1292,9 @@ impl Engine {
         if context.running {
             return internal_failure("実行コンテキストが実行中です（再入は許可されません）");
         }
+        // 実行中は running を立てる（第9.1節 再入 bookkeeping）。両入口で対称に保つ
+        // （[`Self::run_audited`] も同様に立てる）。
+        context.running = true;
 
         // 監査 sink が設定されていなければ、従来どおりの実行経路（監査 wiring なし。opt-in の
         // ため挙動は bit-identical、§1.1 の sink 必須は後続スライス）。設定されていれば監査付き
@@ -1478,14 +1481,19 @@ impl Engine {
         };
 
         // sink へ submit し Ack を待つ（§10.1: Started が ack されるまで script work しない）。
+        // §10 の ack 規則どおり、ack は submit した exact execution と連続 sequence を指すこと。
+        // 別 execution の ack / gap / 未送信 sequence の ack は protocol 違反として fail-closed。
         let started_batch: Arc<[AuditEnvelope]> =
             Arc::from(vec![make_envelope(started_seq, started_event)]);
-        let started_ok = matches!(
-            sink.submit(started_batch, AuditWaker::noop()),
-            AuditSubmit::Ack(_)
-        );
+        let started_ok = match sink.submit(started_batch, AuditWaker::noop()) {
+            AuditSubmit::Ack(ack) => {
+                ack.execution_id == execution_id && ack.through_sequence == started_seq
+            }
+            // Failed / Pending（A-1 では Pending は起きない）は未 ack 扱い。
+            _ => false,
+        };
         if !started_ok {
-            // Started の ack 失敗（Failed、または A-1 では起きない Pending）→ fail-closed。
+            // Started の ack 失敗（Failed / 不正 ack、または A-1 では起きない Pending）→ fail-closed。
             // emergency slot へ Terminal(AuditFailure) を append し、script work は行わない（§10.1）。
             let terminal_event = AuditEvent::Terminal {
                 outcome: TerminalOutcome::AuditFailure,
@@ -1495,7 +1503,7 @@ impl Engine {
                 context_committed: false,
                 host_effects_may_remain: false,
             };
-            let (failure, _) = match journal.append_terminal(&make_envelope(
+            let failure = match journal.append_terminal(&make_envelope(
                 journal.next_sequence(),
                 terminal_event.clone(),
             )) {
@@ -1503,12 +1511,14 @@ impl Engine {
                     let batch: Arc<[AuditEnvelope]> =
                         Arc::from(vec![make_envelope(seq, terminal_event)]);
                     let _ = sink.submit(batch, AuditWaker::noop());
-                    (AuditFailure::Sink, ())
+                    AuditFailure::Sink
                 }
-                Err(failure) => (failure, ()),
+                Err(failure) => failure,
             };
+            // script は 1 命令も走っていないので「保留された本来の terminal」は無い。参考情報
+            // として、監査自体が壊れたことを表す AuditFailure を載せる（Completed の捏造を避ける）。
             return AuditedOutcome::AuditFailed {
-                withheld: TerminalOutcome::Completed,
+                withheld: TerminalOutcome::AuditFailure,
                 failure,
             };
         }
@@ -1530,7 +1540,15 @@ impl Engine {
         };
 
         // 5. Terminal を予約 slot へ append → submit（§8 規則9/10）。
-        let terminal_outcome = crate::audit::terminal_outcome_from(&outcome);
+        // BudgetExceeded の resource は、評価器が畳む前に退避した原本を優先する（§7.2。
+        // control_stop_to_error は細粒度 resource を粗い ErrorKind へ縮約するため、原本が無いと
+        // String/Source/I-O 系が代表値へ化ける）。原本が無い場合のみ ErrorKind から復元する。
+        let exceeded_resource = if matches!(outcome, ExecutionOutcome::BudgetExceeded { .. }) {
+            context.evaluator.take_pending_budget_resource()
+        } else {
+            None
+        };
+        let terminal_outcome = crate::audit::terminal_outcome_from(&outcome, exceeded_resource);
         let context_committed = matches!(
             outcome,
             ExecutionOutcome::Completed { .. } | ExecutionOutcome::Exited { .. }
@@ -1550,10 +1568,25 @@ impl Engine {
             Ok(terminal_seq) => {
                 let batch: Arc<[AuditEnvelope]> =
                     Arc::from(vec![make_envelope(terminal_seq, terminal_event)]);
-                // Terminal の submit が Failed でも journal 上の Terminal は確定済み（§8 規則10）。
-                // A-1 では配送失敗を caller の outcome へは反映しない（本来の outcome を返す）。
-                let _ = sink.submit(batch, AuditWaker::noop());
-                AuditedOutcome::Outcome(Box::new(outcome))
+                // Terminal の配送結果を評価する（§10.1）。配送が成立し（Ack）、かつ ack が
+                // この execution の Terminal sequence を正しく指しているときだけ監査成立とする。
+                // 配送失敗（Failed / 不正 ack / Pending）は fail-closed: journal 上の Terminal は
+                // 確定済み（§8 規則10）だが、監査が成立していないので success な outcome は返さず
+                // AuditFailed を返す（§10.1: 監査が壊れた実行を成功として報告しない）。
+                let delivered = matches!(
+                    sink.submit(batch, AuditWaker::noop()),
+                    AuditSubmit::Ack(ack)
+                        if ack.execution_id == execution_id
+                            && ack.through_sequence == terminal_seq
+                );
+                if delivered {
+                    AuditedOutcome::Outcome(Box::new(outcome))
+                } else {
+                    AuditedOutcome::AuditFailed {
+                        withheld: terminal_outcome,
+                        failure: AuditFailure::Sink,
+                    }
+                }
             }
             // sequence overflow 等で Terminal すら append できない → fail-closed。
             Err(failure) => AuditedOutcome::AuditFailed {
@@ -2959,6 +2992,165 @@ mod tests {
             engine.run(&ok, &mut ctx, standard_request()),
             ExecutionOutcome::InternalFailure { .. }
         ));
+    }
+
+    // --- Phase 6 A-1: audited terminal coverage（各 terminal 種別が Terminal を 1 件出す） ---
+
+    /// 監査 execution_id 付きの standard request を作る helper。
+    fn audited_request(id: u128) -> ExecutionRequest {
+        standard_request().with_execution_id(ExecutionId::new(id.try_into().expect("nonzero")))
+    }
+
+    /// sink の収集 envelope から最後の Terminal event の outcome を取り出す helper。
+    fn terminal_outcome_of(
+        sink: &crate::audit::InMemoryAuditSink,
+    ) -> crate::audit::TerminalOutcome {
+        let envelopes = sink.snapshot();
+        assert_eq!(
+            envelopes.len(),
+            2,
+            "Started + Terminal の 2 件のはず: {envelopes:?}"
+        );
+        assert_eq!(envelopes[0].sequence, 0);
+        assert!(matches!(
+            envelopes[0].event,
+            crate::audit::AuditEvent::ExecutionStarted { .. }
+        ));
+        assert_eq!(envelopes[1].sequence, 1);
+        match &envelopes[1].event {
+            crate::audit::AuditEvent::Terminal { outcome, .. } => outcome.clone(),
+            other => panic!("期待 Terminal, 実際 {other:?}"),
+        }
+    }
+
+    /// granted な exit(code) は audited 経路で Terminal(Exited) を 1 件出す。
+    #[test]
+    fn audited_exit_emits_exited_terminal() {
+        let sink = Arc::new(crate::audit::InMemoryAuditSink::new());
+        let engine = Engine::builder()
+            .audit_sink(sink.clone() as Arc<dyn crate::audit::AuditSink>)
+            .build()
+            .unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "exit(7)\n");
+        let audited = engine.run_audited(
+            &linked,
+            &mut ctx,
+            audited_request(101).with_capabilities(exit_granted()),
+        );
+        assert!(matches!(
+            audited.outcome(),
+            Some(ExecutionOutcome::Exited { code: 7, .. })
+        ));
+        assert_eq!(
+            terminal_outcome_of(&sink),
+            crate::audit::TerminalOutcome::Exited(7)
+        );
+    }
+
+    /// fuel を使い切る実行は audited 経路で Terminal(BudgetExceeded(Fuel)) を 1 件出す。
+    #[test]
+    fn audited_budget_exceeded_emits_budget_terminal_with_resource() {
+        let clock: Arc<dyn crate::budget::MonotonicClock> =
+            Arc::new(crate::budget::FakeClock::new());
+        let mut budget = crate::budget::BudgetConfig::standard(clock.as_ref()).unwrap();
+        budget.total_fuel = 5; // ループ反復で step 上限に達する極小 fuel。
+        let request = ExecutionRequest::new(budget, clock)
+            .expect("同 domain")
+            .with_execution_id(ExecutionId::new(102u128.try_into().unwrap()));
+
+        let sink = Arc::new(crate::audit::InMemoryAuditSink::new());
+        let engine = Engine::builder()
+            .audit_sink(sink.clone() as Arc<dyn crate::audit::AuditSink>)
+            .build()
+            .unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(
+            &engine,
+            "m",
+            "let i = 0\nwhile i < 1000\n  i = i + 1\nend\n",
+        );
+        let audited = engine.run_audited(&linked, &mut ctx, request);
+        assert!(matches!(
+            audited.outcome(),
+            Some(ExecutionOutcome::BudgetExceeded { .. })
+        ));
+        // 原本 resource（Fuel）が §7.2 どおり載る。
+        assert_eq!(
+            terminal_outcome_of(&sink),
+            crate::audit::TerminalOutcome::BudgetExceeded(crate::budget::BudgetResource::Fuel)
+        );
+    }
+
+    /// deadline 到達は audited 経路で Terminal(DeadlineExceeded) を 1 件出す。
+    #[test]
+    fn audited_deadline_emits_deadline_terminal() {
+        let clock = Arc::new(crate::budget::FakeClock::new());
+        let budget = crate::budget::BudgetConfig::standard(clock.as_ref()).unwrap();
+        let request = ExecutionRequest::new(
+            budget,
+            clock.clone() as Arc<dyn crate::budget::MonotonicClock>,
+        )
+        .expect("同 domain")
+        .with_execution_id(ExecutionId::new(103u128.try_into().unwrap()));
+        clock.set(budget.deadline.as_nanos());
+
+        let sink = Arc::new(crate::audit::InMemoryAuditSink::new());
+        let engine = Engine::builder()
+            .audit_sink(sink.clone() as Arc<dyn crate::audit::AuditSink>)
+            .build()
+            .unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "let x = 1\nlet y = 2\n");
+        let audited = engine.run_audited(&linked, &mut ctx, request);
+        assert!(matches!(
+            audited.outcome(),
+            Some(ExecutionOutcome::DeadlineExceeded { .. })
+        ));
+        assert_eq!(
+            terminal_outcome_of(&sink),
+            crate::audit::TerminalOutcome::DeadlineExceeded
+        );
+    }
+
+    /// run 中の panic は audited 経路でも Terminal(InternalFailure) を 1 件出し、context を poison。
+    #[test]
+    fn audited_panic_emits_internal_failure_terminal() {
+        let sink = Arc::new(crate::audit::InMemoryAuditSink::new());
+        let engine = Engine::builder()
+            .audit_sink(sink.clone() as Arc<dyn crate::audit::AuditSink>)
+            .build()
+            .unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        ctx.inject_run_panic_for_test();
+        let linked = compile_link(&engine, "m", "let x = 1\n");
+        let audited =
+            with_silent_panic_hook(|| engine.run_audited(&linked, &mut ctx, audited_request(104)));
+        match audited.outcome() {
+            Some(ExecutionOutcome::InternalFailure { fault_id, .. }) => assert_ne!(*fault_id, 0),
+            other => panic!("期待 InternalFailure, 実際 {other:?}"),
+        }
+        assert_eq!(
+            terminal_outcome_of(&sink),
+            crate::audit::TerminalOutcome::InternalFailure
+        );
+        // audited 経路でも panic は context を poison する。
+        assert!(ctx.is_poisoned());
+    }
+
+    /// no-sink の lifecycle regression: run は実行中 running を立て、戻ると下ろす。再入は弾く。
+    #[test]
+    fn no_sink_run_sets_and_clears_running_flag() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        assert!(!ctx.running, "実行前は running=false");
+        let linked = compile_link(&engine, "m", "let x = 1\n");
+        let outcome = engine.run(&linked, &mut ctx, standard_request());
+        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }));
+        // 戻ると running は確実に下りている（次の実行が再入検査で誤検出しない）。
+        assert!(!ctx.running, "実行後は running=false へ戻る");
+        let again = engine.run(&linked, &mut ctx, standard_request());
+        assert!(matches!(again, ExecutionOutcome::Completed { .. }));
     }
 
     /// LinkError::InternalFailure は Send + Sync な診断値として保持できる。
