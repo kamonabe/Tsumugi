@@ -155,16 +155,26 @@ impl ExecutionId {
 }
 
 /// Engine の不変設定（仕様第3節 `EngineConfig`）。
-#[derive(Clone, Debug)]
+///
+/// `Debug` は手書きで、`audit_sink` の有無だけを出す（sink 本体は secret を保持し得るため
+/// Debug へ出さない。`AuditSink` に `Debug` を要求しない設計、A-1 D2）。
+#[derive(Clone)]
 pub struct EngineConfig {
     /// 実行 backend。
     pub backend: Backend,
     /// 言語 revision。
     pub language_revision: LanguageRevision,
+    /// 監査 sink（Phase 6 A-1、opt-in）。既定は `None`。
+    ///
+    /// `None` のときは監査を一切 emission せず、既存挙動と bit-identical。`Some` を
+    /// [`EngineBuilder::audit_sink`] で設定すると、[`Engine::run`] が `ExecutionStarted` と
+    /// `Terminal` を journal 経由で emission する（§8/§10）。§1.1 の sink 必須ポリシーは
+    /// 後続スライスへ延期する（opt-in の逸脱、`docs/determinism-and-audit.md` §14 参照）。
+    pub audit_sink: Option<Arc<dyn crate::audit::AuditSink>>,
 }
 
 impl Default for EngineConfig {
-    /// 既定は `TreeWalk` + 現行 revision。
+    /// 既定は `TreeWalk` + 現行 revision、監査 sink なし（opt-in）。
     ///
     /// budget は engine 単位ではなく [`ExecutionRequest`] が必須所有する（REV-015 最終形移行
     /// Slice 1、[実行制御仕様](../docs/execution-control.md) §2 不変条件6 / §3）。
@@ -172,7 +182,26 @@ impl Default for EngineConfig {
         Self {
             backend: Backend::TreeWalk,
             language_revision: LanguageRevision::CURRENT,
+            audit_sink: None,
         }
+    }
+}
+
+impl std::fmt::Debug for EngineConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // sink 本体は Debug へ出さない（secret-free）。有無だけを出す。
+        f.debug_struct("EngineConfig")
+            .field("backend", &self.backend)
+            .field("language_revision", &self.language_revision)
+            .field(
+                "audit_sink",
+                &if self.audit_sink.is_some() {
+                    "configured"
+                } else {
+                    "none"
+                },
+            )
+            .finish()
     }
 }
 
@@ -203,6 +232,13 @@ pub enum ConfigError {
     },
     /// 実験 backend が許可されていない。
     ExperimentalBackendNotEnabled,
+    /// 監査 sink と `VmExperimental` backend を同時に設定した（Phase 6 A-1）。
+    ///
+    /// A-1 の run 経路には backend dispatch が無く、常に tree evaluator で実行する。
+    /// この状態で `VmExperimental` label を監査へ載せると、tree 実行を VM 実行として
+    /// 誤報告してしまう（A-1 の tree-only 境界違反）。VM の監査 wiring が入るまで、
+    /// この組み合わせは build 時に拒否する。
+    AuditSinkWithExperimentalBackend,
     /// 同一 [`CapabilityKind`](crate::capability::CapabilityKind) を二重に設定した
     /// （後勝ちにしない。仕様第3節）。host function grant は別 ID なら複数許可する。
     DuplicateCapability {
@@ -297,6 +333,19 @@ impl EngineBuilder {
         self
     }
 
+    /// 監査 sink を設定する（Phase 6 A-1、opt-in、§10）。
+    ///
+    /// 設定すると [`Engine::run`] が `ExecutionStarted`（最初の semantic work の前）と
+    /// `Terminal`（各 terminal commit 点）を journal 経由で emission する。設定しなければ
+    /// 監査は一切起きず、既存挙動と bit-identical（§1.1 の sink 必須は後続スライスへ延期）。
+    ///
+    /// A-1 の run 経路は tree-only のため、`VmExperimental` backend と同時に設定したまま
+    /// [`Self::build`] すると [`ConfigError::AuditSinkWithExperimentalBackend`] を返す。
+    pub fn audit_sink(mut self, sink: Arc<dyn crate::audit::AuditSink>) -> Self {
+        self.config.audit_sink = Some(sink);
+        self
+    }
+
     /// build 済みの host function registry を engine へ登録する（Phase 2、E7、第11.1節）。
     ///
     /// registry は engine 単位の build-time 設定（link 時に name→ID を固定する）であり、実行ごとに
@@ -312,11 +361,18 @@ impl EngineBuilder {
     /// 設定を検証して [`Engine`] を build する。
     ///
     /// `VmExperimental` を選びつつ許可していない場合は
-    /// [`ConfigError::ExperimentalBackendNotEnabled`] を返す。host function registry の
-    /// validation は registry build 時に済んでいるため、ここでは再検証しない。
+    /// [`ConfigError::ExperimentalBackendNotEnabled`] を返す。監査 sink を `VmExperimental`
+    /// backend と同時に設定した場合は [`ConfigError::AuditSinkWithExperimentalBackend`] を返す
+    /// （A-1 の run 経路は tree-only のため。§7.1）。host function registry の validation は
+    /// registry build 時に済んでいるため、ここでは再検証しない。
     pub fn build(self) -> Result<Engine, ConfigError> {
         if self.config.backend == Backend::VmExperimental && !self.allow_experimental_backend {
             return Err(ConfigError::ExperimentalBackendNotEnabled);
+        }
+        // Phase 6 A-1: 監査 sink は tree-only の run 経路だけが対象。VmExperimental と組むと
+        // tree 実行を VM として監査報告してしまうため、VM の監査 wiring が入るまで拒否する。
+        if self.config.audit_sink.is_some() && self.config.backend == Backend::VmExperimental {
+            return Err(ConfigError::AuditSinkWithExperimentalBackend);
         }
         Ok(Engine {
             id: EngineId::allocate(),
@@ -985,6 +1041,12 @@ pub struct ExecutionRequest {
     /// 命令を1つも実行せず [`ExecutionOutcome::Cancelled`] になる（pre-cancel は命令0、EMB-AT-12）。
     /// 既定（`.cancellation(..)` 未指定）は未 cancel の新 token。
     cancellation: crate::budget::CancellationToken,
+    /// host 供給の実行 ID（Phase 6 A-1、監査 envelope の `execution_id`、§7.1）。
+    ///
+    /// 監査 sink を設定した engine で実行する場合に必須（`.with_execution_id(..)` で設定）。
+    /// engine は ambient random source へ触れないため、未設定で sink がある場合は script work
+    /// 前に fail-closed にする（§7.1 / §10.1）。sink 未設定なら無視する。
+    execution_id: Option<ExecutionId>,
 }
 
 impl std::fmt::Debug for ExecutionRequest {
@@ -1023,6 +1085,7 @@ impl ExecutionRequest {
             budget,
             clock,
             cancellation: crate::budget::CancellationToken::new(),
+            execution_id: None,
         })
     }
 
@@ -1054,6 +1117,15 @@ impl ExecutionRequest {
     /// 設定しなければ既定の未 cancel token が使われ、決して cancel されない。
     pub fn cancellation(mut self, value: crate::budget::CancellationToken) -> Self {
         self.cancellation = value;
+        self
+    }
+
+    /// host 供給の実行 ID を設定する（Phase 6 A-1、監査 envelope の `execution_id`、§7.1）。
+    ///
+    /// 監査 sink を設定した engine で実行する場合に必須。engine は ambient random source へ
+    /// 触れないため、host が一意な ID を生成して渡す。sink 未設定の engine では無視される。
+    pub fn with_execution_id(mut self, id: ExecutionId) -> Self {
+        self.execution_id = Some(id);
         self
     }
 }
@@ -1237,16 +1309,96 @@ impl Engine {
         if context.running {
             return internal_failure("実行コンテキストが実行中です（再入は許可されません）");
         }
-
-        // ここから先の失敗は「実行の試行」に起因する。InternalFailure を返す経路はすべて
-        // context を poison する（第10節 規則4）ため、単一の内部関数へ閉じ、その戻り値で
-        // poison を一元判定する。
+        // 実行中は running を立てる（第9.1節 再入 bookkeeping）。両入口で対称に保つ
+        // （[`Self::run_audited`] も同様に立てる）。
         context.running = true;
-        // run / poll 中の unwind panic を host boundary で捕捉する（第11節 規則1）。捕捉した
-        // panic は terminal `ExecutionOutcome::InternalFailure` へ写す（規則2）。payload /
-        // backtrace は公開しない（規則3）。`AssertUnwindSafe` は、panic 後に context を
-        // poison して以後の再利用を拒否する（規則4）ことで正当化する。
-        let outcome = match catch_host_unwind(AssertUnwindSafe(|| {
+
+        // 監査 sink が設定されていなければ、従来どおりの実行経路（監査 wiring なし。opt-in の
+        // ため挙動は bit-identical、§1.1 の sink 必須は後続スライス）。設定されていれば監査付き
+        // 経路へ委譲し、audit 成功時は本来の outcome を、失敗時は fail-closed の非成功
+        // outcome（下記 D1）を `ExecutionOutcome` へ写して返す。audit 失敗を観測したい caller は
+        // [`Self::run_audited`] を使う（`ExecutionOutcome` は `AuditFailure` を表現できないため、
+        // 既存の `InternalFailure` には畳まず別 surface で返す）。
+        if self.config.audit_sink.is_none() {
+            let outcome = self.run_guarded(linked, context, request);
+            context.running = false;
+            if matches!(outcome, ExecutionOutcome::InternalFailure { .. }) {
+                context.poisoned = true;
+            }
+            return outcome;
+        }
+
+        // 監査付き経路。audit 失敗でない限り本来の outcome を返す。
+        let audited = self.run_audited_inner(linked, context, request);
+        context.running = false;
+        let outcome = audited.outcome_for_poison();
+        if matches!(outcome, ExecutionOutcome::InternalFailure { .. }) {
+            context.poisoned = true;
+        }
+        audited.into_execution_outcome()
+    }
+
+    /// 監査 sink を設定した engine 向けの実行入口（Phase 6 A-1、§8/§10）。
+    ///
+    /// 返す [`AuditedOutcome`] は、通常の terminal を運ぶ [`AuditedOutcome::Outcome`] と、
+    /// fail-closed（sink が `Failed` 等）で監査が失敗したことを運ぶ
+    /// [`AuditedOutcome::AuditFailed`] の 2 系統を持つ。いずれの `AuditFailed` でも実行結果は
+    /// success ではない。journal 上の Terminal は失敗 phase によって異なる（詳細は
+    /// [`AuditedOutcome::AuditFailed`] 参照）:
+    ///
+    /// - **Started ack 失敗**（script work 開始前）: emergency slot へ `Terminal(AuditFailure)` が
+    ///   append 済み。language-state は未変更。
+    /// - **最終 Terminal 配送失敗**（§14、A-1 延期）: journal 上の唯一の Terminal は確定済みの
+    ///   `Completed`/`Exited`（`AuditFailure` ではない）。`Completed`/`Exited` の language-state は
+    ///   既に commit 済みで rollback しない。caller はこの context を再利用してはならない。
+    ///
+    /// sink が未設定の engine で呼ぶと監査は起きず、本来の outcome をそのまま
+    /// [`AuditedOutcome::Outcome`] で返す（opt-in）。
+    pub fn run_audited(
+        &self,
+        linked: &LinkedScript,
+        context: &mut ExecutionContext,
+        request: ExecutionRequest,
+    ) -> AuditedOutcome {
+        if context.poisoned {
+            return AuditedOutcome::Outcome(Box::new(internal_failure(
+                "poison 済みの実行コンテキストは再利用できません",
+            )));
+        }
+        if context.running {
+            return AuditedOutcome::Outcome(Box::new(internal_failure(
+                "実行コンテキストが実行中です（再入は許可されません）",
+            )));
+        }
+        context.running = true;
+        let audited = if self.config.audit_sink.is_none() {
+            AuditedOutcome::Outcome(Box::new(self.run_guarded(linked, context, request)))
+        } else {
+            self.run_audited_inner(linked, context, request)
+        };
+        context.running = false;
+        if matches!(
+            audited.outcome_for_poison(),
+            ExecutionOutcome::InternalFailure { .. }
+        ) {
+            context.poisoned = true;
+        }
+        audited
+    }
+
+    /// panic 捕捉付きで `run_inner` を回す（監査 wiring なしの従来経路）。
+    ///
+    /// run / poll 中の unwind panic を host boundary で捕捉する（第11節 規則1）。捕捉した
+    /// panic は terminal `ExecutionOutcome::InternalFailure` へ写す（規則2）。payload /
+    /// backtrace は公開しない（規則3）。`AssertUnwindSafe` は、panic 後に context を
+    /// poison して以後の再利用を拒否する（規則4）ことで正当化する。
+    fn run_guarded(
+        &self,
+        linked: &LinkedScript,
+        context: &mut ExecutionContext,
+        request: ExecutionRequest,
+    ) -> ExecutionOutcome {
+        match catch_host_unwind(AssertUnwindSafe(|| {
             self.run_inner(linked, context, request)
         })) {
             Ok(outcome) => outcome,
@@ -1256,16 +1408,237 @@ impl Engine {
                 // panic 捕捉時点の usage snapshot（counter の read は panic 後も安全）。
                 usage: context.evaluator.budget_usage(),
             },
-        };
-        context.running = false;
-
-        // InternalFailure だけ context を poison する（第10節 規則4）。他 terminal は
-        // begin_execution / run_slice が commit / rollback 済みで、そのまま再利用できる。
-        // run/poll 中の panic 経路も InternalFailure なのでここで一律に poison される。
-        if matches!(outcome, ExecutionOutcome::InternalFailure { .. }) {
-            context.poisoned = true;
         }
-        outcome
+    }
+
+    /// 監査付きの実行本体（§8/§10/§10.1）。sink が設定済みの前提で呼ぶ。
+    ///
+    /// 手順:
+    /// 1. precondition 検証と Program 再構築（失敗は Started 前の precondition 違反。監査上は
+    ///    「開始していない execution」で Started を発行しない。§8）。
+    /// 2. `execution_id` の存在を確認（§7.1、engine は ambient random source へ触れない）。
+    ///    未指定なら script work 前に fail-closed。
+    /// 3. journal を開き、`ExecutionStarted` を sequence 0 へ append → sink へ submit → Ack 待ち。
+    ///    Started が ack されるまで script/import work を開始しない（§10.1）。sink が `Failed`
+    ///    なら emergency slot へ `Terminal(AuditFailure)` を append し `AuditFailed` を返す。
+    /// 4. 実行本体（panic 捕捉付き）を回して terminal outcome を得る。
+    /// 5. outcome を `TerminalOutcome` へ写し、`Terminal` を予約 slot へ append → submit。
+    ///    Terminal の submit が `Failed` でも journal 上の Terminal は確定済み（§8 規則10）。
+    fn run_audited_inner(
+        &self,
+        linked: &LinkedScript,
+        context: &mut ExecutionContext,
+        request: ExecutionRequest,
+    ) -> AuditedOutcome {
+        use crate::audit::{
+            AuditBudget, AuditEnvelope, AuditEvent, AuditFailure, AuditJournal, AuditSubmit,
+            AuditWaker, ExecutionMode, HostTimestamp, TerminalOutcome,
+        };
+
+        let sink = match &self.config.audit_sink {
+            Some(sink) => Arc::clone(sink),
+            // 呼び出し規約違反（sink 未設定で呼ばれた）。従来経路へフォールバック。
+            None => {
+                return AuditedOutcome::Outcome(Box::new(
+                    self.run_guarded(linked, context, request),
+                ));
+            }
+        };
+
+        // 1. precondition 検証と Program 再構築（Started 前。監査対象外の precondition 違反）。
+        // 再構築（保持 source の再 parse）は host boundary の panic 隔離対象（第11節 規則1）。
+        // no-sink 経路（run_guarded）が prepare_program を catch 内で回すのと対称に、監査経路でも
+        // catch_host_unwind で包み、再 parse の panic が Engine::run を貫通せず InternalFailure へ
+        // 写る（＝呼び出し元が context を poison する）ようにする。
+        let prepared =
+            match catch_host_unwind(AssertUnwindSafe(|| self.prepare_program(linked, context))) {
+                Ok(result) => result,
+                Err(fault_id) => {
+                    // 再 parse 中の panic。Started 未発行なので監査 execution は無い（§8）。
+                    return AuditedOutcome::Outcome(Box::new(ExecutionOutcome::InternalFailure {
+                        fault_id,
+                        safe_message: internal_fault_message(fault_id),
+                        usage: context.evaluator.budget_usage(),
+                    }));
+                }
+            };
+        let (program, root_source_bytes) = match prepared {
+            Ok(prepared) => prepared,
+            Err(outcome) => return AuditedOutcome::Outcome(outcome),
+        };
+
+        // 2. execution_id の存在確認（§7.1）。engine は random source へ触れない。
+        let Some(execution_id) = request.execution_id else {
+            // Started を発行する前の fail-closed（script work は一切行っていない）。
+            return AuditedOutcome::Outcome(Box::new(internal_failure(
+                "監査 sink 設定時は ExecutionRequest::with_execution_id が必須です（§7.1）",
+            )));
+        };
+
+        let source_hash = *linked.root().source_hash().as_bytes();
+        let language_revision = linked.root().language_revision().as_str().to_string();
+        let import_graph_hash = *linked.import_graph().graph_hash.as_bytes();
+        let budget = request.budget;
+        // 実行を認可した frozen policy の相関 ID（§7.1）。request がまだ execute へ move される
+        // 前に、評価器へ install されるのと同じ CapabilitySet から決定的な 32 byte を取り出す。
+        // これにより deny-by-default と stdout/filesystem/exit 等を grant した実行を監査上区別できる。
+        let capability_policy_hash = *request.capabilities.id().as_bytes();
+        // timestamp は注入 clock の ns を unix ns として載せる（A-1 は request の monotonic clock
+        // の ns を流用する。順序の正本は sequence、§7.1）。全 envelope で同一値を使う。
+        let timestamp = HostTimestamp {
+            unix_nanoseconds: i128::from(request.clock.now().as_nanos()),
+        };
+        // envelope を組む小ヘルパ（borrow を避けるため値 clone で閉じる）。
+        let make_envelope = |sequence: u64, event: AuditEvent| AuditEnvelope {
+            schema_version: 1,
+            execution_id,
+            source_hash,
+            language_revision: language_revision.clone(),
+            sequence,
+            timestamp,
+            event,
+        };
+
+        let mut journal = AuditJournal::open(AuditBudget::default());
+
+        // 3. ExecutionStarted を sequence 0 へ append。
+        let started_event = AuditEvent::ExecutionStarted {
+            engine_version: env!("CARGO_PKG_VERSION").to_string(),
+            backend: self.config.backend,
+            rules_revision: DETERMINISM_RULES_REVISION,
+            heap_accounting_revision: crate::budget::HEAP_ACCOUNTING_REVISION,
+            budget,
+            // capability policy hash は実行を認可した frozen set の相関 ID（上で算出）。
+            // redaction policy は A-1 では未配線のため安定の既定値を載せる。
+            capability_policy_hash,
+            redaction_policy_id: "default".to_string(),
+            mode: ExecutionMode::Live,
+        };
+        let started_seq = match journal.append_normal(&make_envelope(0, started_event.clone())) {
+            Ok(seq) => seq,
+            // journal 自体が Started を受け付けない（予算等）→ fail-closed（Terminal も出せない）。
+            Err(failure) => {
+                return AuditedOutcome::AuditFailed {
+                    withheld: TerminalOutcome::InternalFailure,
+                    failure,
+                };
+            }
+        };
+
+        // sink へ submit し Ack を待つ（§10.1: Started が ack されるまで script work しない）。
+        // §10 の ack 規則どおり、ack は submit した exact execution と連続 sequence を指すこと。
+        // 別 execution の ack / gap / 未送信 sequence の ack は protocol 違反として fail-closed。
+        let started_batch: Arc<[AuditEnvelope]> =
+            Arc::from(vec![make_envelope(started_seq, started_event)]);
+        let started_ok = match sink.submit(started_batch, AuditWaker::noop()) {
+            AuditSubmit::Ack(ack) => {
+                ack.execution_id == execution_id && ack.through_sequence == started_seq
+            }
+            // Failed / Pending（A-1 では Pending は起きない）は未 ack 扱い。
+            _ => false,
+        };
+        if !started_ok {
+            // Started の ack 失敗（Failed / 不正 ack、または A-1 では起きない Pending）→ fail-closed。
+            // emergency slot へ Terminal(AuditFailure) を append し、script work は行わない（§10.1）。
+            let terminal_event = AuditEvent::Terminal {
+                outcome: TerminalOutcome::AuditFailure,
+                error: None,
+                usage: crate::budget::BudgetUsage::default(),
+                import_graph_hash: None,
+                context_committed: false,
+                host_effects_may_remain: false,
+            };
+            let failure = match journal.append_terminal(&make_envelope(
+                journal.next_sequence(),
+                terminal_event.clone(),
+            )) {
+                Ok(seq) => {
+                    let batch: Arc<[AuditEnvelope]> =
+                        Arc::from(vec![make_envelope(seq, terminal_event)]);
+                    let _ = sink.submit(batch, AuditWaker::noop());
+                    AuditFailure::Sink
+                }
+                Err(failure) => failure,
+            };
+            // script は 1 命令も走っていないので「保留された本来の terminal」は無い。参考情報
+            // として、監査自体が壊れたことを表す AuditFailure を載せる（Completed の捏造を避ける）。
+            return AuditedOutcome::AuditFailed {
+                withheld: TerminalOutcome::AuditFailure,
+                failure,
+            };
+        }
+
+        // 4. 実行本体（panic 捕捉付き）。Started 発行後なので pre-cancel も Started+Terminal を持つ。
+        let outcome = match catch_host_unwind(AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if context.panic_in_run_for_test {
+                panic!("injected run-boundary panic (test only)");
+            }
+            self.execute_program(context, &program, root_source_bytes, request)
+        })) {
+            Ok(outcome) => outcome,
+            Err(fault_id) => ExecutionOutcome::InternalFailure {
+                fault_id,
+                safe_message: internal_fault_message(fault_id),
+                usage: context.evaluator.budget_usage(),
+            },
+        };
+
+        // 5. Terminal を予約 slot へ append → submit（§8 規則9/10）。
+        // BudgetExceeded の resource は、評価器が畳む前に退避した原本を優先する（§7.2。
+        // control_stop_to_error は細粒度 resource を粗い ErrorKind へ縮約するため、原本が無いと
+        // String/Source/I-O 系が代表値へ化ける）。原本が無い場合のみ ErrorKind から復元する。
+        let exceeded_resource = if matches!(outcome, ExecutionOutcome::BudgetExceeded { .. }) {
+            context.evaluator.take_pending_budget_resource()
+        } else {
+            None
+        };
+        let terminal_outcome = crate::audit::terminal_outcome_from(&outcome, exceeded_resource);
+        let context_committed = matches!(
+            outcome,
+            ExecutionOutcome::Completed { .. } | ExecutionOutcome::Exited { .. }
+        );
+        let terminal_event = AuditEvent::Terminal {
+            outcome: terminal_outcome.clone(),
+            error: audit_error_payload_from(&outcome),
+            usage: outcome_usage(&outcome),
+            import_graph_hash: Some(import_graph_hash),
+            context_committed,
+            host_effects_may_remain: false,
+        };
+        match journal.append_terminal(&make_envelope(
+            journal.next_sequence(),
+            terminal_event.clone(),
+        )) {
+            Ok(terminal_seq) => {
+                let batch: Arc<[AuditEnvelope]> =
+                    Arc::from(vec![make_envelope(terminal_seq, terminal_event)]);
+                // Terminal の配送結果を評価する（§10.1）。配送が成立し（Ack）、かつ ack が
+                // この execution の Terminal sequence を正しく指しているときだけ監査成立とする。
+                // 配送失敗（Failed / 不正 ack / Pending）は fail-closed: journal 上の Terminal は
+                // 確定済み（§8 規則10）だが、監査が成立していないので success な outcome は返さず
+                // AuditFailed を返す（§10.1: 監査が壊れた実行を成功として報告しない）。
+                let delivered = matches!(
+                    sink.submit(batch, AuditWaker::noop()),
+                    AuditSubmit::Ack(ack)
+                        if ack.execution_id == execution_id
+                            && ack.through_sequence == terminal_seq
+                );
+                if delivered {
+                    AuditedOutcome::Outcome(Box::new(outcome))
+                } else {
+                    AuditedOutcome::AuditFailed {
+                        withheld: terminal_outcome,
+                        failure: AuditFailure::Sink,
+                    }
+                }
+            }
+            // sequence overflow 等で Terminal すら append できない → fail-closed。
+            Err(failure) => AuditedOutcome::AuditFailed {
+                withheld: terminal_outcome,
+                failure,
+            },
+        }
     }
 
     /// [`Self::run`] の本体（precondition guard の後）。ここから返る InternalFailure は
@@ -1276,35 +1649,11 @@ impl Engine {
         context: &mut ExecutionContext,
         request: ExecutionRequest,
     ) -> ExecutionOutcome {
-        // engine / context の整合を検証する（別 engine の context は実行しない）。
-        if context.engine_id() != self.id() {
-            return internal_failure("実行コンテキストの engine が一致しません");
-        }
-        let root = linked.root();
-        if root.engine_id() != self.id() {
-            return internal_failure("LinkedScript の engine が一致しません");
-        }
-
-        // 実行用 Program を保持 source から再構築する（案 A）。
-        let Some(source_text) = root.retained_source() else {
-            return internal_failure(
-                "実行には source の保持が必要です: retain_source=true で compile してください",
-            );
+        // 実行前の整合検証と Program 再構築（案 A）。失敗は precondition 由来の InternalFailure。
+        let (program, root_source_bytes) = match self.prepare_program(linked, context) {
+            Ok(prepared) => prepared,
+            Err(outcome) => return *outcome,
         };
-        let program = match Parser::new(Lexer::new(source_text).tokenize()).parse() {
-            Ok(program) => program,
-            // compile 済みの script を再 parse して失敗するのは内部不整合（決定的なはず）。
-            Err(errors) => {
-                let detail = errors
-                    .first()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "詳細不明".to_string());
-                return internal_failure(format!(
-                    "保持 source の再 parse に失敗しました: {detail}"
-                ));
-            }
-        };
-        let root_source_bytes = source_text.len() as u64;
 
         // test 専用: 評価器境界での panic を模擬し、E6 の catch_unwind 隔離を検証する。
         // この panic は run の catch_host_unwind 内で捕捉され InternalFailure へ写る。
@@ -1313,6 +1662,63 @@ impl Engine {
             panic!("injected run-boundary panic (test only)");
         }
 
+        self.execute_program(context, &program, root_source_bytes, request)
+    }
+
+    /// 実行前の engine/context 整合検証と、保持 source からの Program 再構築（案 A）。
+    ///
+    /// 成功で runnable な [`Program`] を返す。失敗は precondition 違反の
+    /// [`ExecutionOutcome::InternalFailure`]（呼び出し元が context を poison する）。この経路は
+    /// 監査上「開始していない execution」であり、Started を発行しない（§8）。
+    fn prepare_program(
+        &self,
+        linked: &LinkedScript,
+        context: &ExecutionContext,
+    ) -> Result<(Program, u64), Box<ExecutionOutcome>> {
+        // engine / context の整合を検証する（別 engine の context は実行しない）。
+        if context.engine_id() != self.id() {
+            return Err(Box::new(internal_failure(
+                "実行コンテキストの engine が一致しません",
+            )));
+        }
+        let root = linked.root();
+        if root.engine_id() != self.id() {
+            return Err(Box::new(internal_failure(
+                "LinkedScript の engine が一致しません",
+            )));
+        }
+
+        // 実行用 Program を保持 source から再構築する（案 A）。
+        let Some(source_text) = root.retained_source() else {
+            return Err(Box::new(internal_failure(
+                "実行には source の保持が必要です: retain_source=true で compile してください",
+            )));
+        };
+        let root_source_bytes = source_text.len() as u64;
+        match Parser::new(Lexer::new(source_text).tokenize()).parse() {
+            Ok(program) => Ok((program, root_source_bytes)),
+            // compile 済みの script を再 parse して失敗するのは内部不整合（決定的なはず）。
+            Err(errors) => {
+                let detail = errors
+                    .first()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "詳細不明".to_string());
+                Err(Box::new(internal_failure(format!(
+                    "保持 source の再 parse に失敗しました: {detail}"
+                ))))
+            }
+        }
+    }
+
+    /// 再構築済み Program を評価器へ据えて terminal まで実行する（budget install → pre-cancel
+    /// 判定 → transaction）。監査 wiring は呼び出し元が担い、本体は従来挙動を保つ。
+    fn execute_program(
+        &self,
+        context: &mut ExecutionContext,
+        program: &Program,
+        root_source_bytes: u64,
+        request: ExecutionRequest,
+    ) -> ExecutionOutcome {
         // request は有限 budget・deadline clock・cancellation token を必須所有する
         // （REV-015 最終形移行 Slice 2）。実行直前に 3 つとも評価器へ install する。
         // domain / accounting revision / deadline(>now) は ExecutionRequest::new が構築時に
@@ -1329,7 +1735,8 @@ impl Engine {
         // script 命令を1つも実行せずに Cancelled terminal を返す（"pre-cancel は命令0"）。
         // language-state は何も変更していないので rollback は自明に成立し、context は poison
         // されない（第10節 規則4・5）。判定は install 直後・baseline 課金前の順序を保つことで、
-        // install した token の cancel 状態を見る。
+        // install した token の cancel 状態を見る。監査 wiring では Started 発行後にこの判定へ
+        // 到達するので、pre-cancel も Started+Terminal(Cancelled) を持つ（§8）。
         if request.cancellation.is_cancelled() {
             // 命令0なので usage は空（reset_budget 直後・baseline 課金前。committed/reserved/live
             // とも 0）。finding 3。
@@ -1347,7 +1754,7 @@ impl Engine {
             .evaluator
             .set_host_registry(std::sync::Arc::clone(&self.host_registry));
 
-        let outcome = Self::run_transactional(context, &program, root_source_bytes);
+        let outcome = Self::run_transactional(context, program, root_source_bytes);
 
         // capability 集合も host function registry も reusable context に持ち越さない（仕様第15節
         // 規則5・6）。次 request の empty set か再注入まで、ambient 互換の既定へ戻す。
@@ -1457,6 +1864,137 @@ fn terminal_from_run_error(
         // それ以外の未捕捉 runtime error（rollback 済み）。
         _ => runtime_error_outcome(error, usage),
     }
+}
+
+/// determinism rules revision（§3 `DeterminismRulesRevision`）。A-1 では固定 1。
+///
+/// Phase 6 で rules を跨いだ差分を検出するための revision。本スライスは監査 envelope の
+/// `ExecutionStarted.rules_revision` に載せる固定値だけを持つ（配線は後続スライス）。
+const DETERMINISM_RULES_REVISION: u32 = 1;
+
+/// 監査付き実行（[`Engine::run_audited`]）の結果（Phase 6 A-1、§8/§10.1）。
+///
+/// 通常の terminal を運ぶ [`AuditedOutcome::Outcome`] と、fail-closed で監査が失敗したことを
+/// 運ぶ [`AuditedOutcome::AuditFailed`] の 2 系統を持つ。`ExecutionOutcome` enum は
+/// `AuditFailure` terminal を表現できず（かつ既存の `InternalFailure` へ畳まない方針）、監査
+/// 失敗は本型でのみ surface する（additive。既存 enum を壊さない。D1）。
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum AuditedOutcome {
+    /// 監査が成立した通常の terminal。`ExecutionOutcome` を運ぶ（enum サイズ平準化のため box）。
+    Outcome(Box<ExecutionOutcome>),
+    /// 監査が fail-closed で失敗した（§10.1）。実行結果は success ではない。`withheld` は、
+    /// 監査が成立していれば報告されたはずの terminal 種別。
+    ///
+    /// journal 上の Terminal は失敗した phase によって異なる:
+    ///
+    /// - **Started ack 失敗**（script work 開始前）: emergency slot へ `Terminal(AuditFailure)` が
+    ///   append 済み（sequence overflow など append すら不能な場合を除く）。`withheld` は
+    ///   `AuditFailure`。language-state は未変更。
+    /// - **最終 Terminal 配送失敗**（§14、A-1 延期）: journal 上の唯一の Terminal は確定済みの
+    ///   `Completed`/`Exited` であり、`AuditFailure` ではない。`withheld` はその保留された本来の
+    ///   terminal 種別。`Completed`/`Exited` の language-state は既に commit 済みで A-1 では
+    ///   rollback しない。context は poison されないが、caller は再利用してはならない。
+    AuditFailed {
+        /// 監査が成立していれば報告されたはずの terminal 種別（参考情報）。
+        withheld: crate::audit::TerminalOutcome,
+        /// 監査失敗の理由（§10.1/§11）。
+        failure: crate::audit::AuditFailure,
+    },
+}
+
+impl AuditedOutcome {
+    /// poison 判定用に、この結果が表す `ExecutionOutcome` を参照で返す。
+    ///
+    /// `AuditFailed` は script 実行の内部障害ではないため、poison はしない（Started 前の
+    /// precondition 違反だけが `Outcome(InternalFailure)` として poison 対象になる）。
+    fn outcome_for_poison(&self) -> ExecutionOutcome {
+        match self {
+            AuditedOutcome::Outcome(outcome) => (**outcome).clone(),
+            // 監査失敗自体は context を poison しない（空 usage の非成功 sentinel を返す）。
+            AuditedOutcome::AuditFailed { .. } => ExecutionOutcome::Cancelled {
+                usage: BudgetUsage::default(),
+            },
+        }
+    }
+
+    /// `Engine::run`（`ExecutionOutcome` を返す入口）向けの写像。
+    ///
+    /// 監査成功時は本来の outcome。監査失敗時は、`ExecutionOutcome` が `AuditFailure` を
+    /// 表現できないため、success ではない保守的な terminal として `Cancelled`（空 usage）を
+    /// 返す。監査失敗を正確に観測したい caller は [`Engine::run_audited`] を使う。
+    fn into_execution_outcome(self) -> ExecutionOutcome {
+        match self {
+            AuditedOutcome::Outcome(outcome) => *outcome,
+            AuditedOutcome::AuditFailed { .. } => ExecutionOutcome::Cancelled {
+                usage: BudgetUsage::default(),
+            },
+        }
+    }
+
+    /// 通常 terminal を運ぶ [`AuditedOutcome::Outcome`] の参照。監査失敗時は `None`。
+    pub fn outcome(&self) -> Option<&ExecutionOutcome> {
+        match self {
+            AuditedOutcome::Outcome(outcome) => Some(outcome),
+            AuditedOutcome::AuditFailed { .. } => None,
+        }
+    }
+
+    /// 監査が成立したか（`Outcome` なら true）。
+    pub fn is_audited_ok(&self) -> bool {
+        matches!(self, AuditedOutcome::Outcome(_))
+    }
+}
+
+/// terminal outcome から公開 `usage` snapshot を取り出す（監査 Terminal 用）。
+fn outcome_usage(outcome: &ExecutionOutcome) -> BudgetUsage {
+    match outcome {
+        ExecutionOutcome::Completed { usage }
+        | ExecutionOutcome::Exited { usage, .. }
+        | ExecutionOutcome::RuntimeError { usage, .. }
+        | ExecutionOutcome::BudgetExceeded { usage, .. }
+        | ExecutionOutcome::DeadlineExceeded { usage }
+        | ExecutionOutcome::Cancelled { usage }
+        | ExecutionOutcome::InternalFailure { usage, .. } => *usage,
+    }
+}
+
+/// error terminal から secret-free な監査 error payload を作る（§7.2 `AuditErrorPayload::Full`）。
+///
+/// A-1 では redaction policy 本体を実装しないため、`ExecutionError` の既存 secret-free field
+/// （`code` の安定文字列・行番号・trace の関数名）だけを写す。source 本文・host response・
+/// 自由文の生 message は載せない（§9）。success 系 terminal は `None`。
+fn audit_error_payload_from(outcome: &ExecutionOutcome) -> Option<crate::audit::AuditErrorPayload> {
+    use crate::audit::{AuditError, AuditErrorPayload, AuditFrame};
+    let error = match outcome {
+        ExecutionOutcome::RuntimeError { error, .. }
+        | ExecutionOutcome::BudgetExceeded { error, .. } => error,
+        // Completed / Exited / Deadline / Cancelled / Internal は error payload を持たない
+        // （§7.2: error は error terminal のみ。InternalFailure の safe_message は載せない）。
+        _ => return None,
+    };
+    let trace = error
+        .trace
+        .iter()
+        .take(32)
+        .map(|frame| AuditFrame {
+            function: frame.function.clone(),
+            module_id: String::new(),
+            line: frame.line.unwrap_or(0),
+        })
+        .collect::<Vec<_>>();
+    let omitted_trace_frames = u32::try_from(error.trace.len().saturating_sub(32)).unwrap_or(0);
+    Some(AuditErrorPayload::Full(AuditError {
+        // 安定 error code（ErrorKind の機械可読名）。生 message は載せない（§9）。
+        code: error.code.as_str().to_string(),
+        // message_id は A-1 では error code を流用する（安定 ID 体系は後続スライス）。
+        message_id: error.code.as_str().to_string(),
+        module_id: None,
+        line: error.line,
+        column: None,
+        trace,
+        omitted_trace_frames,
+    }))
 }
 
 /// secret を含まない [`ExecutionOutcome::InternalFailure`] を作る。
@@ -1753,6 +2291,7 @@ mod tests {
         let config = EngineConfig {
             backend: Backend::VmExperimental,
             language_revision: LanguageRevision::CURRENT,
+            audit_sink: None,
         };
         let err = Engine::builder()
             .config(config.clone())
@@ -1766,6 +2305,38 @@ mod tests {
             .build()
             .expect("opt-in build");
         assert_eq!(engine.config().backend, Backend::VmExperimental);
+    }
+
+    /// Phase 6 A-1: 監査 sink + `VmExperimental` backend は build 時に拒否する。
+    /// A-1 の run 経路は tree-only なので、VM label を監査へ載せると tree 実行を VM として
+    /// 誤報告してしまう。VM の監査 wiring が入るまで、この組み合わせを使えないよう固定する。
+    #[test]
+    fn audit_sink_with_experimental_backend_is_rejected() {
+        let sink = Arc::new(crate::audit::InMemoryAuditSink::new());
+        let config = EngineConfig {
+            backend: Backend::VmExperimental,
+            language_revision: LanguageRevision::CURRENT,
+            audit_sink: None,
+        };
+        let err = Engine::builder()
+            .config(config)
+            // experimental backend 自体は許可済みにして、残る拒否理由を sink 併用だけに絞る。
+            .allow_experimental_backend(true)
+            .audit_sink(sink as Arc<dyn crate::audit::AuditSink>)
+            .build()
+            .expect_err("audit_sink + VmExperimental は拒否される");
+        assert_eq!(err, ConfigError::AuditSinkWithExperimentalBackend);
+    }
+
+    /// 対照: 監査 sink は既定の tree-walk backend では問題なく build できる。
+    #[test]
+    fn audit_sink_with_tree_walk_backend_builds() {
+        let sink = Arc::new(crate::audit::InMemoryAuditSink::new());
+        let engine = Engine::builder()
+            .audit_sink(sink as Arc<dyn crate::audit::AuditSink>)
+            .build()
+            .expect("audit_sink + TreeWalk は build できる");
+        assert_eq!(engine.config().backend, Backend::TreeWalk);
     }
 
     #[test]
@@ -2507,6 +3078,226 @@ mod tests {
             engine.run(&ok, &mut ctx, standard_request()),
             ExecutionOutcome::InternalFailure { .. }
         ));
+    }
+
+    // --- Phase 6 A-1: audited terminal coverage（各 terminal 種別が Terminal を 1 件出す） ---
+
+    /// 監査 execution_id 付きの standard request を作る helper。
+    fn audited_request(id: u128) -> ExecutionRequest {
+        standard_request().with_execution_id(ExecutionId::new(id.try_into().expect("nonzero")))
+    }
+
+    /// sink の収集 envelope から最後の Terminal event の outcome を取り出す helper。
+    fn terminal_outcome_of(
+        sink: &crate::audit::InMemoryAuditSink,
+    ) -> crate::audit::TerminalOutcome {
+        let envelopes = sink.snapshot();
+        assert_eq!(
+            envelopes.len(),
+            2,
+            "Started + Terminal の 2 件のはず: {envelopes:?}"
+        );
+        assert_eq!(envelopes[0].sequence, 0);
+        assert!(matches!(
+            envelopes[0].event,
+            crate::audit::AuditEvent::ExecutionStarted { .. }
+        ));
+        assert_eq!(envelopes[1].sequence, 1);
+        match &envelopes[1].event {
+            crate::audit::AuditEvent::Terminal { outcome, .. } => outcome.clone(),
+            other => panic!("期待 Terminal, 実際 {other:?}"),
+        }
+    }
+
+    /// sink の収集 envelope から ExecutionStarted の capability_policy_hash を取り出す helper。
+    fn started_capability_policy_hash(sink: &crate::audit::InMemoryAuditSink) -> [u8; 32] {
+        let envelopes = sink.snapshot();
+        assert_eq!(envelopes[0].sequence, 0);
+        match &envelopes[0].event {
+            crate::audit::AuditEvent::ExecutionStarted {
+                capability_policy_hash,
+                ..
+            } => *capability_policy_hash,
+            other => panic!("期待 ExecutionStarted, 実際 {other:?}"),
+        }
+    }
+
+    /// ExecutionStarted.capability_policy_hash は実行を認可した frozen policy の相関 ID であり、
+    /// 権限内容が異なれば異なる値を emit する（deny-by-default と grant 済みを監査上区別できる）。
+    #[test]
+    fn audited_started_records_capability_policy_hash() {
+        // (1) deny-by-default（空 set）。
+        let empty_sink = Arc::new(crate::audit::InMemoryAuditSink::new());
+        let engine = Engine::builder()
+            .audit_sink(empty_sink.clone() as Arc<dyn crate::audit::AuditSink>)
+            .build()
+            .unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "let x = 1\n");
+        let _ = engine.run_audited(&linked, &mut ctx, audited_request(201));
+        let empty_hash = started_capability_policy_hash(&empty_sink);
+
+        // (2) exit を grant した set。
+        let exit_sink = Arc::new(crate::audit::InMemoryAuditSink::new());
+        let engine2 = Engine::builder()
+            .audit_sink(exit_sink.clone() as Arc<dyn crate::audit::AuditSink>)
+            .build()
+            .unwrap();
+        let mut ctx2 = ExecutionContext::new(&engine2);
+        let linked2 = compile_link(&engine2, "m", "exit(0)\n");
+        let _ = engine2.run_audited(
+            &linked2,
+            &mut ctx2,
+            audited_request(202).with_capabilities(exit_granted()),
+        );
+        let exit_hash = started_capability_policy_hash(&exit_sink);
+
+        // hash は決定的に CapabilitySet::id() から導かれ、空値ではなく、内容差で異なる。
+        assert_eq!(
+            empty_hash,
+            *crate::capability::CapabilitySet::empty().id().as_bytes(),
+            "deny-by-default の hash は空 set の CapabilitySetId に一致する"
+        );
+        assert_eq!(
+            exit_hash,
+            *exit_granted().id().as_bytes(),
+            "grant 済みの hash は対応する CapabilitySetId に一致する"
+        );
+        assert_ne!(
+            empty_hash, exit_hash,
+            "権限内容が異なれば capability_policy_hash も異なる"
+        );
+        assert_ne!(exit_hash, [0u8; 32], "grant 済みの hash は全 0 ではない");
+    }
+
+    /// granted な exit(code) は audited 経路で Terminal(Exited) を 1 件出す。
+    #[test]
+    fn audited_exit_emits_exited_terminal() {
+        let sink = Arc::new(crate::audit::InMemoryAuditSink::new());
+        let engine = Engine::builder()
+            .audit_sink(sink.clone() as Arc<dyn crate::audit::AuditSink>)
+            .build()
+            .unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "exit(7)\n");
+        let audited = engine.run_audited(
+            &linked,
+            &mut ctx,
+            audited_request(101).with_capabilities(exit_granted()),
+        );
+        assert!(matches!(
+            audited.outcome(),
+            Some(ExecutionOutcome::Exited { code: 7, .. })
+        ));
+        assert_eq!(
+            terminal_outcome_of(&sink),
+            crate::audit::TerminalOutcome::Exited(7)
+        );
+    }
+
+    /// fuel を使い切る実行は audited 経路で Terminal(BudgetExceeded(Fuel)) を 1 件出す。
+    #[test]
+    fn audited_budget_exceeded_emits_budget_terminal_with_resource() {
+        let clock: Arc<dyn crate::budget::MonotonicClock> =
+            Arc::new(crate::budget::FakeClock::new());
+        let mut budget = crate::budget::BudgetConfig::standard(clock.as_ref()).unwrap();
+        budget.total_fuel = 5; // ループ反復で step 上限に達する極小 fuel。
+        let request = ExecutionRequest::new(budget, clock)
+            .expect("同 domain")
+            .with_execution_id(ExecutionId::new(102u128.try_into().unwrap()));
+
+        let sink = Arc::new(crate::audit::InMemoryAuditSink::new());
+        let engine = Engine::builder()
+            .audit_sink(sink.clone() as Arc<dyn crate::audit::AuditSink>)
+            .build()
+            .unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(
+            &engine,
+            "m",
+            "let i = 0\nwhile i < 1000\n  i = i + 1\nend\n",
+        );
+        let audited = engine.run_audited(&linked, &mut ctx, request);
+        assert!(matches!(
+            audited.outcome(),
+            Some(ExecutionOutcome::BudgetExceeded { .. })
+        ));
+        // 原本 resource（Fuel）が §7.2 どおり載る。
+        assert_eq!(
+            terminal_outcome_of(&sink),
+            crate::audit::TerminalOutcome::BudgetExceeded(crate::budget::BudgetResource::Fuel)
+        );
+    }
+
+    /// deadline 到達は audited 経路で Terminal(DeadlineExceeded) を 1 件出す。
+    #[test]
+    fn audited_deadline_emits_deadline_terminal() {
+        let clock = Arc::new(crate::budget::FakeClock::new());
+        let budget = crate::budget::BudgetConfig::standard(clock.as_ref()).unwrap();
+        let request = ExecutionRequest::new(
+            budget,
+            clock.clone() as Arc<dyn crate::budget::MonotonicClock>,
+        )
+        .expect("同 domain")
+        .with_execution_id(ExecutionId::new(103u128.try_into().unwrap()));
+        clock.set(budget.deadline.as_nanos());
+
+        let sink = Arc::new(crate::audit::InMemoryAuditSink::new());
+        let engine = Engine::builder()
+            .audit_sink(sink.clone() as Arc<dyn crate::audit::AuditSink>)
+            .build()
+            .unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "let x = 1\nlet y = 2\n");
+        let audited = engine.run_audited(&linked, &mut ctx, request);
+        assert!(matches!(
+            audited.outcome(),
+            Some(ExecutionOutcome::DeadlineExceeded { .. })
+        ));
+        assert_eq!(
+            terminal_outcome_of(&sink),
+            crate::audit::TerminalOutcome::DeadlineExceeded
+        );
+    }
+
+    /// run 中の panic は audited 経路でも Terminal(InternalFailure) を 1 件出し、context を poison。
+    #[test]
+    fn audited_panic_emits_internal_failure_terminal() {
+        let sink = Arc::new(crate::audit::InMemoryAuditSink::new());
+        let engine = Engine::builder()
+            .audit_sink(sink.clone() as Arc<dyn crate::audit::AuditSink>)
+            .build()
+            .unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        ctx.inject_run_panic_for_test();
+        let linked = compile_link(&engine, "m", "let x = 1\n");
+        let audited =
+            with_silent_panic_hook(|| engine.run_audited(&linked, &mut ctx, audited_request(104)));
+        match audited.outcome() {
+            Some(ExecutionOutcome::InternalFailure { fault_id, .. }) => assert_ne!(*fault_id, 0),
+            other => panic!("期待 InternalFailure, 実際 {other:?}"),
+        }
+        assert_eq!(
+            terminal_outcome_of(&sink),
+            crate::audit::TerminalOutcome::InternalFailure
+        );
+        // audited 経路でも panic は context を poison する。
+        assert!(ctx.is_poisoned());
+    }
+
+    /// no-sink の lifecycle regression: run は実行中 running を立て、戻ると下ろす。再入は弾く。
+    #[test]
+    fn no_sink_run_sets_and_clears_running_flag() {
+        let engine = Engine::builder().build().unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        assert!(!ctx.running, "実行前は running=false");
+        let linked = compile_link(&engine, "m", "let x = 1\n");
+        let outcome = engine.run(&linked, &mut ctx, standard_request());
+        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }));
+        // 戻ると running は確実に下りている（次の実行が再入検査で誤検出しない）。
+        assert!(!ctx.running, "実行後は running=false へ戻る");
+        let again = engine.run(&linked, &mut ctx, standard_request());
+        assert!(matches!(again, ExecutionOutcome::Completed { .. }));
     }
 
     /// LinkError::InternalFailure は Send + Sync な診断値として保持できる。

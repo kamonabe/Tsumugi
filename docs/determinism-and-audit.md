@@ -772,6 +772,61 @@ Phase 5のproduction gateで解消する。StableErrorのcode、script type、me
 - nonblocking sink、ack/retry、reentrancy guard、fail-closed、emergency Terminal slotを実装
 - execution-controlのyield/resume/terminalへeventを接続
 
+#### A-1 実装スライス（tree engine、opt-in）
+
+Slice 5 の最小縦切り（A-1）を tree engine にのみ実装した時点の、仕様に対する逸脱と
+未実装範囲を記録する。これは一時的な実装状態であり、仕様（本章 §1〜§13）が正本である。
+
+- **opt-in（§1.1 からの逸脱）**: A-1 では監査 sink を `EngineBuilder::audit_sink` で設定した
+  ときだけ監査が有効になる。sink 未設定時は監査 event を一切 emission せず、既存挙動と
+  bit-identical。§1.1 が規定する sink 必須ポリシー（`ConfigError::AuditSinkRequired`）は、
+  CLI 側の sink 構築が整う後続スライスへ延期する。
+- **emission する event**: `ExecutionStarted`（sequence 0、最初の semantic work の前に ack 待ち）
+  と `Terminal`（各 terminal commit 点で 1 件、最後の event）だけ。`CapabilityDecision` /
+  `HostCallStarted` / `HostCallFinished` / `BudgetCharged` / `Yielded` / `Resumed` は schema 型
+  としては定義済みだが emission 配線を持たない。
+- **`capability_policy_hash` を実配線（§7.1）**: `ExecutionStarted.capability_policy_hash` には、
+  実行を認可した frozen `CapabilitySet` の決定的な相関 ID（`CapabilitySet::id()` の 32 byte）を
+  載せる。これにより deny-by-default（空 set）と stdout/filesystem/exit 等を grant した実行を監査上
+  区別できる。`redaction_policy_id` は redaction 本体が未実装のため A-1 では安定の既定値のまま。
+- **tree-only backend 境界（§2.1/§7.1）**: A-1 の run 経路には backend dispatch が無く、常に tree
+  evaluator で実行する。`ExecutionStarted.backend` が実行実体と食い違わないよう、監査 sink と
+  `Backend::VmExperimental` を同時に設定した engine の build は `ConfigError::AuditSinkWithExperimentalBackend`
+  で拒否する。VM の監査 wiring は Slice 6（VM conformance）へ延期する。
+- **fail-closed（§10.1）**: Started が ack されるまで script/import work を開始しない。ack は
+  §10 の規則どおり、submit した exact な `execution_id` と連続 `sequence`（Started なら 0）を指す
+  ものだけを受理し、別 execution の ack / gap / 未送信 sequence の ack は protocol 違反として
+  fail-closed にする。Started の ack 失敗（`Failed` / 不正 ack / A-1 では起きない `Pending`）では
+  emergency slot へ `Terminal(AuditFailure)` を append し、script work を一切行わない。実行後の
+  `Terminal` の配送失敗（`Failed` / 不正 ack）も fail-closed にし、journal 上の Terminal は確定
+  済み（§8 規則10）でも監査は成立していないため success な outcome を返さない。いずれの場合も
+  監査付き入口 `Engine::run_audited` は success ではない `AuditedOutcome::AuditFailed` を返す。
+  既存の `ExecutionOutcome` enum は変更せず、`AuditFailure` を `InternalFailure` へ畳まない
+  （監査失敗は追加型 `AuditedOutcome` でのみ surface する）。
+- **Terminal 配送失敗後の language-state は rollback しない（§10.1 からの逸脱、A-1）**:
+  tree engine では Completed/Exited の language-state commit が評価器内（`run_slice` →
+  `finalize_session(true)` → `commit_submission`）で、Terminal を sink へ配送する前に確定する。
+  このため実行後の `Terminal` 配送が失敗して `AuditedOutcome::AuditFailed` を返したときでも、
+  **完了済み script の context 変更（binding 等）は commit されたまま残り、roll back されない**。
+  journal 上の唯一の Terminal も `AuditFailure`/`context_committed: false` へは書き換えず、確定済みの
+  `Completed`/`context_committed: true` のまま（§8 規則10: started execution は配送結果に関わらず
+  確定した Terminal を 1 件だけ持ち、§10 のモデルはその実 Terminal の再配送であって `AuditFailure`
+  への書き換えではない）。fail-closed の要件（success を返さない）は満たすが、host は
+  `AuditFailed` を受け取った context を**再利用してはならない**（完了 script の変更が観測され得る）。
+  監査確定を跨いで言語トランザクションを rollback 可能に保つ §10.1 本来の挙動は、retry/backpressure
+  基盤が入る後続スライスへ延期する。
+- **timestamp は monotonic tick（§7.1 の簡略）**: A-1 では envelope の `timestamp.unix_nanoseconds`
+  に、注入された wall/unix `AuditClock` ではなく request の monotonic clock（`request.clock.now()`）の
+  ns を流用する。順序の正本は `sequence` であり `timestamp` は非正本（§7.1）なので影響は限定的だが、
+  値は unix 時刻ではなく monotonic tick である。専用 `AuditClock` の注入は後続スライスへ延期する。
+- **BudgetExceeded resource は原本を保持（§7.2）**: `control_stop_to_error` が細粒度の
+  `BudgetResource` を粗い `ErrorKind` へ縮約するため、監査付き経路では評価器が縮約前に退避した
+  原本 resource を `Terminal(BudgetExceeded(resource))` に載せる（原本が無い場合のみ `ErrorKind`
+  から粗く復元する）。これにより String/Source/I-O 系の細分 resource も §7.2 どおり記録される。
+- **未実装（A-1 では意図的に含めない）**: `AuditBackpressure` の yield 配線（§10.2）と
+  `engine.rs::YieldReason` 変種、redaction policy 本体（§9）、strict deterministic CBOR（§9.2、
+  A-1 の `encoded_bytes` は naive 推定で後で差し替え可能に隔離）、record/replay（§6）、VM の変更。
+
 ### Slice 6: VM conformance
 
 - Charge opcode、StableError、FunctionId、host boundary、transaction、audit semantic eventをtreeと一致させる
