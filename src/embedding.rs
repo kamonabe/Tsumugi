@@ -1422,7 +1422,23 @@ impl Engine {
         };
 
         // 1. precondition 検証と Program 再構築（Started 前。監査対象外の precondition 違反）。
-        let (program, root_source_bytes) = match self.prepare_program(linked, context) {
+        // 再構築（保持 source の再 parse）は host boundary の panic 隔離対象（第11節 規則1）。
+        // no-sink 経路（run_guarded）が prepare_program を catch 内で回すのと対称に、監査経路でも
+        // catch_host_unwind で包み、再 parse の panic が Engine::run を貫通せず InternalFailure へ
+        // 写る（＝呼び出し元が context を poison する）ようにする。
+        let prepared =
+            match catch_host_unwind(AssertUnwindSafe(|| self.prepare_program(linked, context))) {
+                Ok(result) => result,
+                Err(fault_id) => {
+                    // 再 parse 中の panic。Started 未発行なので監査 execution は無い（§8）。
+                    return AuditedOutcome::Outcome(Box::new(ExecutionOutcome::InternalFailure {
+                        fault_id,
+                        safe_message: internal_fault_message(fault_id),
+                        usage: context.evaluator.budget_usage(),
+                    }));
+                }
+            };
+        let (program, root_source_bytes) = match prepared {
             Ok(prepared) => prepared,
             Err(outcome) => return AuditedOutcome::Outcome(outcome),
         };

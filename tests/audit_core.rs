@@ -283,6 +283,52 @@ fn terminal_submit_failure_is_fail_closed_and_not_success() {
 }
 
 #[test]
+fn terminal_submit_failure_leaves_committed_state_documented_a1_behavior() {
+    // §14 A-1 逸脱の明文化を pin する: tree engine は Completed の language-state を
+    // 評価器内（Terminal 配送より前）で commit するため、Terminal 配送が失敗して AuditFailed を
+    // 返しても、完了済み script の context 変更は rollback されず残る。host は AuditFailed を
+    // 受け取った context を再利用してはならない、という逸脱を回帰で固定する。
+    let sink = Arc::new(ScriptedAuditSink::new([
+        ScriptedResponse::AckCorrect, // 1 回目実行の Started
+        ScriptedResponse::Fail,       // 1 回目実行の Terminal（配送失敗）
+                                      // 以降（2 回目実行の Started/Terminal）は tail = AckCorrect
+    ]));
+    let engine = EmbeddingEngine::builder()
+        .audit_sink(sink.clone() as Arc<dyn AuditSink>)
+        .build()
+        .expect("build");
+
+    // 1 回目: `x` を束縛して完了する script。Terminal 配送に失敗する。
+    let define = link_source(&engine, "m", "let x = 1\n");
+    let define_linked = engine.link(&define, LinkRequest::new()).expect("link");
+    let mut ctx = EmbeddingContext::new(&engine);
+    let audited = engine.run_audited(&define_linked, &mut ctx, request_with_id(30));
+
+    // fail-closed: success ではない。journal 上の Terminal は Completed/committed のまま
+    // （AuditFailure へ書き換えない。§8 規則10）＝ withheld は Completed。
+    assert!(!audited.is_audited_ok());
+    match &audited {
+        AuditedOutcome::AuditFailed { withheld, .. } => {
+            assert_eq!(*withheld, TerminalOutcome::Completed);
+        }
+        other => panic!("Terminal fail-closed のはずが: {other:?}"),
+    }
+
+    // 2 回目: 同じ context で `x` を参照する script を走らせる。state が rollback されていれば
+    // `x` は未定義で RuntimeError になるはず。だが A-1 では commit 済みのまま残るので、`x` は
+    // 参照でき、完了する（＝ state は rollback されていない、という逸脱を明文化どおり pin）。
+    let use_binding = link_source(&engine, "m2", "let y = x + 2\n");
+    let use_linked = engine.link(&use_binding, LinkRequest::new()).expect("link");
+    let audited2 = engine.run_audited(&use_linked, &mut ctx, request_with_id(31));
+    match audited2.outcome() {
+        Some(EmbeddingOutcome::Completed { .. }) => {}
+        other => panic!(
+            "A-1 では 1 回目完了 script の binding `x` は rollback されず残るはず（state 継続）: {other:?}"
+        ),
+    }
+}
+
+#[test]
 fn started_wrong_id_ack_is_fail_closed_before_script_work() {
     // Started の ack が別 execution の id を指す（§10 protocol 違反）→ script work せず fail-closed。
     let sink = Arc::new(ScriptedAuditSink::new([ScriptedResponse::AckWrongId]));

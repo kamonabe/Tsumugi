@@ -611,6 +611,13 @@ pub enum AuditFailure {
     EventTooLarge,
     /// sink が永続 error / protocol error を返した（§10）。
     Sink,
+    /// 呼び出し元が渡した envelope が journal 不変条件に違反した（§8）。
+    ///
+    /// append 時に期待する `sequence`（journal が次に払い出す値）と envelope の `sequence` が
+    /// 食い違う、または append 口（normal/terminal）と event 種別が一致しない場合に返る。
+    /// journal は §8 の no-gap / no-duplicate / exactly-one-Terminal を自ら強制するため、
+    /// debug/release を問わず（debug_assert ではなく）この失敗で fail-closed にする。
+    InvariantViolation,
 }
 
 /// per-execution の bounded logical journal（§8/§10.1/§11）。
@@ -689,6 +696,16 @@ impl AuditJournal {
             return Err(AuditFailure::BudgetExceeded);
         }
 
+        // 呼び出し元の envelope を信用せず、journal 自身が sequence/種別を検証する（§8）。
+        // Terminal を通常 event として受けない（append_terminal 専用）。
+        if matches!(envelope.event, AuditEvent::Terminal { .. }) {
+            return Err(AuditFailure::InvariantViolation);
+        }
+        // envelope.sequence は journal が次に払い出す値と一致しなければならない（no-gap/no-dup）。
+        if envelope.sequence != self.next_sequence {
+            return Err(AuditFailure::InvariantViolation);
+        }
+
         let is_started_event = matches!(envelope.event, AuditEvent::ExecutionStarted { .. });
         if is_started_event {
             // Started は sequence 0 に 1 件だけ（§8 規則1）。
@@ -752,7 +769,11 @@ impl AuditJournal {
     /// Started 前・Terminal 後の呼び出しは不変条件違反で `AuditFailure` を返す。sequence の
     /// checked increment の overflow だけは fail-closed にする。
     pub fn append_terminal(&mut self, envelope: &AuditEnvelope) -> Result<u64, AuditFailure> {
-        debug_assert!(matches!(envelope.event, AuditEvent::Terminal { .. }));
+        // 呼び出し元の envelope を信用せず、journal 自身が種別/ sequence を検証する（§8）。
+        // event 種別の検査は debug_assert ではなく全ビルドで有効な fail-closed にする。
+        if !matches!(envelope.event, AuditEvent::Terminal { .. }) {
+            return Err(AuditFailure::InvariantViolation);
+        }
         if !self.started {
             // Started の無い execution に Terminal は無い（§8）。
             return Err(AuditFailure::BudgetExceeded);
@@ -760,6 +781,10 @@ impl AuditJournal {
         if self.terminated {
             // Terminal は 1 件のみ（§8 規則9/10）。
             return Err(AuditFailure::BudgetExceeded);
+        }
+        // envelope.sequence は journal が次に払い出す値と一致しなければならない（no-gap/no-dup）。
+        if envelope.sequence != self.next_sequence {
+            return Err(AuditFailure::InvariantViolation);
         }
         // Terminal は専用予約を使うので通常 byte/event 残量は検査しない（§11）。
         // sequence の overflow だけは fail-closed（§7.1）。
@@ -1398,13 +1423,70 @@ mod tests {
         let id = exec_id(1);
         let mut journal = AuditJournal::open(AuditBudget::default());
         journal.append_normal(&started_envelope(id, 0)).unwrap();
-        // sequence を u64::MAX 手前へ進め、Terminal の checked increment overflow を観測する。
+        // sequence を u64::MAX へ進め、Terminal の checked increment overflow を観測する。
+        // envelope.sequence も next_sequence に揃えて渡し、sequence 検証を通して overflow 経路へ入る。
         journal.next_sequence = u64::MAX;
         assert_eq!(
-            journal.append_terminal(&terminal_envelope(id, 0, TerminalOutcome::Completed)),
+            journal.append_terminal(&terminal_envelope(id, u64::MAX, TerminalOutcome::Completed)),
             Err(AuditFailure::SequenceExhausted)
         );
         // wrap していない（fail-closed）。
+        assert!(!journal.is_terminated());
+    }
+
+    #[test]
+    fn journal_rejects_wrong_sequence_on_normal_append() {
+        // envelope.sequence が journal の次 sequence と食い違うと fail-closed（§8 no-gap/no-dup）。
+        let id = exec_id(1);
+        let mut journal = AuditJournal::open(AuditBudget::default());
+        // 初回 Started に sequence 99 を渡す（期待は 0）。
+        assert_eq!(
+            journal.append_normal(&started_envelope(id, 99)),
+            Err(AuditFailure::InvariantViolation)
+        );
+        // journal 状態は進んでいない（Started 未登録）。
+        assert!(!journal.is_started());
+        assert_eq!(journal.next_sequence(), 0);
+    }
+
+    #[test]
+    fn journal_rejects_terminal_event_via_append_normal() {
+        // Terminal event を通常 append 口へ渡しても受け付けない（append_terminal 専用）。
+        let id = exec_id(1);
+        let mut journal = AuditJournal::open(AuditBudget::default());
+        journal.append_normal(&started_envelope(id, 0)).unwrap();
+        assert_eq!(
+            journal.append_normal(&terminal_envelope(id, 1, TerminalOutcome::Completed)),
+            Err(AuditFailure::InvariantViolation)
+        );
+        // Terminal 化していない（通常 append では terminate しない）。
+        assert!(!journal.is_terminated());
+    }
+
+    #[test]
+    fn journal_rejects_non_terminal_event_via_append_terminal() {
+        // 非 Terminal event を terminal append 口へ渡すと全ビルドで fail-closed（debug_assert ではない）。
+        let id = exec_id(1);
+        let mut journal = AuditJournal::open(AuditBudget::default());
+        journal.append_normal(&started_envelope(id, 0)).unwrap();
+        assert_eq!(
+            journal.append_terminal(&started_envelope(id, 1)),
+            Err(AuditFailure::InvariantViolation)
+        );
+        assert!(!journal.is_terminated());
+    }
+
+    #[test]
+    fn journal_rejects_wrong_sequence_on_terminal_append() {
+        // Terminal の envelope.sequence が次 sequence と食い違うと fail-closed。
+        let id = exec_id(1);
+        let mut journal = AuditJournal::open(AuditBudget::default());
+        journal.append_normal(&started_envelope(id, 0)).unwrap();
+        // 期待は 1 だが 5 を渡す。
+        assert_eq!(
+            journal.append_terminal(&terminal_envelope(id, 5, TerminalOutcome::Completed)),
+            Err(AuditFailure::InvariantViolation)
+        );
         assert!(!journal.is_terminated());
     }
 

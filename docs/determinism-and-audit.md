@@ -795,6 +795,18 @@ Slice 5 の最小縦切り（A-1）を tree engine にのみ実装した時点�
   監査付き入口 `Engine::run_audited` は success ではない `AuditedOutcome::AuditFailed` を返す。
   既存の `ExecutionOutcome` enum は変更せず、`AuditFailure` を `InternalFailure` へ畳まない
   （監査失敗は追加型 `AuditedOutcome` でのみ surface する）。
+- **Terminal 配送失敗後の language-state は rollback しない（§10.1 からの逸脱、A-1）**:
+  tree engine では Completed/Exited の language-state commit が評価器内（`run_slice` →
+  `finalize_session(true)` → `commit_submission`）で、Terminal を sink へ配送する前に確定する。
+  このため実行後の `Terminal` 配送が失敗して `AuditedOutcome::AuditFailed` を返したときでも、
+  **完了済み script の context 変更（binding 等）は commit されたまま残り、roll back されない**。
+  journal 上の唯一の Terminal も `AuditFailure`/`context_committed: false` へは書き換えず、確定済みの
+  `Completed`/`context_committed: true` のまま（§8 規則10: started execution は配送結果に関わらず
+  確定した Terminal を 1 件だけ持ち、§10 のモデルはその実 Terminal の再配送であって `AuditFailure`
+  への書き換えではない）。fail-closed の要件（success を返さない）は満たすが、host は
+  `AuditFailed` を受け取った context を**再利用してはならない**（完了 script の変更が観測され得る）。
+  監査確定を跨いで言語トランザクションを rollback 可能に保つ §10.1 本来の挙動は、retry/backpressure
+  基盤が入る後続スライスへ延期する。
 - **timestamp は monotonic tick（§7.1 の簡略）**: A-1 では envelope の `timestamp.unix_nanoseconds`
   に、注入された wall/unix `AuditClock` ではなく request の monotonic clock（`request.clock.now()`）の
   ns を流用する。順序の正本は `sequence` であり `timestamp` は非正本（§7.1）なので影響は限定的だが、
