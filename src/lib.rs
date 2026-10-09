@@ -10,6 +10,7 @@
 #![allow(clippy::len_without_is_empty)]
 
 pub mod ast;
+pub mod audit;
 pub mod budget;
 pub mod builtin_core;
 pub mod builtin_registry;
@@ -109,8 +110,8 @@ pub use capability::AdapterError;
 // - `embedding::ExecutionOutcome` → [`EmbeddingOutcome`]
 // - `embedding::TraceFrame`     → [`EmbeddingTraceFrame`]
 pub use embedding::{
-    Backend, ConfigError, EngineBuilder, EngineConfig, EngineId, ExecutionError, ExecutionId,
-    HostError, HostErrorCode, LanguageRevision, SourceHash, SourceId,
+    AuditedOutcome, Backend, ConfigError, EngineBuilder, EngineConfig, EngineId, ExecutionError,
+    ExecutionId, HostError, HostErrorCode, LanguageRevision, SourceHash, SourceId,
 };
 pub use embedding::{
     Engine as EmbeddingEngine, ExecutionOutcome as EmbeddingOutcome,
@@ -159,3 +160,15 @@ pub use host_function::{
 // cooperative host function / adapter テストが script 値を構築・判定するために `Value` を
 // crate root へ公開する（REV-015 Slice 5）。host 側は `Response → Value` 変換の責務を担う（OQ-9）。
 pub use value::Value;
+
+// Phase 6 実行時監査（audit）の公開型（A-1 スライス、`docs/determinism-and-audit.md`
+// §7/§8/§10/§11）。schema v1 の envelope/event、sink 契約、監査予算を crate root へ公開する。
+// alpha facade と名前衝突しないため、そのままの名前で re-export する。opt-in: sink を
+// `EngineBuilder::audit_sink` で設定しない限り emission は起きない（§1.1 の sink 必須は後続）。
+pub use audit::{
+    AuditAck, AuditBudget, AuditConfigError, AuditEnvelope, AuditError, AuditErrorPayload,
+    AuditEvent, AuditFailure, AuditFrame, AuditJournal, AuditSink, AuditSinkError, AuditSubmit,
+    AuditTicket, AuditWaker, BudgetChargeReason, CapabilityDecisionKind, EffectStatus,
+    ExecutionMode, HostCallOutcome, HostTimestamp, InMemoryAuditSink, SyncAuditSink,
+    TerminalOutcome,
+};

@@ -772,6 +772,28 @@ Phase 5のproduction gateで解消する。StableErrorのcode、script type、me
 - nonblocking sink、ack/retry、reentrancy guard、fail-closed、emergency Terminal slotを実装
 - execution-controlのyield/resume/terminalへeventを接続
 
+#### A-1 実装スライス（tree engine、opt-in）
+
+Slice 5 の最小縦切り（A-1）を tree engine にのみ実装した時点の、仕様に対する逸脱と
+未実装範囲を記録する。これは一時的な実装状態であり、仕様（本章 §1〜§13）が正本である。
+
+- **opt-in（§1.1 からの逸脱）**: A-1 では監査 sink を `EngineBuilder::audit_sink` で設定した
+  ときだけ監査が有効になる。sink 未設定時は監査 event を一切 emission せず、既存挙動と
+  bit-identical。§1.1 が規定する sink 必須ポリシー（`ConfigError::AuditSinkRequired`）は、
+  CLI 側の sink 構築が整う後続スライスへ延期する。
+- **emission する event**: `ExecutionStarted`（sequence 0、最初の semantic work の前に ack 待ち）
+  と `Terminal`（各 terminal commit 点で 1 件、最後の event）だけ。`CapabilityDecision` /
+  `HostCallStarted` / `HostCallFinished` / `BudgetCharged` / `Yielded` / `Resumed` は schema 型
+  としては定義済みだが emission 配線を持たない。
+- **fail-closed（§10.1）**: Started が ack されるまで script/import work を開始しない。sink が
+  `Failed`（および A-1 では起きない `Pending`）を返すと emergency slot へ `Terminal(AuditFailure)`
+  を append し、監査付き入口 `Engine::run_audited` は success ではない `AuditedOutcome::AuditFailed`
+  を返す。既存の `ExecutionOutcome` enum は変更せず、`AuditFailure` を `InternalFailure` へ畳まない
+  （監査失敗は追加型 `AuditedOutcome` でのみ surface する）。
+- **未実装（A-1 では意図的に含めない）**: `AuditBackpressure` の yield 配線（§10.2）と
+  `engine.rs::YieldReason` 変種、redaction policy 本体（§9）、strict deterministic CBOR（§9.2、
+  A-1 の `encoded_bytes` は naive 推定で後で差し替え可能に隔離）、record/replay（§6）、VM の変更。
+
 ### Slice 6: VM conformance
 
 - Charge opcode、StableError、FunctionId、host boundary、transaction、audit semantic eventをtreeと一致させる
