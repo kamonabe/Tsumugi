@@ -785,6 +785,14 @@ Slice 5 の最小縦切り（A-1）を tree engine にのみ実装した時点�
   と `Terminal`（各 terminal commit 点で 1 件、最後の event）だけ。`CapabilityDecision` /
   `HostCallStarted` / `HostCallFinished` / `BudgetCharged` / `Yielded` / `Resumed` は schema 型
   としては定義済みだが emission 配線を持たない。
+- **`capability_policy_hash` を実配線（§7.1）**: `ExecutionStarted.capability_policy_hash` には、
+  実行を認可した frozen `CapabilitySet` の決定的な相関 ID（`CapabilitySet::id()` の 32 byte）を
+  載せる。これにより deny-by-default（空 set）と stdout/filesystem/exit 等を grant した実行を監査上
+  区別できる。`redaction_policy_id` は redaction 本体が未実装のため A-1 では安定の既定値のまま。
+- **tree-only backend 境界（§2.1/§7.1）**: A-1 の run 経路には backend dispatch が無く、常に tree
+  evaluator で実行する。`ExecutionStarted.backend` が実行実体と食い違わないよう、監査 sink と
+  `Backend::VmExperimental` を同時に設定した engine の build は `ConfigError::AuditSinkWithExperimentalBackend`
+  で拒否する。VM の監査 wiring は Slice 6（VM conformance）へ延期する。
 - **fail-closed（§10.1）**: Started が ack されるまで script/import work を開始しない。ack は
   §10 の規則どおり、submit した exact な `execution_id` と連続 `sequence`（Started なら 0）を指す
   ものだけを受理し、別 execution の ack / gap / 未送信 sequence の ack は protocol 違反として

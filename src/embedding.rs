@@ -232,6 +232,13 @@ pub enum ConfigError {
     },
     /// 実験 backend が許可されていない。
     ExperimentalBackendNotEnabled,
+    /// 監査 sink と `VmExperimental` backend を同時に設定した（Phase 6 A-1）。
+    ///
+    /// A-1 の run 経路には backend dispatch が無く、常に tree evaluator で実行する。
+    /// この状態で `VmExperimental` label を監査へ載せると、tree 実行を VM 実行として
+    /// 誤報告してしまう（A-1 の tree-only 境界違反）。VM の監査 wiring が入るまで、
+    /// この組み合わせは build 時に拒否する。
+    AuditSinkWithExperimentalBackend,
     /// 同一 [`CapabilityKind`](crate::capability::CapabilityKind) を二重に設定した
     /// （後勝ちにしない。仕様第3節）。host function grant は別 ID なら複数許可する。
     DuplicateCapability {
@@ -331,6 +338,9 @@ impl EngineBuilder {
     /// 設定すると [`Engine::run`] が `ExecutionStarted`（最初の semantic work の前）と
     /// `Terminal`（各 terminal commit 点）を journal 経由で emission する。設定しなければ
     /// 監査は一切起きず、既存挙動と bit-identical（§1.1 の sink 必須は後続スライスへ延期）。
+    ///
+    /// A-1 の run 経路は tree-only のため、`VmExperimental` backend と同時に設定したまま
+    /// [`Self::build`] すると [`ConfigError::AuditSinkWithExperimentalBackend`] を返す。
     pub fn audit_sink(mut self, sink: Arc<dyn crate::audit::AuditSink>) -> Self {
         self.config.audit_sink = Some(sink);
         self
@@ -351,11 +361,18 @@ impl EngineBuilder {
     /// 設定を検証して [`Engine`] を build する。
     ///
     /// `VmExperimental` を選びつつ許可していない場合は
-    /// [`ConfigError::ExperimentalBackendNotEnabled`] を返す。host function registry の
-    /// validation は registry build 時に済んでいるため、ここでは再検証しない。
+    /// [`ConfigError::ExperimentalBackendNotEnabled`] を返す。監査 sink を `VmExperimental`
+    /// backend と同時に設定した場合は [`ConfigError::AuditSinkWithExperimentalBackend`] を返す
+    /// （A-1 の run 経路は tree-only のため。§7.1）。host function registry の validation は
+    /// registry build 時に済んでいるため、ここでは再検証しない。
     pub fn build(self) -> Result<Engine, ConfigError> {
         if self.config.backend == Backend::VmExperimental && !self.allow_experimental_backend {
             return Err(ConfigError::ExperimentalBackendNotEnabled);
+        }
+        // Phase 6 A-1: 監査 sink は tree-only の run 経路だけが対象。VmExperimental と組むと
+        // tree 実行を VM として監査報告してしまうため、VM の監査 wiring が入るまで拒否する。
+        if self.config.audit_sink.is_some() && self.config.backend == Backend::VmExperimental {
+            return Err(ConfigError::AuditSinkWithExperimentalBackend);
         }
         Ok(Engine {
             id: EngineId::allocate(),
@@ -1325,8 +1342,15 @@ impl Engine {
     ///
     /// 返す [`AuditedOutcome`] は、通常の terminal を運ぶ [`AuditedOutcome::Outcome`] と、
     /// fail-closed（sink が `Failed` 等）で監査が失敗したことを運ぶ
-    /// [`AuditedOutcome::AuditFailed`] の 2 系統を持つ。後者では実行結果は success ではなく、
-    /// emergency slot へ `Terminal(AuditFailure)` が append 済みである（§10.1）。
+    /// [`AuditedOutcome::AuditFailed`] の 2 系統を持つ。いずれの `AuditFailed` でも実行結果は
+    /// success ではない。journal 上の Terminal は失敗 phase によって異なる（詳細は
+    /// [`AuditedOutcome::AuditFailed`] 参照）:
+    ///
+    /// - **Started ack 失敗**（script work 開始前）: emergency slot へ `Terminal(AuditFailure)` が
+    ///   append 済み。language-state は未変更。
+    /// - **最終 Terminal 配送失敗**（§14、A-1 延期）: journal 上の唯一の Terminal は確定済みの
+    ///   `Completed`/`Exited`（`AuditFailure` ではない）。`Completed`/`Exited` の language-state は
+    ///   既に commit 済みで rollback しない。caller はこの context を再利用してはならない。
     ///
     /// sink が未設定の engine で呼ぶと監査は起きず、本来の outcome をそのまま
     /// [`AuditedOutcome::Outcome`] で返す（opt-in）。
@@ -1455,6 +1479,10 @@ impl Engine {
         let language_revision = linked.root().language_revision().as_str().to_string();
         let import_graph_hash = *linked.import_graph().graph_hash.as_bytes();
         let budget = request.budget;
+        // 実行を認可した frozen policy の相関 ID（§7.1）。request がまだ execute へ move される
+        // 前に、評価器へ install されるのと同じ CapabilitySet から決定的な 32 byte を取り出す。
+        // これにより deny-by-default と stdout/filesystem/exit 等を grant した実行を監査上区別できる。
+        let capability_policy_hash = *request.capabilities.id().as_bytes();
         // timestamp は注入 clock の ns を unix ns として載せる（A-1 は request の monotonic clock
         // の ns を流用する。順序の正本は sequence、§7.1）。全 envelope で同一値を使う。
         let timestamp = HostTimestamp {
@@ -1480,8 +1508,9 @@ impl Engine {
             rules_revision: DETERMINISM_RULES_REVISION,
             heap_accounting_revision: crate::budget::HEAP_ACCOUNTING_REVISION,
             budget,
-            // capability policy hash / redaction policy は A-1 では未配線。安定の空値を載せる。
-            capability_policy_hash: [0u8; 32],
+            // capability policy hash は実行を認可した frozen set の相関 ID（上で算出）。
+            // redaction policy は A-1 では未配線のため安定の既定値を載せる。
+            capability_policy_hash,
             redaction_policy_id: "default".to_string(),
             mode: ExecutionMode::Live,
         };
@@ -1854,9 +1883,18 @@ const DETERMINISM_RULES_REVISION: u32 = 1;
 pub enum AuditedOutcome {
     /// 監査が成立した通常の terminal。`ExecutionOutcome` を運ぶ（enum サイズ平準化のため box）。
     Outcome(Box<ExecutionOutcome>),
-    /// 監査が fail-closed で失敗した（§10.1）。実行結果は success ではない。emergency slot へ
-    /// `Terminal(AuditFailure)` が append 済み（sequence overflow など append すら不能な場合を
-    /// 除く）。`withheld` は、監査が成立していれば報告されたはずの terminal 種別。
+    /// 監査が fail-closed で失敗した（§10.1）。実行結果は success ではない。`withheld` は、
+    /// 監査が成立していれば報告されたはずの terminal 種別。
+    ///
+    /// journal 上の Terminal は失敗した phase によって異なる:
+    ///
+    /// - **Started ack 失敗**（script work 開始前）: emergency slot へ `Terminal(AuditFailure)` が
+    ///   append 済み（sequence overflow など append すら不能な場合を除く）。`withheld` は
+    ///   `AuditFailure`。language-state は未変更。
+    /// - **最終 Terminal 配送失敗**（§14、A-1 延期）: journal 上の唯一の Terminal は確定済みの
+    ///   `Completed`/`Exited` であり、`AuditFailure` ではない。`withheld` はその保留された本来の
+    ///   terminal 種別。`Completed`/`Exited` の language-state は既に commit 済みで A-1 では
+    ///   rollback しない。context は poison されないが、caller は再利用してはならない。
     AuditFailed {
         /// 監査が成立していれば報告されたはずの terminal 種別（参考情報）。
         withheld: crate::audit::TerminalOutcome,
@@ -2267,6 +2305,38 @@ mod tests {
             .build()
             .expect("opt-in build");
         assert_eq!(engine.config().backend, Backend::VmExperimental);
+    }
+
+    /// Phase 6 A-1: 監査 sink + `VmExperimental` backend は build 時に拒否する。
+    /// A-1 の run 経路は tree-only なので、VM label を監査へ載せると tree 実行を VM として
+    /// 誤報告してしまう。VM の監査 wiring が入るまで、この組み合わせを使えないよう固定する。
+    #[test]
+    fn audit_sink_with_experimental_backend_is_rejected() {
+        let sink = Arc::new(crate::audit::InMemoryAuditSink::new());
+        let config = EngineConfig {
+            backend: Backend::VmExperimental,
+            language_revision: LanguageRevision::CURRENT,
+            audit_sink: None,
+        };
+        let err = Engine::builder()
+            .config(config)
+            // experimental backend 自体は許可済みにして、残る拒否理由を sink 併用だけに絞る。
+            .allow_experimental_backend(true)
+            .audit_sink(sink as Arc<dyn crate::audit::AuditSink>)
+            .build()
+            .expect_err("audit_sink + VmExperimental は拒否される");
+        assert_eq!(err, ConfigError::AuditSinkWithExperimentalBackend);
+    }
+
+    /// 対照: 監査 sink は既定の tree-walk backend では問題なく build できる。
+    #[test]
+    fn audit_sink_with_tree_walk_backend_builds() {
+        let sink = Arc::new(crate::audit::InMemoryAuditSink::new());
+        let engine = Engine::builder()
+            .audit_sink(sink as Arc<dyn crate::audit::AuditSink>)
+            .build()
+            .expect("audit_sink + TreeWalk は build できる");
+        assert_eq!(engine.config().backend, Backend::TreeWalk);
     }
 
     #[test]
@@ -3037,6 +3107,67 @@ mod tests {
             crate::audit::AuditEvent::Terminal { outcome, .. } => outcome.clone(),
             other => panic!("期待 Terminal, 実際 {other:?}"),
         }
+    }
+
+    /// sink の収集 envelope から ExecutionStarted の capability_policy_hash を取り出す helper。
+    fn started_capability_policy_hash(sink: &crate::audit::InMemoryAuditSink) -> [u8; 32] {
+        let envelopes = sink.snapshot();
+        assert_eq!(envelopes[0].sequence, 0);
+        match &envelopes[0].event {
+            crate::audit::AuditEvent::ExecutionStarted {
+                capability_policy_hash,
+                ..
+            } => *capability_policy_hash,
+            other => panic!("期待 ExecutionStarted, 実際 {other:?}"),
+        }
+    }
+
+    /// ExecutionStarted.capability_policy_hash は実行を認可した frozen policy の相関 ID であり、
+    /// 権限内容が異なれば異なる値を emit する（deny-by-default と grant 済みを監査上区別できる）。
+    #[test]
+    fn audited_started_records_capability_policy_hash() {
+        // (1) deny-by-default（空 set）。
+        let empty_sink = Arc::new(crate::audit::InMemoryAuditSink::new());
+        let engine = Engine::builder()
+            .audit_sink(empty_sink.clone() as Arc<dyn crate::audit::AuditSink>)
+            .build()
+            .unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "let x = 1\n");
+        let _ = engine.run_audited(&linked, &mut ctx, audited_request(201));
+        let empty_hash = started_capability_policy_hash(&empty_sink);
+
+        // (2) exit を grant した set。
+        let exit_sink = Arc::new(crate::audit::InMemoryAuditSink::new());
+        let engine2 = Engine::builder()
+            .audit_sink(exit_sink.clone() as Arc<dyn crate::audit::AuditSink>)
+            .build()
+            .unwrap();
+        let mut ctx2 = ExecutionContext::new(&engine2);
+        let linked2 = compile_link(&engine2, "m", "exit(0)\n");
+        let _ = engine2.run_audited(
+            &linked2,
+            &mut ctx2,
+            audited_request(202).with_capabilities(exit_granted()),
+        );
+        let exit_hash = started_capability_policy_hash(&exit_sink);
+
+        // hash は決定的に CapabilitySet::id() から導かれ、空値ではなく、内容差で異なる。
+        assert_eq!(
+            empty_hash,
+            *crate::capability::CapabilitySet::empty().id().as_bytes(),
+            "deny-by-default の hash は空 set の CapabilitySetId に一致する"
+        );
+        assert_eq!(
+            exit_hash,
+            *exit_granted().id().as_bytes(),
+            "grant 済みの hash は対応する CapabilitySetId に一致する"
+        );
+        assert_ne!(
+            empty_hash, exit_hash,
+            "権限内容が異なれば capability_policy_hash も異なる"
+        );
+        assert_ne!(exit_hash, [0u8; 32], "grant 済みの hash は全 0 ではない");
     }
 
     /// granted な exit(code) は audited 経路で Terminal(Exited) を 1 件出す。
