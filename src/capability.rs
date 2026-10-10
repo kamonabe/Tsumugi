@@ -2269,6 +2269,147 @@ impl FileHandle for OsFileHandle {
     }
 }
 
+/// 開いた module file を [`ModuleSource`] として chunk 読みする内部 source（設計 §3.4）。
+///
+/// `FileHandle::read_to_end`（chunk read API 無し）で全 byte を一度に読み、`read_chunk` が
+/// `max_bytes` 単位で切り出して複数 [`ModuleChunk::Bytes`] → [`ModuleChunk::Eof`] を返す。
+/// Phase 2 は N 課金が無いため全読み後に Engine 側で 64 KiB 単位へ切る方式を採る（真の streaming
+/// chunk 読みは N 境界が入る Phase 3 で `FileHandle` に chunk API を足して差し替える。器の trait
+/// 形は Phase 2 で確定するので public signature は Phase 3 で変わらない）。UTF-8 検証はしない
+/// （raw bytes を返すだけ。検証は link 層＝C6-c）。
+#[cfg(any(unix, windows))]
+struct FileModuleSource {
+    /// 初回 `read_chunk` で遅延読みする handle。読み終えたら `None`。
+    handle: Option<Box<dyn FileHandle>>,
+    /// 読み込み済み全 byte（初回読み後に確定）。
+    buffer: Vec<u8>,
+    /// `buffer` 内の次 chunk 開始 offset。
+    offset: usize,
+}
+
+#[cfg(any(unix, windows))]
+impl FileModuleSource {
+    fn new(handle: Box<dyn FileHandle>) -> Self {
+        Self {
+            handle: Some(handle),
+            buffer: Vec::new(),
+            offset: 0,
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl ModuleSource for FileModuleSource {
+    fn read_chunk(
+        &mut self,
+        _context: &mut CapabilityCallContext<'_>,
+        max_bytes: NonZeroUsize,
+    ) -> Result<ModuleChunk, AdapterError> {
+        // 初回だけ handle から全 byte を読む（Phase 2 は上限器なしで全読み、設計 §3.4）。
+        if let Some(mut handle) = self.handle.take() {
+            self.buffer = handle.read_to_end(None)?;
+        }
+        if self.offset >= self.buffer.len() {
+            return Ok(ModuleChunk::Eof);
+        }
+        let end = (self.offset + max_bytes.get()).min(self.buffer.len());
+        let chunk = self.buffer[self.offset..end].to_vec();
+        self.offset = end;
+        Ok(ModuleChunk::Bytes(chunk))
+    }
+}
+
+/// `--allow-import-root NAME=PATH` 群を backing にする filesystem [`ModuleResolver`]（設計 §3）。
+///
+/// 各 import root を mount 名 → [`OsDirectoryHandle`]（[`SymlinkPolicy::DenyAll`]）へ束ねて保持し、
+/// link 層が正規化済みで渡す `@NAME/...` specifier を [`FilesystemTarget::parse`] で routing、
+/// [`FsOperation::Import`] 相当の読み取り open で module source を得る。
+///
+/// 層の責務（設計 §3.2）: parse・正規化・mount 存在判定の権威は link 層（C6-c）にある。resolve が
+/// 受け取るのは link 層が検証・正規化済みの `@mount/comp/...` 文字列で、resolve 内の再 parse /
+/// mount 探索は trait 契約を自己完結させるための防御的二重チェック。正規形は `parse` に idempotent
+/// なので正常系では必ず成功・一致し、不一致は正常系では起こり得ない内部 fault として
+/// [`AdapterError::Host`]（`internal: ...`）を返す（link 層が `internal_resolver_fault` へ写す）。
+/// malformed specifier や mount 未登録を resolve が script channel へ写すことはない。
+#[cfg(any(unix, windows))]
+#[derive(Debug)]
+pub struct FilesystemModuleResolver {
+    policy_id: NonZeroU128,
+    /// mount 名 → root handle。CLI が execution 作成前に open 済み。
+    /// [`OsDirectoryHandle`] の `Debug` は host path を出さない（存在 oracle 防止、§8.5）。
+    roots: Vec<(MountName, Arc<OsDirectoryHandle>)>,
+}
+
+#[cfg(any(unix, windows))]
+impl FilesystemModuleResolver {
+    /// import root 群から作る。空・mount 重複は configuration error。
+    pub fn new(
+        policy_id: NonZeroU128,
+        roots: impl IntoIterator<Item = (MountName, Arc<OsDirectoryHandle>)>,
+    ) -> Result<Self, ConfigError> {
+        let roots: Vec<(MountName, Arc<OsDirectoryHandle>)> = roots.into_iter().collect();
+        if roots.is_empty() {
+            return Err(ConfigError::InvalidFilesystemPolicy { code: "no_roots" });
+        }
+        let mut seen = BTreeSet::new();
+        for (mount, _) in &roots {
+            if !seen.insert(mount.clone()) {
+                return Err(ConfigError::InvalidFilesystemPolicy {
+                    code: "duplicate_mount",
+                });
+            }
+        }
+        Ok(Self { policy_id, roots })
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl ModuleResolver for FilesystemModuleResolver {
+    fn policy_id(&self) -> NonZeroU128 {
+        self.policy_id
+    }
+
+    fn resolve(
+        &self,
+        _context: &mut CapabilityCallContext<'_>,
+        request: ResolveRequest<'_>,
+    ) -> Result<ResolvedModule, AdapterError> {
+        // 1. 防御的再 parse（設計 §3.2 step 1）。link 層が正規化済みの `@mount/comp/...` を渡す
+        //    ため正常系では必ず成功する（正規形は parse に idempotent）。失敗は正常系では起こり得ない
+        //    内部 fault として扱い、malformed を script channel へ写さない。
+        let target = FilesystemTarget::parse(request.specifier)
+            .map_err(|_| AdapterError::Host("internal: specifier re-parse mismatch".to_string()))?;
+
+        // 2. 防御的 mount 探索（設計 §3.2 step 2）。link 層で mount 存在は確認済みなので正常系では
+        //    必ず一致する。不一致は正規化／grant 配線の内部不整合として内部 fault 扱い。
+        let root = self
+            .roots
+            .iter()
+            .find(|(mount, _)| *mount == target.mount)
+            .map(|(_, handle)| handle)
+            .ok_or_else(|| {
+                AdapterError::Host("internal: specifier re-parse mismatch".to_string())
+            })?;
+
+        // 3. 一致 root の handle へ read open（設計 §3.2 step 3）。open 失敗（不存在・symlink 拒否
+        //    等）は adapter error をそのまま返す（link 層が `Resolve` へ写す）。
+        let handle = root.open_file(&target.path, OpenFileRequest::ReadExisting)?;
+        let source: Box<dyn ModuleSource> = Box::new(FileModuleSource::new(handle));
+
+        // 4. ModuleId を作る（設計 §3.2 step 4）。入力 specifier は既に正規形 `@mount/comp/...` な
+        //    ので、そのまま id にする（host 絶対 path を含めない）。
+        let id = crate::embedding::ModuleId::new(request.specifier)
+            .map_err(|_| AdapterError::Host("internal: invalid module id".to_string()))?;
+
+        // 5. ResolvedModule を返す（設計 §3.2 step 5）。filesystem source は `Public` 分類。
+        Ok(ResolvedModule {
+            id,
+            source,
+            classification: DataClassification::Public,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3390,6 +3531,222 @@ mod tests {
                 .open_file(&rel(&["v.txt"]), OpenFileRequest::ReadExisting)
                 .expect("open read under verbatim-canonicalized base");
             assert_eq!(f.read_to_end(None).expect("read"), b"vp");
+        }
+
+        // -----------------------------------------------------------------
+        // C6-b: filesystem ModuleResolver 実体 + @NAME/... routing（設計 §3.6）。
+        // link へ未配線なので CLI 観測挙動は不変。resolve の契約だけを直接呼んで固定する。
+        // OS 依存（path 区切り・symlink）のため #[cfg(unix)] 中心。Windows は Phase 7 TODO。
+        // -----------------------------------------------------------------
+
+        /// 単一 root `default`（= tempdir）の resolver を作る。
+        fn resolver_with_default(root: &TempRoot) -> FilesystemModuleResolver {
+            let pid = pid(500);
+            let handle = Arc::new(OsDirectoryHandle::new(
+                root.path.clone(),
+                pid,
+                SymlinkPolicy::DenyAll,
+            ));
+            FilesystemModuleResolver::new(
+                pid,
+                vec![(MountName::new("default").expect("mount"), handle)],
+            )
+            .expect("resolver")
+        }
+
+        /// 名前付き root の resolver を作る。
+        fn resolver_with_mount(name: &str, root: &TempRoot) -> FilesystemModuleResolver {
+            let pid = pid(501);
+            let handle = Arc::new(OsDirectoryHandle::new(
+                root.path.clone(),
+                pid,
+                SymlinkPolicy::DenyAll,
+            ));
+            FilesystemModuleResolver::new(pid, vec![(MountName::new(name).expect("mount"), handle)])
+                .expect("resolver")
+        }
+
+        fn resolve(
+            resolver: &FilesystemModuleResolver,
+            specifier: &str,
+        ) -> Result<ResolvedModule, AdapterError> {
+            with_call_context(|ctx| {
+                resolver.resolve(
+                    ctx,
+                    ResolveRequest {
+                        importer: None,
+                        specifier,
+                        language_revision: crate::embedding::LanguageRevision::CURRENT,
+                    },
+                )
+            })
+        }
+
+        #[test]
+        fn new_rejects_empty_roots() {
+            let err = FilesystemModuleResolver::new(pid(1), Vec::new())
+                .expect_err("empty roots must be config error");
+            assert_eq!(
+                err,
+                ConfigError::InvalidFilesystemPolicy { code: "no_roots" }
+            );
+        }
+
+        #[test]
+        fn new_rejects_duplicate_mount() {
+            let root = TempRoot::new();
+            let h = || {
+                Arc::new(OsDirectoryHandle::new(
+                    root.path.clone(),
+                    pid(1),
+                    SymlinkPolicy::DenyAll,
+                ))
+            };
+            let err = FilesystemModuleResolver::new(
+                pid(1),
+                vec![
+                    (MountName::new("foo").unwrap(), h()),
+                    (MountName::new("foo").unwrap(), h()),
+                ],
+            )
+            .expect_err("duplicate mount must be config error");
+            assert_eq!(
+                err,
+                ConfigError::InvalidFilesystemPolicy {
+                    code: "duplicate_mount"
+                }
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn qualified_specifier_resolves_and_reads_source() {
+            // @foo/mod が root `foo` 配下へ解決され source を読める（設計 §3.6）。
+            let root = TempRoot::new();
+            fs::write(root.path.join("mod.tsg"), b"let x = 1").expect("write module");
+            let resolver = resolver_with_mount("foo", &root);
+            let resolved = resolve(&resolver, "@foo/mod.tsg").expect("resolve");
+            assert_eq!(resolved.id.as_str(), "@foo/mod.tsg");
+            assert_eq!(resolved.classification, DataClassification::Public);
+            let mut source = resolved.source;
+            let bytes = drain_source(source.as_mut(), nz(64));
+            assert_eq!(bytes, b"let x = 1");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn unqualified_specifier_routes_to_default_mount() {
+            // unqualified `mod` が mount `default` へ routing される（設計 §3.6）。
+            let root = TempRoot::new();
+            fs::write(root.path.join("mod.tsg"), b"export none").expect("write module");
+            let resolver = resolver_with_default(&root);
+            let resolved = resolve(&resolver, "mod.tsg").expect("resolve unqualified");
+            // 入力 specifier をそのまま id にする（正規化は link 層＝C6-c。C6-b は受け取った
+            // specifier を信頼して id 化する）。
+            assert_eq!(resolved.id.as_str(), "mod.tsg");
+            let mut source = resolved.source;
+            assert_eq!(drain_source(source.as_mut(), nz(64)), b"export none");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn source_chunks_respect_max_bytes_and_terminate_with_eof() {
+            // source の chunk 分割が 1..=max_bytes に収まり Eof で終わる（設計 §3.6）。
+            let root = TempRoot::new();
+            fs::write(root.path.join("big.tsg"), b"0123456789").expect("write");
+            let resolver = resolver_with_default(&root);
+            let resolved = resolve(&resolver, "big.tsg").expect("resolve");
+            let mut source = resolved.source;
+            // drain_source が各 chunk 長 1..=4 を assert する。10 byte → [4,4,2] + Eof。
+            let bytes = drain_source(source.as_mut(), nz(4));
+            assert_eq!(bytes, b"0123456789");
+            with_call_context(|ctx| {
+                assert!(matches!(
+                    source.read_chunk(ctx, nz(4)).expect("eof"),
+                    ModuleChunk::Eof
+                ));
+            });
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn non_utf8_file_is_returned_as_raw_bytes() {
+            // 非 UTF-8 ファイルでも source は raw bytes を返す（UTF-8 検証は C6-c の link 層）。
+            let root = TempRoot::new();
+            fs::write(root.path.join("bin.tsg"), [0xff, 0xfe, 0x00, 0x01]).expect("write");
+            let resolver = resolver_with_default(&root);
+            let resolved = resolve(&resolver, "bin.tsg").expect("resolve");
+            let mut source = resolved.source;
+            let bytes = drain_source(source.as_mut(), nz(64));
+            assert_eq!(bytes, [0xff, 0xfe, 0x00, 0x01]);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn missing_module_file_maps_to_adapter_error() {
+            // mount は登録済みだが path が不存在 → open 失敗の adapter error（link 層が Resolve へ
+            // 写す）。resolve が null/false へ潰さないことを固定。
+            let root = TempRoot::new();
+            let resolver = resolver_with_default(&root);
+            let res = resolve(&resolver, "nope.tsg");
+            assert!(
+                matches!(res, Err(AdapterError::Host(_))),
+                "missing module must be adapter host error"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn symlink_escaping_root_is_denied_under_deny_all() {
+            // DenyAll で root 外へ逃げる import が拒否される（設計 §3.6）。
+            let root = TempRoot::new();
+            let outside = TempRoot::new();
+            fs::write(outside.path.join("secret.tsg"), b"stolen").expect("write outside");
+            std::os::unix::fs::symlink(outside.path.join("secret.tsg"), root.path.join("link.tsg"))
+                .expect("symlink");
+            let resolver = resolver_with_default(&root);
+            let res = resolve(&resolver, "link.tsg");
+            assert!(
+                matches!(res, Err(AdapterError::Host(_))),
+                "escaping symlink import must be denied"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn mount_mismatch_is_internal_fault_not_script_channel() {
+            // link 層が渡す前提に反して未登録 mount が来た場合（防御的二重チェック）、resolve は
+            // malformed/未登録を script channel へ写さず内部 fault（AdapterError::Host "internal:
+            // ...") を返す（設計 §3.2 の防御的 mount 探索）。
+            let root = TempRoot::new();
+            let resolver = resolver_with_mount("foo", &root);
+            match resolve(&resolver, "@bar/mod.tsg") {
+                Err(AdapterError::Host(msg)) => assert!(
+                    msg.starts_with("internal:"),
+                    "mount mismatch must be internal fault, got {msg:?}"
+                ),
+                Err(e) => panic!("expected internal Host fault, got {e:?}"),
+                Ok(_) => panic!("expected internal Host fault, got Ok"),
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn malformed_specifier_is_internal_fault_not_script_channel() {
+            // link 層が parse 済みを渡す前提に反して malformed（`../escape`）が来た場合も、resolve は
+            // PathError を script channel へ写さず内部 fault として扱う（設計 §3.2 step 1）。
+            let root = TempRoot::new();
+            let resolver = resolver_with_default(&root);
+            for bad in ["../escape", "/abs/mod", "a\0b"] {
+                match resolve(&resolver, bad) {
+                    Err(AdapterError::Host(msg)) => assert!(
+                        msg.starts_with("internal:"),
+                        "malformed `{bad}` must be internal fault, got {msg:?}"
+                    ),
+                    Err(e) => panic!("malformed `{bad}` expected internal fault, got {e:?}"),
+                    Ok(_) => panic!("malformed `{bad}` expected internal fault, got Ok"),
+                }
+            }
         }
     }
 

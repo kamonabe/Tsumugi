@@ -144,6 +144,10 @@ pub use capability::{
     ResolveRequest, ResolvedModule, SymlinkPolicy, SystemClock, SystemInput, SystemOutput,
     derive_policy_id,
 };
+// filesystem `ModuleResolver` 実体（C6-b）。`OsDirectoryHandle` の secure open に依存するため
+// secure handle を実装する platform（unix / windows）でのみコンパイル・再 export する。
+#[cfg(any(unix, windows))]
+pub use capability::FilesystemModuleResolver;
 
 // Phase 2 capability — host function registry（スライス C8/E7、`docs/capability-model.md`
 // 第11節）の公開型。埋め込み host はこれらで registry を組み立て、`EngineBuilder::host_functions`
