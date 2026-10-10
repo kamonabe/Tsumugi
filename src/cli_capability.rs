@@ -12,6 +12,8 @@
 
 use std::sync::Arc;
 
+#[cfg(any(unix, windows))]
+use tsumugi::FilesystemModuleResolver;
 use tsumugi::{
     CapabilitySet, DataClassification, EnvironmentSnapshot, EnvironmentValue, FilesystemCapability,
     FilesystemRoot, FsOperation, MountName, OsDirectoryHandle, ProcessExit, SymlinkPolicy,
@@ -490,7 +492,17 @@ pub fn build_safe_capabilities(
             .expect("single grant never duplicates");
     }
 
-    // --allow-import-root は値検証のみ（parse_cli 済み）。set へは寄与しない。
+    // --allow-import-root NAME=PATH → filesystem ModuleResolver を grant する（設計 §5、C6-c）。
+    // secure handle を実装する platform（unix/windows）でのみ grant する。
+    #[cfg(any(unix, windows))]
+    if !opts.import_roots.is_empty() {
+        let (resolver_pid, roots) = build_import_resolver_roots(&opts.import_roots)?;
+        let resolver = FilesystemModuleResolver::new(resolver_pid, roots)
+            .map_err(|_| CliUsageError::new("エラー: import resolver の構成が不正です"))?;
+        builder = builder
+            .module_resolver(Arc::new(resolver))
+            .expect("single grant never duplicates");
+    }
 
     Ok(builder.build())
 }
@@ -880,14 +892,10 @@ type ImportResolverRoots = (
 /// 作る。resolver 全体の policy_id は各 mount 名・絶対 path を安定直列化した seed から導出し、
 /// 返り値へ添える（CLI の他 adapter と同じ `derive_policy_id` pattern）。
 ///
-/// **本 slice（C6-b）では resolver を grant しない**。`build_safe_capabilities` から呼ばず、
-/// resolver を組んで set へ注入するのは C6-c。ここは「import root → handle」の変換だけを提供する。
-///
-/// C6-c が `build_safe_capabilities` から呼ぶまで production 呼び出し元が無いため、本 slice では
-/// `dead_code` を許可する（テストでは `import_root_tests` が exercise する）。C6-c で grant 配線が
-/// 入れば呼び出し元が付き、この allow は不要になる。
+/// C6-c で `build_safe_capabilities` がこの変換結果を [`FilesystemModuleResolver`] へ渡して
+/// `module_resolver` を grant する。ここは「import root → handle」の変換と resolver policy_id の
+/// 導出だけを担う。
 #[cfg(any(unix, windows))]
-#[allow(dead_code)]
 pub fn build_import_resolver_roots(
     import_roots: &[(String, String)],
 ) -> Result<ImportResolverRoots, CliUsageError> {

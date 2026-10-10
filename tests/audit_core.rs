@@ -29,6 +29,20 @@ fn request_without_id() -> EmbeddingRequest {
     EmbeddingRequest::new(budget, clock).expect("standard budget は同 domain")
 }
 
+/// import なし link 用の既定 [`LinkRequest`]（C6-c の 3 引数 `new`）。
+///
+/// 本ファイルの script は import を持たないため、empty capabilities（resolver 未 grant）+ standard
+/// budget で足りる（import 0 件は resolver を呼ばず空 graph を返す）。
+fn link_request() -> LinkRequest {
+    let clock = FakeClock::new();
+    let budget = BudgetConfig::standard(&clock).expect("standard budget");
+    LinkRequest::new(
+        ExecutionId::new(1u128.try_into().expect("nonzero")),
+        tsumugi::CapabilitySet::empty(),
+        budget,
+    )
+}
+
 fn source(id: &str, text: &'static str) -> Source<'static> {
     Source::new(SourceId::new(id).expect("valid source id"), text)
 }
@@ -56,7 +70,7 @@ fn no_sink_means_no_emission_and_unchanged_outcome() {
     // sink を設定しない engine。既存挙動と bit-identical（監査なし）。
     let engine = EmbeddingEngine::builder().build().expect("build");
     let script = link_source(&engine, "m", "let x = 1\nlet y = x + 2\n");
-    let linked = engine.link(&script, LinkRequest::new()).expect("link");
+    let linked = engine.link(&script, link_request()).expect("link");
     let mut ctx = EmbeddingContext::new(&engine);
 
     // 別の in-memory sink を作っても、engine に設定していないので触られない。
@@ -72,7 +86,7 @@ fn no_sink_means_no_emission_and_unchanged_outcome() {
 fn no_sink_runtime_error_outcome_is_unchanged() {
     let engine = EmbeddingEngine::builder().build().expect("build");
     let script = link_source(&engine, "m", "let x = undefined_name\n");
-    let linked = engine.link(&script, LinkRequest::new()).expect("link");
+    let linked = engine.link(&script, link_request()).expect("link");
     let mut ctx = EmbeddingContext::new(&engine);
     let outcome = engine.run(&linked, &mut ctx, request_without_id());
     assert!(matches!(outcome, EmbeddingOutcome::RuntimeError { .. }));
@@ -88,7 +102,7 @@ fn with_sink_emits_started_then_terminal_in_order() {
         .build()
         .expect("build");
     let script = link_source(&engine, "m", "let x = 1\nlet y = x + 2\n");
-    let linked = engine.link(&script, LinkRequest::new()).expect("link");
+    let linked = engine.link(&script, link_request()).expect("link");
     let mut ctx = EmbeddingContext::new(&engine);
 
     let execution_id = ExecutionId::new(42u128.try_into().unwrap());
@@ -146,7 +160,7 @@ fn with_sink_runtime_error_maps_to_runtime_error_terminal() {
         .build()
         .expect("build");
     let script = link_source(&engine, "m", "let x = undefined_name\n");
-    let linked = engine.link(&script, LinkRequest::new()).expect("link");
+    let linked = engine.link(&script, link_request()).expect("link");
     let mut ctx = EmbeddingContext::new(&engine);
 
     let audited = engine.run_audited(&linked, &mut ctx, request_with_id(7));
@@ -181,7 +195,7 @@ fn with_sink_pre_cancel_has_started_and_cancelled_terminal() {
         .build()
         .expect("build");
     let script = link_source(&engine, "m", "let x = 1\n");
-    let linked = engine.link(&script, LinkRequest::new()).expect("link");
+    let linked = engine.link(&script, link_request()).expect("link");
     let mut ctx = EmbeddingContext::new(&engine);
 
     let token = tsumugi::CancellationToken::new();
@@ -226,7 +240,7 @@ fn failing_sink_is_fail_closed_and_not_success() {
         .expect("build");
     // completion するはずの script。sink が Failed なら実行結果は success にならない。
     let script = link_source(&engine, "m", "let x = 1\nlet y = x + 2\n");
-    let linked = engine.link(&script, LinkRequest::new()).expect("link");
+    let linked = engine.link(&script, link_request()).expect("link");
     let mut ctx = EmbeddingContext::new(&engine);
 
     let audited = engine.run_audited(&linked, &mut ctx, request_with_id(5));
@@ -257,7 +271,7 @@ fn terminal_submit_failure_is_fail_closed_and_not_success() {
         .build()
         .expect("build");
     let script = link_source(&engine, "m", "let x = 1\nlet y = x + 2\n");
-    let linked = engine.link(&script, LinkRequest::new()).expect("link");
+    let linked = engine.link(&script, link_request()).expect("link");
     let mut ctx = EmbeddingContext::new(&engine);
 
     let audited = engine.run_audited(&linked, &mut ctx, request_with_id(11));
@@ -300,7 +314,7 @@ fn terminal_submit_failure_leaves_committed_state_documented_a1_behavior() {
 
     // 1 回目: `x` を束縛して完了する script。Terminal 配送に失敗する。
     let define = link_source(&engine, "m", "let x = 1\n");
-    let define_linked = engine.link(&define, LinkRequest::new()).expect("link");
+    let define_linked = engine.link(&define, link_request()).expect("link");
     let mut ctx = EmbeddingContext::new(&engine);
     let audited = engine.run_audited(&define_linked, &mut ctx, request_with_id(30));
 
@@ -318,7 +332,7 @@ fn terminal_submit_failure_leaves_committed_state_documented_a1_behavior() {
     // `x` は未定義で RuntimeError になるはず。だが A-1 では commit 済みのまま残るので、`x` は
     // 参照でき、完了する（＝ state は rollback されていない、という逸脱を明文化どおり pin）。
     let use_binding = link_source(&engine, "m2", "let y = x + 2\n");
-    let use_linked = engine.link(&use_binding, LinkRequest::new()).expect("link");
+    let use_linked = engine.link(&use_binding, link_request()).expect("link");
     let audited2 = engine.run_audited(&use_linked, &mut ctx, request_with_id(31));
     match audited2.outcome() {
         Some(EmbeddingOutcome::Completed { .. }) => {}
@@ -338,7 +352,7 @@ fn started_wrong_id_ack_is_fail_closed_before_script_work() {
         .expect("build");
     // side-effect probe: completion すれば ctx に x が束縛されるが、ここでは走ってはならない。
     let script = link_source(&engine, "m", "let x = 1\nlet y = x + 2\n");
-    let linked = engine.link(&script, LinkRequest::new()).expect("link");
+    let linked = engine.link(&script, link_request()).expect("link");
     let mut ctx = EmbeddingContext::new(&engine);
 
     let audited = engine.run_audited(&linked, &mut ctx, request_with_id(21));
@@ -370,7 +384,7 @@ fn started_wrong_sequence_ack_is_fail_closed_before_script_work() {
         .build()
         .expect("build");
     let script = link_source(&engine, "m", "let x = 1\nlet y = x + 2\n");
-    let linked = engine.link(&script, LinkRequest::new()).expect("link");
+    let linked = engine.link(&script, link_request()).expect("link");
     let mut ctx = EmbeddingContext::new(&engine);
 
     let audited = engine.run_audited(&linked, &mut ctx, request_with_id(22));
@@ -401,7 +415,7 @@ fn with_sink_but_missing_execution_id_fails_before_script_work() {
         .build()
         .expect("build");
     let script = link_source(&engine, "m", "let x = 1\n");
-    let linked = engine.link(&script, LinkRequest::new()).expect("link");
+    let linked = engine.link(&script, link_request()).expect("link");
     let mut ctx = EmbeddingContext::new(&engine);
 
     let audited = engine.run_audited(&linked, &mut ctx, request_without_id());

@@ -250,7 +250,10 @@ impl LinkRequest {
         operation_id: ExecutionId,
         capabilities: CapabilitySet,
         budget: BudgetConfig,
-    ) -> Result<Self, ConfigError>;
+    ) -> Self;
+
+    // cancellation注入の補助builder（additive）。既定は never-cancel token。
+    pub fn with_cancellation(self, token: CancellationToken) -> Self;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -282,7 +285,7 @@ impl Engine {
 
 `ModuleId::new`は1..=1024 UTF-8 bytes、NULなしを受理する。resolverはcredential、query secret、絶対local pathをIDへ含めてはならない。
 
-`link`はEngine ID、language revision、backendの順に検証し、不一致なら対応する`LinkError`を返してresolverを呼ばない。Phase 1はimport 0件だけをlinkでき、import文が1件以上あれば`FeatureUnavailable { feature: "module_resolver" }`とする。Phase 2では全importを実行前にresolver capabilityで解決し、循環・深度・module compile・callable symbol/arityを検証する。resolver capabilityなしならresolver call 0で`Denied`。run中のdynamic importは禁止する。import 0件でも空graphを持つ。
+`link`はEngine ID、language revision、backendの順に検証し、不一致なら対応する`LinkError`を返してresolverを呼ばない。Phase 2では全importを実行前にresolver capabilityで解決し、**循環・深度・module単体compile・hash**を検証する。static cross-module callable symbol/arityの検証はPhase 2のlink検証に含めず、export/symbolモデルが入る後続Phase（exportモデル導入スライス）へ移す。未解決のcross-module symbolはlinkで静的に落とさず、run時に`RuntimeError`（name error等）へ落ちる。resolver capabilityなしでimportがあればresolver call 0で terminal `Denied`とする。`cancellation`は`with_cancellation`で注入し、link開始前のcancelはresolver call 0で`Cancelled`。run中のdynamic importは禁止する。import 0件でも空graphを持つ。`FeatureUnavailable`はPhase 2最終形でも列挙に残すが、import解決がEngine APIへ配線された後はimportを理由に返されない（到達しない保持variant）。
 
 `LinkRequest`はresolverへ渡すoperation ID、capability、[実行予算・協調実行仕様](execution-control.md)の有限`BudgetConfig`、cancellationを所有する。deadlineは`BudgetConfig.deadline`を使い、source/module/import count・bytesを同文書の`BudgetUsage`へ課金する。Phase 1/2のmeter実装を内部縦切りにしても、無制限limitや独立optional deadlineをpublic APIへ置かない。`create_execution`からlinkする場合も同じrequest budget/controlを共有し、別の計数系を作らない。
 
@@ -467,7 +470,7 @@ pub enum StartError {
 | 段階 | 許可 | 禁止 | 失敗channel |
 |---|---|---|---|
 | compile | root lex/parse/backend compile/hash | import、OS、host callback | `CompileErrors` |
-| Created/link | resolver import、module compile、cycle/depth/symbol/hash、source budget | script命令、runtime FS、stdio、clock | `ExecutionOutcome`またはpre-handle `LinkError` |
+| Created/link | resolver import、module単体compile、cycle/depth/hash、source budget（static cross-module symbol/arityはPhase 2外・後続Phase） | script命令、runtime FS、stdio、clock | `ExecutionOutcome`またはpre-handle `LinkError` |
 | start/create | engine/context/request整合、finite budget検証、capability freeze、admission | script命令、host callback | `StartError` |
 | poll/run | control確認後にscript、capability、host callback、audit | process exit、ambient access、runtime import | `PollResult` / `ExecutionOutcome` |
 
@@ -505,7 +508,7 @@ tsumugi [OPTIONS] [SCRIPT [ARGS...]]
 - `args()`はbinary名、script path、CLI flagを含めない。
 - 非UTF-8、unknown option、option値欠落、profile/capability usage errorはscript開始前にstderrへ診断しexit 1とする。help/versionだけstdout・0である。
 - profile/capability optionの値検証とgrant構築は[Capability Model仕様](capability-model.md)第14節に従う。safe profileのstdout既定はbuilderによる明示`Stdout` grantでありambient accessではない。
-- **C9/C10時点のcapability注入経路**: E7（import/REPLのEngine API統合）が未配線のため、CLIはprofileから組んだfrozen `CapabilitySet`を経路別に注入する——importなしtree file/stdinはEngine API（`ExecutionRequest::with_capabilities`）、importありtreeとREPLはalpha facade（`ExecutionContext::set_capabilities`）へ直接、全VM経路は`Vm::set_capabilities`。REPLはsession開始時に1回注入し全submissionへ持ち越す。import/REPLのEngine API統合はE7残。
+- **C9/C10時点のcapability注入経路**: CLIはprofileから組んだfrozen `CapabilitySet`を経路別に注入する——tree file/stdin（importの有無を問わず）はEngine API（`ExecutionRequest::with_capabilities`、link時は`LinkRequest.capabilities`）、REPLはalpha facade（`ExecutionContext::set_capabilities`）へ直接、全VM経路は`Vm::set_capabilities`。tree file/stdinのimport解決はC6/E7でEngine resolverへ統合済み（`--allow-import-root`が`module_resolver`をgrant）。REPLはsession開始時に1回注入し全submissionへ持ち越す。REPL/VMのEngine API統合はE7残/E9。
 
 | 結果 | file/stdin mode | REPL |
 |---|---:|---|
@@ -550,7 +553,7 @@ compatibility shimもprocess exitやambient accessを復活させず、script操
 | E5 | 1 | Completed/Runtime/Internal/Cancelled(pre-run) channel | process継続、catch規則 |
 | E6 | 1 | compile/link/run panic隔離 | unwind test、fault ID |
 | E7 | 2 | capability/import graph/Denied/Exited/HostError/host function接続 | capability Phase 2基準 |
-| E8a | 1 | CLIがEngine APIだけを通る入口統合、基本引数転送（🟡 importなしtree file/stdinはEngine API経由で完了。import・REPLはE7、VMはE9で統合） | EMB-AT-15/16/17のPhase 1範囲、AUD-018 |
+| E8a | 1 | CLIがEngine APIだけを通る入口統合、基本引数転送（🟡 tree file/stdinはimportの有無を問わずEngine API経由で完了〔importはC6/E7〕。REPLはE7、VMはE9で統合） | EMB-AT-15/16/17のPhase 1範囲、AUD-018 |
 | E8b | 2 | capability profile/options、safe/legacy移行 | EMB-AT-10/11/16、CAP-AT-23〜26、migration warning |
 | E9 | 5/7 | VM experimental adapter/conformance | 同API、差分0でstable化 |
 | E10 | N-1/N | deprecation/migration | compile test |
@@ -568,7 +571,7 @@ E1→E2→E3→E4→E5→E6→E8a、次にE7→E8b。E11以降をPhase 1/2完了
 | EMB-AT-02 | 1 | Compiled/Linkedは`Send+Sync`、Context/Handleは`!Send+!Sync`のcompile-time assertion |
 | EMB-AT-03 | 1 | foreign CompiledScriptをlink時、foreign LinkedScript/contextをstart時に対応するmismatchで拒否しresolver/命令0 |
 | EMB-AT-04 | 1 | 同contextの同時startをborrowまたはContextBusyで拒否 |
-| EMB-AT-05 | 1/2 | compile時resolver/OS/callback 0、link時script/stdio 0、run時resolver 0。Phase 1 importはFeatureUnavailable |
+| EMB-AT-05 | 1/2 | compile時resolver/OS/callback 0、link時script/stdio 0、run時resolver 0。Phase 2でimportはlink時にresolver capabilityで解決（resolver未grantは terminal `Denied`）。Phase 1の「importはFeatureUnavailable」はC6/E7で解消済み |
 | EMB-AT-06 | 1 | Ready dropは命令0、context再利用可 |
 | EMB-AT-07 | 1〜4 | InternalFailure以外のterminal後はframe cleanでcommit/rollback規則どおり再利用可、InternalFailureだけpoison |
 | EMB-AT-08 | 1〜4 | Completed/Exitedだけ全language-state commit、caught error後のCompleted/Exitedもcommit、その他terminalは開始時点へrollback。完了済み外部I/Oは戻さずauditへ記録しtree/VM一致 |
@@ -591,8 +594,8 @@ E1→E2→E3→E4→E5→E6→E8a、次にE7→E8b。E11以降をPhase 1/2完了
 ## 16. ロードマップ・監査項目との関係
 
 - **Phase 0:** fault非保証、panic/abort責任分界は[脅威モデル](threat-model.md)。
-- **Phase 1:** E1〜E6・E8a、EMB-AT-01〜09・13・15〜17を完了条件とする。E8aでCLIのtree/VM両経路をEngine APIだけへ統合し、基本引数転送を行う。現行tree-only facadeだけでは不足する。E8aの実装は、CLIのtree file/stdin実行のうちimportなしrootをEngine API（`compile`→`link`→`run`）だけへ統合し、`ExecutionRequest.arguments`で引数転送・`ExecutionOutcome`→exit code変換を第12節どおりに行うところまで。importを含むroot（Phase 1 embeddingの`link`が`FeatureUnavailable { feature: "module_resolver" }`で拒否）とREPL（入力間の状態継続とimport解決が必要）は、import resolverが入るE7（Phase 2）でEngine APIへ統合する。VM経路のEngine API統合はE9（Phase 5）。したがってEMB-AT-17は現時点でimportなしtree file/stdin経路について満たし、残り（import・REPL・VM）はE7/E9で満たす。
+- **Phase 1:** E1〜E6・E8a、EMB-AT-01〜09・13・15〜17を完了条件とする。E8aでCLIのtree/VM両経路をEngine APIだけへ統合し、基本引数転送を行う。現行tree-only facadeだけでは不足する。E8aの実装は、CLIのtree file/stdin実行のうちimportなしrootをEngine API（`compile`→`link`→`run`）だけへ統合し、`ExecutionRequest.arguments`で引数転送・`ExecutionOutcome`→exit code変換を第12節どおりに行うところまで。importを含むtree file/stdin rootはC6/E7でEngine API（`compile`→`link`→`run`）へ統合済み（`link`がresolver capabilityでimportを解決し、resolver未grant + importは terminal `Denied`）。REPL（入力間の状態継続とimport解決が必要）はE7残としてalpha facadeを継続する。VM経路のEngine API統合はE9（Phase 5）。したがってEMB-AT-17はtree file/stdin経路（importの有無を問わず）について満たし、残り（REPL・VM）はE7/E9で満たす。
 - **Phase 2:** E7・E8b、EMB-AT-10/11/16、CAP-AT-23〜26と[capability model](capability-model.md)のPhase 2基準を完了する。E8bでcapability profile/optionsとsafe/legacy移行を接続する。
-- **AUD-018:** process argvをExecutionRequest snapshotへ置換し、複数script引数とCLI syntaxを固定した。E8aでimportなしtree file/stdin経路の引数転送を`EmbeddingRequest::with_arguments`→`Engine::run`経由へ載せ替えた（import・REPLはE7で統合するまでalpha facadeの`set_script_args`を使う）。
+- **AUD-018:** process argvをExecutionRequest snapshotへ置換し、複数script引数とCLI syntaxを固定した。E8a/C6-cでtree file/stdin経路（importの有無を問わず）の引数転送を`EmbeddingRequest::with_arguments`→`Engine::run`経由へ載せ替えた（REPLはE7で統合するまでalpha facadeの`set_script_args`を使う）。
 - **AUD-020:** Engineでpath文字列checkをせず、path-handle adapterへ委譲する。
 - **AUD-049:** compile/link callable解決は単一catalogを使い、host registryを第4のbuiltin名一覧にしない。

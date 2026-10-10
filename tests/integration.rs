@@ -221,6 +221,41 @@ fn fixture_needs_legacy(name: &str) -> bool {
     )
 }
 
+/// import を含む fixture（C6-c で tree 経路は Engine resolver 経由になった）。
+///
+/// C6-c 以降、**tree 経路の file import は `module_resolver` capability が必須**になった（Q2 =
+/// Denied all-in、設計 §4.5/§8）。これらの fixture は bare-path import（`import "import_lib.tsg"`）
+/// を使い、fixtures ディレクトリ内の兄弟ファイルを import するため、tree arm では
+/// `--allow-import-root default=<fixtures_dir>` を付けて `default` mount へ routing する
+/// （bare → `@default/...` 正規化）。VM arm は E9/Phase 5 まで ModuleLoader 経路に残るため
+/// import root を付けず従来挙動のまま（意図的な tree/VM 既知差、設計 §4.4 blast radius）。
+fn fixture_has_import(name: &str) -> bool {
+    matches!(
+        name,
+        "import_basic"
+            | "import_nested"
+            | "import_static_resolution"
+            | "import_circular"
+            | "function_id_import"
+            | "runtime_global_import"
+            | "error_import_not_found"
+            | "error_import_before_side_effects"
+    )
+}
+
+/// fixture の実効 [`FixtureKind`]（arm 依存）。
+///
+/// `import_circular` は tree arm では link 層が循環を検出して `Cycle` terminal（exit 1、設計 §4.4）
+/// になるため **Error**、VM arm は ModuleLoader の resolved-skip で成功扱い（従来 A/B 出力）のため
+/// **Golden**。両 arm で kind が割れるのは意図的な既知差（設計 §4.4 blast radius、Q2 の帰結）。
+fn effective_fixture_kind(name: &str, kind: FixtureKind, use_vm: bool) -> FixtureKind {
+    if name == "import_circular" && !use_vm {
+        FixtureKind::Error
+    } else {
+        kind
+    }
+}
+
 /// fixture を1つ実行して stdout / stderr / 終了コードを検証する
 fn run_fixture(name: &str, kind: FixtureKind, use_vm: bool) {
     let mode = if use_vm { "VM" } else { "tree-walk" };
@@ -236,6 +271,13 @@ fn run_fixture(name: &str, kind: FixtureKind, use_vm: bool) {
     if fixture_needs_legacy(name) {
         command.arg("--profile").arg("legacy");
     }
+    // C6-c: import を含む fixture の tree arm は `module_resolver` grant が必須（Q2）。
+    // bare-path import を fixtures ディレクトリ基準の `default` mount へ routing する。
+    // VM arm は ModuleLoader 経路（E9 まで）なので import root を付けない。
+    if fixture_has_import(name) && !use_vm {
+        let import_root = format!("default={}", fixtures_dir().to_str().expect("UTF-8 パス"));
+        command.arg("--allow-import-root").arg(import_root);
+    }
     command
         .arg(&script)
         .stdout(std::process::Stdio::piped())
@@ -244,6 +286,7 @@ fn run_fixture(name: &str, kind: FixtureKind, use_vm: bool) {
         command.env(key, value);
     }
 
+    let kind = effective_fixture_kind(name, kind, use_vm);
     let context = format!("{name} [{mode}]");
     let child = command
         .spawn()
@@ -455,6 +498,14 @@ const CUSTOM_FIXTURES: &[&str] = &[
     "error_stack_overflow",
 ];
 
+/// tree/VM で kind が割れる fixture（arm 依存で Golden/Error が変わる、設計 §4.4）。
+///
+/// `import_circular` は VM arm が Golden（ModuleLoader の resolved-skip で A/B 出力）、tree arm が
+/// Error（Engine resolver が循環を `Cycle` terminal で検出）。そのため `.expected`（VM 用）と
+/// `.expected_err`（tree 用）の両方を持つ。宣言テーブルは代表 kind（Golden）に載せ、tree arm の
+/// Error 化は `effective_fixture_kind` が行う。directory 整合検査はこの fixture の二重 kind を許容する。
+const DUAL_KIND_FIXTURES: &[&str] = &["import_circular"];
+
 /// 他の fixture から import される補助ファイル（単体では実行しない）。
 const HELPER_FIXTURES: &[&str] = &[
     "function_id_import_lib",
@@ -498,8 +549,10 @@ fn fixture_declarations_match_directory() {
         ("エラー系", &error_files, ERROR_FIXTURES),
     ] {
         for file in files {
+            // dual-kind fixture は代表 kind のテーブルにだけ載る（もう一方の期待ファイルは
+            // arm 依存で参照される）。整合検査では代表 kind 以外の分類を免除する。
             assert!(
-                declared.contains(&file.as_str()),
+                declared.contains(&file.as_str()) || DUAL_KIND_FIXTURES.contains(&file.as_str()),
                 "{label} fixture `{file}` が宣言テーブルに登録されていません。\
                  fixture_tests! へ追加してください"
             );
@@ -752,6 +805,15 @@ fn cli_default_budget_allows_light_import_less_script_tree() {
 // サンドボックス境界テスト（import 先の検証）
 // =============================================================
 
+/// root 外への import が両 engine で拒否されることを検証する。
+///
+/// C6-c で tree/VM の遮断 channel が意図的に分岐した（Q2 = Denied all-in、設計 §4.4/§8）:
+/// - **VM arm**: ModuleLoader 経路（E9 まで）。従来どおり `TSUMUGI_SANDBOX` の許可範囲外 import を
+///   `サンドボックス違反` の runtime error で遮断する。
+/// - **tree arm**: Engine resolver 経路。`--allow-import-root default=<dir>`（import 元ディレクトリ）
+///   を grant し、root 外の絶対 path import は resolver が `invalid_import_specifier`（絶対 path は
+///   malformed specifier、設計 §3.2 の 2 channel 分離）として link 段で拒否する。どちらも exit 1 で
+///   import 先コードは実行されない（"leaked" が漏れない）。
 #[test]
 fn import_outside_sandbox_is_blocked_in_both_engines() {
     for use_vm in [false, true] {
@@ -759,8 +821,9 @@ fn import_outside_sandbox_is_blocked_in_both_engines() {
         let label = format!("sandbox-import-{}", if use_vm { "vm" } else { "tree" });
         let dir = TestDir::new(&label);
 
-        // サンドボックス外の実在ファイルと、それをimportするスクリプトを用意する
-        let outside = dir.path.join("outside.tsg");
+        // import 元ディレクトリの外にある実在ファイルと、それを絶対 path で import する root。
+        let outside_dir = TestDir::new(&format!("sandbox-import-outside-{label}"));
+        let outside = outside_dir.path.join("outside.tsg");
         std::fs::write(&outside, "print(\"leaked\")").expect("import先の作成に失敗");
         let script = dir.path.join("main.tsg");
         std::fs::write(
@@ -775,18 +838,25 @@ fn import_outside_sandbox_is_blocked_in_both_engines() {
         )
         .expect("スクリプトの作成に失敗");
 
-        // サンドボックスは fixtures ディレクトリのみ → 一時ディレクトリのimport先は許可外
-        let sandbox = fixtures_dir();
         let context = format!("sandbox import [{mode}]");
-        let output = run_script_process(
-            &script,
-            use_vm,
-            &[(
-                "TSUMUGI_SANDBOX",
-                sandbox.to_str().expect("パスがUTF-8ではありません"),
-            )],
-            &context,
-        );
+        let mut command = Command::new(tsumugi_bin());
+        if use_vm {
+            // VM arm: ModuleLoader 経路。TSUMUGI_SANDBOX の許可範囲は import 元 dir のみ。
+            command.arg("--vm").env("TSUMUGI_SANDBOX", dir.as_str());
+        } else {
+            // tree arm: resolver 経路。default mount は import 元 dir のみ。root 外絶対 path は拒否。
+            command
+                .arg("--allow-import-root")
+                .arg(format!("default={}", dir.as_str()));
+        }
+        command
+            .arg(&script)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = command
+            .spawn()
+            .unwrap_or_else(|e| panic!("{context}: 起動失敗: {e}"));
+        let output = wait_with_timeout(child, DEFAULT_TIMEOUT, &context);
         let stdout = normalize(&String::from_utf8_lossy(&output.stdout));
         let stderr = normalize(&String::from_utf8_lossy(&output.stderr));
 
@@ -794,10 +864,17 @@ fn import_outside_sandbox_is_blocked_in_both_engines() {
             !output.status.success(),
             "{context}: 終了コード0で終了しました\n--- stderr ---\n{stderr}"
         );
-        assert!(
-            stderr.contains("サンドボックス違反"),
-            "{context}: importのサンドボックスエラーが出ません\n--- stderr ---\n{stderr}"
-        );
+        if use_vm {
+            assert!(
+                stderr.contains("サンドボックス違反"),
+                "{context}: VM import のサンドボックスエラーが出ません\n--- stderr ---\n{stderr}"
+            );
+        } else {
+            assert!(
+                stderr.contains("invalid_import_specifier"),
+                "{context}: tree import の resolver 拒否が出ません\n--- stderr ---\n{stderr}"
+            );
+        }
         assert_eq!(
             stdout, "",
             "{context}: 許可外のimport先が実行されました\n--- stdout ---\n{stdout}"
@@ -809,87 +886,88 @@ fn import_outside_sandbox_is_blocked_in_both_engines() {
     }
 }
 
+/// REV-015 Slice 2: import module は import_count へ課金する。上限 0 では初めての import 解決で
+/// source 上限エラーになり 1 文も実行しない。
+///
+/// C6-c + option B 以降、**legacy env budget（`TSUMUGI_MAX_IMPORT_COUNT`）が効くのは VM arm だけ**に
+/// なった。tree arm の file/stdin は embedding Engine API（standard budget）経由になり legacy env budget
+/// を参照しない（import なし script が既に option B で tree=standard budget になっていたのと同じ理由を、
+/// C6-c が import あり script へ広げた）。そのため本テストは VM arm のみを対象にする（意図的な
+/// tree/VM 既知差）。tree 経路の import budget 境界は Phase 3（CAP-AT-17）で embedding budget として扱う。
 #[test]
-fn import_count_limit_gates_file_execution_in_both_engines() {
-    // REV-015 Slice 2: import module は import_count へ課金する。上限 0 では
-    // root は実行できるが、初めての import 解決で source 上限エラーになり
-    // 1 文も実行しない。tree/VM で観測挙動を一致させる。
-    for use_vm in [false, true] {
-        let mode = if use_vm { "VM" } else { "tree-walk" };
-        let label = format!("import-count-{}", if use_vm { "vm" } else { "tree" });
-        let dir = TestDir::new(&label);
+fn import_count_limit_gates_file_execution_vm() {
+    let use_vm = true;
+    let dir = TestDir::new("import-count-vm");
 
-        let lib = dir.path.join("lib.tsg");
-        std::fs::write(&lib, "let helper = 42\n").expect("lib の作成に失敗");
-        let script = dir.path.join("main.tsg");
-        std::fs::write(&script, "import \"lib.tsg\"\nprint(\"AFTER\")\n")
-            .expect("main の作成に失敗");
+    let lib = dir.path.join("lib.tsg");
+    std::fs::write(&lib, "let helper = 42\n").expect("lib の作成に失敗");
+    let script = dir.path.join("main.tsg");
+    std::fs::write(&script, "import \"lib.tsg\"\nprint(\"AFTER\")\n").expect("main の作成に失敗");
 
-        let context = format!("import count limit [{mode}]");
-        let output = run_script_process(
-            &script,
-            use_vm,
-            &[
-                ("TSUMUGI_SANDBOX", dir.as_str()),
-                ("TSUMUGI_MAX_IMPORT_COUNT", "0"),
-            ],
-            &context,
-        );
-        let (stdout, stderr) = output_text(&output);
+    let context = "import count limit [VM]";
+    let output = run_script_process(
+        &script,
+        use_vm,
+        &[
+            ("TSUMUGI_SANDBOX", dir.as_str()),
+            ("TSUMUGI_MAX_IMPORT_COUNT", "0"),
+        ],
+        context,
+    );
+    let (stdout, stderr) = output_text(&output);
 
-        assert!(
-            !output.status.success(),
-            "{context}: 終了コード0で終了しました\n--- stderr ---\n{stderr}"
-        );
-        assert!(
-            stderr.contains("import の本数が上限を超えました"),
-            "{context}: import count 上限が適用されていません\n--- stderr ---\n{stderr}"
-        );
-        // 1 文も実行しないため後続の print は出ない。
-        assert_eq!(
-            stdout, "",
-            "{context}: 上限超過後に実行されました\n--- stdout ---\n{stdout}"
-        );
-    }
+    assert!(
+        !output.status.success(),
+        "{context}: 終了コード0で終了しました\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stderr.contains("import の本数が上限を超えました"),
+        "{context}: import count 上限が適用されていません\n--- stderr ---\n{stderr}"
+    );
+    // 1 文も実行しないため後続の print は出ない。
+    assert_eq!(
+        stdout, "",
+        "{context}: 上限超過後に実行されました\n--- stdout ---\n{stdout}"
+    );
 }
 
+/// REV-015 Slice 2: import source は source_bytes と import_bytes の両方へ課金する。上限内なら
+/// root + import が実行される。
+///
+/// `import_count_limit_gates_file_execution_vm` と同じ理由で、legacy env budget が効く VM arm のみを
+/// 対象にする（C6-c + option B で tree arm は standard budget へ移行、legacy env budget 非参照）。
 #[test]
-fn import_source_bytes_charged_allows_execution_within_limit_in_both_engines() {
-    // REV-015 Slice 2: import source は source_bytes と import_bytes の両方へ
-    // 課金する。上限内なら root + import が実行される。tree/VM で一致する。
-    for use_vm in [false, true] {
-        let mode = if use_vm { "VM" } else { "tree-walk" };
-        let label = format!("import-bytes-ok-{}", if use_vm { "vm" } else { "tree" });
-        let dir = TestDir::new(&label);
+fn import_source_bytes_charged_allows_execution_within_limit_vm() {
+    let use_vm = true;
+    let dir = TestDir::new("import-bytes-ok-vm");
 
-        let lib = dir.path.join("lib.tsg");
-        std::fs::write(&lib, "let helper = 7\n").expect("lib の作成に失敗");
-        let script = dir.path.join("main.tsg");
-        std::fs::write(&script, "import \"lib.tsg\"\nprint(helper)\n").expect("main の作成に失敗");
+    let lib = dir.path.join("lib.tsg");
+    std::fs::write(&lib, "let helper = 7\n").expect("lib の作成に失敗");
+    let script = dir.path.join("main.tsg");
+    std::fs::write(&script, "import \"lib.tsg\"\nprint(helper)\n").expect("main の作成に失敗");
 
-        let context = format!("import bytes within limit [{mode}]");
-        let output = run_script_process(
-            &script,
-            use_vm,
-            &[
-                ("TSUMUGI_SANDBOX", dir.as_str()),
-                // root + import の合計 byte 数を十分に上回る上限。
-                ("TSUMUGI_MAX_SOURCE_BYTES", "1024"),
-                ("TSUMUGI_MAX_IMPORT_BYTES", "1024"),
-            ],
-            &context,
-        );
-        let (stdout, stderr) = output_text(&output);
+    let context = "import bytes within limit [VM]";
+    let output = run_script_process(
+        &script,
+        use_vm,
+        &[
+            ("TSUMUGI_SANDBOX", dir.as_str()),
+            // root + import の合計 byte 数を十分に上回る上限。
+            ("TSUMUGI_MAX_SOURCE_BYTES", "1024"),
+            ("TSUMUGI_MAX_IMPORT_BYTES", "1024"),
+        ],
+        context,
+    );
+    let (stdout, stderr) = output_text(&output);
 
-        assert!(
-            output.status.success(),
-            "{context}: 上限内なのに失敗しました\n--- stderr ---\n{stderr}"
-        );
-        assert!(
-            stdout.contains("7"),
-            "{context}: import した値が使えていません\n--- stdout ---\n{stdout}"
-        );
-    }
+    assert!(
+        output.status.success(),
+        "{context}: 上限内なのに失敗しました\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stdout.contains("7"),
+        "{context}: import した値が使えていません\n--- stdout ---\n{stdout}"
+    );
 }
 
 #[test]

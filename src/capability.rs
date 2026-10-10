@@ -68,6 +68,77 @@ impl CapabilityKind {
     }
 }
 
+/// capability denial の分類（仕様第13節 `DenialCode`）。
+///
+/// grant の有無・operation・resource のどのレベルで拒否されたかを示す。import resolver 不足は
+/// [`DenialCode::ResourceNotGranted`]（authority 不足）で表す。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum DenialCode {
+    /// capability 自体が grant されていない。
+    CapabilityNotGranted,
+    /// capability はあるが、要求 operation が grant されていない。
+    OperationNotGranted,
+    /// operation はあるが、要求 resource が grant されていない。
+    ResourceNotGranted,
+    /// 要求された host function が grant されていない。
+    HostFunctionNotGranted,
+}
+
+/// 拒否された操作の crate 定義識別子（仕様第13節 `OperationId`）。
+///
+/// crate が定義する固定 ASCII identifier。import 解決は `"module.resolve"`。host が任意文字列を
+/// 注入する余地は無い（固定値のみ）。
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct OperationId(String);
+
+impl OperationId {
+    /// crate 定義の固定 identifier から作る（crate 内部限定）。
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// identifier 文字列を返す。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// host が公開（Public）と宣言した resource の label（仕様第13節 `ResourceLabel`）。
+///
+/// host が明示的に Public と宣言した label のみを載せる。import resolver 不足の denial は
+/// 絶対 path / specifier 原文を漏らさないため `public_resource: None` を使う（§8.5 存在 oracle 回避）。
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct ResourceLabel(String);
+
+impl ResourceLabel {
+    /// Public と宣言された label から作る。
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// label 文字列を返す。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// capability 拒否の構造化記述（仕様第13節 `Denial`）。
+///
+/// `LinkError::Denied` と `ExecutionOutcome::Denied` が共有する単一型（独自 struct を作らない）。
+/// `public_resource` は host が Public と宣言した label のみを載せ、絶対 path・credential・
+/// specifier 原文は含めない（§8.5・§13）。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Denial {
+    /// 拒否のレベル。
+    pub code: DenialCode,
+    /// 拒否された authority 種別。
+    pub capability: CapabilityKind,
+    /// 拒否された操作の固定 identifier。
+    pub operation: OperationId,
+    /// host が Public と宣言した resource label（無ければ `None`）。
+    pub public_resource: Option<ResourceLabel>,
+}
+
 /// 環境変数値の機密分類（仕様第5節 `DataClassification`）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum DataClassification {
@@ -555,6 +626,15 @@ pub trait ModuleResolver: Send + Sync + 'static {
         context: &mut CapabilityCallContext<'_>,
         request: ResolveRequest<'_>,
     ) -> Result<ResolvedModule, AdapterError>;
+
+    /// 指定 mount 名を解決対象として知っているか（link 層の mount 存在判定、設計 §3.2・§4.5）。
+    ///
+    /// link 層は resolve を呼ぶ前にこれで mount 存在を確認し、未登録なら terminal `Denied` にする
+    /// （malformed specifier とは別 channel）。既定は `true`（mount の概念を持たない resolver は
+    /// 全 specifier を自前で解決する前提）。filesystem resolver は登録 mount だけ `true` を返す。
+    fn knows_mount(&self, _mount: &str) -> bool {
+        true
+    }
 }
 
 /// resolve 要求（仕様第10節 `ResolveRequest`）。
@@ -1327,6 +1407,11 @@ impl CapabilitySet {
     /// filesystem authority（crate 内部限定。C5-c で fs builtin が consult する）。
     pub(crate) fn filesystem(&self) -> Option<&FilesystemCapability> {
         self.0.filesystem.as_ref()
+    }
+
+    /// module resolver authority（crate 内部限定。C6-c で link 層が import を解決する）。
+    pub(crate) fn module_resolver(&self) -> Option<&Arc<dyn ModuleResolver>> {
+        self.0.module_resolver.as_ref()
     }
 
     /// process exit authority（crate 内部限定。C1 では未配線、C7 で使う）。
@@ -2367,6 +2452,10 @@ impl FilesystemModuleResolver {
 impl ModuleResolver for FilesystemModuleResolver {
     fn policy_id(&self) -> NonZeroU128 {
         self.policy_id
+    }
+
+    fn knows_mount(&self, mount: &str) -> bool {
+        self.roots.iter().any(|(name, _)| name.as_str() == mount)
     }
 
     fn resolve(
@@ -3776,19 +3865,16 @@ mod tests {
     fn drain_source(source: &mut dyn ModuleSource, max_bytes: NonZeroUsize) -> Vec<u8> {
         with_call_context(|ctx| {
             let mut out = Vec::new();
-            loop {
-                match source.read_chunk(ctx, max_bytes).expect("read_chunk") {
-                    ModuleChunk::Bytes(bytes) => {
-                        assert!(
-                            !bytes.is_empty() && bytes.len() <= max_bytes.get(),
-                            "chunk len {} outside 1..={}",
-                            bytes.len(),
-                            max_bytes.get()
-                        );
-                        out.extend_from_slice(&bytes);
-                    }
-                    ModuleChunk::Eof => break,
-                }
+            while let ModuleChunk::Bytes(bytes) =
+                source.read_chunk(ctx, max_bytes).expect("read_chunk")
+            {
+                assert!(
+                    !bytes.is_empty() && bytes.len() <= max_bytes.get(),
+                    "chunk len {} outside 1..={}",
+                    bytes.len(),
+                    max_bytes.get()
+                );
+                out.extend_from_slice(&bytes);
             }
             out
         })

@@ -138,11 +138,11 @@ pub use embedding::ContextError;
 // alpha facade と名前衝突しないため、そのまま crate root へ re-export する。
 pub use capability::{
     CapabilityCallContext, CapabilityKind, CapabilitySet, CapabilitySetBuilder, CapabilitySetId,
-    Clock, DataClassification, DirectoryHandle, EnvironmentSnapshot, EnvironmentValue,
-    FilesystemCapability, FilesystemRoot, FsOperation, HostFunctionId, Input, ModuleChunk,
-    ModuleResolver, ModuleSource, MountName, OsDirectoryHandle, Output, ProcessExit,
-    ResolveRequest, ResolvedModule, SymlinkPolicy, SystemClock, SystemInput, SystemOutput,
-    derive_policy_id,
+    Clock, DataClassification, Denial, DenialCode, DirectoryHandle, EnvironmentSnapshot,
+    EnvironmentValue, FilesystemCapability, FilesystemRoot, FsOperation, HostFunctionId, Input,
+    ModuleChunk, ModuleResolver, ModuleSource, MountName, OperationId, OsDirectoryHandle, Output,
+    ProcessExit, ResolveRequest, ResolvedModule, ResourceLabel, SymlinkPolicy, SystemClock,
+    SystemInput, SystemOutput, derive_policy_id,
 };
 // filesystem `ModuleResolver` 実体（C6-b）。`OsDirectoryHandle` の secure open に依存するため
 // secure handle を実装する platform（unix / windows）でのみコンパイル・再 export する。

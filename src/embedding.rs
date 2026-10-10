@@ -679,6 +679,12 @@ struct CompiledScriptInner {
     /// [組み込みAPI仕様](../docs/embedding-api.md) 第4.1節を正本とする）。import の有無だけは
     /// link 判定に必要なので `bool` に畳んで持つ。
     has_imports: bool,
+    /// root source の top-level import specifier を出現順に収集したもの（specifier と行番号）。
+    ///
+    /// compile 時に AST の `Stmt::Import { path, line }` を走査して収集する（再 parse /
+    /// `retain_source` 非依存、設計 §4.3 step 2）。link 層（C6-c）が module resolver へ渡す
+    /// root import 列として使う。
+    import_specifiers: Vec<(String, usize)>,
     /// `retain_source=true` のとき保持する source 本文。
     ///
     /// E3 の実行入口はこの本文を再 parse して実行する。したがって
@@ -721,6 +727,11 @@ impl CompiledScript {
     /// root source に top-level import 文があるか（link 判定用、crate 内部）。
     pub(crate) fn has_imports(&self) -> bool {
         self.0.has_imports
+    }
+
+    /// root source の top-level import specifier（出現順、crate 内部）。link 層が解決に使う。
+    pub(crate) fn import_specifiers(&self) -> &[(String, usize)] {
+        &self.0.import_specifiers
     }
 }
 
@@ -817,25 +828,60 @@ impl std::fmt::Debug for LinkedScript {
 
 /// link 要求（仕様第5節 `LinkRequest`）。
 ///
-/// E2 では capability / budget / cancellation を伴う import 解決を行わない（Phase 1 は
-/// import 0 件のみ link 可能）。最終形の `operation_id` / `capabilities` / `budget` /
-/// `cancellation` は Phase 2/3（E7・E11）で導入する。現状は最小の骨格に留める。
-#[derive(Clone, Debug, Default)]
+/// Phase 2（C6/E7）で import 解決を Engine API へ配線した最終形。resolver 相関用の
+/// `operation_id`、import 解決の authority を持つ `capabilities`、link 時 budget 器
+/// （`budget`）、link 開始前 cancel 観測用の `cancellation` を持つ。
+#[derive(Clone)]
 pub struct LinkRequest {
-    _private: (),
+    /// resolver へ渡す相関 ID。
+    pub operation_id: ExecutionId,
+    /// import 解決の authority（`module_resolver` を含み得る）。
+    pub capabilities: crate::capability::CapabilitySet,
+    /// link 時 budget 器（Phase 2 は remaining-bytes getter の器のみ、N 境界は Phase 3）。
+    pub budget: crate::budget::BudgetConfig,
+    /// link 開始前・各 resolve 前に観測する cancel token（§4.3 step 0）。
+    pub cancellation: crate::budget::CancellationToken,
 }
 
 impl LinkRequest {
-    /// 既定の link 要求を作る。
-    pub fn new() -> Self {
-        Self { _private: () }
+    /// link 要求を作る（仕様第5節の 3 引数 `new`）。cancellation は never-cancel token を既定とする。
+    pub fn new(
+        operation_id: ExecutionId,
+        capabilities: crate::capability::CapabilitySet,
+        budget: crate::budget::BudgetConfig,
+    ) -> Self {
+        Self {
+            operation_id,
+            capabilities,
+            budget,
+            cancellation: crate::budget::CancellationToken::new(),
+        }
+    }
+
+    /// cancellation token を差し替える（補助 builder、設計 §4.1）。
+    ///
+    /// 仕様第5節の 3 引数 `new` に無い additive な public API。CLI/test はこの builder で
+    /// cancellation を注入し、`run` 経路と同じ token インスタンスを共有させる（§4.6）。
+    pub fn with_cancellation(mut self, token: crate::budget::CancellationToken) -> Self {
+        self.cancellation = token;
+        self
+    }
+}
+
+impl std::fmt::Debug for LinkRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // capability 本体・budget 値は出さず identity と有無だけを見せる（secret-free）。
+        f.debug_struct("LinkRequest")
+            .field("operation_id", &self.operation_id)
+            .field("capabilities", &self.capabilities.id())
+            .finish_non_exhaustive()
     }
 }
 
 /// link 失敗（仕様第5節 `LinkError`）。
 ///
-/// E2（Phase 1、import 0 件）で到達し得る variant のみを持つ。resolver / capability /
-/// budget / deadline / cancel 等は Phase 2/3 で追加する。`#[non_exhaustive]`。
+/// Phase 2（C6/E7）で import 解決を配線した最終形の全 variant を持つ。`#[non_exhaustive]`
+/// により variant 追加を breaking にしない。
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum LinkError {
@@ -845,7 +891,11 @@ pub enum LinkError {
     RevisionMismatch,
     /// backend が一致しない。
     BackendMismatch,
-    /// 現在の Phase で未提供の機能を要求した（Phase 1 の import など）。
+    /// 現在の Phase で未提供の機能を要求した。
+    ///
+    /// C6-c 後は import を理由にこの variant を返すことはない（import あり + resolver 未 grant は
+    /// [`LinkError::Denied`]、engine/revision/backend 不一致は各 Mismatch）。最終形にも保持するが
+    /// 実質的に到達しない保持 variant（設計 §4.2・§4.6）。
     FeatureUnavailable {
         /// 未提供の機能名。
         feature: &'static str,
@@ -860,6 +910,36 @@ pub enum LinkError {
         /// secret を含まない表示用メッセージ。
         safe_message: String,
     },
+    /// import があるのに authority（`module_resolver`）が無い等、capability 不足で拒否した
+    /// terminal（§4.5、capability-model §13）。script からは catch できない。
+    Denied(crate::capability::Denial),
+    /// resolver が解決に失敗した／malformed specifier／内部 resolver fault 等の host boundary 失敗。
+    Resolve(HostError),
+    /// 解決済み module の UTF-8 不正 / 単体 compile 失敗（§4.4）。
+    InvalidModule {
+        /// 不正だった module の ID。
+        module: ModuleId,
+        /// module compile 診断（1 件以上、source 位置順）。
+        diagnostics: CompileErrors,
+    },
+    /// import の循環を検出した。`chain` は循環の閉路（起点を末尾に再掲、§4.4）。
+    Cycle {
+        /// 循環を構成する module ID 列（起点を末尾に再掲）。
+        chain: Vec<ModuleId>,
+    },
+    /// import の深度が上限を超えた（§4.3 step 6）。
+    DepthExceeded {
+        /// 深度上限（`MAX_IMPORT_DEPTH`）。
+        limit: u32,
+    },
+    /// link 時 budget 超過（Phase 3 で実効化。器としての variant）。
+    BudgetExceeded(crate::budget::BudgetExceeded),
+    /// link 時 deadline 超過。
+    DeadlineExceeded,
+    /// link 開始前・解決中に cancel された（§4.3 step 0）。
+    Cancelled,
+    /// backend 固有の実行失敗。
+    Backend(ExecutionError),
 }
 
 impl Engine {
@@ -905,7 +985,15 @@ impl Engine {
             })?;
 
         let source_hash = SourceHash::from_bytes(hash::sha256(source.text.as_bytes()));
-        let has_imports = program.iter().any(is_import_stmt);
+        // top-level import specifier を出現順に収集する（設計 §4.3 step 2、再 parse 非依存）。
+        let import_specifiers: Vec<(String, usize)> = program
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::Import { path, line } => Some((path.clone(), *line)),
+                _ => None,
+            })
+            .collect();
+        let has_imports = !import_specifiers.is_empty();
 
         Ok(CompiledScript(Arc::new(CompiledScriptInner {
             engine_id: self.id(),
@@ -914,6 +1002,7 @@ impl Engine {
             language_revision: self.config().language_revision,
             backend: self.config().backend,
             has_imports,
+            import_specifiers,
             retained_source: options.retain_source.then(|| source.text.to_string()),
         })))
     }
@@ -921,9 +1010,9 @@ impl Engine {
     /// [`CompiledScript`] を link して [`LinkedScript`] を作る（仕様第5節）。
     ///
     /// engine ID → revision → backend の順に検証し、不一致なら対応する [`LinkError`] を返す。
-    /// Phase 1 では import 0 件だけを link でき、import 文が1件以上あれば
-    /// [`LinkError::FeatureUnavailable`]（`feature: "module_resolver"`）を返す。import 0 件でも
-    /// 空 graph を持つ。
+    /// import があれば `request.capabilities` の `module_resolver` で解決する（Phase 2、C6/E7）。
+    /// resolver 未 grant + import あり は resolver call 0 の terminal [`LinkError::Denied`]。
+    /// import 0 件は空 graph の [`LinkedScript`] を返す。
     pub fn link(
         &self,
         script: &CompiledScript,
@@ -947,7 +1036,7 @@ impl Engine {
     fn link_inner(
         &self,
         script: &CompiledScript,
-        _request: LinkRequest,
+        request: LinkRequest,
     ) -> Result<LinkedScript, LinkError> {
         if script.engine_id() != self.id() {
             return Err(LinkError::EngineMismatch);
@@ -959,39 +1048,439 @@ impl Engine {
             return Err(LinkError::BackendMismatch);
         }
 
-        // Phase 1: import が1件でもあれば module resolver 未提供として拒否する。
-        if script.has_imports() {
-            return Err(LinkError::FeatureUnavailable {
-                feature: "module_resolver",
-            });
+        // step 0: engine/revision/backend 検証直後・resolver 取得より前に cancel を観測する
+        // （resolver call 0 契約、設計 §4.3 step 0）。
+        if request.cancellation.is_cancelled() {
+            return Err(LinkError::Cancelled);
         }
 
-        let root = script.source_hash();
-        // import 0 件の空 graph。
+        let root_hash = script.source_hash();
+
+        // step 1: resolver capability を取得する。import があるのに resolver 未 grant なら
+        // resolver を一度も呼ばず terminal Denied（CAP-AT-16、設計 §4.5）。
+        let resolver = match request.capabilities.module_resolver() {
+            Some(resolver) => resolver,
+            None => {
+                if script.has_imports() {
+                    return Err(LinkError::Denied(resolver_absent_denial()));
+                }
+                // import 0 件 + resolver 無しは従来どおり空 graph。
+                return Ok(self.empty_linked_script(script, root_hash));
+            }
+        };
+
+        // import 0 件なら resolver があっても空 graph（resolver は呼ばない）。
+        if !script.has_imports() {
+            return Ok(self.empty_linked_script(script, root_hash));
+        }
+
+        // step 2〜8: import を解決して graph を構築する。
+        let resolution = self.resolve_import_graph(script, resolver.as_ref(), &request)?;
+
+        let revision = script.language_revision();
+        let root_imports_str: Vec<&str> = resolution
+            .root_imports
+            .iter()
+            .map(ModuleId::as_str)
+            .collect();
+        let nodes_encoded: Vec<(&str, SourceHash, Vec<&str>)> = resolution
+            .nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.module_id.as_str(),
+                    node.source_hash,
+                    node.imports.iter().map(ModuleId::as_str).collect(),
+                )
+            })
+            .collect();
+        let nodes_ref: Vec<(&str, SourceHash, &[&str])> = nodes_encoded
+            .iter()
+            .map(|(id, hash, imports)| (*id, *hash, imports.as_slice()))
+            .collect();
         let graph_hash = SourceHash::from_bytes(hash::import_graph_hash(
-            script.language_revision(),
-            root,
-            &[],
-            &[],
+            revision,
+            root_hash,
+            &root_imports_str,
+            &nodes_ref,
         ));
+
         let import_graph = ImportGraph {
-            root,
-            root_imports: Vec::new(),
-            nodes: Vec::new(),
+            root: root_hash,
+            root_imports: resolution.root_imports,
+            nodes: resolution.nodes,
             graph_hash,
         };
 
-        let script_hash = SourceHash::from_bytes(hash::linked_script_hash(
-            script.language_revision(),
-            root,
-            graph_hash,
-        ));
+        let script_hash =
+            SourceHash::from_bytes(hash::linked_script_hash(revision, root_hash, graph_hash));
 
         Ok(LinkedScript(Arc::new(LinkedScriptInner {
             root: script.clone(),
             import_graph,
             script_hash,
         })))
+    }
+
+    /// import 0 件の空 graph を持つ [`LinkedScript`] を作る。
+    fn empty_linked_script(&self, script: &CompiledScript, root_hash: SourceHash) -> LinkedScript {
+        let revision = script.language_revision();
+        let graph_hash =
+            SourceHash::from_bytes(hash::import_graph_hash(revision, root_hash, &[], &[]));
+        let import_graph = ImportGraph {
+            root: root_hash,
+            root_imports: Vec::new(),
+            nodes: Vec::new(),
+            graph_hash,
+        };
+        let script_hash =
+            SourceHash::from_bytes(hash::linked_script_hash(revision, root_hash, graph_hash));
+        LinkedScript(Arc::new(LinkedScriptInner {
+            root: script.clone(),
+            import_graph,
+            script_hash,
+        }))
+    }
+
+    /// root から BFS/DFS で import を解決し、`root_imports` と `nodes` を構築する
+    /// （設計 §4.3 step 3〜8）。cycle / depth / 同 ID・異 hash / UTF-8 / module compile を検証する。
+    fn resolve_import_graph(
+        &self,
+        script: &CompiledScript,
+        resolver: &dyn crate::capability::ModuleResolver,
+        request: &LinkRequest,
+    ) -> Result<ResolvedGraph, LinkError> {
+        use std::collections::HashMap;
+
+        let revision = script.language_revision();
+        let mut call_id: u64 = 0;
+
+        // 解決済み module → source_hash（二重展開防止と同 ID/異 hash 判定、§4.4）。
+        let mut resolved: HashMap<ModuleId, SourceHash> = HashMap::new();
+        // 構築済み node（module_id をキーに重複構築を避ける）。
+        let mut node_map: HashMap<ModuleId, ImportNode> = HashMap::new();
+
+        // root の import を正規化して root_imports を作る（§4.3 step 2 の収集 + 正規化）。
+        let mut root_imports: Vec<ModuleId> = Vec::new();
+        // DFS フレーム: (解決する module ID, その specifier, depth)。root import は importer=None。
+        // active スタック上の循環検出のため、再帰を手続きの明示 stack で表す。
+        self.resolve_module_imports(
+            resolver,
+            request,
+            revision,
+            None,
+            script.import_specifiers(),
+            0,
+            &mut call_id,
+            &mut resolved,
+            &mut node_map,
+            &mut Vec::new(),
+            &mut root_imports,
+        )?;
+
+        // nodes を module_id の UTF-8 昇順で並べる（§4.3 step 8、hash encoding 契約）。
+        let mut nodes: Vec<ImportNode> = node_map.into_values().collect();
+        nodes.sort_by(|a, b| a.module_id.as_str().cmp(b.module_id.as_str()));
+
+        Ok(ResolvedGraph {
+            root_imports,
+            nodes,
+        })
+    }
+
+    /// `importer` が出した import 群（specifier 列）を順に解決する再帰ヘルパ。
+    ///
+    /// `active` は現在 DFS で訪問中の module ID スタック（循環検出用）。`out_imports` には、
+    /// この呼び出しが解決した各 import の正規化済み `ModuleId` を出現順に積む（importer の
+    /// `imports` 列 / root の `root_imports` 列になる）。
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_module_imports(
+        &self,
+        resolver: &dyn crate::capability::ModuleResolver,
+        request: &LinkRequest,
+        revision: LanguageRevision,
+        importer: Option<&ModuleId>,
+        specifiers: &[(String, usize)],
+        depth: usize,
+        call_id: &mut u64,
+        resolved: &mut std::collections::HashMap<ModuleId, SourceHash>,
+        node_map: &mut std::collections::HashMap<ModuleId, ImportNode>,
+        active: &mut Vec<ModuleId>,
+        out_imports: &mut Vec<ModuleId>,
+    ) -> Result<(), LinkError> {
+        for (specifier, _line) in specifiers {
+            // 各 resolve 前に cancel を観測する（§4.3 step 0 の loop 内確認）。
+            if request.cancellation.is_cancelled() {
+                return Err(LinkError::Cancelled);
+            }
+
+            // specifier を parse / 正規化する（malformed / mount は 2 channel 分離）。
+            let (module_id, normalized) = self.normalize_specifier(specifier, resolver)?;
+
+            // この import の ID を importer / root の imports 列へ記録する（出現順）。
+            out_imports.push(module_id.clone());
+
+            // 循環検出: active に既在なら Cycle（起点を末尾に再掲、§4.4）。
+            if let Some(pos) = active.iter().position(|m| m == &module_id) {
+                let mut chain: Vec<ModuleId> = active[pos..].to_vec();
+                chain.push(module_id.clone());
+                return Err(LinkError::Cycle { chain });
+            }
+
+            // 深度境界（§4.3 step 6）。import を depth 段降りた時点が MAX に達したら拒否する。
+            // 既解決の dedup は resolve 後（同 ID/異 hash 判定と同じ地点）で行う（§4.3 step 4）。
+            // ただし既解決 module は再展開しない契約なので、深度は未解決 module へ降りるときだけ
+            // 消費させる判断が要る。ここでは「resolve → hash 判定 → 既解決なら skip」の順で統一し、
+            // 深度境界は未解決 module の子を降りる再帰呼び出し（depth+1）で評価される。
+            if depth >= crate::limits::MAX_IMPORT_DEPTH {
+                return Err(LinkError::DepthExceeded {
+                    limit: crate::limits::MAX_IMPORT_DEPTH as u32,
+                });
+            }
+
+            // resolver を呼ぶ（§4.3 step 3）。
+            *call_id += 1;
+            let resolved_module = {
+                let mut context = self.link_call_context(request, *call_id);
+                resolver
+                    .resolve(
+                        &mut context,
+                        crate::capability::ResolveRequest {
+                            importer,
+                            specifier: &normalized,
+                            language_revision: revision,
+                        },
+                    )
+                    .map_err(adapter_error_to_link_error)?
+            };
+
+            // resolver が返す ID は正規化済み specifier と一致する契約（§3.2）。防御的に
+            // 不一致は内部 fault として扱う。
+            if resolved_module.id != module_id {
+                return Err(LinkError::Resolve(host_error("internal_resolver_fault")));
+            }
+
+            // source を 64 KiB chunk で Eof まで読み、bytes を連結する（§4.3 step 3）。
+            let bytes = self.read_module_source(resolved_module.source, request, call_id)?;
+
+            // source_hash を連結後の生 bytes から算出する（§4.3 step 4 / LOW-2）。
+            let source_hash = SourceHash::from_bytes(hash::sha256(&bytes));
+
+            // 同 ID / 異 hash は Resolve（embedding-api §5.1、後勝ちにしない、§4.4）。
+            if let Some(existing) = resolved.get(&module_id) {
+                if *existing != source_hash {
+                    return Err(LinkError::Resolve(host_error("module_hash_mismatch")));
+                }
+                continue;
+            }
+
+            // UTF-8 検証（§4.3 step 3）。invalid なら InvalidModule。
+            let text = match std::str::from_utf8(&bytes) {
+                Ok(text) => text,
+                Err(_) => {
+                    return Err(LinkError::InvalidModule {
+                        module: module_id.clone(),
+                        diagnostics: CompileErrors {
+                            diagnostics: vec![CompileDiagnostic {
+                                code: CompileDiagnosticCode::Lex,
+                                line: None,
+                                column: None,
+                                safe_message: "module source が UTF-8 ではありません".to_string(),
+                            }],
+                        },
+                    });
+                }
+            };
+
+            // module 単体 compile（parse まで）。失敗は InvalidModule（§4.3 step 3）。
+            let module_program = {
+                let tokens = Lexer::new(text).tokenize();
+                Parser::new(tokens)
+                    .parse()
+                    .map_err(|errors| LinkError::InvalidModule {
+                        module: module_id.clone(),
+                        diagnostics: CompileErrors {
+                            diagnostics: errors.iter().map(compile_diagnostic_from).collect(),
+                        },
+                    })?
+            };
+
+            // この module の import specifier を出現順に収集する。
+            let module_specifiers: Vec<(String, usize)> = module_program
+                .iter()
+                .filter_map(|stmt| match stmt {
+                    Stmt::Import { path, line } => Some((path.clone(), *line)),
+                    _ => None,
+                })
+                .collect();
+
+            // 解決済みに登録し、active へ push して子 import を降りる（§4.4）。
+            resolved.insert(module_id.clone(), source_hash);
+            active.push(module_id.clone());
+            let mut child_imports: Vec<ModuleId> = Vec::new();
+            self.resolve_module_imports(
+                resolver,
+                request,
+                revision,
+                Some(&module_id),
+                &module_specifiers,
+                depth + 1,
+                call_id,
+                resolved,
+                node_map,
+                active,
+                &mut child_imports,
+            )?;
+            active.pop();
+
+            node_map.insert(
+                module_id.clone(),
+                ImportNode {
+                    module_id,
+                    source_hash,
+                    imports: child_imports,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// specifier を parse・正規化し、正規形 `ModuleId` と正規化済み specifier 文字列を返す
+    /// （§3.2「`ModuleId` 正規形」、2 channel 分離の HIGH-2）。
+    fn normalize_specifier(
+        &self,
+        specifier: &str,
+        resolver: &dyn crate::capability::ModuleResolver,
+    ) -> Result<(ModuleId, String), LinkError> {
+        use crate::capability::FilesystemTarget;
+
+        // malformed specifier（PathError）→ Resolve(code "invalid_import_specifier")。
+        let target = FilesystemTarget::parse(specifier)
+            .map_err(|_| LinkError::Resolve(host_error("invalid_import_specifier")))?;
+
+        // 正規形 `@mount/comp/comp/...` を組み立てる（unqualified は @default/... へ正規化）。
+        let mut normalized = String::from("@");
+        normalized.push_str(target.mount.as_str());
+        for component in target.path.components() {
+            normalized.push('/');
+            normalized.push_str(component);
+        }
+
+        // mount 未登録は terminal Denied（authority 不足、§3.2 の 2 channel 分離）。resolver が
+        // 知らない mount は resolve まで来ず link 層で Denied にする。
+        if !resolver.knows_mount(target.mount.as_str()) {
+            return Err(LinkError::Denied(resolver_absent_denial()));
+        }
+
+        let module_id = ModuleId::new(normalized.clone())
+            .map_err(|_| LinkError::Resolve(host_error("invalid_import_specifier")))?;
+        Ok((module_id, normalized))
+    }
+
+    /// resolver が返す source を 64 KiB chunk で Eof まで読み、bytes を連結する（§4.3 step 3）。
+    fn read_module_source(
+        &self,
+        mut source: Box<dyn crate::capability::ModuleSource>,
+        request: &LinkRequest,
+        call_id: &mut u64,
+    ) -> Result<Vec<u8>, LinkError> {
+        use std::num::NonZeroUsize;
+        const CHUNK: usize = 64 * 1024;
+        let max_bytes = NonZeroUsize::new(CHUNK).expect("64 KiB は非ゼロ");
+        let mut bytes = Vec::new();
+        loop {
+            // chunk 取得前にも cancel を観測する（§4.3 step 0）。
+            if request.cancellation.is_cancelled() {
+                return Err(LinkError::Cancelled);
+            }
+            *call_id += 1;
+            let mut context = self.link_call_context(request, *call_id);
+            let chunk = source
+                .read_chunk(&mut context, max_bytes)
+                .map_err(adapter_error_to_link_error)?;
+            match chunk {
+                crate::capability::ModuleChunk::Bytes(chunk) => {
+                    // chunk 長 > max_bytes は adapter 契約違反（§4.3 step 3）。
+                    if chunk.len() > max_bytes.get() {
+                        return Err(LinkError::Resolve(host_error(
+                            "resolver_contract_violation",
+                        )));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                crate::capability::ModuleChunk::Eof => break,
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// link 時 resolver / source 呼び出し用の [`CapabilityCallContext`] を組む。
+    ///
+    /// deadline / cancellation は `request` の budget・token を共有する。remaining-bytes は
+    /// Phase 2 では器のみ（import byte 上限を上限適用せず getter 値として渡す。CAP-AT-17 は
+    /// Phase 3）。`may_yield` は link 層では false（link は top-level driver 文脈でない）。
+    fn link_call_context<'a>(
+        &self,
+        request: &'a LinkRequest,
+        call_id: u64,
+    ) -> crate::capability::CapabilityCallContext<'a> {
+        crate::capability::CapabilityCallContext::new(
+            &request.capabilities,
+            request.budget.deadline,
+            request.cancellation.clone(),
+            request.budget.max_import_bytes,
+            request.budget.max_import_bytes,
+            false,
+            call_id,
+        )
+    }
+}
+
+/// 解決済み import graph の中間結果（root_imports と nodes）。
+struct ResolvedGraph {
+    root_imports: Vec<ModuleId>,
+    nodes: Vec<ImportNode>,
+}
+
+/// resolver 不足時に返す固定の [`Denial`]（設計 §4.2・§4.5）。
+fn resolver_absent_denial() -> crate::capability::Denial {
+    crate::capability::Denial {
+        code: crate::capability::DenialCode::ResourceNotGranted,
+        capability: crate::capability::CapabilityKind::ModuleResolver,
+        operation: crate::capability::OperationId::new("module.resolve"),
+        public_resource: None,
+    }
+}
+
+/// 固定 code の [`HostError`]（link 層の `Resolve` 用）。`safe_message` に specifier 原文・
+/// 絶対 path を入れない（§8.5 存在 oracle 回避）。
+fn host_error(code: &str) -> HostError {
+    HostError {
+        code: HostErrorCode::new(code).expect("固定 host error code は常に妥当"),
+        safe_message: String::new(),
+        retryable: false,
+    }
+}
+
+/// adapter の失敗を link 層の [`LinkError`] へ写す（設計 §4.3 step 3）。
+fn adapter_error_to_link_error(error: crate::capability::AdapterError) -> LinkError {
+    use crate::budget::ControlStop;
+    use crate::capability::AdapterError;
+    match error {
+        AdapterError::Host(_) => LinkError::Resolve(host_error("resolver_failed")),
+        AdapterError::SecureResolutionUnsupported => {
+            LinkError::Resolve(host_error("secure_resolution_unsupported"))
+        }
+        AdapterError::DirectoryReadFailed => LinkError::Resolve(host_error("resolver_failed")),
+        AdapterError::NonUtf8EntryName => LinkError::Resolve(host_error("resolver_failed")),
+        AdapterError::Control(stop) => match stop {
+            ControlStop::Cancelled => LinkError::Cancelled,
+            ControlStop::DeadlineExceeded { .. } => LinkError::DeadlineExceeded,
+            ControlStop::BudgetExceeded(exceeded) => LinkError::BudgetExceeded(exceeded),
+            ControlStop::InternalFailure(_) => {
+                LinkError::Resolve(host_error("internal_resolver_fault"))
+            }
+        },
     }
 }
 
@@ -2066,11 +2555,6 @@ fn execution_error_from(error: &TsumugiError) -> ExecutionError {
     }
 }
 
-/// top-level import 文か。
-fn is_import_stmt(stmt: &Stmt) -> bool {
-    matches!(stmt, Stmt::Import { .. })
-}
-
 /// 内部 [`TsumugiError`]（compile フェーズ）を [`CompileDiagnostic`] へ写す。
 fn compile_diagnostic_from(error: &TsumugiError) -> CompileDiagnostic {
     let (line, message) = match error {
@@ -2262,6 +2746,22 @@ mod tests {
         let token = crate::budget::CancellationToken::new();
         token.cancel();
         standard_request().cancellation(token)
+    }
+
+    /// import なし link テスト用の既定 [`LinkRequest`]（empty capabilities + standard budget）。
+    ///
+    /// C6-c で `LinkRequest::new` が 3 引数化したため、import 0 件を link するテストはこの helper で
+    /// 既定要求を作る（operation_id は固定、capabilities は empty = resolver 未 grant、budget は
+    /// standard）。import 0 件は resolver を呼ばず空 graph を返すので empty で足りる。
+    fn link_request() -> LinkRequest {
+        let clock = crate::budget::FakeClock::new();
+        let budget = crate::budget::BudgetConfig::standard(&clock)
+            .expect("standard budget の生成は成功する");
+        LinkRequest::new(
+            ExecutionId::new(std::num::NonZeroU128::new(1).expect("1 は非ゼロ")),
+            crate::capability::CapabilitySet::empty(),
+            budget,
+        )
     }
 
     #[test]
@@ -2553,7 +3053,7 @@ mod tests {
         let script = engine
             .compile(src("m", "let x = 1\n"), &CompileOptions::default())
             .unwrap();
-        let linked = engine.link(&script, LinkRequest::new()).expect("link");
+        let linked = engine.link(&script, link_request()).expect("link");
 
         let graph = linked.import_graph();
         assert!(graph.root_imports.is_empty());
@@ -2573,8 +3073,12 @@ mod tests {
         assert_eq!(linked.script_hash().as_bytes(), &expected_script);
     }
 
+    /// C6-c（CAP-AT-16）: import があるのに resolver を grant していない link は、resolver を一度も
+    /// 呼ばず terminal `Denied(ResourceNotGranted / ModuleResolver / "module.resolve" / None)` を返す
+    /// （Q2 = Denied all-in、設計 §4.5）。Phase 1 の `FeatureUnavailable` は返さない。
     #[test]
-    fn link_rejects_imports_in_phase1() {
+    fn link_denies_imports_without_resolver() {
+        use crate::capability::{CapabilityKind, DenialCode};
         let engine = Engine::builder().build().unwrap();
         let script = engine
             .compile(
@@ -2582,15 +3086,19 @@ mod tests {
                 &CompileOptions::default(),
             )
             .unwrap();
+        // link_request() は empty capabilities（resolver 未 grant）。
         let err = engine
-            .link(&script, LinkRequest::new())
-            .expect_err("import rejected");
-        assert_eq!(
-            err,
-            LinkError::FeatureUnavailable {
-                feature: "module_resolver"
+            .link(&script, link_request())
+            .expect_err("import は resolver 未 grant で Denied");
+        match err {
+            LinkError::Denied(denial) => {
+                assert_eq!(denial.code, DenialCode::ResourceNotGranted);
+                assert_eq!(denial.capability, CapabilityKind::ModuleResolver);
+                assert_eq!(denial.operation.as_str(), "module.resolve");
+                assert_eq!(denial.public_resource, None);
             }
-        );
+            other => panic!("expected Denied, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2601,7 +3109,7 @@ mod tests {
             .compile(src("m", "let x = 1\n"), &CompileOptions::default())
             .unwrap();
         let err = engine_b
-            .link(&script, LinkRequest::new())
+            .link(&script, link_request())
             .expect_err("foreign engine");
         assert_eq!(err, LinkError::EngineMismatch);
     }
@@ -2624,7 +3132,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let linked = engine.link(&script, LinkRequest::new()).unwrap();
+        let linked = engine.link(&script, link_request()).unwrap();
         let mut ctx = ExecutionContext::new(&engine);
         let outcome = engine.run(&linked, &mut ctx, standard_request());
         assert!(matches!(outcome, ExecutionOutcome::Completed { .. }));
@@ -2643,7 +3151,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let linked = engine.link(&script, LinkRequest::new()).unwrap();
+        let linked = engine.link(&script, link_request()).unwrap();
         let mut ctx = ExecutionContext::new(&engine);
         match engine.run(&linked, &mut ctx, standard_request()) {
             ExecutionOutcome::RuntimeError { error, .. } => {
@@ -2667,7 +3175,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let linked = engine.link(&script, LinkRequest::new()).unwrap();
+        let linked = engine.link(&script, link_request()).unwrap();
         let mut ctx = ExecutionContext::new(&engine);
         match engine.run(&linked, &mut ctx, standard_request()) {
             ExecutionOutcome::RuntimeError { error, .. } => {
@@ -2689,7 +3197,7 @@ mod tests {
         let script = engine
             .compile(retained("m", "let x = 1\n"), &CompileOptions::default())
             .unwrap();
-        let linked = engine.link(&script, LinkRequest::new()).unwrap();
+        let linked = engine.link(&script, link_request()).unwrap();
         let mut ctx = ExecutionContext::new(&engine);
         match engine.run(&linked, &mut ctx, standard_request()) {
             ExecutionOutcome::InternalFailure { fault_id, .. } => {
@@ -2712,7 +3220,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let linked = engine_a.link(&script, LinkRequest::new()).unwrap();
+        let linked = engine_a.link(&script, link_request()).unwrap();
         let mut foreign_ctx = ExecutionContext::new(&engine_b);
         assert!(matches!(
             engine_a.run(&linked, &mut foreign_ctx, standard_request()),
@@ -2734,7 +3242,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let linked1 = engine.link(&first, LinkRequest::new()).unwrap();
+        let linked1 = engine.link(&first, link_request()).unwrap();
         assert!(matches!(
             engine.run(&linked1, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
@@ -2749,7 +3257,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let linked2 = engine.link(&second, LinkRequest::new()).unwrap();
+        let linked2 = engine.link(&second, link_request()).unwrap();
         assert!(matches!(
             engine.run(&linked2, &mut ctx, standard_request()),
             ExecutionOutcome::Completed { .. }
@@ -2777,12 +3285,12 @@ mod tests {
             hex(script.source_hash().as_bytes()),
             hex(&hash::sha256(b"let x = 1\n"))
         );
-        let linked = engine.link(&script, LinkRequest::new()).unwrap();
+        let linked = engine.link(&script, link_request()).unwrap();
         // graph_hash と script_hash が決定的であること（同一入力で不変）。
         let script2 = engine
             .compile(src("golden", "let x = 1\n"), &CompileOptions::default())
             .unwrap();
-        let linked2 = engine.link(&script2, LinkRequest::new()).unwrap();
+        let linked2 = engine.link(&script2, link_request()).unwrap();
         assert_eq!(
             linked.import_graph().graph_hash,
             linked2.import_graph().graph_hash
@@ -2802,7 +3310,7 @@ mod tests {
                 },
             )
             .unwrap();
-        engine.link(&script, LinkRequest::new()).unwrap()
+        engine.link(&script, link_request()).unwrap()
     }
 
     /// EMB-AT-08: 未捕捉 runtime error は execution 開始時点まで全 language-state を rollback し、
@@ -2900,7 +3408,7 @@ mod tests {
         let script = engine
             .compile(retained("m", "let x = 1\n"), &CompileOptions::default())
             .unwrap();
-        let linked = engine.link(&script, LinkRequest::new()).unwrap();
+        let linked = engine.link(&script, link_request()).unwrap();
         assert!(matches!(
             engine.run(&linked, &mut ctx, standard_request()),
             ExecutionOutcome::InternalFailure { .. }
@@ -2999,7 +3507,7 @@ mod tests {
         let script = engine
             .compile(retained("m", "let x = 1\n"), &CompileOptions::default())
             .unwrap();
-        let linked = engine.link(&script, LinkRequest::new()).unwrap();
+        let linked = engine.link(&script, link_request()).unwrap();
         assert!(matches!(
             engine.run(&linked, &mut ctx, standard_request()),
             ExecutionOutcome::InternalFailure { .. }
@@ -4604,5 +5112,478 @@ mod tests {
             .err()
             .expect("colliding name must fail at registry build");
         assert!(matches!(err, ConfigError::DuplicateCallableName { .. }));
+    }
+}
+
+// ===========================================================================
+// C6-c: link 時 import 解決の Engine API 配線テスト（設計 §4.7）。
+//
+// link 層が resolver を使って import graph を構築・検証する経路を直接固定する。resolver
+// 呼び出し回数カウンタ付きの fake resolver で CAP-AT-16（resolver call 0）/ cycle / depth /
+// 同 ID 異 hash / UTF-8 / 契約違反 / pre-cancel / 未登録 mount / malformed / ImportGraph golden /
+// EMB-AT-05（run 時 resolver 0）を検証する。
+// ===========================================================================
+#[cfg(test)]
+mod c6c_tests {
+    use super::*;
+    use crate::budget::{BudgetConfig, CancellationToken, FakeClock};
+    use crate::capability::{
+        AdapterError, CapabilityCallContext, CapabilityKind, CapabilitySet, DenialCode,
+        ModuleChunk, ModuleResolver, ModuleSource, ResolveRequest, ResolvedModule,
+    };
+    use std::collections::HashMap;
+    use std::num::{NonZeroU128, NonZeroUsize};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn pid(n: u128) -> NonZeroU128 {
+        NonZeroU128::new(n).expect("non-zero")
+    }
+
+    /// in-memory な [`ModuleSource`]。`bytes` を `max_bytes` 単位で切り出して返す。
+    struct InMemorySource {
+        bytes: Vec<u8>,
+        offset: usize,
+    }
+    impl ModuleSource for InMemorySource {
+        fn read_chunk(
+            &mut self,
+            _context: &mut CapabilityCallContext<'_>,
+            max_bytes: NonZeroUsize,
+        ) -> Result<ModuleChunk, AdapterError> {
+            if self.offset >= self.bytes.len() {
+                return Ok(ModuleChunk::Eof);
+            }
+            let end = (self.offset + max_bytes.get()).min(self.bytes.len());
+            let chunk = self.bytes[self.offset..end].to_vec();
+            self.offset = end;
+            Ok(ModuleChunk::Bytes(chunk))
+        }
+    }
+
+    /// `max_bytes` を 1 byte 超過する chunk を返す契約違反 source。
+    struct OversizedSource {
+        emitted: bool,
+    }
+    impl ModuleSource for OversizedSource {
+        fn read_chunk(
+            &mut self,
+            _context: &mut CapabilityCallContext<'_>,
+            max_bytes: NonZeroUsize,
+        ) -> Result<ModuleChunk, AdapterError> {
+            if self.emitted {
+                return Ok(ModuleChunk::Eof);
+            }
+            self.emitted = true;
+            Ok(ModuleChunk::Bytes(vec![b'x'; max_bytes.get() + 1]))
+        }
+    }
+
+    /// 呼び出し回数カウンタ付きの fake resolver。
+    ///
+    /// `sources`: 正規化済み specifier（`@default/a` 等）→ module の生 bytes。resolve ごとに
+    /// `calls` を +1 する。`mount` 既定は `default`（`knows_mount` が `default` を知っていると返す）。
+    struct CountingResolver {
+        sources: HashMap<String, Vec<u8>>,
+        calls: Arc<AtomicUsize>,
+        mounts: Vec<String>,
+    }
+    impl CountingResolver {
+        fn new(sources: &[(&str, &str)]) -> (Self, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let map = sources
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
+                .collect();
+            (
+                Self {
+                    sources: map,
+                    calls: Arc::clone(&calls),
+                    mounts: vec!["default".to_string()],
+                },
+                calls,
+            )
+        }
+        fn with_bytes(sources: Vec<(&str, Vec<u8>)>) -> (Self, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let map = sources
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect();
+            (
+                Self {
+                    sources: map,
+                    calls: Arc::clone(&calls),
+                    mounts: vec!["default".to_string()],
+                },
+                calls,
+            )
+        }
+    }
+    impl ModuleResolver for CountingResolver {
+        fn policy_id(&self) -> NonZeroU128 {
+            pid(99)
+        }
+        fn knows_mount(&self, mount: &str) -> bool {
+            self.mounts.iter().any(|m| m == mount)
+        }
+        fn resolve(
+            &self,
+            _context: &mut CapabilityCallContext<'_>,
+            request: ResolveRequest<'_>,
+        ) -> Result<ResolvedModule, AdapterError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let id = ModuleId::new(request.specifier)
+                .map_err(|e| AdapterError::Host(format!("bad id: {e:?}")))?;
+            let bytes = self
+                .sources
+                .get(request.specifier)
+                .cloned()
+                .ok_or_else(|| AdapterError::Host("not found".to_string()))?;
+            Ok(ResolvedModule {
+                id,
+                source: Box::new(InMemorySource { bytes, offset: 0 }),
+                classification: crate::capability::DataClassification::Public,
+            })
+        }
+    }
+
+    /// 契約違反 source を返す resolver。
+    struct OversizedResolver {
+        calls: Arc<AtomicUsize>,
+    }
+    impl ModuleResolver for OversizedResolver {
+        fn policy_id(&self) -> NonZeroU128 {
+            pid(98)
+        }
+        fn resolve(
+            &self,
+            _context: &mut CapabilityCallContext<'_>,
+            request: ResolveRequest<'_>,
+        ) -> Result<ResolvedModule, AdapterError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ResolvedModule {
+                id: ModuleId::new(request.specifier).expect("id"),
+                source: Box::new(OversizedSource { emitted: false }),
+                classification: crate::capability::DataClassification::Public,
+            })
+        }
+    }
+
+    fn budget() -> BudgetConfig {
+        let clock = FakeClock::new();
+        BudgetConfig::standard(&clock).expect("standard budget")
+    }
+
+    fn op_id() -> ExecutionId {
+        ExecutionId::new(pid(1))
+    }
+
+    fn caps_with(resolver: Arc<dyn ModuleResolver>) -> CapabilitySet {
+        CapabilitySet::builder()
+            .module_resolver(resolver)
+            .expect("grant resolver")
+            .build()
+    }
+
+    fn compile_root(engine: &Engine, text: &str) -> CompiledScript {
+        engine
+            .compile(
+                Source::new(SourceId::new("root").expect("id"), text),
+                &CompileOptions::default(),
+            )
+            .expect("compile root")
+    }
+
+    // --- CAP-AT-16: resolver 未 grant + import → resolver call 0 の Denied ---
+    #[test]
+    fn cap_at_16_import_without_resolver_is_denied_call_0() {
+        let engine = Engine::builder().build().unwrap();
+        let (resolver, calls) = CountingResolver::new(&[("@default/a", "let a = 1\n")]);
+        // resolver を作るが grant しない（empty capabilities）。
+        drop(resolver);
+        let script = compile_root(&engine, "import \"a\"\n");
+        let req = LinkRequest::new(op_id(), CapabilitySet::empty(), budget());
+        let err = engine.link(&script, req).expect_err("denied");
+        match err {
+            LinkError::Denied(d) => {
+                assert_eq!(d.code, DenialCode::ResourceNotGranted);
+                assert_eq!(d.capability, CapabilityKind::ModuleResolver);
+                assert_eq!(d.operation.as_str(), "module.resolve");
+                assert_eq!(d.public_resource, None);
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "resolver は呼ばれない");
+    }
+
+    // --- CAP-AT-16(b): resolver grant + import → link 成功、解決は link 内のみ ---
+    #[test]
+    fn cap_at_16_import_with_resolver_resolves_at_link() {
+        let engine = Engine::builder().build().unwrap();
+        let (resolver, calls) = CountingResolver::new(&[("@default/a", "let a = 1\n")]);
+        let script = compile_root(&engine, "import \"a\"\n");
+        let req = LinkRequest::new(op_id(), caps_with(Arc::new(resolver)), budget());
+        let linked = engine.link(&script, req).expect("link ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a を 1 回解決");
+        let graph = linked.import_graph();
+        assert_eq!(graph.root_imports.len(), 1);
+        assert_eq!(graph.root_imports[0].as_str(), "@default/a");
+        assert_eq!(graph.nodes.len(), 1);
+        assert_eq!(graph.nodes[0].module_id.as_str(), "@default/a");
+    }
+
+    // --- 循環: a → b → a（chain は起点を末尾に再掲）---
+    #[test]
+    fn cycle_a_b_a_reports_chain() {
+        let engine = Engine::builder().build().unwrap();
+        let (resolver, _calls) = CountingResolver::new(&[
+            ("@default/a", "import \"b\"\n"),
+            ("@default/b", "import \"a\"\n"),
+        ]);
+        let script = compile_root(&engine, "import \"a\"\n");
+        let req = LinkRequest::new(op_id(), caps_with(Arc::new(resolver)), budget());
+        let err = engine.link(&script, req).expect_err("cycle");
+        match err {
+            LinkError::Cycle { chain } => {
+                let got: Vec<&str> = chain.iter().map(ModuleId::as_str).collect();
+                assert_eq!(got, vec!["@default/a", "@default/b", "@default/a"]);
+            }
+            other => panic!("expected Cycle, got {other:?}"),
+        }
+    }
+
+    // --- 自己循環: a → a（chain == [@default/a, @default/a]）---
+    #[test]
+    fn self_cycle_a_a_reports_chain() {
+        let engine = Engine::builder().build().unwrap();
+        let (resolver, _calls) = CountingResolver::new(&[("@default/a", "import \"a\"\n")]);
+        let script = compile_root(&engine, "import \"a\"\n");
+        let req = LinkRequest::new(op_id(), caps_with(Arc::new(resolver)), budget());
+        let err = engine.link(&script, req).expect_err("self cycle");
+        match err {
+            LinkError::Cycle { chain } => {
+                let got: Vec<&str> = chain.iter().map(ModuleId::as_str).collect();
+                assert_eq!(got, vec!["@default/a", "@default/a"]);
+            }
+            other => panic!("expected Cycle, got {other:?}"),
+        }
+    }
+
+    // --- 深度: MAX_IMPORT_DEPTH を超える chain で DepthExceeded ---
+    #[test]
+    fn depth_exceeded_reports_limit() {
+        let engine = Engine::builder().build().unwrap();
+        // m0 → m1 → ... と各 module が次を import する深い鎖を作る。
+        let depth = crate::limits::MAX_IMPORT_DEPTH + 5;
+        let mut sources: Vec<(String, String)> = Vec::new();
+        for i in 0..depth {
+            sources.push((format!("@default/m{i}"), format!("import \"m{}\"\n", i + 1)));
+        }
+        let src_refs: Vec<(&str, &str)> = sources
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let (resolver, _calls) = CountingResolver::new(&src_refs);
+        let script = compile_root(&engine, "import \"m0\"\n");
+        let req = LinkRequest::new(op_id(), caps_with(Arc::new(resolver)), budget());
+        let err = engine.link(&script, req).expect_err("depth");
+        match err {
+            LinkError::DepthExceeded { limit } => {
+                assert_eq!(limit, crate::limits::MAX_IMPORT_DEPTH as u32);
+            }
+            other => panic!("expected DepthExceeded, got {other:?}"),
+        }
+    }
+
+    // --- 未登録 mount → terminal Denied（resolver は呼ばれない）---
+    #[test]
+    fn unregistered_mount_is_denied() {
+        let engine = Engine::builder().build().unwrap();
+        let (resolver, calls) = CountingResolver::new(&[("@default/a", "let a = 1\n")]);
+        // CountingResolver は default のみ知る。@none は未登録。
+        let script = compile_root(&engine, "import \"@none/a\"\n");
+        let req = LinkRequest::new(op_id(), caps_with(Arc::new(resolver)), budget());
+        let err = engine.link(&script, req).expect_err("denied");
+        assert!(matches!(err, LinkError::Denied(_)), "got {err:?}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "未登録 mount で resolver は呼ばない"
+        );
+    }
+
+    // --- malformed specifier → Resolve(invalid_import_specifier)（InvalidModule ではない）---
+    #[test]
+    fn malformed_specifier_is_resolve_error() {
+        let engine = Engine::builder().build().unwrap();
+        for bad in ["../escape", "/abs/mod"] {
+            let (resolver, _calls) = CountingResolver::new(&[]);
+            let script = compile_root(&engine, &format!("import \"{bad}\"\n"));
+            let req = LinkRequest::new(op_id(), caps_with(Arc::new(resolver)), budget());
+            let err = engine.link(&script, req).expect_err("resolve err");
+            match err {
+                LinkError::Resolve(h) => {
+                    assert_eq!(h.code.as_str(), "invalid_import_specifier");
+                }
+                other => panic!("malformed `{bad}` expected Resolve, got {other:?}"),
+            }
+        }
+    }
+
+    // --- pre-link cancel → Cancelled、resolver call 0 ---
+    #[test]
+    fn pre_link_cancel_is_cancelled_call_0() {
+        let engine = Engine::builder().build().unwrap();
+        let (resolver, calls) = CountingResolver::new(&[("@default/a", "let a = 1\n")]);
+        let script = compile_root(&engine, "import \"a\"\n");
+        let token = CancellationToken::new();
+        token.cancel();
+        let req = LinkRequest::new(op_id(), caps_with(Arc::new(resolver)), budget())
+            .with_cancellation(token);
+        let err = engine.link(&script, req).expect_err("cancelled");
+        assert!(matches!(err, LinkError::Cancelled), "got {err:?}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "cancel 済みで resolver は呼ばない"
+        );
+    }
+
+    // --- 同 ID / 異 hash → Resolve ---
+    #[test]
+    fn same_id_different_hash_is_resolve_error() {
+        // root が同じ specifier `a` を 2 回 import するが、resolver は呼ばれるたびに別内容を返す。
+        struct FlakyResolver {
+            counter: AtomicUsize,
+        }
+        impl ModuleResolver for FlakyResolver {
+            fn policy_id(&self) -> NonZeroU128 {
+                pid(97)
+            }
+            fn resolve(
+                &self,
+                _c: &mut CapabilityCallContext<'_>,
+                request: ResolveRequest<'_>,
+            ) -> Result<ResolvedModule, AdapterError> {
+                let n = self.counter.fetch_add(1, Ordering::SeqCst);
+                let bytes = format!("let v = {n}\n").into_bytes();
+                Ok(ResolvedModule {
+                    id: ModuleId::new(request.specifier).expect("id"),
+                    source: Box::new(InMemorySource { bytes, offset: 0 }),
+                    classification: crate::capability::DataClassification::Public,
+                })
+            }
+        }
+        let engine = Engine::builder().build().unwrap();
+        let resolver = Arc::new(FlakyResolver {
+            counter: AtomicUsize::new(0),
+        });
+        // root に同じ import を 2 回書く。1 回目で resolved へ登録、2 回目は同 ID だが別 hash。
+        let script = compile_root(&engine, "import \"a\"\nimport \"a\"\n");
+        let req = LinkRequest::new(op_id(), caps_with(resolver), budget());
+        let err = engine.link(&script, req).expect_err("hash mismatch");
+        match err {
+            LinkError::Resolve(h) => assert_eq!(h.code.as_str(), "module_hash_mismatch"),
+            other => panic!("expected Resolve(module_hash_mismatch), got {other:?}"),
+        }
+    }
+
+    // --- 非 UTF-8 module → InvalidModule ---
+    #[test]
+    fn non_utf8_module_is_invalid_module() {
+        let engine = Engine::builder().build().unwrap();
+        let (resolver, _calls) =
+            CountingResolver::with_bytes(vec![("@default/a", vec![0xff, 0xfe, 0x00])]);
+        let script = compile_root(&engine, "import \"a\"\n");
+        let req = LinkRequest::new(op_id(), caps_with(Arc::new(resolver)), budget());
+        let err = engine.link(&script, req).expect_err("invalid module");
+        match err {
+            LinkError::InvalidModule { module, .. } => {
+                assert_eq!(module.as_str(), "@default/a");
+            }
+            other => panic!("expected InvalidModule, got {other:?}"),
+        }
+    }
+
+    // --- resolver_contract_violation: max_bytes 超過 chunk → Resolve ---
+    #[test]
+    fn resolver_contract_violation_is_resolve_error() {
+        let engine = Engine::builder().build().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = Arc::new(OversizedResolver {
+            calls: Arc::clone(&calls),
+        });
+        let script = compile_root(&engine, "import \"a\"\n");
+        let req = LinkRequest::new(op_id(), caps_with(resolver), budget());
+        let err = engine.link(&script, req).expect_err("contract violation");
+        match err {
+            LinkError::Resolve(h) => assert_eq!(h.code.as_str(), "resolver_contract_violation"),
+            other => panic!("expected Resolve(resolver_contract_violation), got {other:?}"),
+        }
+    }
+
+    // --- ImportGraph golden: 実 node が入り graph_hash が決定的 ---
+    #[test]
+    fn import_graph_is_populated_and_hash_deterministic() {
+        let engine = Engine::builder().build().unwrap();
+        let build = || {
+            let (resolver, _c) = CountingResolver::new(&[
+                ("@default/a", "import \"b\"\nlet a = 1\n"),
+                ("@default/b", "let b = 2\n"),
+            ]);
+            let script = compile_root(&engine, "import \"a\"\n");
+            let req = LinkRequest::new(op_id(), caps_with(Arc::new(resolver)), budget());
+            engine.link(&script, req).expect("link")
+        };
+        let g1 = build();
+        let g2 = build();
+        let graph = g1.import_graph();
+        // root → a、a → b の実 node。
+        assert_eq!(graph.root_imports.len(), 1);
+        let ids: Vec<&str> = graph.nodes.iter().map(|n| n.module_id.as_str()).collect();
+        assert_eq!(ids, vec!["@default/a", "@default/b"], "nodes は id 昇順");
+        // a は b を import する node を持つ。
+        let a = graph
+            .nodes
+            .iter()
+            .find(|n| n.module_id.as_str() == "@default/a")
+            .expect("a node");
+        assert_eq!(a.imports.len(), 1);
+        assert_eq!(a.imports[0].as_str(), "@default/b");
+        // graph_hash / script_hash は同一入力で決定的。
+        assert_eq!(graph.graph_hash, g2.import_graph().graph_hash);
+        assert_eq!(g1.script_hash(), g2.script_hash());
+    }
+
+    // --- EMB-AT-05: run 時 resolver call 0（解決は link で済み、run は resolver を触らない）---
+    #[test]
+    fn emb_at_05_run_does_not_call_resolver() {
+        let engine = Engine::builder().build().unwrap();
+        // run するため root を retain=true で compile し、import は default routing で解決する。
+        // root 本文は import した名前を使わない（評価器の ambient ModuleLoader は tempdir を持たない
+        // ため、ここでは import 解決を link 層のみで観測し、run は root の素の文だけ実行する）。
+        let (resolver, calls) = CountingResolver::new(&[("@default/a", "let a = 1\n")]);
+        let script = engine
+            .compile(
+                Source::new(SourceId::new("root").expect("id"), "let x = 1\n"),
+                &CompileOptions {
+                    retain_source: true,
+                },
+            )
+            .expect("compile");
+        let req = LinkRequest::new(op_id(), caps_with(Arc::new(resolver)), budget());
+        let linked = engine.link(&script, req).expect("link");
+        // import 0 件 root なので link でも resolver は呼ばれない（空 graph）。
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // run して resolver call が増えないことを固定（run は resolver を一切呼ばない）。
+        let mut context = ExecutionContext::new(&engine);
+        let clock: Arc<dyn crate::budget::MonotonicClock> =
+            Arc::new(crate::budget::SystemMonotonicClock::new());
+        let run_budget = BudgetConfig::standard(clock.as_ref()).expect("budget");
+        let run_req = ExecutionRequest::new(run_budget, clock).expect("req");
+        let outcome = engine.run(&linked, &mut context, run_req);
+        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "run 中 resolver call 0");
     }
 }
