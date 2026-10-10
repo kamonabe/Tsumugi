@@ -23,7 +23,7 @@
 //! 実行中の grant/revoke はない（原則2・3）。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::{NonZeroU64, NonZeroU128};
+use std::num::{NonZeroU64, NonZeroU128, NonZeroUsize};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -522,10 +522,59 @@ impl Output for SystemOutput {
     }
 }
 
-/// import 解決 authority（仕様第10節 `ModuleResolver`）。C1 は `policy_id` のみ。解決は C6。
+/// bounded chunked module source（仕様第10節 `ModuleSource`）。
+///
+/// Engine が link 時に 64 KiB 以下の chunk で読み出す。[`CapabilityCallContext`] を取り、
+/// deadline / cancellation / 残量 byte を getter で観測する（C3〜C5 と同じ Phase-2-最小流儀。
+/// §4/§6 の `check_control`/`reserve` 最終 signature は Phase 3 で導入）。
+pub trait ModuleSource: Send + 'static {
+    /// 次の chunk を読む。`max_bytes` を超えない byte 列、または終端を返す。
+    fn read_chunk(
+        &mut self,
+        context: &mut CapabilityCallContext<'_>,
+        max_bytes: NonZeroUsize,
+    ) -> Result<ModuleChunk, AdapterError>;
+}
+
+/// [`ModuleSource::read_chunk`] の 1 回ぶんの結果（仕様第10節 `ModuleChunk`）。
+pub enum ModuleChunk {
+    /// 1..=max_bytes の byte 列。空は返さない（空は [`ModuleChunk::Eof`]）。
+    Bytes(Vec<u8>),
+    /// これ以上 byte がない。
+    Eof,
+}
+
+/// import 解決 authority（仕様第10節 `ModuleResolver`）。C1 は `policy_id` のみ。C6 で `resolve` を追加。
 pub trait ModuleResolver: Send + Sync + 'static {
     /// policy 相関 ID。
     fn policy_id(&self) -> NonZeroU128;
+
+    /// import specifier を logical module へ解決する（link 時のみ呼ばれる）。
+    fn resolve(
+        &self,
+        context: &mut CapabilityCallContext<'_>,
+        request: ResolveRequest<'_>,
+    ) -> Result<ResolvedModule, AdapterError>;
+}
+
+/// resolve 要求（仕様第10節 `ResolveRequest`）。
+pub struct ResolveRequest<'a> {
+    /// この import を出した module（root からの import は `None`）。
+    pub importer: Option<&'a crate::embedding::ModuleId>,
+    /// script が書いた import specifier（例 `@foo/util`）。host path へ変換前の生文字列。
+    pub specifier: &'a str,
+    /// 解決時の language revision。
+    pub language_revision: crate::embedding::LanguageRevision,
+}
+
+/// resolve の成功結果（仕様第10節 `ResolvedModule`）。
+pub struct ResolvedModule {
+    /// 解決した logical module の ID。同じ module へは同じ ID を返す契約。
+    pub id: crate::embedding::ModuleId,
+    /// bounded source。Engine が chunk 読みする。
+    pub source: Box<dyn ModuleSource>,
+    /// source の分類（監査・将来の情報 flow 用）。
+    pub classification: DataClassification,
 }
 
 /// filesystem 操作粒度（仕様第8.1節 `FsOperation`）。
@@ -2267,6 +2316,74 @@ mod tests {
         fn policy_id(&self) -> NonZeroU128 {
             self.0
         }
+
+        fn resolve(
+            &self,
+            _context: &mut CapabilityCallContext<'_>,
+            request: ResolveRequest<'_>,
+        ) -> Result<ResolvedModule, AdapterError> {
+            // 固定の in-memory source を返す test double。specifier をそのまま
+            // ModuleId へ写し（正規化は C6-c の link 層が行う）、specifier 文字列の
+            // byte 列を source として供給する。
+            let id = crate::embedding::ModuleId::new(request.specifier)
+                .map_err(|e| AdapterError::Host(format!("invalid module id: {e:?}")))?;
+            let source = Box::new(InMemorySource::new(request.specifier.as_bytes().to_vec()));
+            Ok(ResolvedModule {
+                id,
+                source,
+                classification: DataClassification::Public,
+            })
+        }
+    }
+
+    /// in-memory な [`ModuleSource`] test double。`bytes` を `max_bytes` 単位で切り出して
+    /// 複数 [`ModuleChunk::Bytes`] として返し、尽きたら [`ModuleChunk::Eof`] を返す。
+    struct InMemorySource {
+        bytes: Vec<u8>,
+        offset: usize,
+    }
+
+    impl InMemorySource {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self { bytes, offset: 0 }
+        }
+    }
+
+    impl ModuleSource for InMemorySource {
+        fn read_chunk(
+            &mut self,
+            _context: &mut CapabilityCallContext<'_>,
+            max_bytes: NonZeroUsize,
+        ) -> Result<ModuleChunk, AdapterError> {
+            if self.offset >= self.bytes.len() {
+                return Ok(ModuleChunk::Eof);
+            }
+            let end = (self.offset + max_bytes.get()).min(self.bytes.len());
+            let chunk = self.bytes[self.offset..end].to_vec();
+            self.offset = end;
+            Ok(ModuleChunk::Bytes(chunk))
+        }
+    }
+
+    /// 契約違反 double（`max_bytes` 超過の `Bytes` を返す）。C6-c の
+    /// `resolver_contract_violation` テストで使う（型は C6-a で定義）。
+    struct OversizedSource {
+        emitted: bool,
+    }
+
+    impl ModuleSource for OversizedSource {
+        fn read_chunk(
+            &mut self,
+            _context: &mut CapabilityCallContext<'_>,
+            max_bytes: NonZeroUsize,
+        ) -> Result<ModuleChunk, AdapterError> {
+            if self.emitted {
+                return Ok(ModuleChunk::Eof);
+            }
+            self.emitted = true;
+            // max_bytes を 1 byte 超過させる（契約違反）。
+            Ok(ModuleChunk::Bytes(vec![b'x'; max_bytes.get() + 1]))
+        }
     }
 
     struct FakeDir(NonZeroU128, SymlinkPolicy);
@@ -3274,5 +3391,122 @@ mod tests {
                 .expect("open read under verbatim-canonicalized base");
             assert_eq!(f.read_to_end(None).expect("read"), b"vp");
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // C6-a: ModuleResolver::resolve + ModuleSource（adapter 面）。
+    // link へ未配線なので観測挙動は不変。resolve/read_chunk の契約だけを固定する。
+    // ---------------------------------------------------------------------
+
+    /// test 用に [`CapabilityCallContext`] を組んで `body` へ渡す。resolver/source は
+    /// 本 slice では context の制御 getter を参照しないので、固定値で足りる。
+    fn with_call_context<R>(body: impl FnOnce(&mut CapabilityCallContext<'_>) -> R) -> R {
+        use crate::budget::{CancellationToken, MonotonicClock};
+        let set = CapabilitySet::empty();
+        let clock = crate::budget::FakeClock::new();
+        let deadline = clock.instant_at(0);
+        let cancellation = CancellationToken::new();
+        let mut context =
+            CapabilityCallContext::new(&set, deadline, cancellation, u64::MAX, u64::MAX, false, 1);
+        body(&mut context)
+    }
+
+    fn nz(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("non-zero")
+    }
+
+    /// 全 chunk を連結し、各 chunk が `1..=max_bytes` に収まることを確認して bytes を返す。
+    fn drain_source(source: &mut dyn ModuleSource, max_bytes: NonZeroUsize) -> Vec<u8> {
+        with_call_context(|ctx| {
+            let mut out = Vec::new();
+            loop {
+                match source.read_chunk(ctx, max_bytes).expect("read_chunk") {
+                    ModuleChunk::Bytes(bytes) => {
+                        assert!(
+                            !bytes.is_empty() && bytes.len() <= max_bytes.get(),
+                            "chunk len {} outside 1..={}",
+                            bytes.len(),
+                            max_bytes.get()
+                        );
+                        out.extend_from_slice(&bytes);
+                    }
+                    ModuleChunk::Eof => break,
+                }
+            }
+            out
+        })
+    }
+
+    #[test]
+    fn fake_resolver_returns_in_memory_source() {
+        let resolver = FakeResolver(pid(7));
+        let resolved = with_call_context(|ctx| {
+            resolver
+                .resolve(
+                    ctx,
+                    ResolveRequest {
+                        importer: None,
+                        specifier: "@foo/util",
+                        language_revision: crate::embedding::LanguageRevision::CURRENT,
+                    },
+                )
+                .expect("resolve")
+        });
+        assert_eq!(resolved.id.as_str(), "@foo/util");
+        assert_eq!(resolved.classification, DataClassification::Public);
+        // source は specifier の byte 列をそのまま供給する（C6-a は raw bytes のみ、
+        // UTF-8 検証は C6-c の link 層）。
+        let mut source = resolved.source;
+        let bytes = drain_source(source.as_mut(), nz(4));
+        assert_eq!(bytes, b"@foo/util");
+    }
+
+    #[test]
+    fn in_memory_source_splits_across_max_bytes() {
+        // 10 byte を max_bytes=4 で読むと [4,4,2] の 3 chunk + Eof。各 chunk 長は 1..=4。
+        let mut source = InMemorySource::new(b"0123456789".to_vec());
+        let bytes = drain_source(&mut source, nz(4));
+        assert_eq!(bytes, b"0123456789");
+        // 連結後は再度 Eof を返す。
+        with_call_context(|ctx| {
+            assert!(matches!(
+                source.read_chunk(ctx, nz(4)).expect("eof"),
+                ModuleChunk::Eof
+            ));
+        });
+    }
+
+    #[test]
+    fn in_memory_source_empty_input_is_immediate_eof() {
+        let mut source = InMemorySource::new(Vec::new());
+        with_call_context(|ctx| {
+            assert!(matches!(
+                source.read_chunk(ctx, nz(64)).expect("eof"),
+                ModuleChunk::Eof
+            ));
+        });
+    }
+
+    #[test]
+    fn contract_violation_source_can_exceed_max_bytes() {
+        // 契約違反 double は max_bytes を超過する Bytes を返せる（型として表現できることの固定。
+        // 契約違反の検出・写しは C6-c の link 層が行う）。
+        let mut source = OversizedSource { emitted: false };
+        with_call_context(|ctx| {
+            let max = nz(8);
+            match source.read_chunk(ctx, max).expect("read_chunk") {
+                ModuleChunk::Bytes(bytes) => {
+                    assert!(
+                        bytes.len() > max.get(),
+                        "oversized double should exceed max_bytes"
+                    );
+                }
+                ModuleChunk::Eof => panic!("expected oversized Bytes"),
+            }
+            assert!(matches!(
+                source.read_chunk(ctx, max).expect("eof"),
+                ModuleChunk::Eof
+            ));
+        });
     }
 }

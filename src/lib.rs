@@ -139,9 +139,10 @@ pub use embedding::ContextError;
 pub use capability::{
     CapabilityCallContext, CapabilityKind, CapabilitySet, CapabilitySetBuilder, CapabilitySetId,
     Clock, DataClassification, DirectoryHandle, EnvironmentSnapshot, EnvironmentValue,
-    FilesystemCapability, FilesystemRoot, FsOperation, HostFunctionId, Input, ModuleResolver,
-    MountName, OsDirectoryHandle, Output, ProcessExit, SymlinkPolicy, SystemClock, SystemInput,
-    SystemOutput, derive_policy_id,
+    FilesystemCapability, FilesystemRoot, FsOperation, HostFunctionId, Input, ModuleChunk,
+    ModuleResolver, ModuleSource, MountName, OsDirectoryHandle, Output, ProcessExit,
+    ResolveRequest, ResolvedModule, SymlinkPolicy, SystemClock, SystemInput, SystemOutput,
+    derive_policy_id,
 };
 
 // Phase 2 capability — host function registry（スライス C8/E7、`docs/capability-model.md`
