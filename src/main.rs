@@ -10,11 +10,12 @@ use cli_capability::{
     build_safe_capabilities, parse_cli,
 };
 use tsumugi::{
-    BudgetConfig, CapabilitySet, CompileErrors, EmbeddingContext, EmbeddingEngine,
-    EmbeddingOutcome, EmbeddingRequest, EmbeddingTraceFrame, Engine, ExecutionContext,
-    ExecutionError, LinkError, LinkRequest, Source as EmbeddingSource, SourceId,
-    SystemMonotonicClock, compiler::Compiler, embedding::CompileOptions, error::TsumugiError,
-    lexer::Lexer, module::ModuleLoader, parser::Parser, token::Token, vm::Vm,
+    BudgetConfig, CancellationToken, CapabilitySet, CompileErrors, EmbeddingContext,
+    EmbeddingEngine, EmbeddingOutcome, EmbeddingRequest, EmbeddingTraceFrame, Engine,
+    ExecutionContext, ExecutionError, ExecutionId, LinkError, LinkRequest,
+    Source as EmbeddingSource, SourceId, SystemMonotonicClock, compiler::Compiler,
+    embedding::CompileOptions, error::TsumugiError, lexer::Lexer, module::ModuleLoader,
+    parser::Parser, token::Token, vm::Vm,
 };
 
 fn main() {
@@ -168,14 +169,12 @@ fn read_stdin_source() -> String {
     source
 }
 
-/// ツリーウォーク版で source を実行する（ファイル / stdin 共通、E8a）。
+/// ツリーウォーク版で source を実行する（ファイル / stdin 共通、C6-c = E7-import）。
 ///
-/// import なし root は embedding Engine API（[`EmbeddingEngine`]）だけを通す（EMB-AT-17 の
-/// Phase 1 範囲）。Phase 1 の embedding `link` は import 解決を持たず import 文を拒否するため
-/// （import resolver は Phase 2/E7）、import を含む root は現行の alpha facade（`ModuleLoader`
-/// 経由）へフォールバックする。この import ありの Engine API 統合は E7 で行う。
-///
-/// どちらの経路も同じ診断表示・exit code 契約（[組み込みAPI仕様] 第12節）を満たす。
+/// import の有無によらず embedding Engine API（[`EmbeddingEngine`]）を通す。import があれば
+/// `link` が frozen capability の `module_resolver`（CLI が `--allow-import-root` から grant）で
+/// 解決する。resolver 未 grant + import あり は terminal `Denied`（exit 1、actionable 診断）。
+/// REPL は依然 alpha facade（`run_source_alpha`）を使う（Engine 統合は E7 残）。
 fn run_source(source: &str, script_path: &str, script_args: Vec<String>, frozen: CapabilitySet) {
     let engine = EmbeddingEngine::builder()
         .build()
@@ -195,20 +194,26 @@ fn run_source(source: &str, script_path: &str, script_args: Vec<String>, frozen:
         }
     };
 
-    let linked = match engine.link(&script, LinkRequest::new()) {
+    // REV-015 最終形移行 Slice 1（option B）: CLI 経路の既定を有限 budget にする。
+    // 単一の SystemMonotonicClock を 1 個だけ作り、BudgetConfig::standard の deadline 生成と
+    // link/run request への clock 注入で同一 instance を共有する（clock_id を一致させ
+    // ForeignClock を避ける）。
+    let clock: Arc<dyn tsumugi::MonotonicClock> = Arc::new(SystemMonotonicClock::new());
+    let budget = BudgetConfig::standard(clock.as_ref())
+        .expect("standard budget の生成は overflow しない限り成功する");
+    // 実行 1 回ぶんの cancellation token を 1 個生成し、link と run の両 request へ同じ clone を
+    // 渡す（設計 §4.6。link 開始前 cancel が実 token で機能する）。CLI は別スレッド cancel を
+    // 使わないが、link/run で同一計数系を共有する契約に揃える。
+    let cancellation = CancellationToken::new();
+    // CLI 固定の operation_id（resolver 相関用、監査 sink 無しなので値は固定で足りる）。
+    let operation_id = ExecutionId::new(std::num::NonZeroU128::new(1).expect("1 は非ゼロ"));
+
+    // import の有無によらず link を通す。import あり + resolver 未 grant は terminal Denied。
+    let link_request = LinkRequest::new(operation_id, frozen.clone(), budget)
+        .with_cancellation(cancellation.clone());
+    let linked = match engine.link(&script, link_request) {
         Ok(linked) => linked,
-        // import を含む root は Phase 1 embedding では link できない（module resolver は
-        // Phase 2/E7）。この場合だけ alpha facade（`ModuleLoader` 経由）へフォールバックして
-        // 従来どおり解決・実行する。import ありの Engine API 統合は E7 で行う。
-        Err(LinkError::FeatureUnavailable {
-            feature: "module_resolver",
-        }) => {
-            run_source_alpha(source, script_path, script_args, frozen);
-            return;
-        }
         Err(error) => {
-            // import なし root のその他の link 失敗は engine/revision/backend 不一致のみ。
-            // 単一 Engine を使う CLI では実際には到達しないが、防御的に診断して終了する。
             print_link_error(&error);
             std::process::exit(1);
         }
@@ -216,58 +221,16 @@ fn run_source(source: &str, script_path: &str, script_args: Vec<String>, frozen:
 
     let mut context = EmbeddingContext::new(&engine);
     context.set_script_path(script_path);
-    // REV-015 最終形移行 Slice 1（option B）: import なし CLI 経路の既定を有限 budget にする。
-    // 単一の SystemMonotonicClock を 1 個だけ作り、BudgetConfig::standard の deadline 生成と
-    // request への clock 注入で同一 instance を共有する（clock_id を一致させ ForeignClock を
-    // 避ける）。legacy の unbounded/ambient 既定へは戻さない（設計 §3 / §4）。
-    let clock: Arc<dyn tsumugi::MonotonicClock> = Arc::new(SystemMonotonicClock::new());
-    let budget = BudgetConfig::standard(clock.as_ref())
-        .expect("standard budget の生成は overflow しない限り成功する");
     // C9/C10: CLI が profile（safe/legacy）から組んだ frozen capability set を注入する。
-    // import なし tree 経路は embedding Engine API（ExecutionRequest 経由）で注入する。
     let request = EmbeddingRequest::new(budget, Arc::clone(&clock))
         .expect("standard budget は自身を生成した clock と同 domain なので検証を通る")
         .with_arguments(script_args)
-        .with_capabilities(frozen);
+        .with_capabilities(frozen)
+        .cancellation(cancellation);
 
     let exit_code = exit_code_for_outcome(engine.run(&linked, &mut context, request));
     if exit_code != 0 {
         std::process::exit(exit_code);
-    }
-}
-
-/// import を含む root を alpha facade（`ModuleLoader` 経由）で実行するフォールバック（E8a）。
-///
-/// Phase 1 の embedding `link` は import 解決を持たないため、import ありの tree 実行は現行の
-/// alpha facade を使う。import ありでも Engine API へ統合するのは E7（Phase 2、capability /
-/// import resolver）の作業である。C9/C10: frozen set は既存の
-/// `ExecutionContext::set_capabilities`（engine.rs、Evaluator へ委譲）で注入する。
-fn run_source_alpha(
-    source: &str,
-    script_path: &str,
-    script_args: Vec<String>,
-    frozen: CapabilitySet,
-) {
-    let engine = Engine::new();
-    let mut context = ExecutionContext::new();
-    context.set_script_path(script_path);
-    context.set_script_args(script_args);
-    context.set_capabilities(frozen);
-
-    if let Err(errors) = execute(&engine, source, &mut context) {
-        // C7（REV-023）: exit() は structured terminal。error 表示せず、context に記録された
-        // 終了コードで process を終了する。
-        if errors
-            .iter()
-            .any(|e| matches!(e.kind(), Some(tsumugi::error::ErrorKind::ProcessExit)))
-        {
-            let code = context.take_pending_exit().unwrap_or(0);
-            std::process::exit(code as i32);
-        }
-        for e in &errors {
-            eprintln!("{}", e);
-        }
-        std::process::exit(1);
     }
 }
 
@@ -358,9 +321,44 @@ fn print_compile_errors(errors: &CompileErrors) {
     }
 }
 
-/// link 失敗を stderr へ出す。import なし root では engine/revision/backend 不一致のみ。
+/// link 失敗を stderr へ出す（exit 1）。
+///
+/// import あり + resolver 未 grant（`Denied`）は原因と対処を明示する actionable 診断にする
+/// （Q2、設計 §8.5 の存在 oracle 回避のため絶対 path・specifier 原文は漏らさない）。
 fn print_link_error(error: &LinkError) {
-    eprintln!("リンクエラー: {:?}", error);
+    match error {
+        LinkError::Denied(_) => {
+            eprintln!(
+                "エラー: import がありますが module resolver が許可されていません。\
+                 `--allow-import-root NAME=PATH` で import root を指定してください。"
+            );
+        }
+        LinkError::Resolve(host) => {
+            // code は固定の安全文字列。specifier 原文・絶対 path は含めない（§8.5）。
+            eprintln!("import 解決エラー: {}", host.code.as_str());
+        }
+        LinkError::InvalidModule { diagnostics, .. } => {
+            eprintln!("import モジュールが不正です:");
+            print_compile_errors(diagnostics);
+        }
+        LinkError::Cycle { chain } => {
+            let path: Vec<&str> = chain.iter().map(|m| m.as_str()).collect();
+            eprintln!("import の循環を検出しました: {}", path.join(" -> "));
+        }
+        LinkError::DepthExceeded { limit } => {
+            eprintln!("import のネストが深すぎます (上限: {})", limit);
+        }
+        LinkError::Cancelled => {
+            eprintln!("link がキャンセルされました");
+        }
+        LinkError::DeadlineExceeded => {
+            eprintln!("link の deadline を超過しました");
+        }
+        other => {
+            // engine/revision/backend 不一致・budget・backend・internal は防御的に表示する。
+            eprintln!("リンクエラー: {:?}", other);
+        }
+    }
 }
 
 /// REPL（対話実行モード）。
@@ -423,21 +421,6 @@ fn run_repl(frozen: CapabilitySet) {
 
         input.clear();
     }
-}
-
-/// ソースを実行する CLI 用のアダプター。
-///
-/// パースエラーは複数件、実行時エラーは1件という既存の表示契約を維持する。
-fn execute(
-    engine: &Engine,
-    source: &str,
-    context: &mut ExecutionContext,
-) -> Result<(), Vec<TsumugiError>> {
-    let script = engine.compile(source)?;
-    engine
-        .execute(&script, context)
-        .map(|_| ())
-        .map_err(|error| vec![error])
 }
 
 /// REPL の1入力を実行する CLI 用アダプター（AUD-024）。

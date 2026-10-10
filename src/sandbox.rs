@@ -1,12 +1,15 @@
-//! import 解決サンドボックス（C6 専用に縮退）
+//! import 解決サンドボックス（ModuleLoader 経路専用に縮退）
 //!
 //! 環境変数 `TSUMUGI_SANDBOX` が設定されている場合、import 解決（`module.rs::ModuleLoader`）の
 //! 対象パスが許可リスト内に収まっているか検証する。未設定の場合はサンドボックス無効（全パス許可）。
 //!
-//! C10 で runtime fs builtin（`read_file` 等）の ambient 経路は capability 経路へ全面移行した
-//! ため、本モジュールの `check_path` / `check_entry_path` を呼ぶのは **import 解決
-//! （`module.rs`、C6）だけ** になった。import resolver が capability（`ModuleResolver`、C6/E7）
-//! 化されたら本モジュールごと撤去する。
+//! C6-c で **tree 経路の file/stdin import は Engine resolver（`ModuleResolver` capability）
+//! 経由へ移行**し、本モジュールを呼ばなくなった。本モジュールの `check_path` /
+//! `check_entry_path` を呼ぶのは、いまだ `ModuleLoader` を使う **VM import（E9/Phase 5）と
+//! REPL import（E7 残）だけ**である。これらが ModuleLoader を手放し Engine resolver へ統合
+//! されるまで、本モジュールは import 用に残す（設計 §3.5 の「撤去」は ModuleLoader の唯一の
+//! 呼び出し元が消える前提に立っていたが、ModuleLoader は VM/REPL 用に C6 では温存されるため、
+//! 撤去はその統合まで保留する）。
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

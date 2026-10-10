@@ -1574,9 +1574,9 @@ fn nonterminal_drop_rolls_back_and_closes_without_blocking_host_pending() {
 fn embedding_standard_budget_request_completes_import_less_script() {
     use std::sync::Arc;
     use tsumugi::{
-        BudgetConfig, EmbeddingContext, EmbeddingEngine, EmbeddingOutcome, EmbeddingRequest,
-        LinkRequest, MonotonicClock, Source, SourceId, SystemMonotonicClock,
-        embedding::CompileOptions,
+        BudgetConfig, CapabilitySet, EmbeddingContext, EmbeddingEngine, EmbeddingOutcome,
+        EmbeddingRequest, ExecutionId, LinkRequest, MonotonicClock, Source, SourceId,
+        SystemMonotonicClock, embedding::CompileOptions,
     };
 
     let engine = EmbeddingEngine::builder()
@@ -1591,8 +1591,17 @@ fn embedding_standard_budget_request_completes_import_less_script() {
             },
         )
         .expect("import なし script の compile は成功する");
+    // C6-c: LinkRequest は 3 引数化。import なし root は empty capabilities + standard budget で link
+    // できる（resolver を呼ばず空 graph）。
+    let link_clock = SystemMonotonicClock::new();
+    let link_budget = BudgetConfig::standard(&link_clock).expect("standard budget");
+    let link_request = LinkRequest::new(
+        ExecutionId::new(1u128.try_into().expect("nonzero")),
+        CapabilitySet::empty(),
+        link_budget,
+    );
     let linked = engine
-        .link(&script, LinkRequest::new())
+        .link(&script, link_request)
         .expect("import なし root は link できる");
 
     let mut context = EmbeddingContext::new(&engine);

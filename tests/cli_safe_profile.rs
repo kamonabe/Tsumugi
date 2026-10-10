@@ -284,12 +284,18 @@ fn unqualified_path_requires_default_mount() {
     }
 }
 
+/// C6-c: `@foo/...` qualified import は両 engine で exit 1 になる（理由は engine で異なる）。
+///
+/// tree 経路では link 層の resolver が `@foo/bar.tsg` を mount `foo` へ routing して**解決は成功**する
+/// が、実行時の import 展開は依然 評価器内 `ModuleLoader`（ambient、`@mount` routing 未配線）が担う
+/// ため、`@foo/bar.tsg` をリテラル相対 path として扱い run 時 import error になる（link と run で
+/// resolver が別経路という既知の Phase 2 ギャップ。E9/E7 で統合）。VM 経路も ModuleLoader が
+/// `@foo/...` をリテラル扱いして未解決 import error になる。どちらも exit 1。
 #[test]
-fn allow_import_root_has_no_effect_on_at_syntax() {
+fn at_syntax_import_fails_in_both_engines() {
     for use_vm in [false, true] {
-        // --allow-import-root を付けても @foo/... は alpha ModuleLoader がリテラル相対として解決し
-        // import error になる（従来どおり未解決）。import error は safe/legacy 問わず起きる。
         let dir = TestDir::new("imp");
+        std::fs::write(dir.path.join("bar.tsg"), "let v = 1\n").unwrap();
         let script = dir.path.join("s.tsg");
         std::fs::write(&script, "import \"@foo/bar.tsg\"\nprint(1)").unwrap();
         let mut cmd = Command::new(tsumugi_bin());
@@ -302,31 +308,74 @@ fn allow_import_root_has_no_effect_on_at_syntax() {
         let output = cmd.output().expect("spawn");
         assert!(
             !output.status.success(),
-            "@foo/... は未解決 import error [vm={use_vm}]"
+            "@foo/... は両 engine で import error [vm={use_vm}]"
         );
     }
 }
 
+/// C6-c（Q2 = Denied all-in）: tree 経路の相対 import は `--allow-import-root` が必須になった。
+///
+/// 従来は safe profile で `--allow-import-root` 無しの相対 import（ambient fs）が動いていたが、
+/// C6-c で tree 経路は Engine resolver（capability）経由になり、resolver 未 grant + import は
+/// terminal `Denied`（exit 1）になる（設計 §4.5/§8、マニフェスト原則2 明示的 capability）。
+/// import root を渡せば `@default/...` routing で従来どおり解決・実行できる。
+/// VM 経路は E9/Phase 5 まで ModuleLoader に残るため従来どおり import root 無しで動く（意図的な
+/// tree/VM 既知差、設計 §4.4）。
 #[test]
-fn relative_import_still_works_under_safe() {
-    for use_vm in [false, true] {
-        // 相対パス import は従来どおり動く（import 解決は C6 の sandbox 経路、profile 非依存）。
-        let dir = TestDir::new("relimp");
-        std::fs::write(dir.path.join("lib.tsg"), "let helper = 42\n").unwrap();
-        let main = dir.path.join("main.tsg");
-        std::fs::write(&main, "import \"lib.tsg\"\nprint(helper)").unwrap();
-        let mut cmd = Command::new(tsumugi_bin());
-        if use_vm {
-            cmd.arg("--vm");
-        }
-        cmd.arg(&main);
-        let output = cmd.output().expect("spawn");
-        let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
-        assert!(
-            output.status.success(),
-            "相対 import は safe でも動く [vm={use_vm}]: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(stdout.contains("42"), "import した値: {stdout}");
-    }
+fn relative_import_tree_requires_import_root() {
+    let dir = TestDir::new("relimp-tree");
+    std::fs::write(dir.path.join("lib.tsg"), "let helper = 42\n").unwrap();
+    let main = dir.path.join("main.tsg");
+    std::fs::write(&main, "import \"lib.tsg\"\nprint(helper)").unwrap();
+
+    // import root 無し → terminal Denied（exit 1、actionable 診断）。
+    let output = Command::new(tsumugi_bin())
+        .arg(&main)
+        .output()
+        .expect("spawn");
+    assert!(
+        !output.status.success(),
+        "tree 相対 import は resolver 未 grant で拒否される"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--allow-import-root"),
+        "Denied 診断が対処方法を示す: {stderr}"
+    );
+
+    // import root 指定 → default routing で解決・実行できる。
+    let output = Command::new(tsumugi_bin())
+        .arg("--allow-import-root")
+        .arg(format!("default={}", dir.as_str()))
+        .arg(&main)
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(
+        output.status.success(),
+        "import root 指定で tree 相対 import は動く: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("42"), "import した値: {stdout}");
+}
+
+/// VM 経路は E9/Phase 5 まで ModuleLoader に残るため、相対 import が従来どおり動く（import root 不要）。
+#[test]
+fn relative_import_vm_still_works_without_import_root() {
+    let dir = TestDir::new("relimp-vm");
+    std::fs::write(dir.path.join("lib.tsg"), "let helper = 42\n").unwrap();
+    let main = dir.path.join("main.tsg");
+    std::fs::write(&main, "import \"lib.tsg\"\nprint(helper)").unwrap();
+    let output = Command::new(tsumugi_bin())
+        .arg("--vm")
+        .arg(&main)
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(
+        output.status.success(),
+        "VM 相対 import は従来どおり動く: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("42"), "import した値: {stdout}");
 }

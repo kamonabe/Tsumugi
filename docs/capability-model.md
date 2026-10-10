@@ -1,7 +1,7 @@
 # Tsumugi — Capability Model仕様
 
 最終更新: 2026-10-07
-設計ステータス: **実装仕様確定・実装進行中**（C1〜C5・C7・C8・C9／C10〔CLI safe/legacy profile・ambient OS access 削除〕実装済み。C6〔ModuleResolver／import 解決〕は未実装。詳細は [ロードマップ](roadmap.md) Phase 2 を参照）
+設計ステータス: **実装仕様確定・実装進行中**（C1〜C10 実装済み。C6〔ModuleResolver／import 解決〕はPhase 2最小形としてtree経路のlink時解決を実装済み〔VM import統合はE9/Phase 5、REPLはE7残、budget N境界はC11/Phase 3〕。詳細は [ロードマップ](roadmap.md) Phase 2 を参照）
 
 ## 1. 目的と規範範囲
 
@@ -463,6 +463,8 @@ builtin mappingは固定する。`read_file`/`read_lines`は`ReadExisting`、`wr
 
 lexical path syntaxはcapability lookupより先に検証し、`PathError`をcatch可能な`RuntimeErrorCode::Argument`へ変換する。syntaxが正しい場合だけcapability/mount/operationを調べ、不足時はadapter/OS call 0で内部`Denial`を生成する。script filesystem operationではsafe fieldだけからcatch可能なcanonical `sandbox` errorへ変換し、未捕捉なら`RuntimeError`とする。handler開始前のimport resolver denialだけはcatch不可terminal `Denied`である。存在path/不存在pathを同じpublic denial code/messageにし、absolute host path、symlink、permissionを含めない。grant済みroot内のnot-found等だけがcatch可能なcanonical `host` errorまたは既存言語意味論の`null`/`false`になれる。denyを`null`/`false`へ変換しない。
 
+このargument error規定はscript runtimeのfilesystem operation用である。link層のmalformed import specifierにはscript handlerもcatchable channelも無いため適用せず、terminal `LinkError::Resolve(code: "invalid_import_specifier")`を採る（mount未登録はterminal `Denied`。§13も参照）。
+
 ### 8.6 Filesystem policy encoding
 
 CapabilitySetIdにはmount UTF-8 byte順で次をencodeする。
@@ -513,6 +515,9 @@ pub trait ModuleResolver: Send + Sync + 'static {
         context: &mut CapabilityCallContext<'_>,
         request: ResolveRequest<'_>,
     ) -> Result<ResolvedModule, AdapterError>;
+    // link層がresolveより先にmount存在を確認するためのhook（未登録mount→terminal Denied）。
+    // 既定trueで、mountの概念を持たないresolverは全specifierを自前で解決する前提。
+    fn knows_mount(&self, _mount: &str) -> bool { true }
 }
 
 pub struct ResolveRequest<'a> {
@@ -528,9 +533,9 @@ pub struct ResolvedModule {
 }
 ```
 
-resolverはlink時だけ呼ぶ。Engineはsourceを64 KiB以下のchunkで読み、Phase 3のmodule/total limit NならN+1を蓄積する前に停止する。chunkがmaxを超えたadapterは`HostErrorCode="resolver_contract_violation"`。完了bytesをUTF-8検証し、invalidならmodule compile diagnostic。
+resolverはlink時だけ呼ぶ（C6-cで実装済み）。`CapabilityCallContext`はC3〜C5と同じPhase-2最小のgetter流儀（`deadline()`/`cancellation()`/`remaining_*_bytes()`等）で、§4/§6の`check_control`/`reserve`最終signatureはPhase 3で導入する。Engineはsourceを64 KiB以下のchunkで読み、Phase 3のmodule/total limit NならN+1を蓄積する前に停止する（Phase 2は器のみ・上限非適用）。chunkがmaxを超えたadapterは`HostErrorCode="resolver_contract_violation"`。完了bytesをUTF-8検証し、invalidなら`LinkError::InvalidModule`。
 
-ModuleIdは同じlogical moduleへ同じIDを返す。同ID/異hashはlink error。HTTP resolverをcoreへ内蔵しない。host adapterがnetwork/TLS/redirect/credential/timeout/size/cache/supply-chainを担う。
+ModuleIdは同じlogical moduleへ同じIDを返す。同ID/異hashのlink errorは、owning docである[組み込みAPI仕様](embedding-api.md) §5.1のとおり`LinkError::Resolve`で拒否し後勝ちにしない。HTTP resolverをcoreへ内蔵しない。host adapterがnetwork/TLS/redirect/credential/timeout/size/cache/supply-chainを担う。
 
 ## 11. HostFunctionRegistry
 
@@ -682,7 +687,11 @@ pub struct Denial {
 }
 ```
 
+C6-cで上記4型（`Denial`/`DenialCode`/`OperationId`/`ResourceLabel`）を`src/capability.rs`に実装し、crate rootへre-exportした。`LinkError::Denied`と`ExecutionOutcome::Denied`は同一の`Denial`型を共有する（独自structを作らない）。import resolver不足時の固定値は`code: ResourceNotGranted` / `capability: ModuleResolver` / `operation: OperationId::new("module.resolve")` / `public_resource: None`で、`"module.resolve"`がcrate初出のfixed identifierである。
+
 invalid pathはhost API misuseでなく、grantの有無を調べる前にcatch可能なcanonical argument errorとする。capability/mount/operation不足はOS/adapter call 0の`Denial`を生成する。script operationではそのsafe fieldだけからcanonical capability errorを作りcatch可能、link/control-planeではterminal `Denied`にする。いずれも存在、absolute path、environment value、callback detailを含めない。
+
+この「invalid path → catch可能なargument error」規定はscript runtimeのfilesystem operation用であり、script handlerが存在しないlink層のmalformed import specifierには適用しない。link層はcatchable channel（scriptがtry/catchできる経路）を持たないため、malformed import specifierはargument errorへ落とさずterminal `LinkError::Resolve(code: "invalid_import_specifier")`を採る（mount未登録はterminal `Denied`。2 channelを混在させない）。
 
 Phase 6 event schemaは[決定性・実行時監査仕様](determinism-and-audit.md)第7節の`ExecutionStarted`、`CapabilityDecision`、`HostCallStarted`、`HostCallFinished`、`BudgetCharged`、`Yielded`、`Resumed`、`Terminal`だけを使う。`CapabilityAllowed`、`CapabilityDenied`、`ExecutionTerminated`等の別event名を定義しない。host call denyも同じoperation ID/call IDで`HostCallStarted`→`CapabilityDecision(Deny)`→`HostCallFinished(Denied)`とし、adapter/OS call 0でpairを閉じる。Phase 2はdescriptor/redaction metadataとeventへの写像を固定するがeventを発行せず、Phase 6でbounded journal、sequence、ack、fail-closedを有効化する。
 
@@ -717,7 +726,7 @@ OPTIONS:
 - `NAME`はMountName grammar。`OP`は`read|write|create|delete|metadata|list`。`import`は`--fs-op`では受理せずresolver optionだけで付与する。
 - `--fs-root NAME=PATH`と`--fs-op NAME=...`は1対1必須。CLIはroot directory handleをexecution作成前に開き、safe profileのsymlink policyを常に`DenyAll`とする。
 - scriptは`@NAME/...`でrootを選ぶ。unqualified pathにはNAME `default`が必要である。
-- `--allow-import-root NAME=PATH`は本revision（C9/C10）では**grammar受理・値検証（NAME/PATH）のみ**を行い、`module_resolver`をgrantせずCapabilitySetIdにも寄与しない。`@NAME/...`を解決するfilesystem `ModuleResolver`化・link配線（`@NAME/...`実効化）はC6/E7で行う。本revisionの実観測挙動として、`--allow-import-root foo=...`を渡しても`import "@foo/..."`はalpha `ModuleLoader`がリテラル相対パスとして解決し未解決import errorになる（従来の相対パスimportだけが動く）。
+- `--allow-import-root NAME=PATH`はC6-cでfilesystem `ModuleResolver`を構築してsafe profileへgrantする（各NAMEをmount root、`SymlinkPolicy::DenyAll`で`OsDirectoryHandle`化）。これによりtree file/stdin経路のimportはlink時にEngine resolverで解決され、`@NAME/...`が実効化される（unqualified pathはmount `default`へrouting）。grantされるため`--allow-import-root`付きsafe setのCapabilitySetIdは`module_resolver` groupを含むように変わる。importがあるのに`--allow-import-root`を1つも渡さないtree実行は、resolver未grantでterminal `Denied`（exit 1、`--allow-import-root NAME=PATH`を促すactionable診断）になる——ambient相対パスimportは廃止した（原則2 明示的capability）。VM経路のimportはE9/Phase 5まで依然alpha `ModuleLoader`（`@NAME/...`未配線・リテラル相対扱い）で、import rootなしでも従来どおり動く（意図的なtree/VM既知差）。
 - capability optionはsafe profileだけで受理し、legacyとの同時指定はusage error 1とする。
 - `--allow-env KEY`はCLI execution作成時にprocess envのOS上のkey同一性で完全一致する値をsnapshotする。不存在はsnapshotへ入れずwarningなし。protected runtime keyは第5節のOS-aware判定でusage error 1とする。
 - `--allow-clock`はsystem clock、`--allow-script-stdin`はscript Input、`--allow-exit`はProcessExitをprofile builderへ明示grantする。
@@ -785,7 +794,7 @@ AUD-049のcontract testは、BuiltinSpec全entryのtree/VM/compiler/generated do
 | C3 | 2 | Environment/args/Clock | ambient process read 0 |
 | C4 | 2 | Input/Output trait | deny/EOF/HostError分離 |
 | C5 | 2 | mount routing/DirectoryHandle/FileHandle | path/symlink/oracle |
-| C6 | 2 | ModuleResolver/stream/link接続 | runtime resolver 0 |
+| C6 | 2 | ModuleResolver/stream/link接続（実装済み。tree経路のimportをlink時resolverで解決、runtime resolver 0） | runtime resolver 0 |
 | C7 | 2 | ProcessExit | structured Exited |
 | C8 | 2 | HostFunctionRegistry metadata/grant | name/arity/redaction/panic |
 | C9 | 2 | CLI safe/legacy | AUD-018、migration warning |
@@ -815,17 +824,17 @@ C1→C2、C3/C4/C5/C7を並行、C6はstream後、C8はBuiltinSpec衝突検査�
 | CAP-AT-13 | 2 | FS operation matrix全組合せで1 authority欠落ごとI/O前に内部Denialを生成。script operationはcatch可能sandbox error、未捕捉時RuntimeError |
 | CAP-AT-14 | 2 | secure resolution不能adapterはfail closed、文字列fallback 0。script operationはcatch可能host error、未捕捉時RuntimeError |
 | CAP-AT-15 | 3 | file read/write N-1/N成功、N+1はallocation/write前BudgetExceeded |
-| CAP-AT-16 | 2 | importありresolverなしはresolver call 0のterminal Denied。grant時linkだけ、run 0 |
+| CAP-AT-16 | 2 | importありresolverなしはresolver call 0のterminal Denied。grant時linkだけ、run 0（C6-cで実装・テスト済み: `cap_at_16_*` / `emb_at_05_run_does_not_call_resolver`） |
 | CAP-AT-17 | 3 | source N-1/N成功、N+1はchunk蓄積前拒否 |
 | CAP-AT-18 | 2 | exit capabilityなしはprocess/OS call 0のcatch可能capability error（未捕捉時RuntimeError）、あり0/255 Exited、-1/256 RuntimeError、process継続 |
 | CAP-AT-19 | 2/3 | Phase 2でregistered/granted 4組合せとarity。ungrantedはcallback 0のcatch可能capability error（未捕捉時RuntimeError）。Phase 3でfuel N-1/N/N+1 |
 | CAP-AT-20 | 2 | catalog/tree/VM/compiler/generated docsの名前・arity・metadata完全一致、重複build error |
 | CAP-AT-21 | 2/3 | callback success/catch可能host error/panicを分離。Phase 3でresult N+1 BudgetExceeded。link前host failureはterminal HostError |
 | CAP-AT-22 | 2/6 | Omit/TypeOnly/LengthOnly serializerにfake secret本文0。Phase 6でsink eventも同じ |
-| CAP-AT-23 | 2 | safe profileでroot source読込みとprofile builderが明示grantしたstdout以外ambient call 0。`--deny-stdout`時はstdout call 0。`--fs-op`は6トークン対応操作のみmapping一致（RecursiveDelete/ImportはCLI非対象で`remove_tree`は常にdeny）。`--allow-import-root`はset ID不変で`@NAME/...`は未解決 |
+| CAP-AT-23 | 2 | safe profileでroot source読込みとprofile builderが明示grantしたstdout以外ambient call 0。`--deny-stdout`時はstdout call 0。`--fs-op`は6トークン対応操作のみmapping一致（RecursiveDelete/ImportはCLI非対象で`remove_tree`は常にdeny）。C6-cで`--allow-import-root`は`module_resolver`をgrantするためset IDが変化し、tree経路の`@NAME/...`が実効化される（unqualifiedは`default`へrouting） |
 | CAP-AT-24 | 2/6 | legacy互換、empty sandbox/env allowはstderr warning各1。legacy symlinkは`FollowWithinRoot`、root選択曖昧はprofile構築error（exit 1）。Phase 6でも別eventを追加せずcanonical schemaとfail-closedを維持 |
 | CAP-AT-25 | N | 本revisionはN-1を飛ばしsafe既定（N相当）を採るため、golden は「無指定=safe」vs「`--profile legacy`」のprofile選択差2点へ縮退して固定する |
-| CAP-AT-26 | 2 | safeで旧環境変数変更がset ID/挙動へ影響0。射程はruntime fs/env/clock/stdin/exit/stdoutのcapability経路に限り、import解決（C6の`sandbox.rs`/`TSUMUGI_SANDBOX`依存を継続）は対象外（fixtureにimportを含めない） |
+| CAP-AT-26 | 2 | safeで旧環境変数変更がset ID/挙動へ影響0。射程はruntime fs/env/clock/stdin/exit/stdoutのcapability経路に限る。C6-cでtree経路のimport解決はEngine resolver（capability）へ移行し`sandbox.rs`/`TSUMUGI_SANDBOX`非依存になった（import側sandboxはVM/REPLのalpha `ModuleLoader`経路にのみ残る）。本fixtureは引き続きimportを含めない |
 | CAP-AT-27 | 2 | adapter/CLI以外のprocess env、runtime fs、stdio、process exit、ambient clock直接利用0 |
 | CAP-AT-28 | 2 | CapabilitySetId/filesystem encodingのgolden bytes/hash固定 |
 | CAP-AT-29 | 2 | 複数mount qualified/default/missing/duplicateのroutingを完全一致検証 |

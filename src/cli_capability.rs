@@ -12,6 +12,8 @@
 
 use std::sync::Arc;
 
+#[cfg(any(unix, windows))]
+use tsumugi::FilesystemModuleResolver;
 use tsumugi::{
     CapabilitySet, DataClassification, EnvironmentSnapshot, EnvironmentValue, FilesystemCapability,
     FilesystemRoot, FsOperation, MountName, OsDirectoryHandle, ProcessExit, SymlinkPolicy,
@@ -490,7 +492,17 @@ pub fn build_safe_capabilities(
             .expect("single grant never duplicates");
     }
 
-    // --allow-import-root は値検証のみ（parse_cli 済み）。set へは寄与しない。
+    // --allow-import-root NAME=PATH → filesystem ModuleResolver を grant する（設計 §5、C6-c）。
+    // secure handle を実装する platform（unix/windows）でのみ grant する。
+    #[cfg(any(unix, windows))]
+    if !opts.import_roots.is_empty() {
+        let (resolver_pid, roots) = build_import_resolver_roots(&opts.import_roots)?;
+        let resolver = FilesystemModuleResolver::new(resolver_pid, roots)
+            .map_err(|_| CliUsageError::new("エラー: import resolver の構成が不正です"))?;
+        builder = builder
+            .module_resolver(Arc::new(resolver))
+            .expect("single grant never duplicates");
+    }
 
     Ok(builder.build())
 }
@@ -861,6 +873,56 @@ fn fs_root_path() -> std::path::PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// §3.3 / §5 import root → mount root handle 構築（C6-b。grant 配線は C6-c）
+// ---------------------------------------------------------------------------
+
+/// import resolver の policy_id と、mount 名 → open 済み root handle の対の組
+/// （`build_import_resolver_roots` の返り値）。
+#[cfg(any(unix, windows))]
+type ImportResolverRoots = (
+    std::num::NonZeroU128,
+    Vec<(MountName, Arc<OsDirectoryHandle>)>,
+);
+
+/// `--allow-import-root NAME=PATH` 群を [`FilesystemModuleResolver`] 用の
+/// `(MountName, Arc<OsDirectoryHandle>)` へ変換する（設計 §3.3）。
+///
+/// 各 `(NAME, PATH)` を CWD 基準で lexical 絶対化し（`absolutize_lexical`、`build_filesystem` と
+/// 同じ）、`SymlinkPolicy::DenyAll`（import で symlink を追従しない）で `OsDirectoryHandle` を
+/// 作る。resolver 全体の policy_id は各 mount 名・絶対 path を安定直列化した seed から導出し、
+/// 返り値へ添える（CLI の他 adapter と同じ `derive_policy_id` pattern）。
+///
+/// C6-c で `build_safe_capabilities` がこの変換結果を [`FilesystemModuleResolver`] へ渡して
+/// `module_resolver` を grant する。ここは「import root → handle」の変換と resolver policy_id の
+/// 導出だけを担う。
+#[cfg(any(unix, windows))]
+pub fn build_import_resolver_roots(
+    import_roots: &[(String, String)],
+) -> Result<ImportResolverRoots, CliUsageError> {
+    let mut seed_parts: Vec<Vec<u8>> = Vec::new();
+    let mut resolved: Vec<(MountName, std::path::PathBuf)> = Vec::new();
+    for (name, path) in import_roots {
+        let mount = MountName::new(name).map_err(|_| {
+            CliUsageError::new(format!("エラー: import root の名前が不正です: {}", name))
+        })?;
+        let abs = absolutize_lexical(path);
+        seed_parts.push(name.as_bytes().to_vec());
+        seed_parts.push(abs.to_string_lossy().as_bytes().to_vec());
+        resolved.push((mount, abs));
+    }
+    let parts: Vec<&[u8]> = seed_parts.iter().map(|p| p.as_slice()).collect();
+    let resolver_pid = derive_policy_id(&policy_seed(b"import-resolver", &parts));
+    let roots = resolved
+        .into_iter()
+        .map(|(mount, abs)| {
+            let handle = OsDirectoryHandle::new(abs, resolver_pid, SymlinkPolicy::DenyAll);
+            (mount, Arc::new(handle))
+        })
+        .collect();
+    Ok((resolver_pid, roots))
+}
+
+// ---------------------------------------------------------------------------
 // §9 parse_cli 単体テスト（副作用前・exit 1、2 フェーズ順序、固定優先順位）
 // ---------------------------------------------------------------------------
 
@@ -1111,5 +1173,75 @@ mod parse_tests {
         // legacy + capability 不整合（フェーズ 2 ①）が --fs-root/--fs-op 1:1（②）より先。
         let msg = err_msg(&["--profile", "legacy", "--fs-root", "d=/tmp"]);
         assert!(msg.contains("capability オプションは safe profile でのみ"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §3.3 / §5 import root → handle 構築のテスト（C6-b。grant 配線は C6-c）
+// ---------------------------------------------------------------------------
+//
+// handle を open するだけで実ファイル I/O はしないので OS を問わず回せるが、helper 自体が
+// secure handle に依存するため #[cfg(any(unix, windows))] で gate する。
+#[cfg(any(unix, windows))]
+#[cfg(test)]
+mod import_root_tests {
+    use super::*;
+    use tsumugi::{DirectoryHandle, ModuleResolver};
+
+    fn pair(name: &str, path: &str) -> (String, String) {
+        (name.to_string(), path.to_string())
+    }
+
+    #[test]
+    fn empty_roots_build_empty_handle_set() {
+        let (_, roots) = build_import_resolver_roots(&[]).expect("empty is ok");
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn builds_mount_handles_with_deny_all_policy() {
+        let roots = vec![pair("foo", "/tmp/a"), pair("bar", "/tmp/b")];
+        let (pid, handles) = build_import_resolver_roots(&roots).expect("build");
+        assert_eq!(handles.len(), 2);
+        assert_eq!(handles[0].0.as_str(), "foo");
+        assert_eq!(handles[1].0.as_str(), "bar");
+        // import handle は symlink を追従しない（DenyAll）。
+        for (_, h) in &handles {
+            assert_eq!(h.symlink_policy(), SymlinkPolicy::DenyAll);
+            // handle の policy_id は resolver の pid と一致する。
+            assert_eq!(h.policy_id(), pid);
+        }
+    }
+
+    #[test]
+    fn policy_id_is_deterministic_for_same_roots() {
+        let roots = vec![pair("foo", "/tmp/a")];
+        let (p1, _) = build_import_resolver_roots(&roots).expect("build");
+        let (p2, _) = build_import_resolver_roots(&roots).expect("build");
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn policy_id_differs_for_different_roots() {
+        let (p1, _) = build_import_resolver_roots(&[pair("foo", "/tmp/a")]).expect("build");
+        let (p2, _) = build_import_resolver_roots(&[pair("foo", "/tmp/b")]).expect("build");
+        assert_ne!(p1, p2);
+    }
+
+    #[test]
+    fn invalid_mount_name_is_rejected() {
+        // MountName 検証に通らない名前は configuration error（CLI は exit 1）。
+        let err = build_import_resolver_roots(&[pair("1bad", "/tmp/a")])
+            .expect_err("invalid mount name must fail");
+        assert!(err.to_string().contains("import root の名前が不正"));
+    }
+
+    #[test]
+    fn constructs_filesystem_module_resolver_from_handles() {
+        // 構築した handle 群から FilesystemModuleResolver を組めること（grant は C6-c）。
+        let (pid, handles) = build_import_resolver_roots(&[pair("foo", "/tmp/a")]).expect("build");
+        let resolver = tsumugi::FilesystemModuleResolver::new(pid, handles)
+            .expect("resolver from import roots");
+        assert_eq!(resolver.policy_id(), pid);
     }
 }

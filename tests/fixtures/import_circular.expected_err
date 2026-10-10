@@ -1,0 +1,1 @@
+import の循環を検出しました: @default/import_circular_a.tsg -> @default/import_circular_b.tsg -> @default/import_circular_a.tsg
