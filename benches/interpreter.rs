@@ -12,7 +12,9 @@
 //! `execute` は `iter_batched` を使い、`Evaluator::new()` や `Chunk` の複製を
 //! セットアップとして測定対象から外す。engine間の比較は同じフェーズ同士で行う。
 
-use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 use tsumugi::ast::Program;
 use tsumugi::compiler::Compiler;
