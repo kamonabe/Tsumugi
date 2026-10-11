@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # GitHub Actions のバージョン更新（CI ワークフローの action タグを追従）
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+    open-pull-requests-limit: 5
+
+  # cargo 依存（現状は dev-dependencies の criterion のみ。依存増加に備えて設定）
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "deps"
+    open-pull-requests-limit: 5
