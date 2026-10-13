@@ -16,6 +16,12 @@
 //!
 //! 比較 / 等価の意味論（`NaN == NaN` は `false` 等）は [`crate::value::NumericOrder`] が
 //! 正本であり、本モジュールはそこへ関与しない。
+//!
+//! 同じ決定性 Slice 1 の shared primitive である `DeterminismRulesRevision`
+//! （[`docs/determinism-and-audit.md`] §3.1、backend 非依存規則の revision・初期値 1）は
+//! `crate::embedding` 側に固定値として定義されているのが正本であり、本モジュールでは
+//! 二重定義も再 export もしない。Float/NaN helper と revision を合わせて Slice 1 の
+//! deterministic primitive 群を構成する、という位置づけだけをここで相互参照する。
 
 /// 演算で生じた NaN を畳み込む canonical quiet NaN の bit pattern（§4.5）。
 ///
