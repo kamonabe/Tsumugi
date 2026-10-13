@@ -80,7 +80,10 @@ pub fn float_to_deterministic_bits(f: f64) -> u64 {
 mod tests {
     use super::*;
 
+    // ランタイムで 0.0/0.0 が生む NaN を canonicalize する経路を意図的に検証するため、
+    // zero_divided_by_zero lint を許可する（f64::NAN では当該経路を踏まない）。
     #[test]
+    #[allow(clippy::zero_divided_by_zero)]
     fn canonicalize_folds_all_nan_sources_to_canonical_bits() {
         let nan_sources = [
             f64::NAN,
@@ -93,7 +96,10 @@ mod tests {
         }
     }
 
+    // -0.0 == 0.0 が true という IEEE 754 の等価意味論を仕様として明示的に検証するため、
+    // 定数 assert の lint を許可する。
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn canonicalize_preserves_signed_zero_but_bits_distinguish_it() {
         // 値としての符号ビットは保持する。
         assert_eq!(canonicalize_float(-0.0).to_bits(), (-0.0f64).to_bits());
@@ -106,7 +112,10 @@ mod tests {
         assert!(-0.0f64 == 0.0f64);
     }
 
+    // 3.14 は数学定数 PI の近似ではなく parse/format の round-trip 用のテスト入力なので、
+    // approx_constant lint を許可する。
     #[test]
+    #[allow(clippy::approx_constant)]
     fn parse_float_is_locale_independent() {
         assert_eq!(parse_float("3.14").unwrap(), 3.14);
         assert_eq!(format_float(3.14), "3.14");
