@@ -15,6 +15,7 @@ pub mod budget;
 pub mod builtin_core;
 pub mod builtin_registry;
 pub mod capability;
+pub mod determinism;
 pub mod embedding;
 pub mod engine;
 pub mod env;

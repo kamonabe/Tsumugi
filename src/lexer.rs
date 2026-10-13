@@ -147,7 +147,8 @@ impl Lexer {
         }
 
         if is_float {
-            match s.parse::<f64>() {
+            // parse 契約は determinism helper に 1 本化する（小数点 '.' / locale 非依存。§4.4）。
+            match crate::determinism::parse_float(&s) {
                 Ok(n) => Token::Float(n),
                 Err(_) => Token::Error(format!("浮動小数点リテラルが不正です: {}", s)),
             }

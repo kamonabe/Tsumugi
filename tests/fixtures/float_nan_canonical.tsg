@@ -1,0 +1,31 @@
+# Float / NaN の決定的挙動（決定性 Slice 1、§4.5）
+#
+# 共有 helper 経由で tree-walk と VM が bit-identical になることを確認する。
+# NaN 生成・Infinity・-0.0・NaN 比較・-0.0 == 0.0 を print する。
+
+# NaN の生成（複数経路でも同じ canonical NaN 表示）
+let nan1 = 0.0 / 0.0
+let nan2 = (1.0 / 0.0) - (1.0 / 0.0)
+print(nan1)
+print(nan2)
+
+# Infinity（符号を保持）
+print(1.0 / 0.0)
+print(-1.0 / 0.0)
+
+# -0.0 の表示
+let neg_zero = -0.0
+print(neg_zero)
+
+# NaN の比較（IEEE 754: NaN は自分自身とも等しくない）
+print(nan1 == nan1)
+print(nan1 != nan1)
+
+# NaN の大小比較はすべて false
+print(nan1 < 1.0)
+print(nan1 > 1.0)
+print(nan1 <= 1.0)
+print(nan1 >= 1.0)
+
+# -0.0 == 0.0 は true
+print(neg_zero == 0.0)

@@ -147,7 +147,7 @@ slice量だけを変えるmetamorphic testは別入力間の強い追加性質�
 importは[言語仕様](language-spec.md)どおり、最初のscript statementより前に全件解決する。module resolverは[Capability仕様](capability-model.md)の注入adapterだけを使い、次を固定する。
 
 - source内のimport specifierは正規化せずresolverへ渡す。filesystem resolverの相対path検査はCapability仕様の`RelativePath`規則に従う。
-- resolverが返す`ModuleId`はopaqueで安定なUTF-8 identifierであり、同じlogical moduleには同じIDを返す。engineはpathとして再解釈・case fold・Unicode normalizeしない。
+- resolverが返す`ModuleId`はopaqueで安定なUTF-8 identifierであり、同じlogical moduleには同じIDを返す。engineはpathとして再解釈・case fold・Unicode normalizeしない。このno-normalization契約（§4.4のlocale/Unicode非正規化と一致）はSlice 1でshared primitiveの実装doc comment（`ModuleId`）に明文化済み。
 - `ModuleId`にabsolute local path、credential、query secretを含めない。
 - 同一execution中のmodule graphはimmutable snapshotであり、host filesystemやresolver登録の後続変更を観測しない。
 - 解決・parse・capability・budget失敗時は1文も実行しない。
@@ -177,6 +177,7 @@ pathの表示順・比較はproviderが返すpublic UTF-8 labelのbyte順とす�
 - `-0.0 == 0.0`は`true`。deterministic binary encodingではsign bitを保持し、表示規則は言語仕様に従う。
 - host responseからFloatを受け取る時もNaNをcanonicalizeし、Infinity・NaNをIntへ変換する規則は安定error codeで固定する。
 - Floatのparse、format、serializeはlocale非依存の同一algorithmをtree/VM/record-replayで共有する。
+- 上記のNaN canonicalization・parse・format・deterministic bit化はSlice 1でshared helper（`src/determinism.rs`）へ集約済みであり、意味論・表示規則は不変のまま実装位置だけを1本化している。
 
 ### 4.6 error
 
@@ -747,6 +748,8 @@ Phase 5のproduction gateで解消する。StableErrorのcode、script type、me
 - `LanguageRevision`、`DeterminismRulesRevision`、StableError、ModuleId、source/import graph hashを実装
 - locale/Unicode/Float/NaN/BTreeMap/path規則を共有helperへ集約
 - AUD-048のFunctionIdをtreeへ導入
+
+Float/NaNのcanonicalization・parse・formatとserialize用bit化は`src/determinism.rs`へ、`DeterminismRulesRevision`固定値と`ModuleId`のno-normalization契約は`src/embedding.rs`のshared primitiveへ集約済み。残りはStableError。状態は[ロードマップ](roadmap.md)「ステータス一覧」を参照する。
 
 ### Slice 2: HostBoundaryとFakeHost
 

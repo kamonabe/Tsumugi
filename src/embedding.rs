@@ -749,6 +749,12 @@ impl std::fmt::Debug for CompiledScript {
 }
 
 /// import module の識別子（仕様第5節 `ModuleId`）。1..=1024 UTF-8 bytes、NUL なし。
+///
+/// 決定性 Slice 1 の shared primitive（[`docs/determinism-and-audit.md`] §4.2 / §4.4）。
+/// `ModuleId` は opaque で安定な UTF-8 identifier であり、同じ logical module には同じ ID を返す。
+/// engine は path として再解釈せず、case fold も Unicode normalize もしない（§4.4 の
+/// locale/Unicode 非正規化契約と一致する）。[`Self::new`] の `validate_identifier` による
+/// 1..=1024 UTF-8 bytes・NUL なしの検証はこの不変条件の一部であり、変更しない。
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ModuleId(String);
 
@@ -2357,6 +2363,10 @@ fn terminal_from_run_error(
 
 /// determinism rules revision（§3 `DeterminismRulesRevision`）。A-1 では固定 1。
 ///
+/// 決定性 Slice 1 の shared primitive。[`docs/determinism-and-audit.md`] §3.1 の
+/// `DeterminismInput.rules_revision`（backend 非依存規則の revision、初期値 1）に対応する
+/// backend 非依存の固定値であり、ここが唯一の定義。Float/NaN など他の deterministic helper は
+/// [`crate::determinism`] に集約しており、本定数も同じ Slice 1 primitive として相互参照する。
 /// Phase 6 で rules を跨いだ差分を検出するための revision。本スライスは監査 envelope の
 /// `ExecutionStarted.rules_revision` に載せる固定値だけを持つ（配線は後続スライス）。
 const DETERMINISM_RULES_REVISION: u32 = 1;

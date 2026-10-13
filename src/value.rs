@@ -514,7 +514,7 @@ impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Value::Int(n) => write!(f, "Int({})", n),
-            Value::Float(n) => write!(f, "Float({})", n),
+            Value::Float(n) => write!(f, "Float({})", crate::determinism::format_float(*n)),
             Value::Str(s) => write!(f, "Str({:?})", s.as_str()),
             Value::Bool(b) => write!(f, "Bool({})", b),
             Value::Null => write!(f, "Null"),
@@ -876,7 +876,7 @@ impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Value::Int(n) => write!(f, "{}", n),
-            Value::Float(n) => write!(f, "{}", n),
+            Value::Float(n) => write!(f, "{}", crate::determinism::format_float(*n)),
             Value::Str(s) => write!(f, "{}", s.as_str()),
             Value::Bool(b) => write!(f, "{}", b),
             Value::Null => write!(f, "null"),
