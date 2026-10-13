@@ -629,6 +629,10 @@ enum RoundMode {
 ///
 /// `i64::MAX as f64` は 2^63 へ丸められるため、上端 2^63 は表現できず受理しない。
 /// 下端 `-2^63`（= `i64::MIN`）は f64 で正確に表現できるため受理する。
+///
+/// これは Float→Int 変換の検査層であり、Float の bit canonicalization
+/// （[`crate::determinism::canonicalize_float`]）とは別層。入力 NaN は canonical かどうかに
+/// 関わらず一律にエラーへ落とすため、挙動は本 Slice で不変。
 fn checked_float_to_i64(
     value: f64,
     mode: RoundMode,
@@ -715,15 +719,19 @@ pub fn builtin_to_int(args: &[Value], line: usize) -> Result<Value, TsumugiError
 pub fn builtin_to_float(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     check_arity("to_float", args, 1, line)?;
     match &args[0] {
-        Value::Float(f) => Ok(Value::Float(*f)),
-        Value::Int(n) => Ok(Value::Float(*n as f64)),
-        Value::Str(s) => s.parse::<f64>().map(Value::Float).map_err(|_| {
-            TsumugiError::runtime_with_kind(
-                line,
-                crate::error::ErrorKind::Conversion,
-                "to_float で Float に変換できません: 数値として解釈できません",
-            )
-        }),
+        Value::Float(f) => Ok(Value::Float(crate::determinism::canonicalize_float(*f))),
+        Value::Int(n) => Ok(Value::Float(crate::determinism::canonicalize_float(
+            *n as f64,
+        ))),
+        Value::Str(s) => crate::determinism::parse_float(s)
+            .map(Value::Float)
+            .map_err(|_| {
+                TsumugiError::runtime_with_kind(
+                    line,
+                    crate::error::ErrorKind::Conversion,
+                    "to_float で Float に変換できません: 数値として解釈できません",
+                )
+            }),
         other => Err(TsumugiError::builtin_arg_type(
             line,
             "to_float",
@@ -746,7 +754,9 @@ pub fn builtin_abs(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
                     "abs の結果が表現できません",
                 ))
             }),
-        Value::Float(f) => Ok(Value::Float(f.abs())),
+        Value::Float(f) => Ok(Value::Float(crate::determinism::canonicalize_float(
+            f.abs(),
+        ))),
         other => Err(TsumugiError::builtin_arg_type(
             line,
             "abs",
@@ -761,7 +771,7 @@ pub fn builtin_abs(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
 ///
 /// NumericOrder で厳密比較し、選択した operand を**元の型のまま**返す
 /// （Int を渡せば Int が返る）。同値時は第 1 引数を返す。いずれかが NaN の
-/// ときは canonical NaN（`Float(f64::NAN)`）を返す。
+/// ときは canonical NaN（[`crate::determinism::canonical_nan`]）を返す。
 fn builtin_min_max(
     name: &str,
     args: &[Value],
@@ -791,7 +801,9 @@ fn builtin_min_max(
 
     match NumericOrder::compare(&args[0], &args[1]) {
         // NaN が絡む場合は canonical NaN を返す。
-        Some(NumericOrdering::UnorderedNaN) | None => Ok(Value::Float(f64::NAN)),
+        Some(NumericOrdering::UnorderedNaN) | None => {
+            Ok(Value::Float(crate::determinism::canonical_nan()))
+        }
         Some(NumericOrdering::Equal) => Ok(args[0].clone()),
         Some(NumericOrdering::Less) => {
             // args[0] < args[1]

@@ -1202,7 +1202,7 @@ impl Vm {
                         .checked_neg()
                         .map(Value::Int)
                         .ok_or_else(|| TsumugiError::int_overflow(line, "符号反転"))?,
-                    Value::Float(n) => Value::Float(-n),
+                    Value::Float(n) => Value::Float(crate::determinism::canonicalize_float(-n)),
                     other => {
                         return Err(TsumugiError::unary_type(
                             line,
@@ -2241,9 +2241,15 @@ impl Vm {
                 .checked_add(*b)
                 .map(Value::Int)
                 .ok_or_else(|| TsumugiError::int_overflow(line, "加算")),
-            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
-            (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
-            (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + *b as f64)),
+            (Value::Float(a), Value::Float(b)) => {
+                Ok(Value::Float(crate::determinism::canonicalize_float(a + b)))
+            }
+            (Value::Int(a), Value::Float(b)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(*a as f64 + b),
+            )),
+            (Value::Float(a), Value::Int(b)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(a + *b as f64),
+            )),
             (Value::Str(a), Value::Str(b)) => {
                 Ok(Value::str_constant(format!("{}{}", a.as_str(), b.as_str())))
             }
@@ -2268,9 +2274,15 @@ impl Vm {
                 .checked_sub(*b)
                 .map(Value::Int)
                 .ok_or_else(|| TsumugiError::int_overflow(line, "減算")),
-            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
-            (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 - b)),
-            (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a - *b as f64)),
+            (Value::Float(a), Value::Float(b)) => {
+                Ok(Value::Float(crate::determinism::canonicalize_float(a - b)))
+            }
+            (Value::Int(a), Value::Float(b)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(*a as f64 - b),
+            )),
+            (Value::Float(a), Value::Int(b)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(a - *b as f64),
+            )),
             _ => Err(TsumugiError::arithmetic_type(
                 line,
                 crate::ast::BinOpKind::Sub,
@@ -2286,9 +2298,15 @@ impl Vm {
                 .checked_mul(*b)
                 .map(Value::Int)
                 .ok_or_else(|| TsumugiError::int_overflow(line, "乗算")),
-            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
-            (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 * b)),
-            (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a * *b as f64)),
+            (Value::Float(a), Value::Float(b)) => {
+                Ok(Value::Float(crate::determinism::canonicalize_float(a * b)))
+            }
+            (Value::Int(a), Value::Float(b)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(*a as f64 * b),
+            )),
+            (Value::Float(a), Value::Int(b)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(a * *b as f64),
+            )),
             _ => Err(TsumugiError::arithmetic_type(
                 line,
                 crate::ast::BinOpKind::Mul,
@@ -2309,9 +2327,15 @@ impl Vm {
                         .ok_or_else(|| TsumugiError::int_overflow(line, "除算"))
                 }
             }
-            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a / b)),
-            (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 / b)),
-            (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a / *b as f64)),
+            (Value::Float(a), Value::Float(b)) => {
+                Ok(Value::Float(crate::determinism::canonicalize_float(a / b)))
+            }
+            (Value::Int(a), Value::Float(b)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(*a as f64 / b),
+            )),
+            (Value::Float(a), Value::Int(b)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(a / *b as f64),
+            )),
             _ => Err(TsumugiError::arithmetic_type(
                 line,
                 crate::ast::BinOpKind::Div,
@@ -2332,9 +2356,15 @@ impl Vm {
                         .ok_or_else(|| TsumugiError::int_overflow(line, "剰余"))
                 }
             }
-            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a % b)),
-            (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 % b)),
-            (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a % *b as f64)),
+            (Value::Float(a), Value::Float(b)) => {
+                Ok(Value::Float(crate::determinism::canonicalize_float(a % b)))
+            }
+            (Value::Int(a), Value::Float(b)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(*a as f64 % b),
+            )),
+            (Value::Float(a), Value::Int(b)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(a % *b as f64),
+            )),
             _ => Err(TsumugiError::arithmetic_type(
                 line,
                 crate::ast::BinOpKind::Mod,

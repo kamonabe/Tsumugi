@@ -2326,24 +2326,54 @@ impl Evaluator {
                 }
             }
 
-            // 浮動小数点
-            (Value::Float(l), BinOpKind::Add, Value::Float(r)) => Ok(Value::Float(l + r)),
-            (Value::Float(l), BinOpKind::Sub, Value::Float(r)) => Ok(Value::Float(l - r)),
-            (Value::Float(l), BinOpKind::Mul, Value::Float(r)) => Ok(Value::Float(l * r)),
-            (Value::Float(l), BinOpKind::Div, Value::Float(r)) => Ok(Value::Float(l / r)),
-            (Value::Float(l), BinOpKind::Mod, Value::Float(r)) => Ok(Value::Float(l % r)),
+            // 浮動小数点（演算結果 NaN は共有 helper で canonicalize する。§4.5）
+            (Value::Float(l), BinOpKind::Add, Value::Float(r)) => {
+                Ok(Value::Float(crate::determinism::canonicalize_float(l + r)))
+            }
+            (Value::Float(l), BinOpKind::Sub, Value::Float(r)) => {
+                Ok(Value::Float(crate::determinism::canonicalize_float(l - r)))
+            }
+            (Value::Float(l), BinOpKind::Mul, Value::Float(r)) => {
+                Ok(Value::Float(crate::determinism::canonicalize_float(l * r)))
+            }
+            (Value::Float(l), BinOpKind::Div, Value::Float(r)) => {
+                Ok(Value::Float(crate::determinism::canonicalize_float(l / r)))
+            }
+            (Value::Float(l), BinOpKind::Mod, Value::Float(r)) => {
+                Ok(Value::Float(crate::determinism::canonicalize_float(l % r)))
+            }
 
             // Int と Float の混合
-            (Value::Int(l), BinOpKind::Add, Value::Float(r)) => Ok(Value::Float(*l as f64 + r)),
-            (Value::Float(l), BinOpKind::Add, Value::Int(r)) => Ok(Value::Float(l + *r as f64)),
-            (Value::Int(l), BinOpKind::Sub, Value::Float(r)) => Ok(Value::Float(*l as f64 - r)),
-            (Value::Float(l), BinOpKind::Sub, Value::Int(r)) => Ok(Value::Float(l - *r as f64)),
-            (Value::Int(l), BinOpKind::Mul, Value::Float(r)) => Ok(Value::Float(*l as f64 * r)),
-            (Value::Float(l), BinOpKind::Mul, Value::Int(r)) => Ok(Value::Float(l * *r as f64)),
-            (Value::Int(l), BinOpKind::Div, Value::Float(r)) => Ok(Value::Float(*l as f64 / r)),
-            (Value::Float(l), BinOpKind::Div, Value::Int(r)) => Ok(Value::Float(l / *r as f64)),
-            (Value::Int(l), BinOpKind::Mod, Value::Float(r)) => Ok(Value::Float(*l as f64 % r)),
-            (Value::Float(l), BinOpKind::Mod, Value::Int(r)) => Ok(Value::Float(l % *r as f64)),
+            (Value::Int(l), BinOpKind::Add, Value::Float(r)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(*l as f64 + r),
+            )),
+            (Value::Float(l), BinOpKind::Add, Value::Int(r)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(l + *r as f64),
+            )),
+            (Value::Int(l), BinOpKind::Sub, Value::Float(r)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(*l as f64 - r),
+            )),
+            (Value::Float(l), BinOpKind::Sub, Value::Int(r)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(l - *r as f64),
+            )),
+            (Value::Int(l), BinOpKind::Mul, Value::Float(r)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(*l as f64 * r),
+            )),
+            (Value::Float(l), BinOpKind::Mul, Value::Int(r)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(l * *r as f64),
+            )),
+            (Value::Int(l), BinOpKind::Div, Value::Float(r)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(*l as f64 / r),
+            )),
+            (Value::Float(l), BinOpKind::Div, Value::Int(r)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(l / *r as f64),
+            )),
+            (Value::Int(l), BinOpKind::Mod, Value::Float(r)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(*l as f64 % r),
+            )),
+            (Value::Float(l), BinOpKind::Mod, Value::Int(r)) => Ok(Value::Float(
+                crate::determinism::canonicalize_float(l % *r as f64),
+            )),
 
             // 文字列結合
             (Value::Str(l), BinOpKind::Add, Value::Str(r)) => {
@@ -2421,7 +2451,9 @@ impl Evaluator {
                 .checked_neg()
                 .map(Value::Int)
                 .ok_or_else(|| TsumugiError::int_overflow(line, "符号反転")),
-            (UnaryOpKind::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
+            (UnaryOpKind::Neg, Value::Float(f)) => {
+                Ok(Value::Float(crate::determinism::canonicalize_float(-f)))
+            }
             (UnaryOpKind::Not, v) => Ok(Value::Bool(!v.is_truthy())),
             _ => Err(TsumugiError::unary_type(line, *op, val)),
         }

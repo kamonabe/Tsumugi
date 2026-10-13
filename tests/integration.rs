@@ -424,6 +424,7 @@ fixture_tests!(
         filesystem,
         first_class_fn,
         fizzbuzz,
+        float_nan_canonical,
         float_special,
         for_closure_binding,
         for_iteration_snapshot,
