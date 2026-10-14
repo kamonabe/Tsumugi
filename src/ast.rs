@@ -962,9 +962,13 @@ pub(crate) fn validate_program_depth(program: &Program) -> Result<(), crate::err
         .collect();
 
     if let Some(line) = excessive_depth_line(worklist) {
-        return Err(TsumugiError::runtime_with_kind(
+        // StackOverflow は 2 テンプレート（再帰深度 / AST 深度）を持つクラス B kind。
+        // kind だけでは一意化できないため、AST 深度テンプレートの message_id を付与する
+        // （再帰深度側は error.rs::call_depth_limit が別 ID を付与。StableError §8.2）。
+        return Err(TsumugiError::runtime_with_message_id(
             line,
             ErrorKind::StackOverflow,
+            crate::stable_error::message_id::OVERFLOW_AST_DEPTH,
             format!("ASTのネストが深すぎます (上限: {})", MAX_AST_DEPTH),
         ));
     }

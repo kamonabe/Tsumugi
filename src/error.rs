@@ -227,6 +227,23 @@ pub enum TsumugiError {
         message: String,
         kind: ErrorKind,
         trace: Vec<TraceFrame>,
+        /// per-template の安定 message ID タグ（StableError 射影用、`src/stable_error.rs`）。
+        ///
+        /// `None`（= tag 0）は canonical constructor がタグ未付与（`runtime_with_kind` 直呼び）。
+        /// この場合 射影側 `message_id_for` が kind から ID を補完する（クラス A）。`Some(tag)` は
+        /// canonical constructor が自分のテンプレート ID を付与済み（クラス B、1 kind が複数
+        /// テンプレートを持つため kind だけでは一意化できない）。
+        ///
+        /// 表現は `u16` の tag（[`crate::stable_error::message_id`] の定数）で、安定 ASCII キー
+        /// 文字列への対応は `stable_error` 側の単一テーブルが持つ（二重管理回避）。`u16` にして
+        /// `kind: ErrorKind` 隣の既存 padding に収め、`Runtime` 変種のサイズ（深い tree 再帰で
+        /// stack を伝播する）を増やさないための選択（`&'static str` 直持ちは fat pointer で
+        /// 16 byte 増え、128 深度の native 再帰を stack overflow させる回帰があった）。
+        ///
+        /// この field は観測挙動（`error_type()` / `message()` / `line()` / `kind()` /
+        /// `Display`）に一切影響しない内部表現であり、StableError primitive（決定性 Slice 1）
+        /// のためだけに追加した。
+        message_id: Option<std::num::NonZeroU16>,
     },
 }
 
@@ -246,6 +263,30 @@ impl TsumugiError {
             message: message.into(),
             kind,
             trace: Vec::new(),
+            message_id: None,
+        }
+    }
+
+    /// ランタイムエラーを種別＋ per-template message ID 付きで生成する（StableError 射影用）。
+    ///
+    /// `runtime_with_kind` と同じ観測挙動を持つ（kind / message / line / trace は不変）が、
+    /// `message_id` 内部 field に per-template の安定 ID タグを載せる。1 kind が複数テンプレートを
+    /// 持つ kind（クラス B。`Type` / `Index` / `Argument` 等）の canonical constructor が、kind
+    /// だけでは一意化できないテンプレート ID を射影側へ渡すために使う（`src/stable_error.rs`
+    /// §8.2）。`runtime_with_kind` の signature は変えないため、error.rs 外の直接呼び出し元
+    /// （vm.rs 等）には影響しない。
+    pub(crate) fn runtime_with_message_id(
+        line: usize,
+        kind: ErrorKind,
+        message_id: std::num::NonZeroU16,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::Runtime {
+            line,
+            message: message.into(),
+            kind,
+            trace: Vec::new(),
+            message_id: Some(message_id),
         }
     }
 
@@ -284,11 +325,14 @@ impl TsumugiError {
                 message,
                 kind,
                 trace: ref existing,
+                message_id,
             } if existing.is_empty() => Self::Runtime {
                 line,
                 message,
                 kind,
                 trace,
+                // message_id は観測挙動に影響しない内部タグ。trace 付加で変えずそのまま引き継ぐ。
+                message_id,
             },
             other => other,
         }
@@ -313,18 +357,20 @@ impl TsumugiError {
 impl TsumugiError {
     /// 変数 read・callee 名が未定義
     pub fn undefined_name(line: usize, name: &str) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Name,
+            crate::stable_error::message_id::NAME_UNDEFINED,
             format!("未定義の変数または関数: {}", name),
         )
     }
 
     /// 未定義変数への通常代入
     pub fn assign_undefined(line: usize, name: &str) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Name,
+            crate::stable_error::message_id::NAME_ASSIGN_UNDEFINED,
             format!("未定義の変数に代入: {}", name),
         )
     }
@@ -336,9 +382,10 @@ impl TsumugiError {
 
     /// 整数演算 overflow
     pub fn int_overflow(line: usize, operation: &str) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::IntOverflow,
+            crate::stable_error::message_id::INT_OVERFLOW_ARITHMETIC,
             format!("整数オーバーフロー: {}", operation),
         )
     }
@@ -350,9 +397,10 @@ impl TsumugiError {
         left: &Value,
         right: &Value,
     ) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Type,
+            crate::stable_error::message_id::TYPE_ARITHMETIC,
             format!(
                 "演算子 {} は {} と {} に適用できません",
                 binop_symbol(op),
@@ -364,9 +412,10 @@ impl TsumugiError {
 
     /// 単項演算の対象型不正
     pub fn unary_type(line: usize, op: crate::ast::UnaryOpKind, operand: &Value) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Type,
+            crate::stable_error::message_id::TYPE_UNARY,
             format!(
                 "演算子 {} は {} に適用できません",
                 unaryop_symbol(op),
@@ -382,9 +431,10 @@ impl TsumugiError {
         left: &Value,
         right: &Value,
     ) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Type,
+            crate::stable_error::message_id::TYPE_COMPARISON,
             format!(
                 "比較演算子 {} は {} と {} に適用できません",
                 binop_symbol(op),
@@ -396,9 +446,10 @@ impl TsumugiError {
 
     /// List index が Int でない
     pub fn list_index_type(line: usize, actual: &Value) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Type,
+            crate::stable_error::message_id::TYPE_LIST_INDEX,
             format!(
                 "List のインデックスは Int である必要があります: {}",
                 type_name(actual)
@@ -408,9 +459,10 @@ impl TsumugiError {
 
     /// Str index が Int でない
     pub fn str_index_type(line: usize, actual: &Value) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Type,
+            crate::stable_error::message_id::TYPE_STR_INDEX,
             format!(
                 "Str のインデックスは Int である必要があります: {}",
                 type_name(actual)
@@ -420,9 +472,10 @@ impl TsumugiError {
 
     /// Dict key が Str でない
     pub fn dict_key_type(line: usize, actual: &Value) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Type,
+            crate::stable_error::message_id::TYPE_DICT_KEY,
             format!(
                 "Dict のキーは Str である必要があります: {}",
                 type_name(actual)
@@ -432,36 +485,40 @@ impl TsumugiError {
 
     /// List index 範囲外
     pub fn list_index_out_of_range(line: usize, index: i64, len: usize) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Index,
+            crate::stable_error::message_id::INDEX_LIST_OUT_OF_RANGE,
             format!("List のインデックスが範囲外です: {} (長さ: {})", index, len),
         )
     }
 
     /// Str index 範囲外
     pub fn str_index_out_of_range(line: usize, index: i64, len: usize) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Index,
+            crate::stable_error::message_id::INDEX_STR_OUT_OF_RANGE,
             format!("Str のインデックスが範囲外です: {} (長さ: {})", index, len),
         )
     }
 
     /// index read 非対応型
     pub fn index_read_unsupported(line: usize, actual: &Value) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Type,
+            crate::stable_error::message_id::TYPE_INDEX_READ_UNSUPPORTED,
             format!("インデックスアクセスできない型です: {}", type_name(actual)),
         )
     }
 
     /// index assignment 非対応型
     pub fn index_assign_unsupported(line: usize, actual: &Value) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Type,
+            crate::stable_error::message_id::TYPE_INDEX_ASSIGN_UNSUPPORTED,
             format!("インデックス代入できない型です: {}", type_name(actual)),
         )
     }
@@ -477,18 +534,20 @@ impl TsumugiError {
 
     /// 非 callable の呼び出し
     pub fn not_callable(line: usize, actual: &Value) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Type,
+            crate::stable_error::message_id::TYPE_NOT_CALLABLE,
             format!("呼び出せない型です: {}", type_name(actual)),
         )
     }
 
     /// user function / method の arity 不一致
     pub fn user_arity(line: usize, callable: &str, expected: usize, actual: usize) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Argument,
+            crate::stable_error::message_id::ARGUMENT_USER_ARITY,
             format!(
                 "{} の引数個数が一致しません: 期待 {}, 実際 {}",
                 callable, expected, actual
@@ -498,9 +557,10 @@ impl TsumugiError {
 
     /// builtin の arity 不一致
     pub fn builtin_arity(line: usize, builtin: &str, expected: usize, actual: usize) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Argument,
+            crate::stable_error::message_id::ARGUMENT_BUILTIN_ARITY,
             format!(
                 "{} の引数個数が一致しません: 期待 {}, 実際 {}",
                 builtin, expected, actual
@@ -510,9 +570,10 @@ impl TsumugiError {
 
     /// variadic builtin の最小 arity 不足
     pub fn builtin_min_arity(line: usize, builtin: &str, minimum: usize, actual: usize) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Argument,
+            crate::stable_error::message_id::ARGUMENT_BUILTIN_MIN_ARITY,
             format!(
                 "{} の引数が不足しています: 最小 {}, 実際 {}",
                 builtin, minimum, actual
@@ -525,9 +586,10 @@ impl TsumugiError {
     /// host function は `Exact`/`Range` のどちらもあり得るため、期待個数ではなく actual だけを
     /// 載せる（descriptor は公開しない）。
     pub fn host_function_arity(line: usize, name: &str, actual: usize) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Argument,
+            crate::stable_error::message_id::ARGUMENT_HOST_FUNCTION_ARITY,
             format!("{} の引数個数が契約と一致しません: 実際 {}", name, actual),
         )
     }
@@ -540,9 +602,10 @@ impl TsumugiError {
         expected: &str,
         actual: &Value,
     ) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::BuiltinType,
+            crate::stable_error::message_id::BUILTIN_TYPE_ARG_TYPE,
             format!(
                 "{} の第 {} 引数は {} である必要があります: {}",
                 builtin,
@@ -555,9 +618,10 @@ impl TsumugiError {
 
     /// callback が非 callable
     pub fn callback_not_callable(line: usize, builtin: &str, actual: &Value) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Type,
+            crate::stable_error::message_id::TYPE_CALLBACK_NOT_CALLABLE,
             format!(
                 "{} のコールバックは呼び出し可能である必要があります: {}",
                 builtin,
@@ -568,9 +632,10 @@ impl TsumugiError {
 
     /// callback の arity 不一致
     pub fn callback_arity(line: usize, builtin: &str, actual: usize) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Argument,
+            crate::stable_error::message_id::ARGUMENT_CALLBACK_ARITY,
             format!(
                 "{} のコールバック引数個数が一致しません: 期待 1, 実際 {}",
                 builtin, actual
@@ -580,27 +645,30 @@ impl TsumugiError {
 
     /// push / pop の第1引数が変数でない
     pub fn mutation_target_not_variable(line: usize, builtin: &str) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::BuiltinType,
+            crate::stable_error::message_id::BUILTIN_TYPE_MUTATION_TARGET,
             format!("{} の第 1 引数には List 変数を指定してください", builtin),
         )
     }
 
     /// 空 List への pop
     pub fn pop_empty_list(line: usize) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::BuiltinType,
+            crate::stable_error::message_id::BUILTIN_TYPE_POP_EMPTY,
             "pop は空の List には使用できません",
         )
     }
 
     /// builtin 固有の状態不正
     pub fn builtin_state(line: usize, builtin: &str, state: &str) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::BuiltinType,
+            crate::stable_error::message_id::BUILTIN_TYPE_STATE,
             format!("{} は {} には使用できません", builtin, state),
         )
     }
@@ -619,9 +687,10 @@ impl TsumugiError {
 
     /// user function depth 上限
     pub fn call_depth_limit(line: usize, limit: usize) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::StackOverflow,
+            crate::stable_error::message_id::OVERFLOW_CALL_DEPTH,
             format!("スタックオーバーフロー: 再帰が深すぎます (上限: {})", limit),
         )
     }
@@ -846,18 +915,20 @@ impl TsumugiError {
 
     /// loop 外の break
     pub fn break_outside_loop(line: usize) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::ControlFlow,
+            crate::stable_error::message_id::CONTROL_FLOW_BREAK,
             "break はループの中でのみ使用できます",
         )
     }
 
     /// `exit` の終了コードが 0..=255 の範囲外（第3.4節「`exit` code範囲外」、catch 可能）。
     pub fn exit_code_out_of_range(line: usize, code: i64) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Argument,
+            crate::stable_error::message_id::ARGUMENT_EXIT_CODE_RANGE,
             format!(
                 "exit の終了コードは 0 から 255 の範囲で指定してください: {}",
                 code
@@ -898,9 +969,12 @@ impl TsumugiError {
     /// （存在 oracle 防止、CAP-AT-12/13）。message に host path・symlink・permission を
     /// 含めない。存在 path と不存在 path で同一の code/message になる。
     pub fn filesystem_denied(line: usize) -> Self {
-        Self::runtime_with_kind(
+        // Sandbox は 2 テンプレート（filesystem_denied / sandbox.rs のパス範囲外違反）を持つ
+        // クラス B kind。kind だけでは一意化できないため message_id を付与する（§8.2）。
+        Self::runtime_with_message_id(
             line,
             ErrorKind::Sandbox,
+            crate::stable_error::message_id::SANDBOX_FILESYSTEM_DENIED,
             "ファイルシステム操作が許可されていません",
         )
     }
@@ -921,9 +995,10 @@ impl TsumugiError {
 
     /// loop 外の continue
     pub fn continue_outside_loop(line: usize) -> Self {
-        Self::runtime_with_kind(
+        Self::runtime_with_message_id(
             line,
             ErrorKind::ControlFlow,
+            crate::stable_error::message_id::CONTROL_FLOW_CONTINUE,
             "continue はループの中でのみ使用できます",
         )
     }

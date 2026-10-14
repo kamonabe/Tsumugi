@@ -2544,6 +2544,8 @@ fn execution_error_from(error: &TsumugiError) -> ExecutionError {
             message,
             kind,
             trace,
+            // message_id は StableError 射影用の内部タグ（§8.3）。ExecutionError へは写さない。
+            ..
         } => ExecutionError {
             code: *kind,
             safe_message: message.clone(),

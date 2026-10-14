@@ -82,9 +82,10 @@ fn authorize_path(target: PathBuf, original: &Path, line: usize) -> Result<PathB
         return Ok(target);
     }
 
-    Err(TsumugiError::runtime_with_kind(
+    Err(TsumugiError::runtime_with_message_id(
         line,
         crate::error::ErrorKind::Sandbox,
+        crate::stable_error::message_id::SANDBOX_PATH_DENIED,
         format!(
             "サンドボックス違反: パス \"{}\" は許可範囲外です",
             original.display()

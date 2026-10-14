@@ -16,8 +16,18 @@ use crate::error::{ErrorKind, TsumugiError};
 use crate::limits::MAX_IMPORT_DEPTH;
 use crate::value::HeapToken;
 
-fn import_error(line: usize, message: impl Into<String>) -> TsumugiError {
-    TsumugiError::runtime_with_kind(line, ErrorKind::Import, message)
+/// import 失敗 error を per-template message_id 付きで生成する。
+///
+/// `Import` は 3 テンプレート（ネスト深度 / 読込不能 / 構文不正）を持つクラス B kind であり、
+/// kind だけでは一意化できないため、呼び出し側がテンプレートの message_id を渡す
+/// （StableError §8.2、`src/stable_error.rs`）。観測挙動（kind=`import` / message / line）は
+/// 不変で、message_id 内部タグだけが載る。
+fn import_error(
+    line: usize,
+    message_id: std::num::NonZeroU16,
+    message: impl Into<String>,
+) -> TsumugiError {
+    TsumugiError::runtime_with_message_id(line, ErrorKind::Import, message_id, message)
 }
 
 /// リンク中に初めて解決した import モジュール 1 本の記録。
@@ -181,6 +191,7 @@ impl ModuleLoader {
         let canonical = std::fs::canonicalize(&resolved).map_err(|_| {
             import_error(
                 line,
+                crate::stable_error::message_id::IMPORT_UNREADABLE,
                 format!(
                     "import に失敗しました: モジュールを読み込めません: {}",
                     path
@@ -201,6 +212,7 @@ impl ModuleLoader {
         if depth >= MAX_IMPORT_DEPTH {
             return Err(import_error(
                 line,
+                crate::stable_error::message_id::IMPORT_DEPTH,
                 format!(
                     "import 失敗: ネストが深すぎます (上限: {})",
                     MAX_IMPORT_DEPTH
@@ -211,6 +223,7 @@ impl ModuleLoader {
         let source = std::fs::read_to_string(&canonical).map_err(|_| {
             import_error(
                 line,
+                crate::stable_error::message_id::IMPORT_UNREADABLE,
                 format!(
                     "import に失敗しました: モジュールを読み込めません: {}",
                     path
@@ -248,6 +261,10 @@ fn parse_module(source: &str, path: &str, line: usize) -> Result<Program, Tsumug
                     path
                 ),
             };
-            import_error(line, message)
+            import_error(
+                line,
+                crate::stable_error::message_id::IMPORT_SYNTAX,
+                message,
+            )
         })
 }

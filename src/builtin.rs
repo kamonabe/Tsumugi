@@ -317,9 +317,10 @@ impl Evaluator {
             }
             "exit" => {
                 if args.len() > 1 {
-                    return Err(TsumugiError::runtime_with_kind(
+                    return Err(TsumugiError::runtime_with_message_id(
                         line,
                         crate::error::ErrorKind::Argument,
+                        crate::stable_error::message_id::ARGUMENT_EXIT_ARITY,
                         format!("exit() は引数0〜1個ですが、{}個渡されました", args.len()),
                     ));
                 }

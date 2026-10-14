@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-10-12
+最終更新: 2026-10-14
 
 > このロードマップは「進捗だけ」を追う。機能の詳細・採用/不採用の理由は各設計正本に置く
 > （ドキュメントの役割分担は [ドキュメント運用ガイド](documentation-guide.md) を参照）。
@@ -9,8 +9,8 @@
 ## 現在地
 
 - **フェーズ:** Phase 2（deny-by-default capability）・Phase 3/4（包括的な実行予算・協調実行）を並行して進行中。
-- **現在の slice:** 決定性 Slice 1（規範的 primitive）＝Phase 5 の着手部分。
-- **次のタスク:** 決定性 Slice 1 の残り＝StableError を実装する。状態・詳細は「ステータス一覧」の該当項目と [決定性・実行時監査仕様](determinism-and-audit.md) 第14節 Slice 1 を参照（deterministic shared helpers〔NaN canonicalization `0x7ff8_0000_0000_0000`・Float format〕と DeterminismRulesRevision/ModuleId 正規化、および FunctionId＝AUD-048 は実装完了済みで、この残りには含まない）。
+- **現在の slice:** 決定性 Slice 1（規範的 primitive）＝Phase 5 の着手部分は実装完了（StableError を含む deterministic primitive が一通り揃った。VM parity・FakeHost gate・audit normalize は後続 slice）。
+- **次のタスク:** 包括 budget の残り（REV-001/REV-015、Phase 3/4）＝REV-001 の全順序化（REV-017）と残 I/O/host budget、Phase 6 audit への budget/event 伝播。状態・詳細は「ステータス一覧」の REV-001/REV-015 と [実行予算・協調実行仕様](execution-control.md) を参照（決定性 Slice 1 の deterministic shared helpers・DeterminismRulesRevision/ModuleId 正規化・FunctionId＝AUD-048・StableError は実装完了済み）。
 
 ## マイルストーン（Phase 0〜7）
 
@@ -58,7 +58,7 @@
 | AUD-036 | lossy 数値変換（Float→Int・file_size・exit は完了、`Exited` の `usage` field が残り） | 🟡 | [次期意味論・実装決定](semantic-decisions.md) §10 |
 | AUD-045 | MSRV 1.97・stable/MSRV CI・install/release・artifact・署名/SBOM/OCI・運用 gate | 🟡 | [検証・リリース・運用設計](verification-release-operations.md) §3〜10・17〜18節 |
 | AUD-048 | 動的評価ごとの per-instance `FunctionId` による関数等価性 | ✅ | [次期意味論・実装決定](semantic-decisions.md) §12・[決定性・実行時監査仕様](determinism-and-audit.md) §4.7 |
-| Phase 5 残 | deterministic shared helpers（NaN canonicalization `0x7ff8_0000_0000_0000`・Float format）と DeterminismRulesRevision/ModuleId 正規化は完了。残りは StableError | 🟡 | [決定性・実行時監査仕様](determinism-and-audit.md) 第14節 Slice 1 |
+| Phase 5 残 | deterministic shared helpers（NaN canonicalization `0x7ff8_0000_0000_0000`・Float format）・DeterminismRulesRevision/ModuleId 正規化・StableError（`src/stable_error.rs`、tree 射影）は完了。Slice 1 の deterministic primitive は一通り揃った。残りは Slice 2〜6（HostBoundary/FakeHost・VM parity・audit normalize・record/replay 等） | 🟡 | [決定性・実行時監査仕様](determinism-and-audit.md) 第14節 Slice 1〜6 |
 | Phase 6 残 | 他 6 event emission・`AuditBackpressure` yield・redaction 本体・strict CBOR・record/replay・VM 対応・sink 必須化（A-1 は実装済み） | 🟡 | [決定性・実行時監査仕様](determinism-and-audit.md) §6〜12・14 Slice 5 |
 | 品質改善 | 未着手の処理改善（`dispatch` の match 分割・`exec_stmt` 分割・sandbox `OnceLock` テスタビリティ・fuzzing 導入） | ⬜ | [設計](design.md) |
 
@@ -66,11 +66,12 @@
 
 先頭ほど優先。各ステップの状態は上記「ステータス一覧」の対応 ID を参照する（ここでは再掲しない）。
 
-1. **決定性 Slice 1 の残り（Phase 5）** — StableError。正本: [決定性・実行時監査仕様](determinism-and-audit.md) 第14節 Slice 1。※ deterministic shared helpers・DeterminismRulesRevision/ModuleId 正規化・FunctionId（AUD-048）は実装完了済みでこの残りには含まない。
-2. **包括 budget の残り（REV-001/REV-015、Phase 3/4）** — REV-001 の全順序化（REV-017）と残 I/O/host budget、Phase 6 audit への budget/event 伝播。正本: [実行予算・協調実行仕様](execution-control.md)。
-3. **Phase 1/2 の残り** — REPL の Engine API 統合（E7 残）、VM/E9 の import・resolver 統合（Phase 5）、CAP-AT-17 の budget N 境界（Phase 3/C11）。正本: [組み込みAPI仕様](embedding-api.md)・[Capability Model仕様](capability-model.md)。
-4. **Phase 6 audit の残り** — 他 6 event emission ほか。正本: [決定性・実行時監査仕様](determinism-and-audit.md)。
-5. **Phase 7 運用保証** — MSRV・release/install・artifact・OCI・運用資材。正本: [検証・リリース・運用設計](verification-release-operations.md)。
+1. **包括 budget の残り（REV-001/REV-015、Phase 3/4）** — REV-001 の全順序化（REV-017）と残 I/O/host budget、Phase 6 audit への budget/event 伝播。正本: [実行予算・協調実行仕様](execution-control.md)。
+2. **Phase 1/2 の残り** — REPL の Engine API 統合（E7 残）、VM/E9 の import・resolver 統合（Phase 5）、CAP-AT-17 の budget N 境界（Phase 3/C11）。正本: [組み込みAPI仕様](embedding-api.md)・[Capability Model仕様](capability-model.md)。
+3. **Phase 6 audit の残り** — 他 6 event emission ほか。正本: [決定性・実行時監査仕様](determinism-and-audit.md)。
+4. **Phase 7 運用保証** — MSRV・release/install・artifact・OCI・運用資材。正本: [検証・リリース・運用設計](verification-release-operations.md)。
+
+> 完了（直近）: 決定性 Slice 1 の残り＝StableError（`src/stable_error.rs`、tree 射影）を実装。これで Slice 1 の deterministic primitive（deterministic shared helpers・DeterminismRulesRevision/ModuleId 正規化・FunctionId＝AUD-048・StableError）は一通り揃った。VM parity・FakeHost gate・audit normalize は Slice 2〜6。
 
 > 設計 slice に沿う詳細な実装順は各 spec（特に [次期意味論・実装決定](semantic-decisions.md) 第17節「移行順」と [実行予算・協調実行仕様](execution-control.md) 第14節 Slice 定義）を正本とする。
 
