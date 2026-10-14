@@ -29,6 +29,7 @@ pub mod module;
 pub mod parser;
 pub mod sandbox;
 pub mod scheduler;
+pub mod stable_error;
 pub mod token;
 pub mod value;
 
@@ -166,6 +167,12 @@ pub use host_function::{
 // cooperative host function / adapter テストが script 値を構築・判定するために `Value` を
 // crate root へ公開する（REV-015 Slice 5）。host 側は `Response → Value` 変換の責務を担う（OQ-9）。
 pub use value::Value;
+
+// StableError primitive（決定性 Slice 1、`docs/determinism-and-audit.md` §4.6）の公開型。
+// backend 非依存の安定した構造化 error を内部 `TsumugiError` から射影する。embedding surface と
+// 名前衝突しないため素の名前で crate root へ re-export する。`ErrorCode` は `error::ErrorKind` の
+// 型エイリアスであり、`error::ErrorKind` の公開と矛盾しない（同一型の別名）。
+pub use stable_error::{ErrorCode, ErrorMessageId, StableError, StableFrame};
 
 // Phase 6 実行時監査（audit）の公開型（A-1 スライス、`docs/determinism-and-audit.md`
 // §7/§8/§10/§11）。schema v1 の envelope/event、sink 契約、監査予算を crate root へ公開する。

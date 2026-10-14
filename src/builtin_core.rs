@@ -93,9 +93,10 @@ pub fn validate_context_builtin_call(
         "input" | "args" => check_arity_count(name, arg_count, 0, line),
         "exit" => {
             if arg_count > 1 {
-                Err(TsumugiError::runtime_with_kind(
+                Err(TsumugiError::runtime_with_message_id(
                     line,
                     crate::error::ErrorKind::Argument,
+                    crate::stable_error::message_id::ARGUMENT_EXIT_ARITY,
                     format!("exit() は引数0〜1個ですが、{}個渡されました", arg_count),
                 ))
             } else {
@@ -640,16 +641,18 @@ fn checked_float_to_i64(
     line: usize,
 ) -> Result<i64, TsumugiError> {
     if value.is_nan() {
-        return Err(TsumugiError::runtime_with_kind(
+        return Err(TsumugiError::runtime_with_message_id(
             line,
             crate::error::ErrorKind::Conversion,
+            crate::stable_error::message_id::CONVERSION_FLOAT_TO_INT,
             format!("{builtin} で Int に変換できません: NaN"),
         ));
     }
     if value.is_infinite() {
-        return Err(TsumugiError::runtime_with_kind(
+        return Err(TsumugiError::runtime_with_message_id(
             line,
             crate::error::ErrorKind::Conversion,
+            crate::stable_error::message_id::CONVERSION_FLOAT_TO_INT,
             format!("{builtin} で Int に変換できません: 非有限値"),
         ));
     }
@@ -666,9 +669,10 @@ fn checked_float_to_i64(
     const MIN: f64 = -9_223_372_036_854_775_808.0; // -2^63 = i64::MIN
     const LIMIT: f64 = 9_223_372_036_854_775_808.0; // 2^63（受理しない上端）
     if !(MIN..LIMIT).contains(&rounded) {
-        return Err(TsumugiError::runtime_with_kind(
+        return Err(TsumugiError::runtime_with_message_id(
             line,
             crate::error::ErrorKind::Conversion,
+            crate::stable_error::message_id::CONVERSION_FLOAT_TO_INT,
             format!("{builtin} で Int に変換できません: i64 範囲外"),
         ));
     }
@@ -680,9 +684,10 @@ fn checked_float_to_i64(
 /// wrap・負値を返さず `int_overflow` エラーにする（AUD-036）。
 fn checked_file_size_to_i64(size: u64, line: usize) -> Result<i64, TsumugiError> {
     i64::try_from(size).map_err(|_| {
-        TsumugiError::runtime_with_kind(
+        TsumugiError::runtime_with_message_id(
             line,
             crate::error::ErrorKind::IntOverflow,
+            crate::stable_error::message_id::INT_OVERFLOW_FILE_SIZE,
             "ファイルサイズを Int で表現できません",
         )
     })
@@ -700,9 +705,10 @@ pub fn builtin_to_int(args: &[Value], line: usize) -> Result<Value, TsumugiError
         )?)),
         Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
         Value::Str(s) => s.parse::<i64>().map(Value::Int).map_err(|_| {
-            TsumugiError::runtime_with_kind(
+            TsumugiError::runtime_with_message_id(
                 line,
                 crate::error::ErrorKind::Conversion,
+                crate::stable_error::message_id::CONVERSION_TO_INT,
                 "to_int で Int に変換できません: 数値として解釈できません",
             )
         }),
@@ -726,9 +732,10 @@ pub fn builtin_to_float(args: &[Value], line: usize) -> Result<Value, TsumugiErr
         Value::Str(s) => crate::determinism::parse_float(s)
             .map(Value::Float)
             .map_err(|_| {
-                TsumugiError::runtime_with_kind(
+                TsumugiError::runtime_with_message_id(
                     line,
                     crate::error::ErrorKind::Conversion,
+                    crate::stable_error::message_id::CONVERSION_TO_FLOAT,
                     "to_float で Float に変換できません: 数値として解釈できません",
                 )
             }),
@@ -1422,9 +1429,10 @@ fn fs_route<'a>(
             Ok(None) => return Err(TsumugiError::filesystem_denied(line)),
             Ok(Some(target)) => target,
             Err(_) => {
-                return Err(TsumugiError::runtime_with_kind(
+                return Err(TsumugiError::runtime_with_message_id(
                     line,
                     crate::error::ErrorKind::Argument,
+                    crate::stable_error::message_id::ARGUMENT_INVALID_PATH,
                     "ファイルパスの形式が不正です",
                 ));
             }
@@ -1432,9 +1440,10 @@ fn fs_route<'a>(
         None => crate::capability::FilesystemTarget::parse(path).map_err(|_| {
             // lexical 検証を capability lookup より先に行う（PathError は catch 可能な argument
             // error。authority channel と分離する、第8.5節）。message に host path を含めない。
-            TsumugiError::runtime_with_kind(
+            TsumugiError::runtime_with_message_id(
                 line,
                 crate::error::ErrorKind::Argument,
+                crate::stable_error::message_id::ARGUMENT_INVALID_PATH,
                 "ファイルパスの形式が不正です",
             )
         })?,

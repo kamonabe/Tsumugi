@@ -1,6 +1,6 @@
 # Tsumugi 決定性・実行時監査仕様
 
-最終更新: 2026-08-31
+最終更新: 2026-10-14
 
 設計ステータス: **実装仕様確定・未実装**
 
@@ -199,6 +199,8 @@ pub struct StableError {
 `code`、`script_type`、`message_id`、source位置、trace frame順をbackend間で一致させる。`script_message`も`try` / `catch`から観測可能なため同じ日本語templateと値serializationを共有する。host向けlocalized displayは別層とし、determinism比較とaudit schemaへ使わない。
 
 budget、deadline、cancel、audit failure、internal invariant、replay mismatchはhost control-plane terminalであり、script-visible `Value::Error`へ変換しない。
+
+> 実装メモ（Slice 1）: この`StableError`は`src/stable_error.rs`に実装している。`ErrorCode`は独立enumを作らず`error::ErrorKind`を正本として型エイリアス再利用し（`embedding::ExecutionError.code`の前例に倣う）、`ErrorMessageId`はper-template（canonical messageテンプレート1個に1 ID）で採番する。射影は内部`TsumugiError`/`ErrorKind`から単一関数`StableError::project`で行い、安定型文字列・canonical message・traceを二重管理しない。uncatchable terminalは`ErrorKind::is_uncatchable`を唯一の判定正本として射影しない（`None`）。これらは§4.6の意味を変えない実装上の決定であり、normative structは上記のまま。
 
 ### 4.7 function identity
 
@@ -749,7 +751,7 @@ Phase 5のproduction gateで解消する。StableErrorのcode、script type、me
 - locale/Unicode/Float/NaN/BTreeMap/path規則を共有helperへ集約
 - AUD-048のFunctionIdをtreeへ導入
 
-Float/NaNのcanonicalization・parse・formatとserialize用bit化は`src/determinism.rs`へ、`DeterminismRulesRevision`固定値と`ModuleId`のno-normalization契約は`src/embedding.rs`のshared primitiveへ集約済み。残りはStableError。状態は[ロードマップ](roadmap.md)「ステータス一覧」を参照する。
+Float/NaNのcanonicalization・parse・formatとserialize用bit化は`src/determinism.rs`へ、`DeterminismRulesRevision`固定値と`ModuleId`のno-normalization契約は`src/embedding.rs`のshared primitiveへ集約済み。StableErrorは`src/stable_error.rs`へ実装済み（内部`TsumugiError`/`ErrorKind`からtree backendで決定的に射影する。VM parity・FakeHost gate・audit normalizeは後続slice）。これでSlice 1のdeterministic primitiveは一通り揃った。状態は[ロードマップ](roadmap.md)「ステータス一覧」を参照する。
 
 ### Slice 2: HostBoundaryとFakeHost
 
