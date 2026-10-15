@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-10-14
+最終更新: 2026-10-15
 
 > このロードマップは「進捗だけ」を追う。機能の詳細・採用/不採用の理由は各設計正本に置く
 > （ドキュメントの役割分担は [ドキュメント運用ガイド](documentation-guide.md) を参照）。
@@ -10,7 +10,7 @@
 
 - **フェーズ:** Phase 2（deny-by-default capability）・Phase 3/4（包括的な実行予算・協調実行）を並行して進行中。
 - **現在の slice:** 決定性 Slice 1（規範的 primitive）＝Phase 5 の着手部分は実装完了（StableError を含む deterministic primitive が一通り揃った。VM parity・FakeHost gate・audit normalize は後続 slice）。
-- **次のタスク:** 包括 budget の残り（REV-001/REV-015、Phase 3/4）＝REV-001 の全順序化（REV-017）と残 I/O/host budget、Phase 6 audit への budget/event 伝播。状態・詳細は「ステータス一覧」の REV-001/REV-015 と [実行予算・協調実行仕様](execution-control.md) を参照（決定性 Slice 1 の deterministic shared helpers・DeterminismRulesRevision/ModuleId 正規化・FunctionId＝AUD-048・StableError は実装完了済み）。
+- **次のタスク:** 包括 budget の残り（REV-001/REV-015、Phase 3/4）＝REV-001 の全順序化（REV-017。設計は §17.8 で確定済み、残りは実装）と残 I/O/host budget、Phase 6 audit への budget/event 伝播。状態・詳細は「ステータス一覧」の REV-001/REV-015/REV-017 と [実行予算・協調実行仕様](execution-control.md) を参照（決定性 Slice 1 の deterministic shared helpers・DeterminismRulesRevision/ModuleId 正規化・FunctionId＝AUD-048・StableError は実装完了済み）。
 
 ## マイルストーン（Phase 0〜7）
 
@@ -46,7 +46,7 @@
 | REV-012 | call 評価順の status / doc drift 解消（意味論正本は第5節＝AUD-017） | 🟡 | [次期意味論・実装決定](semantic-decisions.md) §17.5 |
 | REV-014 | sandbox/env/limits/stdio/clock を `EngineConfig`/`ExecutionRequest` へ移す | ⬜ | [Capability Model仕様](capability-model.md)・[組み込みAPI仕様](embedding-api.md) |
 | REV-016 | script からの Rc cycle による回収不能 heap（baseline 課金・clear・tenant 分離） | ⬜ | [設計](design.md) |
-| REV-017 | HumanDisplay/CanonicalRepr/TotalOrder の分離（REV-001 と連動） | ⬜ | [次期意味論・実装決定](semantic-decisions.md) §17.1.9 |
+| REV-017 | HumanDisplay/CanonicalRepr/TotalOrder の分離による sort/list_dir 全順序化（設計確定・実装未、REV-001 と連動） | 🟡 | [次期意味論・実装決定](semantic-decisions.md) §17.8 |
 | REV-019 | `now()` の epoch 前/clock error と `u64 as i64` を clock capability + checked で扱う | ⬜ | [Capability Model仕様](capability-model.md)・[実行予算・協調実行仕様](execution-control.md) |
 | REV-022 | safe profile で denial と OS 失敗を区別（EOF/I-O error を Null/false へ畳まない） | ⬜ | [Capability Model仕様](capability-model.md)・[組み込みAPI仕様](embedding-api.md) |
 | REV-024 | MSRV 固定・action pin・release/fuzz/stress gate の段階導入 | 🟡 | [検証・リリース・運用設計](verification-release-operations.md) |
@@ -66,12 +66,14 @@
 
 先頭ほど優先。各ステップの状態は上記「ステータス一覧」の対応 ID を参照する（ここでは再掲しない）。
 
-1. **包括 budget の残り（REV-001/REV-015、Phase 3/4）** — REV-001 の全順序化（REV-017）と残 I/O/host budget、Phase 6 audit への budget/event 伝播。正本: [実行予算・協調実行仕様](execution-control.md)。
+1. **包括 budget の残り（REV-001/REV-015、Phase 3/4）** — REV-001 の全順序化（REV-017。設計確定済み §17.8、残りは `TotalOrder` の実装と sort/list_dir への接続）と残 I/O/host budget、Phase 6 audit への budget/event 伝播。正本: [実行予算・協調実行仕様](execution-control.md)、全順序化の設計は [次期意味論・実装決定](semantic-decisions.md) §17.8。
 2. **Phase 1/2 の残り** — REPL の Engine API 統合（E7 残）、VM/E9 の import・resolver 統合（Phase 5）、CAP-AT-17 の budget N 境界（Phase 3/C11）。正本: [組み込みAPI仕様](embedding-api.md)・[Capability Model仕様](capability-model.md)。
 3. **Phase 6 audit の残り** — 他 6 event emission ほか。正本: [決定性・実行時監査仕様](determinism-and-audit.md)。
 4. **Phase 7 運用保証** — MSRV・release/install・artifact・OCI・運用資材。正本: [検証・リリース・運用設計](verification-release-operations.md)。
 
-> 完了（直近）: 決定性 Slice 1 の残り＝StableError（`src/stable_error.rs`、tree 射影）を実装。これで Slice 1 の deterministic primitive（deterministic shared helpers・DeterminismRulesRevision/ModuleId 正規化・FunctionId＝AUD-048・StableError）は一通り揃った。VM parity・FakeHost gate・audit normalize は Slice 2〜6。
+> 完了（直近）: REV-017（全順序化）の設計を確定（[次期意味論・実装決定](semantic-decisions.md) §17.8）。sort / `list_dir` を文字列表現比較から全値型を覆う単一の全順序 `TotalOrder`（数値は REV-003 の `NumericOrder` を再利用した厳密数値順）へ移す破壊的変更を、採用判断・却下案・データモデル・tree/VM 変更箇所・budget 課金・error・移行・test・受入基準の 8 観点で設計確定した（revision 0.21 予定、実装は未着手）。§17.1.9 と language-spec.md の sort 行に drift note を入れ、本変更が §17.8 を正本とすることを明示した。
+>
+> 完了（その前）: 決定性 Slice 1 の残り＝StableError（`src/stable_error.rs`、tree 射影）を実装。これで Slice 1 の deterministic primitive（deterministic shared helpers・DeterminismRulesRevision/ModuleId 正規化・FunctionId＝AUD-048・StableError）は一通り揃った。VM parity・FakeHost gate・audit normalize は Slice 2〜6。
 
 > 設計 slice に沿う詳細な実装順は各 spec（特に [次期意味論・実装決定](semantic-decisions.md) 第17節「移行順」と [実行予算・協調実行仕様](execution-control.md) 第14節 Slice 定義）を正本とする。
 
