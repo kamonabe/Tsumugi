@@ -1534,7 +1534,7 @@ HTTPは新規optional機能であり、adapter未登録contextでは名前未定
 - canonical host call lifecycle、capability decision、terminalのaudit欠落がなく、sink failure時にfail-closedとなる。
 - default context/CLIからnetworkへ到達できない。
 
-## 17. 詳細レビュー由来の追加設計（REV-003 / 004 / 005 / 009 / 012 / 021）
+## 17. 詳細レビュー由来の追加設計（REV-003 / 004 / 005 / 006 / 009 / 012 / 017 / 021）
 
 本節は [`semantic-review/Tsumugi-detailed-review-20260907.md`](../semantic-review/Tsumugi-detailed-review-20260907.md) の指摘のうち、レビュー時点で**設計が不足していた（設計欄が △ または ×）6件**の次期実装仕様を定める。レビューが「検討◎/設計◎、実装のみ未」とした指摘（REV-001/002/006/007/013/014/015/016/017/018/019/020/022/023/024/025）は、既存の各設計文書と本書の該当節を正本とし、実装バックログへ直結させる。それらへ本節で新しい決定を追加しない。
 
@@ -1617,7 +1617,7 @@ compare_int_float(i: i64, f: f64) -> NumericOrdering:
 
 #### 17.1.9 実装状況
 
-✅ 実装済み（仕様 revision 0.19）。`src/value.rs` に `NumericOrder` / `NumericOrdering` を新設し、`Int×Float` を `trunc` / `fract` 分離 + `i128` widen で丸めなし比較する（`±Infinity` は有限 Int と大小確定、`NaN` は `UnorderedNaN`、`i128` 範囲外の巨大 Float は magnitude で決着）。`PartialEq` の `Int×Float` / `Float×Int`、tree（`src/eval.rs`）と VM（`src/vm.rs`）の関係演算子、`min` / `max`（`src/builtin_core.rs`）がこの単一実装を経由する。`contains` は `PartialEq` 経由で自動的に追随する。`min` / `max` は選択した operand を元の型のまま返し、同値時は第 1 引数、NaN 入力は canonical NaN を返す。`sort` は現行仕様どおり文字列表現比較を維持し（別課題）、本節の sort 数値順化は対象外とした。`value.rs` の unit test 11 件と golden fixture `numeric_strict_comparison`（tree/VM 一致）で境界値・推移性・対称性・min/max 戻り型を固定する。
+✅ 実装済み（仕様 revision 0.19）。`src/value.rs` に `NumericOrder` / `NumericOrdering` を新設し、`Int×Float` を `trunc` / `fract` 分離 + `i128` widen で丸めなし比較する（`±Infinity` は有限 Int と大小確定、`NaN` は `UnorderedNaN`、`i128` 範囲外の巨大 Float は magnitude で決着）。`PartialEq` の `Int×Float` / `Float×Int`、tree（`src/eval.rs`）と VM（`src/vm.rs`）の関係演算子、`min` / `max`（`src/builtin_core.rs`）がこの単一実装を経由する。`contains` は `PartialEq` 経由で自動的に追随する。`min` / `max` は選択した operand を元の型のまま返し、同値時は第 1 引数、NaN 入力は canonical NaN を返す。`sort` は現行仕様どおり文字列表現比較を維持する（本節の sort 数値順化は対象外）。sort / `list_dir` の全順序化（数値順を含む）は §17.8（REV-017）で設計を確定した（revision 0.21、設計確定・未実装）。`value.rs` の unit test 11 件と golden fixture `numeric_strict_comparison`（tree/VM 一致）で境界値・推移性・対称性・min/max 戻り型を固定する。
 
 ### 17.2 `Chunk::patch_jump` の fallible 化と builder 封印（REV-004）
 
@@ -2036,6 +2036,133 @@ run_frames dispatch loop:
 - 正規 compiler 出力の観測挙動（step 到達点を除く）が変わらず、tree / VM で kind・message・line が一致する。
 - §17.2（REV-004）builder 封印・§17.3（REV-005）capture 記述子と同一 build へ統合し、旧 API・旧フォールバックを併存させない。
 
+### 17.8 HumanDisplay / CanonicalRepr / TotalOrder の分離と全順序 sort（REV-017）
+
+> 設計ステータス: 設計確定・未実装。本節は sort / `list_dir` の並び順を「文字列表現比較」から**全値型を覆う単一の全順序 `TotalOrder`** へ移す次期仕様（revision 0.21）を定める。REV-003（§17.1）が確立した `NumericOrder` を数値帯で再利用し、観測挙動が変わる破壊的変更として扱う。REV-001（HumanDisplay / CanonicalRepr / TotalOrder の 3 層分離）と連動する。
+
+#### 17.8.1 採用判断
+
+sort（builtin）と `list_dir`（名前の整列）の順序を、各要素を人間向け表示文字列へ描画してその Unicode コードポイント順に並べる現行方式から、**全ての `Value` を覆う決定的な全順序 `TotalOrder`** による比較へ置き換える。これにより `sort([3, 10, 2])` は現行の `[10, 2, 3]`（`"10" < "2" < "3"`）ではなく **`[2, 3, 10]`**（数値順）になる。
+
+値の「表示」「正規化表現」「順序」という 3 つの関心を、次の 3 層として明示的に分離する（REV-001 連動）。
+
+- **HumanDisplay**: 人間向けの描画（`print` / `Display` が見せるもの）。**挙動は現行のまま変えない**。`src/determinism.rs` の `format_float`（canonical NaN 畳み込み・小数描画）を含む既存経路がこれにあたる。
+- **CanonicalRepr**: 正規化表現。等価判定・ハッシュ・監査正規化で用いる「同値を同一表現へ畳む」層。既存の正規化（canonical quiet NaN への畳み込み §4.5、`PartialEq` の数値跨ぎ等価 §17.1、Dict key の BTreeMap コードポイント順）がこれにあたり、本 REV で新しい正規化規則は追加しない。
+- **TotalOrder**: 全ての値に対する決定的な全順序。sort と `list_dir` の整列が参照する**本 REV の新規規範成果物**。tree・VM の両 backend で**同一**でなければならない（manifesto 原則5「同じ結果・同じ副作用順序」）。
+
+数値要素は HumanDisplay（文字列描画）ではなく `NumericOrder`（REV-003）で順序づける。異種混在リストでも決定的に並ぶよう、型帯（type band）をまたぐ順序も小さく明示的な規則で定義し、「何でも並べられる」という現行の利便性は全順序として保ったまま維持する（manifesto 原則8「小さく理解可能な中核」）。
+
+#### 17.8.2 却下案
+
+- **現行どおり文字列表現比較を維持する**: `sort([3,10,2])` が `[10,2,3]` になる数値の桁違い問題が残り、REV-003 で `<` / `==` / `min` / `max` を厳密数値順にした一方で sort だけ文字列順という backend 内の不整合が残るため却下する。
+- **数値帯だけ数値順にし、異種混在は従来どおり文字列順へフォールバックする**: 比較規則が「同型なら数値順・異型なら文字列順」と二枚看板になり、全順序の推移性が壊れる（`Int(2) < Str("10")` の判定が描画依存になる）ため却下する。全型を 1 本の全順序で覆う。
+- **異種混在リストの sort を型エラーにする**: 現行の「何でも並べられる」利便性を失い、既存 script を広く壊すため却下する。型帯順で決定的に並べる。
+- **NaN を sort から除外する／エラーにする**: REV-003 で NaN は既に canonical 化され値として流通するため、除外は不整合。数値帯の末尾という固定位置を与える。
+
+#### 17.8.3 データモデル / アルゴリズム
+
+全順序 `TotalOrder` を次で定義する。tree・VM・builtin が参照する**単一実装**とし、backend 間で結果が食い違わないようにする（REV-003 の `NumericOrder` と同じ集約方針）。
+
+```text
+TotalOrder::compare(&Value, &Value) -> std::cmp::Ordering   // 常に Less/Equal/Greater を返す（Unordered を作らない）
+```
+
+**型帯（type band）順**。まず値の型帯を次の全順序で比較する。帯が異なればこの順で決着する。
+
+```text
+Null < Bool < 数値(Int/Float 統合) < Str < List < Dict < Fn(Fn/VmFn) < Error
+```
+
+`src/value.rs` の `Value` enum に実在する全 variant（`Int` / `Float` / `Str` / `Bool` / `Null` / `List` / `Dict` / `Fn` / `VmFn` / `Error`）へそれぞれ帯を割り当てる。帯の割り当ては `src/error.rs` の `type_name`（canonical 型名）と整合させ、`Fn` と `VmFn` は同一帯「Fn」とする（`type_name` が両者を `"Fn"` へ畳むのと一致）。
+
+> 注記（brief との差分）: 本 REV の着手指示は Value variant として `Class` / `Instance` / `BoundMethod` を想定していたが、現行 `src/value.rs` にこれらの variant は**存在しない**（クラスは §18 実装順 12 の低優先度機能として未着手）。実在する variant は上記 10 種で、帯割り当てはこの 10 種に対して閉じている。クラス系 variant が将来追加されたときは、本節へ帯を追記するまで `TotalOrder` の対象に含めない（追加は別 REV）。なお本 REV は着手指示（brief）で「§17.6」と参照されたが、doc 上の実体は本節 **§17.8**（§17.6 は REV-021 `remove_dir`）であり、節番号のずれは brief 側の参照ずれで doc の内容には影響しない。
+
+**同一帯内の順序**を帯ごとに次で定義する。
+
+- **Null**: 単一値。常に `Equal`。
+- **Bool**: `false < true`。
+- **数値（Int / Float 統合）**: `NumericOrder::compare`（REV-003 §17.1）で順序づける。Int と Float は 1 本の帯として統合し、`2^53` 近傍も丸めなしで厳密に並ぶ。`NumericOrder` が `UnorderedNaN` を返す組（NaN が絡む比較）は全順序では決着が要るため、**NaN を数値帯の末尾**（`+Infinity` の後ろ）へ固定配置する。すなわち数値帯内は `-Infinity < 有限値（厳密順） < +Infinity < NaN` とし、NaN どうしは `Equal`（REV-003 で canonical quiet NaN へ畳み済みなので 1 種類）。実装は `NumericOrder::compare` が `Less/Equal/Greater` を返せばそれを採り、`UnorderedNaN` のときだけ「NaN は非 NaN より大、NaN 同士は等しい」規則で `Ordering` へ写す。
+- **Str**: Unicode コードポイント順（`str` の `Ord`、すなわち UTF-8 バイト順＝コードポイント順）。Dict key が BTreeMap のコードポイント順で並ぶのと一貫させる（language-spec の `values(dict)`「キーのコードポイント順」と同じ規則）。
+- **List**: 要素ごとに**同じ `TotalOrder` で再帰的**に比較する辞書式（lexicographic）順序。先頭要素から順に比較し、最初に差が出た位置で決着する。全要素が等しく一方が他方の prefix なら**短い方を小さい**とする（`[] < [1] < [1,2]`）。空リストは任意の非空リストより小さい。ネストした List も同じ規則で再帰する。
+- **Dict**: key でソート済みの `(key, value)` 列として辞書式比較する。Dict backing は `BTreeMap<String, Value>` なので iteration は既に key のコードポイント昇順であり、この順の `(key, value)` 列を要素とみなして List と同じ辞書式規則を適用する。各ペアはまず key を Str 規則で比較し、key が等しければ value を `TotalOrder` で再帰比較する。全ペアが等しく一方が他方の prefix なら短い方（＝エントリ数が少ない方）を小さいとする。空 Dict は任意の非空 Dict より小さい。
+- **Fn（Fn / VmFn）**: 関数値は内容順序を持たないため、**帯内では全て `Equal`** とする（安定ソートにより元の相対順序が保たれる）。`FunctionId`（AUD-048）は実行内の同一性比較専用で順序の意味を持たず、script や audit へ生値を公開しないため sort key にしない。tree の `Fn` と VM の `VmFn` は同一帯・帯内 `Equal` で、backend 差を順序へ漏らさない。
+- **Error**: 構造化エラー値も内容順序を持たせず、**帯内では全て `Equal`** とする（`error_type` / `message` / `line` を順序キーにしない。message には description が入り安定順序の根拠に乏しいため）。安定ソートで元の相対順序を保つ。
+
+この定義で `TotalOrder` は全順序の 3 性質（完全性・反対称性・推移性）を満たす。帯順は固定全順序、数値帯は `NumericOrder`（REV-003 で推移性・反対称性を保証済み）＋ NaN 末尾固定、Str/List/Dict はコードポイント順と辞書式の合成で、いずれも全順序を保存する。Fn / Error 帯内の `Equal` は反射的で推移性を壊さない。
+
+#### 17.8.4 tree / VM 変更箇所
+
+- 新規 `TotalOrder`（`src/value.rs` もしくは専用 module）: 上記全順序の単一実装。`NumericOrder` を数値帯で呼び出す。tree・VM・builtin が共通に参照する。
+- `src/builtin_core.rs` `builtin_sort_budgeted`: 要素を `render_display` で文字列キー化して `a.0.cmp(&b.0)` で安定ソートする現行実装を、`TotalOrder::compare` を comparator とする安定ソート（`sort_by`）へ置換する。描画文字列キーの事前生成はやめ、比較時に `TotalOrder` を適用する。安定性は維持（同順位要素は元順序を保つ）。
+- `src/builtin_core.rs` `list_dir`: `names.sort_by_key(|v| v.to_string())` を、名前（`Value::Str`）に対する `TotalOrder::compare`（＝ Str 帯のコードポイント順）での安定ソートへ置換する。list_dir の要素は常に Str なので実効順序はコードポイント順で、現行の `to_string()` キー（Str の表示は内容そのもの）と同一順になる想定だが、キー経路を全順序へ一本化して backend 差・将来の型拡張差を作らない。
+- `src/eval.rs` / `src/vm.rs`: sort / list_dir は builtin dispatch 経由で共通実装を呼ぶため、両 backend が同一の `TotalOrder` を通ることを保証する（新たな backend 固有分岐を作らない）。
+
+既存の `builtin_sort_budgeted` doc comment にある「全順序 TotalOrderKey への分離は REV-017 で扱う」の記述が本節で確定する。
+
+#### 17.8.5 budget 課金
+
+sort / 比較の per-element 課金は **execution-control.md の charge table（`collection element を走査・copy・生成 | 1 / element`、`map`/`filter`/`sort`/比較/serialize 等）が正本**で、本 REV はその値を変更しない。現行 `builtin_sort_budgeted` は要素ごとに `render_display`（fuel + per-item byte 上限で有限化）で描画キーを作り課金していた。全順序化後は描画キーを作らないため、課金は次のとおりとする。
+
+- **要素あたり 1 の走査課金**は維持する（charge table の `1 / element`）。sort は要素数 n に対して有限（`O(n log n)` 比較）で、charge table の per-element 課金で上限が効く。
+- 文字列描画をやめることで `render_display` の per-item byte 課金（UTF-8 payload scan 課金）が sort 経路から**減る**（HumanDisplay への依存が切れる）。これは課金値の引き下げではなく、不要になった描画作業の除去であり、charge table の既存値はそのまま。
+- `TotalOrder::compare` は値どうしの直接比較で、List / Dict の再帰比較も要素走査として `1 / element` の範囲に収まる。深いネストは要素走査課金が自然に積み上がり有限で停止する。
+- **新しい課金概念が必要かどうか**（例: 比較 1 回あたりの明示課金を sort の `n log n` 比較へ課すべきか）は execution-control.md を正本とする設計項目として同書側で確定する。本節では「charge table の per-element 課金で有限性は担保され、現行の charge 値を変更しない」ことだけを固定し、charge table の数値編集は行わない。
+
+#### 17.8.6 error
+
+- sort / list_dir は型エラーを増やさない。異種混在リストも型帯順で決定的に並べ、エラーにしない（却下案参照）。
+- budget 超過（fuel / deadline / cancel）は現行どおり `ControlStop` → 既存の budget error へ写す。全順序化で新しい error category は追加しない。
+- list_dir の非 UTF-8 名・個別 entry 失敗は REV-009（§17.4）の `invalid_encoding` / `directory_read` host error が引き続き正本で、整列はエラーにならなかった名前の集合に対して行う（本 REV は順序だけを変える）。
+
+#### 17.8.7 移行
+
+破壊的変更。仕様 revision を **0.20 → 0.21** へ上げる（`src/embedding.rs` の `LanguageRevision` に `V0_21` を追加し `CURRENT` を更新する実装は未実装側で行う）。
+
+影響する script:
+
+- **数値を含むリストを sort している script**: `sort([3, 10, 2])` が `[10, 2, 3]` から `[2, 3, 10]` へ変わる。桁数の異なる整数・Int と Float の混在で特に観測差が出る。
+- **異種混在リストを sort している script**: 従来は全要素の文字列描画のコードポイント順だったが、型帯順＋帯内全順序へ変わる（例: `Bool` と数値の相対位置が描画文字列順から帯順へ変わる）。
+- **list_dir の結果順に依存している script**: 名前は Str なので実効順序はコードポイント順のままで、観測差は想定しない（キー経路のみ全順序へ一本化）。
+- **sort の budget / fuel 消費に依存している script**: 全順序化で要素の文字列描画（`render_display` の per-item byte 課金）が sort 経路から外れるため、同じ入力でも sort の fuel / budget 消費が現行より減る。消費量は charge table の per-element 課金（値は不変）で引き続き有限に上限される。budget / fuel 消費は観測可能・監査対象（manifesto 原則5・原則7）であり、この消費差も順序差と同じく revision 境界で説明される観測差として扱う。revision 0.21 を要求する script にのみ適用される。
+
+移行方針: revision 0.21 を要求する script は新しい全順序で、revision 0.20 以下を要求する script は従来の文字列表現順で動く（revision は link 時に検証される §3）。language-spec は実装が入るまで現行挙動（文字列表現比較）を記述し続け、本節への drift note で予告する（部分実装を『次 revision 対応』と表示しない運用規則に従う）。
+
+#### 17.8.8 テスト行列
+
+DESIGN ONLY（本節はテストを記述しない。意図するテストを記述する）。
+
+- 数値順: `sort([3, 10, 2]) == [2, 3, 10]`、Int/Float 混在（`[2, 1.5, 10]` → `[1.5, 2, 10]`）、`2^53` 近傍の Int/Float、`-0.0`/`0.0`、`±Infinity`、NaN が末尾へ来ること。
+- Str: コードポイント順。Dict key 順との一貫性。
+- 型帯順: 各帯の代表値を 1 リストへ混ぜ、`Null < Bool < 数値 < Str < List < Dict < Fn < Error` の順に並ぶこと。
+- List 再帰: `[] < [1] < [1,2] < [2]`、ネストした List、prefix 規則（短い方が小）。
+- Dict: 空 Dict、key ソート済み `(key,value)` 列の辞書式、value 再帰、prefix 規則。
+- Fn / Error: 帯内で安定（元順序保持）であること。tree の `Fn` と VM の `VmFn` が同一帯・同順位であること。
+- 安定性: 同順位要素が元の相対順序を保つこと。
+- budget: 大きなリスト・深いネストで per-element 課金により有限停止すること。
+- **tree / VM parity**: §17.1.9 の `numeric_strict_comparison` golden fixture と同様に、全順序 sort / list_dir の golden fixture（例: `total_order_sort`）を追加し、tree と VM で順序・budget 消費・error が一致することを固定する。加えて `value.rs` に `TotalOrder` の unit test（全順序 3 性質・帯順・再帰・NaN 末尾）を置く。
+
+#### 17.8.9 受入基準
+
+- sort / list_dir が全ての経路で単一の `TotalOrder` を通り、tree / VM で順序が一致する。
+- 数値要素が `NumericOrder`（REV-003）で並び、`sort([3,10,2]) == [2,3,10]`。NaN は数値帯の末尾。
+- `src/value.rs` の全 `Value` variant（10 種）に帯が定義され、未定義 variant がない。
+- List / Dict が再帰的辞書式順（空・ネスト・prefix 規則を含む）で並ぶ。
+- 全順序の 3 性質（完全性・反対称性・推移性）を property / unit test が示す。
+- 安定ソートで同順位要素の元順序が保たれる。
+- charge table（execution-control.md）の課金値を変更していない。budget 超過で有限停止する。sort の per-element 課金は不変だが、描画 byte 課金が sort 経路から外れることによる budget / fuel 消費差を golden fixture の budget 消費比較で固定する。
+- revision が 0.20 → 0.21 へ上がり、language-spec は実装完了まで現行挙動を記述し続ける（drift note で予告）。
+
+#### 17.8.10 実装状況
+
+設計確定・未実装（仕様 revision 0.21 を予定）。現行実装（revision 0.20）の sort / list_dir は文字列表現比較のままで、本節の全順序化は未着手。`src/builtin_core.rs` の `builtin_sort_budgeted`（描画キー安定ソート）・`list_dir`（`sort_by_key(to_string)`）が置換対象。REV-001 の 3 層分離（HumanDisplay / CanonicalRepr / TotalOrder）と連動し、`TotalOrder` が新規規範成果物となる。
+
+#### 17.8.11 設計レビューへの対応（revision 1）
+
+本節は設計レビュー（CHANGES_REQUESTED, MEDIUM 1 / NIT 1）を受けた改訂版。各 finding への対応は次のとおり。
+
+- **F1（MEDIUM, 移行節に budget / fuel 消費の観測差が未記載）**: 対応。§17.8.7 移行の影響 script 列挙へ「sort の budget / fuel 消費に依存している script」を追加し、描画 byte 課金が sort 経路から外れることで消費が減る観測差（manifesto 原則5・原則7 の観測可能性）を revision 0.21 の境界事項として明記した。あわせて §17.8.9 受入基準へ、この消費差を golden fixture の budget 消費比較で固定する 1 項を追加し C7（parity fixture）/ C8（budget 課金）と地続きにした。
+- **F2（NIT, brief ↔ doc の節番号ずれ）**: 対応（任意修正を採用）。§17.8.3 の注記へ「brief は §17.6 と参照したが doc 実体は §17.8（§17.6 は REV-021）」の 1 文を追加した。doc の内容妥当性には元から影響しないが、追跡時の混乱を避けるため明文化した。
+
 ## 18. 実装順
 
 次期revisionは以下の順で進める。各段階でfmt、Clippy、全test、paired golden、defensive testを通し、意味論変更と内部リファクタを同じcommitへ混在させない。
@@ -2057,7 +2184,7 @@ run_frames dispatch loop:
 ## 19. 文書全体の最終受入基準
 
 - AUD-016/017/018/019/024/033/034/036/047/048/049/050の採用判断、却下案、規範挙動、状態、変更箇所、error、移行、test、受入基準が実装PRから追跡できる。
-- §17のREV-003/004/005/006/009/012/021についても、同じ8観点（採用判断・却下案・データモデル・変更箇所・error・移行・test・受入基準）が実装PRから追跡できる。REV-012は既存の第5節（AUD-017）を正本とし、本書で新しい意味論を追加しない。REV-006（§17.7）は停止性をper-instruction課金で担保し、verifierを唯一の停止性根拠にしない。
+- §17のREV-003/004/005/006/009/012/017/021についても、同じ8観点（採用判断・却下案・データモデル・変更箇所・error・移行・test・受入基準）が実装PRから追跡できる。REV-017（§17.8）は設計確定・未実装で、sort / `list_dir` の全順序化（revision 0.21）を定める。REV-012は既存の第5節（AUD-017）を正本とし、本書で新しい意味論を追加しない。REV-006（§17.7）は停止性をper-instruction課金で担保し、verifierを唯一の停止性根拠にしない。
 - tree/VMで意図しないbackend別期待値が残らない。
 - 現行 `language-spec.md` は実装完了まで変更せず、現行挙動の正本として維持する。
 - クラスは「設計済み・低優先度」、HTTPは「設計済み・着手禁止」として扱われる。
