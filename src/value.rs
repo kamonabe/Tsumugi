@@ -372,6 +372,227 @@ impl NumericOrder {
     }
 }
 
+/// 全ての `Value` を覆う決定的な全順序（REV-017、semantic-decisions §17.8）
+///
+/// sort（builtin）と `list_dir`（名前の整列）が revision 0.21 で参照する単一実装。
+/// tree・VM・builtin が同じこの実装を通ることで backend 間の順序差を作らない
+/// （REV-003 の `NumericOrder` と同じ集約方針）。常に `Less`/`Equal`/`Greater` を返す
+/// 全順序で、`NumericOrder` の `UnorderedNaN` のような未決着を外へ漏らさない。
+///
+/// # 型帯（type band）順（§17.8.3）
+///
+/// ```text
+/// Null < Bool < 数値(Int/Float 統合) < Str < List < Dict < Fn(Fn/VmFn) < Error
+/// ```
+///
+/// 帯割り当ては `crate::error::type_name`（canonical 型名）と整合させる。特に
+/// `Fn` と `VmFn` は同一帯「Fn」とし（`type_name` が両者を `"Fn"` へ畳むのと一致）、
+/// backend 差（tree の `Fn` / VM の `VmFn`）を順序へ漏らさない。
+pub struct TotalOrder;
+
+impl TotalOrder {
+    /// 2 つの値を全順序で比較する。常に `Less`/`Equal`/`Greater` を返す。
+    pub fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+
+        let (ra, rb) = (Self::band_rank(a), Self::band_rank(b));
+        if ra != rb {
+            // 帯が異なれば帯 rank で決着する。
+            return ra.cmp(&rb);
+        }
+
+        // 同一帯内の順序（§17.8.3）。
+        match (a, b) {
+            // Null: 単一値。常に Equal。
+            (Value::Null, Value::Null) => Ordering::Equal,
+            // Bool: false < true。
+            (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+            // Str: Unicode コードポイント順（UTF-8 バイト順＝コードポイント順）。
+            (Value::Str(x), Value::Str(y)) => x.as_str().cmp(y.as_str()),
+            // List: 要素ごとに同じ TotalOrder で再帰する辞書式順序。
+            // prefix は短い方が小（Iterator::cmp 相当）。
+            (Value::List(x), Value::List(y)) => Self::compare_seq(x.iter(), y.iter()),
+            // Dict: BTreeMap の (key, value) 列を辞書式比較する。
+            // key を Str 規則で、等しければ value を再帰比較。prefix は entry 数が少ない
+            // 方が小（空 Dict が最小）。
+            (Value::Dict(x), Value::Dict(y)) => Self::compare_dict(x, y),
+            // Fn / VmFn: 内容順序を持たないため帯内は全て Equal（FunctionId を key にしない）。
+            // 安定ソートで元の相対順序が保たれる。tree の Fn と VM の VmFn も相互 Equal。
+            (Value::Fn { .. }, Value::Fn { .. })
+            | (Value::Fn { .. }, Value::VmFn { .. })
+            | (Value::VmFn { .. }, Value::Fn { .. })
+            | (Value::VmFn { .. }, Value::VmFn { .. }) => Ordering::Equal,
+            // Error: 内容順序を持たせず帯内は全て Equal
+            // （error_type/message/line を key にしない）。
+            (Value::Error { .. }, Value::Error { .. }) => Ordering::Equal,
+            // 数値帯（Int/Float 統合）: NumericOrder を経由し、NaN を数値帯の末尾へ固定。
+            _ => Self::compare_numeric(a, b),
+        }
+    }
+
+    /// budget 課金付きの全順序比較（REV-017 §17.8.5）。
+    ///
+    /// [`Self::compare`] と同じ順序を返すが、List / Dict の再帰的要素走査ごとに `1 / element`
+    /// の fuel を課金する。これにより共有 DAG（1 つの List 値を多数の位置から参照して論理
+    /// サイズが指数化した値）の比較も、走査課金が有限に積み上がり budget 超過で停止する
+    /// （manifesto 原則: ホストの安定性）。sort の 0.21 経路がソート比較ごとにこれを呼ぶ。
+    /// charge table の per-element 課金（値は不変）を比較走査へ適用するもので、新しい課金概念は
+    /// 導入しない。
+    pub fn compare_budgeted(
+        a: &Value,
+        b: &Value,
+        budget: &mut crate::budget::BudgetLedger,
+        phase: ExecutionPhase,
+    ) -> Result<std::cmp::Ordering, ControlStop> {
+        use std::cmp::Ordering;
+
+        let (ra, rb) = (Self::band_rank(a), Self::band_rank(b));
+        if ra != rb {
+            return Ok(ra.cmp(&rb));
+        }
+
+        match (a, b) {
+            (Value::List(x), Value::List(y)) => {
+                let mut ix = x.iter();
+                let mut iy = y.iter();
+                loop {
+                    match (ix.next(), iy.next()) {
+                        (Some(ex), Some(ey)) => {
+                            // 要素 1 つの走査ごとに課金する（§17.8.5 の 1 / element を比較走査へ）。
+                            budget.charge_fuel(1, phase)?;
+                            match Self::compare_budgeted(ex, ey, budget, phase)? {
+                                Ordering::Equal => continue,
+                                non_eq => return Ok(non_eq),
+                            }
+                        }
+                        (Some(_), None) => return Ok(Ordering::Greater),
+                        (None, Some(_)) => return Ok(Ordering::Less),
+                        (None, None) => return Ok(Ordering::Equal),
+                    }
+                }
+            }
+            (Value::Dict(x), Value::Dict(y)) => {
+                let mut ix = x.iter();
+                let mut iy = y.iter();
+                loop {
+                    match (ix.next(), iy.next()) {
+                        (Some((kx, vx)), Some((ky, vy))) => {
+                            budget.charge_fuel(1, phase)?;
+                            match kx.as_str().cmp(ky.as_str()) {
+                                Ordering::Equal => {}
+                                non_eq => return Ok(non_eq),
+                            }
+                            match Self::compare_budgeted(vx, vy, budget, phase)? {
+                                Ordering::Equal => continue,
+                                non_eq => return Ok(non_eq),
+                            }
+                        }
+                        (Some(_), None) => return Ok(Ordering::Greater),
+                        (None, Some(_)) => return Ok(Ordering::Less),
+                        (None, None) => return Ok(Ordering::Equal),
+                    }
+                }
+            }
+            // 非 collection 帯（スカラ・Str・Fn・Error）は再帰しないので課金なしで決着する。
+            _ => Ok(Self::compare(a, b)),
+        }
+    }
+
+    /// 型帯 rank（§17.8.3）。`error.rs::type_name` の畳み（Fn/VmFn→"Fn"）と一致させる。
+    fn band_rank(v: &Value) -> u8 {
+        match v {
+            Value::Null => 0,
+            Value::Bool(_) => 1,
+            // Int と Float を 1 本の数値帯へ統合する。
+            Value::Int(_) | Value::Float(_) => 2,
+            Value::Str(_) => 3,
+            Value::List(_) => 4,
+            Value::Dict(_) => 5,
+            // Fn/VmFn は同一帯（type_name が両者を "Fn" へ畳むのと一致）。
+            Value::Fn { .. } | Value::VmFn { .. } => 6,
+            Value::Error { .. } => 7,
+        }
+    }
+
+    /// 数値帯の順序（§17.8.3）。`NumericOrder::compare` の `Less`/`Equal`/`Greater` を
+    /// 素通しし、`UnorderedNaN`（NaN が絡む比較）のときだけ「NaN は非 NaN より大、NaN
+    /// 同士は Equal」で `Ordering` へ写す。これで `-Inf < 有限値 < +Inf < NaN` を実現する。
+    fn compare_numeric(a: &Value, b: &Value) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match NumericOrder::compare(a, b) {
+            Some(NumericOrdering::Less) => Ordering::Less,
+            Some(NumericOrdering::Equal) => Ordering::Equal,
+            Some(NumericOrdering::Greater) => Ordering::Greater,
+            Some(NumericOrdering::UnorderedNaN) => {
+                let a_nan = Self::is_nan_value(a);
+                let b_nan = Self::is_nan_value(b);
+                match (a_nan, b_nan) {
+                    (true, true) => Ordering::Equal, // NaN == NaN（canonical quiet NaN 1 種）
+                    (true, false) => Ordering::Greater, // NaN は末尾
+                    (false, true) => Ordering::Less,
+                    // 数値帯で両者が非 NaN なら NumericOrder が決着するはずで、ここへは来ない。
+                    (false, false) => Ordering::Equal,
+                }
+            }
+            // band_rank で数値帯に入ったものだけが来るため None は発生しない。
+            None => Ordering::Equal,
+        }
+    }
+
+    fn is_nan_value(v: &Value) -> bool {
+        matches!(v, Value::Float(f) if f.is_nan())
+    }
+
+    /// 要素列を同じ TotalOrder で再帰する辞書式比較（prefix は短い方が小）。
+    fn compare_seq<'a>(
+        a: impl Iterator<Item = &'a Value>,
+        b: impl Iterator<Item = &'a Value>,
+    ) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let mut a = a;
+        let mut b = b;
+        loop {
+            match (a.next(), b.next()) {
+                (Some(x), Some(y)) => match Self::compare(x, y) {
+                    Ordering::Equal => continue,
+                    non_eq => return non_eq,
+                },
+                (Some(_), None) => return Ordering::Greater, // b が prefix（短い）
+                (None, Some(_)) => return Ordering::Less,    // a が prefix（短い）
+                (None, None) => return Ordering::Equal,
+            }
+        }
+    }
+
+    /// Dict の辞書式比較。(key, value) 列として key は Str 規則、value は再帰、
+    /// prefix は entry 数が少ない方が小（空 Dict が最小）。
+    fn compare_dict(
+        a: &BTreeMap<String, Value>,
+        b: &BTreeMap<String, Value>,
+    ) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let mut ia = a.iter();
+        let mut ib = b.iter();
+        loop {
+            match (ia.next(), ib.next()) {
+                (Some((ka, va)), Some((kb, vb))) => {
+                    match ka.as_str().cmp(kb.as_str()) {
+                        Ordering::Equal => {}
+                        non_eq => return non_eq,
+                    }
+                    match Self::compare(va, vb) {
+                        Ordering::Equal => continue,
+                        non_eq => return non_eq,
+                    }
+                }
+                (Some(_), None) => return Ordering::Greater,
+                (None, Some(_)) => return Ordering::Less,
+                (None, None) => return Ordering::Equal,
+            }
+        }
+    }
+}
+
 /// ツリーウォーク用関数の不変部分
 ///
 /// 呼び出しごとに本体ASTを複製しないよう `Rc` で共有する。
@@ -1474,5 +1695,316 @@ mod tests {
             over,
             Err(crate::budget::ControlStop::BudgetExceeded(_))
         ));
+    }
+
+    // ---- REV-017: TotalOrder（全順序）, semantic-decisions §17.8 ----
+
+    use std::cmp::Ordering;
+
+    fn s(x: &str) -> Value {
+        Value::str_from(x)
+    }
+    fn list(xs: Vec<Value>) -> Value {
+        Value::List(Tracked::constant(xs))
+    }
+    fn dict(pairs: Vec<(&str, Value)>) -> Value {
+        let mut m = BTreeMap::new();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), v);
+        }
+        Value::Dict(Tracked::constant(m))
+    }
+    fn tree_fn() -> Value {
+        Value::Fn {
+            id: FunctionId(1),
+            def: Rc::new(FnDef {
+                name: "<lambda>".to_string(),
+                params: vec![],
+                body: crate::ast::Block::from(Vec::new()),
+            }),
+            captured: Rc::new(HashMap::new()),
+            header: Value::fn_header_untracked(),
+            retain_tokens: Vec::new(),
+        }
+    }
+    fn vm_fn() -> Value {
+        Value::VmFn {
+            id: FunctionId(2),
+            name: "<lambda>".to_string(),
+            arity: 0,
+            params: vec![],
+            chunk: Rc::new(crate::chunk::Chunk::new()),
+            upvalues: Vec::new(),
+            header: Value::fn_header_untracked(),
+            retain_tokens: Vec::new(),
+        }
+    }
+    fn err_val() -> Value {
+        Value::Error {
+            error_type: "type".to_string(),
+            message: "boom".to_string(),
+            line: 1,
+        }
+    }
+
+    /// TotalOrder で安定ソートした結果を返すヘルパ（builtin_sort_budgeted の 0.21 経路と同じ比較）。
+    fn total_sort(mut xs: Vec<Value>) -> Vec<Value> {
+        xs.sort_by(TotalOrder::compare);
+        xs
+    }
+
+    #[test]
+    fn total_order_numeric_sort() {
+        assert_eq!(
+            total_sort(vec![int(3), int(10), int(2)]),
+            vec![int(2), int(3), int(10)]
+        );
+        // Int/Float 混在は 1 本の数値帯で並ぶ。
+        assert_eq!(
+            total_sort(vec![int(2), flt(1.5), int(10)]),
+            vec![flt(1.5), int(2), int(10)]
+        );
+    }
+
+    #[test]
+    fn total_order_numeric_near_2pow53() {
+        // 2^53 = 9007199254740992。丸めなしの厳密順序。
+        let a = int(9007199254740993); // 2^53 + 1
+        let f = flt(9007199254740992.0); // 2^53
+        assert_eq!(TotalOrder::compare(&f, &a), Ordering::Less);
+        assert_eq!(TotalOrder::compare(&a, &f), Ordering::Greater);
+    }
+
+    #[test]
+    fn total_order_signed_zero_equal() {
+        // -0.0 と 0.0 は数値として等しい。
+        assert_eq!(TotalOrder::compare(&flt(-0.0), &flt(0.0)), Ordering::Equal);
+        assert_eq!(TotalOrder::compare(&flt(0.0), &flt(-0.0)), Ordering::Equal);
+    }
+
+    #[test]
+    fn total_order_infinities_and_nan_at_end() {
+        let ninf = flt(f64::NEG_INFINITY);
+        let pinf = flt(f64::INFINITY);
+        let nan = flt(f64::NAN);
+        // -Inf < 有限 < +Inf < NaN。NaN を含むため Value の PartialEq（NaN != NaN）に依存せず、
+        // 各位置を型・値で確認する。
+        let sorted = total_sort(vec![pinf, int(0), ninf, nan.clone()]);
+        assert!(matches!(sorted[0], Value::Float(f) if f == f64::NEG_INFINITY));
+        assert_eq!(sorted[1], int(0));
+        assert!(matches!(sorted[2], Value::Float(f) if f == f64::INFINITY));
+        assert!(matches!(sorted[3], Value::Float(f) if f.is_nan())); // NaN は末尾
+        // NaN は末尾・NaN 同士は Equal。
+        assert_eq!(TotalOrder::compare(&nan, &nan), Ordering::Equal);
+        assert_eq!(TotalOrder::compare(&nan, &int(0)), Ordering::Greater);
+        assert_eq!(TotalOrder::compare(&int(0), &nan), Ordering::Less);
+    }
+
+    #[test]
+    fn total_order_str_code_point_order() {
+        assert_eq!(
+            total_sort(vec![s("banana"), s("apple"), s("Cherry")]),
+            // 大文字は小文字よりコードポイントが小さい。
+            vec![s("Cherry"), s("apple"), s("banana")]
+        );
+    }
+
+    #[test]
+    fn total_order_type_band_order() {
+        // Null < Bool < 数値 < Str < List < Dict < Fn < Error（代表値 1 つずつ）。
+        let input = vec![
+            err_val(),
+            tree_fn(),
+            dict(vec![("k", int(1))]),
+            list(vec![int(1)]),
+            s("x"),
+            int(5),
+            Value::Bool(true),
+            Value::Null,
+        ];
+        let sorted = total_sort(input);
+        let ranks: Vec<u8> = sorted.iter().map(TotalOrder::band_rank).collect();
+        assert_eq!(ranks, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn total_order_list_recursion_and_prefix() {
+        // [] < [1] < [1,2] < [2]
+        assert_eq!(
+            total_sort(vec![
+                list(vec![int(2)]),
+                list(vec![int(1), int(2)]),
+                list(vec![int(1)]),
+                list(vec![]),
+            ]),
+            vec![
+                list(vec![]),
+                list(vec![int(1)]),
+                list(vec![int(1), int(2)]),
+                list(vec![int(2)]),
+            ]
+        );
+        // ネスト List も同じ規則で再帰する。
+        assert_eq!(
+            total_sort(vec![
+                list(vec![int(1), list(vec![int(2)])]),
+                list(vec![int(1), list(vec![int(1)])]),
+                list(vec![int(1)]),
+            ]),
+            vec![
+                list(vec![int(1)]),
+                list(vec![int(1), list(vec![int(1)])]),
+                list(vec![int(1), list(vec![int(2)])]),
+            ]
+        );
+    }
+
+    #[test]
+    fn total_order_dict_empty_keysorted_value_recursion_prefix() {
+        // 空 Dict が最小、key ソート済み (key,value) 列の辞書式。
+        assert_eq!(
+            total_sort(vec![
+                dict(vec![("b", int(1))]),
+                dict(vec![("a", int(2))]),
+                dict(vec![]),
+            ]),
+            vec![
+                dict(vec![]),
+                dict(vec![("a", int(2))]),
+                dict(vec![("b", int(1))]),
+            ]
+        );
+        // key が等しければ value を再帰比較する。
+        assert_eq!(
+            total_sort(vec![dict(vec![("a", int(2))]), dict(vec![("a", int(1))])]),
+            vec![dict(vec![("a", int(1))]), dict(vec![("a", int(2))])]
+        );
+        // prefix: entry 数が少ない方が小。
+        assert_eq!(
+            TotalOrder::compare(
+                &dict(vec![("a", int(1))]),
+                &dict(vec![("a", int(1)), ("b", int(1))])
+            ),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn total_order_fn_and_error_equal_within_band() {
+        // Fn 帯内は全て Equal。tree の Fn と VM の VmFn は同一帯・同順位。
+        assert_eq!(TotalOrder::compare(&tree_fn(), &vm_fn()), Ordering::Equal);
+        assert_eq!(TotalOrder::compare(&vm_fn(), &tree_fn()), Ordering::Equal);
+        assert_eq!(
+            TotalOrder::band_rank(&tree_fn()),
+            TotalOrder::band_rank(&vm_fn())
+        );
+        // Error 帯内も全て Equal（内容を key にしない）。
+        let e1 = err_val();
+        let e2 = Value::Error {
+            error_type: "name".to_string(),
+            message: "other".to_string(),
+            line: 99,
+        };
+        assert_eq!(TotalOrder::compare(&e1, &e2), Ordering::Equal);
+    }
+
+    #[test]
+    fn total_order_stable_for_equal_rank() {
+        // 同順位（Fn 帯）要素は安定ソートで元の相対順序を保つ。
+        let f1 = Value::Fn {
+            id: FunctionId(10),
+            def: Rc::new(FnDef {
+                name: "a".to_string(),
+                params: vec![],
+                body: crate::ast::Block::from(Vec::new()),
+            }),
+            captured: Rc::new(HashMap::new()),
+            header: Value::fn_header_untracked(),
+            retain_tokens: Vec::new(),
+        };
+        let f2 = Value::Fn {
+            id: FunctionId(11),
+            def: Rc::new(FnDef {
+                name: "b".to_string(),
+                params: vec![],
+                body: crate::ast::Block::from(Vec::new()),
+            }),
+            captured: Rc::new(HashMap::new()),
+            header: Value::fn_header_untracked(),
+            retain_tokens: Vec::new(),
+        };
+        let sorted = total_sort(vec![f1.clone(), f2.clone()]);
+        // 元順序 f1, f2 が保たれる（id で判定）。
+        assert_eq!(sorted[0], f1);
+        assert_eq!(sorted[1], f2);
+    }
+
+    #[test]
+    fn total_order_three_properties() {
+        // 代表値集合で完全性・反対称性・推移性を網羅的に検査する。
+        let samples = vec![
+            Value::Null,
+            Value::Bool(false),
+            Value::Bool(true),
+            flt(f64::NEG_INFINITY),
+            int(-10),
+            flt(1.5),
+            int(2),
+            int(10),
+            flt(f64::INFINITY),
+            flt(f64::NAN),
+            s("a"),
+            s("b"),
+            list(vec![]),
+            list(vec![int(1)]),
+            list(vec![int(1), int(2)]),
+            dict(vec![]),
+            dict(vec![("a", int(1))]),
+            tree_fn(),
+            vm_fn(),
+            err_val(),
+        ];
+
+        // 完全性: 任意 2 値が比較可能（compare は常に Ordering を返すので型で保証されるが、
+        // 反対称性と併せて確認する）。
+        for a in &samples {
+            for b in &samples {
+                let ab = TotalOrder::compare(a, b);
+                let ba = TotalOrder::compare(b, a);
+                // 反対称性: compare(a,b) == reverse(compare(b,a))。
+                assert_eq!(ab, ba.reverse(), "antisymmetry failed");
+            }
+        }
+
+        // 推移性: a<=b && b<=c ⇒ a<=c。
+        let le = |a: &Value, b: &Value| TotalOrder::compare(a, b) != Ordering::Greater;
+        for a in &samples {
+            for b in &samples {
+                for c in &samples {
+                    if le(a, b) && le(b, c) {
+                        assert!(le(a, c), "transitivity failed");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn total_order_terminates_on_large_and_deep_lists() {
+        // 純比較なので大きい/深いリストでも停止する（panic/無限ループしない）。
+        let big_a: Vec<Value> = (0..10_000).map(int).collect();
+        let big_b: Vec<Value> = (0..10_000).map(int).collect();
+        assert_eq!(
+            TotalOrder::compare(&list(big_a), &list(big_b)),
+            Ordering::Equal
+        );
+        // 深いネスト（1000 段）。
+        let mut deep_a = list(vec![int(0)]);
+        let mut deep_b = list(vec![int(0)]);
+        for _ in 0..1000 {
+            deep_a = list(vec![deep_a]);
+            deep_b = list(vec![deep_b]);
+        }
+        assert_eq!(TotalOrder::compare(&deep_a, &deep_b), Ordering::Equal);
     }
 }

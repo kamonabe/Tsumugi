@@ -128,7 +128,7 @@ fn with_sink_emits_started_then_terminal_in_order() {
     assert_eq!(envelopes[0].schema_version, 1);
     assert_eq!(envelopes[0].execution_id, execution_id);
     assert_eq!(envelopes[0].source_hash, *script.source_hash().as_bytes());
-    assert_eq!(envelopes[0].language_revision, "0.20");
+    assert_eq!(envelopes[0].language_revision, "0.21");
     assert!(matches!(
         envelopes[0].event,
         AuditEvent::ExecutionStarted { .. }

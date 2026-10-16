@@ -368,6 +368,11 @@ pub struct Evaluator {
     /// host-call に到達したとき、adapter を二度 dispatch せずこの結果を式結果へ写す（Ok は値、
     /// Err(AdapterError) は §4.4 の写像で terminal/`host` error）。
     resumed_host_call: Option<(u64, Result<Value, crate::capability::AdapterError>)>,
+    /// この実行の言語 revision（REV-017 §17.8.7）。sort / `list_dir` の整列が参照する全順序の
+    /// 既定/全順序切替をこれで分岐する。`set_capabilities` と対称に、埋め込み host が実行単位で
+    /// 注入し（`set_language_revision`）、CLI/テストは既定 `CURRENT`（=0.21）で動く。
+    /// backend 固有分岐を作らないため VM 側（`Vm`）と同一シグネチャで持つ。
+    language_revision: crate::embedding::LanguageRevision,
 }
 
 /// suspend / resume できる 1 回の実行セッション（REV-015 Slice 3 PR-d-2）。
@@ -426,6 +431,8 @@ impl Evaluator {
             next_host_call_id: 0,
             yield_for_host_call: false,
             resumed_host_call: None,
+            // 既定は現行 revision（=0.21）。埋め込み host が set_language_revision で上書きする。
+            language_revision: crate::embedding::LanguageRevision::CURRENT,
         }
     }
 
@@ -523,6 +530,17 @@ impl Evaluator {
     /// この実行の capability 集合を参照する（builtin dispatch から consult する）。
     pub(crate) fn capabilities(&self) -> &crate::capability::CapabilitySet {
         &self.capabilities
+    }
+
+    /// この実行の言語 revision を設定する（REV-017 §17.8.7）。埋め込み host が実行単位で
+    /// 注入する。`set_capabilities` と対称で、VM 側（`Vm::set_language_revision`）と同一シグネチャ。
+    pub fn set_language_revision(&mut self, revision: crate::embedding::LanguageRevision) {
+        self.language_revision = revision;
+    }
+
+    /// この実行の言語 revision を参照する（builtin dispatch から consult する）。
+    pub(crate) fn language_revision(&self) -> crate::embedding::LanguageRevision {
+        self.language_revision
     }
 
     /// この実行の host function registry を設定する（Phase 2 C8）。埋め込み host が実行単位で

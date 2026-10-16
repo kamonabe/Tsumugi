@@ -261,6 +261,7 @@ fn file_size_of_real_file_is_positive_int() {
         &[Value::str_constant("@data/f.txt".to_string())],
         &fs,
         1024,
+        tsumugi::LanguageRevision::CURRENT,
         1,
     ) {
         Ok(Value::Int(n)) => assert_eq!(n, 5, "file_size はバイト数を返す"),
@@ -281,6 +282,7 @@ fn missing_file_is_host_error() {
         &[Value::str_constant("@data/no_such.txt".to_string())],
         &fs,
         1024,
+        tsumugi::LanguageRevision::CURRENT,
         1,
     );
     let error = result.expect_err("存在しない file の file_size は host error");

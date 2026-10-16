@@ -422,18 +422,25 @@ pub fn builtin_contains(args: &[Value], line: usize) -> Result<Value, TsumugiErr
     }
 }
 
-/// `sort` の budget-aware 版（REV-001）。ソートキーを `to_string`（Display）で materialize
-/// する代わりに `BudgetLedger::render_display` で描画し、共有 DAG の指数時間／出力を fuel +
-/// per-item byte 上限で有限化する。tree/VM の dispatch 境界が budget を渡して呼ぶ。
+/// `sort` の budget-aware 版（REV-001 / REV-017）。
 ///
-/// 順序は現状どおり **文字列表現比較**（`str` の Unicode コードポイント順）を維持する
-/// （language-spec「文字列表現で比較」・semantic-decisions §17.1.9 で数値順化は別課題）。
-/// キーを先に全要素ぶん生成してから安定ソートするため、`sort_by_key(to_string)` と同一の
-/// 順序・安定性になる（同一キーの要素は元の順序を保つ）。全順序 TotalOrderKey への分離は
-/// REV-017 で扱う。
+/// revision 0.21 以降（§17.8）は全値型を覆う単一の全順序 [`crate::value::TotalOrder`] で
+/// 安定ソートする。描画文字列キーを作らず、値どうしを直接比較する（`sort([3, 10, 2])` が
+/// 数値順の `[2, 3, 10]` になる）。per-element 走査課金は charge table の `1 / element`
+/// （execution-control.md）を維持するため明示的に行う。文字列描画をやめることで `render_display`
+/// の per-item byte 課金が sort 経路から外れ、同じ入力でも fuel 消費が 0.20 より減る
+/// （§17.8.5 / §17.8.7 の観測差。charge table の値は不変）。
+///
+/// revision 0.20 以下は従来どおり **文字列表現比較**（`str` の Unicode コードポイント順）を
+/// 維持する。各要素を `BudgetLedger::render_display` で描画し、共有 DAG の指数時間／出力を
+/// fuel + per-item byte 上限で有限化してから `sort_by_key(to_string)` 相当の安定ソートを行う。
+///
+/// どちらの revision でも tree/VM の dispatch 境界が同じこの関数を呼び、backend 固有分岐を
+/// 作らない。安定性（同順位要素は元順序を保つ）は両 revision で維持する。
 pub fn builtin_sort_budgeted(
     args: &[Value],
     budget: &mut crate::budget::BudgetLedger,
+    revision: crate::embedding::LanguageRevision,
     line: usize,
 ) -> Result<Value, TsumugiError> {
     check_arity("sort", args, 1, line)?;
@@ -442,6 +449,46 @@ pub fn builtin_sort_budgeted(
             line, "sort", 1, "List", &args[0],
         ));
     };
+
+    if revision >= crate::embedding::LanguageRevision::V0_21 {
+        // REV-017: 全順序 TotalOrder で値どうしを直接比較する（描画キーを作らない）。
+        // 比較ごとに budget 課金する `compare_budgeted` を使うことで、per-element 走査課金
+        // （charge table の 1 / element、値は不変）を比較走査へ適用する。これにより共有 DAG
+        // 要素を含む List の比較も走査課金が有限に積み上がり budget 超過で停止する（§17.8.5）。
+        //
+        // `sort_by` の comparator は失敗を返せないため、最初に起きた `ControlStop` を捕捉して
+        // 以降は `Equal` を返し、ソート後に取り出して error へ写す。安定ソート（sort_by は
+        // stable）で同順位要素は元順序を保つ。
+        use std::cmp::Ordering;
+        let phase = crate::budget::ExecutionPhase::Run;
+        // まず要素数ぶんの走査課金を明示的に行う（§17.8.5 の 1 / element）。render_display が
+        // 担っていた per-node fuel の代替で、要素数 n に対して有限に積む（単調増加）。
+        for _ in list.iter() {
+            budget
+                .charge_fuel(1, phase)
+                .map_err(|stop| crate::budget::control_stop_to_error(stop, 0, line))?;
+        }
+        let mut stop: Option<crate::budget::ControlStop> = None;
+        let mut sorted: Vec<Value> = (**list).clone();
+        sorted.sort_by(|a, b| {
+            if stop.is_some() {
+                return Ordering::Equal;
+            }
+            match crate::value::TotalOrder::compare_budgeted(a, b, budget, phase) {
+                Ok(ord) => ord,
+                Err(s) => {
+                    stop = Some(s);
+                    Ordering::Equal
+                }
+            }
+        });
+        if let Some(s) = stop {
+            return Err(crate::budget::control_stop_to_error(s, 0, line));
+        }
+        return Ok(Value::List(Tracked::constant(sorted)));
+    }
+
+    // revision <= 0.20: 従来の文字列表現比較を温存する。
     // 各要素の描画キーを budget-aware に先に生成する（materialize 前に打ち切る）。
     let mut keyed: Vec<(String, Value)> = Vec::with_capacity(list.len());
     for v in list.iter() {
@@ -1163,10 +1210,11 @@ pub fn dispatch_fs(
     args: &[Value],
     filesystem: Option<&crate::capability::FilesystemCapability>,
     max_collection: u64,
+    revision: crate::embedding::LanguageRevision,
     line: usize,
 ) -> Result<Value, TsumugiError> {
     match filesystem {
-        Some(fs) => dispatch_filesystem_capability(name, args, fs, max_collection, line),
+        Some(fs) => dispatch_filesystem_capability(name, args, fs, max_collection, revision, line),
         None => Err(TsumugiError::filesystem_denied(line)),
     }
 }
@@ -1192,6 +1240,7 @@ pub fn dispatch_filesystem_capability(
     args: &[Value],
     filesystem: &crate::capability::FilesystemCapability,
     max_collection: u64,
+    revision: crate::embedding::LanguageRevision,
     line: usize,
 ) -> Result<Value, TsumugiError> {
     use crate::capability::{FsOperation, OpenFileRequest, RemoveKind, WriteMode};
@@ -1335,7 +1384,15 @@ pub fn dispatch_filesystem_capability(
                 check_collection_size(names.len().saturating_add(1), max_collection, line)?;
                 names.push(Value::str_constant(entry.name));
             }
-            names.sort_by_key(|v| v.to_string());
+            // REV-017: 整列キーを全順序 TotalOrder へ一本化する。list_dir の要素は常に Str
+            // なので実効順序はコードポイント順で両 revision 同一だが、キー経路を全順序へ
+            // 寄せて backend 差・将来の型拡張差を作らない（§17.8.4）。整列はエラーにならな
+            // かった名前集合に対してのみ行う（REV-009 の per-entry 処理は不変）。
+            if revision >= crate::embedding::LanguageRevision::V0_21 {
+                names.sort_by(crate::value::TotalOrder::compare);
+            } else {
+                names.sort_by_key(|v| v.to_string());
+            }
             Ok(Value::List(Tracked::constant(names)))
         }
         "file_size" => {
