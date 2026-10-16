@@ -1617,7 +1617,7 @@ compare_int_float(i: i64, f: f64) -> NumericOrdering:
 
 #### 17.1.9 実装状況
 
-✅ 実装済み（仕様 revision 0.19）。`src/value.rs` に `NumericOrder` / `NumericOrdering` を新設し、`Int×Float` を `trunc` / `fract` 分離 + `i128` widen で丸めなし比較する（`±Infinity` は有限 Int と大小確定、`NaN` は `UnorderedNaN`、`i128` 範囲外の巨大 Float は magnitude で決着）。`PartialEq` の `Int×Float` / `Float×Int`、tree（`src/eval.rs`）と VM（`src/vm.rs`）の関係演算子、`min` / `max`（`src/builtin_core.rs`）がこの単一実装を経由する。`contains` は `PartialEq` 経由で自動的に追随する。`min` / `max` は選択した operand を元の型のまま返し、同値時は第 1 引数、NaN 入力は canonical NaN を返す。`sort` は現行仕様どおり文字列表現比較を維持する（本節の sort 数値順化は対象外）。sort / `list_dir` の全順序化（数値順を含む）は §17.8（REV-017）で設計を確定した（revision 0.21、設計確定・未実装）。`value.rs` の unit test 11 件と golden fixture `numeric_strict_comparison`（tree/VM 一致）で境界値・推移性・対称性・min/max 戻り型を固定する。
+✅ 実装済み（仕様 revision 0.19）。`src/value.rs` に `NumericOrder` / `NumericOrdering` を新設し、`Int×Float` を `trunc` / `fract` 分離 + `i128` widen で丸めなし比較する（`±Infinity` は有限 Int と大小確定、`NaN` は `UnorderedNaN`、`i128` 範囲外の巨大 Float は magnitude で決着）。`PartialEq` の `Int×Float` / `Float×Int`、tree（`src/eval.rs`）と VM（`src/vm.rs`）の関係演算子、`min` / `max`（`src/builtin_core.rs`）がこの単一実装を経由する。`contains` は `PartialEq` 経由で自動的に追随する。`min` / `max` は選択した operand を元の型のまま返し、同値時は第 1 引数、NaN 入力は canonical NaN を返す。`sort` は本 REV（revision 0.19）の時点では文字列表現比較を維持した（本節の sort 数値順化は対象外）。sort / `list_dir` の全順序化（数値順を含む）は §17.8（REV-017）で実装済み（revision 0.21）となり、`NumericOrder` を数値帯で再利用する。`value.rs` の unit test 11 件と golden fixture `numeric_strict_comparison`（tree/VM 一致）で境界値・推移性・対称性・min/max 戻り型を固定する。
 
 ### 17.2 `Chunk::patch_jump` の fallible 化と builder 封印（REV-004）
 
@@ -2038,7 +2038,7 @@ run_frames dispatch loop:
 
 ### 17.8 HumanDisplay / CanonicalRepr / TotalOrder の分離と全順序 sort（REV-017）
 
-> 設計ステータス: 設計確定・未実装。本節は sort / `list_dir` の並び順を「文字列表現比較」から**全値型を覆う単一の全順序 `TotalOrder`** へ移す次期仕様（revision 0.21）を定める。REV-003（§17.1）が確立した `NumericOrder` を数値帯で再利用し、観測挙動が変わる破壊的変更として扱う。REV-001（HumanDisplay / CanonicalRepr / TotalOrder の 3 層分離）と連動する。
+> 設計ステータス: ✅ 実装済み（仕様 revision 0.21）。本節は sort / `list_dir` の並び順を「文字列表現比較」から**全値型を覆う単一の全順序 `TotalOrder`** へ移す仕様（revision 0.21）を定める。REV-003（§17.1）が確立した `NumericOrder` を数値帯で再利用し、観測挙動が変わる破壊的変更として扱う。REV-001（HumanDisplay / CanonicalRepr / TotalOrder の 3 層分離）と連動する。
 
 #### 17.8.1 採用判断
 
@@ -2154,7 +2154,7 @@ DESIGN ONLY（本節はテストを記述しない。意図するテストを記
 
 #### 17.8.10 実装状況
 
-設計確定・未実装（仕様 revision 0.21 を予定）。現行実装（revision 0.20）の sort / list_dir は文字列表現比較のままで、本節の全順序化は未着手。`src/builtin_core.rs` の `builtin_sort_budgeted`（描画キー安定ソート）・`list_dir`（`sort_by_key(to_string)`）が置換対象。REV-001 の 3 層分離（HumanDisplay / CanonicalRepr / TotalOrder）と連動し、`TotalOrder` が新規規範成果物となる。
+✅ 実装済み（仕様 revision 0.21）。`src/value.rs` に全 10 variant を覆う単一の全順序 `TotalOrder`（純比較版 `compare` と per-element 課金版 `compare_budgeted`）を新設し、`builtin_sort_budgeted`・`list_dir` が revision で経路を分岐する（`>= V0_21` で全順序、`<= V0_20` は従来の描画キー順を温存）。`src/embedding.rs` に `LanguageRevision::V0_21`（`CURRENT=V0_21`、`as_str()=>"0.21"`）を追加し、tree（`src/eval.rs`）/ VM（`src/vm.rs`）に対称な `language_revision` フィールドと set/get を足して run-path で注入する。帯順は §17.8.3 どおり Null < Bool < 数値 < Str < List < Dict < Fn < Error、数値帯は `NumericOrder` 再利用で NaN を末尾固定、List / Dict は再帰辞書式＋prefix 規則、Fn / Error は帯内 Equal。`value.rs` の unit test 12 件（全順序 3 性質・帯順・再帰・prefix・NaN 末尾・安定性・大規模/深ネスト停止）、golden fixture `total_order_sort`（tree / VM parity）、`tests/total_order_budget.rs`（同一 backend 0.20 vs 0.21 の消費差・単調性・完了）で固定する。charge table（execution-control.md）の課金値は不変。REV-001 の 3 層分離（HumanDisplay / CanonicalRepr / TotalOrder）と連動し、`TotalOrder` が規範成果物となる。
 
 #### 17.8.11 設計レビューへの対応（revision 1）
 
@@ -2184,7 +2184,7 @@ DESIGN ONLY（本節はテストを記述しない。意図するテストを記
 ## 19. 文書全体の最終受入基準
 
 - AUD-016/017/018/019/024/033/034/036/047/048/049/050の採用判断、却下案、規範挙動、状態、変更箇所、error、移行、test、受入基準が実装PRから追跡できる。
-- §17のREV-003/004/005/006/009/012/017/021についても、同じ8観点（採用判断・却下案・データモデル・変更箇所・error・移行・test・受入基準）が実装PRから追跡できる。REV-017（§17.8）は設計確定・未実装で、sort / `list_dir` の全順序化（revision 0.21）を定める。REV-012は既存の第5節（AUD-017）を正本とし、本書で新しい意味論を追加しない。REV-006（§17.7）は停止性をper-instruction課金で担保し、verifierを唯一の停止性根拠にしない。
+- §17のREV-003/004/005/006/009/012/017/021についても、同じ8観点（採用判断・却下案・データモデル・変更箇所・error・移行・test・受入基準）が実装PRから追跡できる。REV-017（§17.8）は実装済み（revision 0.21）で、sort / `list_dir` の全順序化を定める。REV-012は既存の第5節（AUD-017）を正本とし、本書で新しい意味論を追加しない。REV-006（§17.7）は停止性をper-instruction課金で担保し、verifierを唯一の停止性根拠にしない。
 - §20（`format_time` の `%z`/`%Z` 追加）の採用判断・採用理由・却下案・OS非依存条件・バックエンド非差分・後方互換・変更箇所・残論点・受入基準が実装PRから追跡できる。
 - tree/VMで意図しないbackend別期待値が残らない。
 - 現行 `language-spec.md` は実装完了まで変更せず、現行挙動の正本として維持する。

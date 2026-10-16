@@ -857,7 +857,7 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 | `remove_dir(path)` | **空ディレクトリのみ**を削除する。非空ディレクトリは削除しない（再帰削除は `remove_tree`）。成功で true（revision 0.20 で再帰削除から変更、REV-021） |
 | `remove_tree(path)` | ディレクトリを中身ごと**再帰削除**する。final symlinkはlink自体だけを削除し、targetをたどらない。成功で true（revision 0.20 で追加、REV-021） |
 | `rename(from, to)` | ファイル/ディレクトリを移動・リネーム。from/toのfinal symlinkはtargetでなくdirectory entry自体として扱う。成功で true |
-| `list_dir(path)` | ディレクトリ内のエントリ名をリストで返す。失敗で null |
+| `list_dir(path)` | ディレクトリ内のエントリ名をリストで返す。失敗で null。名前（Str）は `sort` と同じ全順序 `TotalOrder` で整列する（Str 帯のコードポイント順。revision 0.21 で整列キーを全順序へ一本化、REV-017。実効順序はコードポイント順で従来と同一） |
 | `file_size(path)` | ファイルサイズ（バイト）を整数で返す。失敗で null。サイズが i64 で表現できない（`i64::MAX` 超）場合は wrap・負値を返さず `int_overflow` エラー |
 | `trim(str)` | 前後の空白を除去 |
 | `starts_with(str, prefix)` | 接頭辞チェック |
@@ -869,7 +869,7 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 | `abs(num)` | 絶対値 |
 | `min(a, b)` | 小さい方を返す。厳密な数値比較で選び、選ばれた引数を**元の型のまま**返す（`min(2, 2.5)`は`Int`の`2`）。同値なら第1引数、いずれかが`NaN`なら`NaN`を返す |
 | `max(a, b)` | 大きい方を返す。厳密な数値比較で選び、選ばれた引数を**元の型のまま**返す（`max(3, 2.5)`は`Int`の`3`）。同値なら第1引数、いずれかが`NaN`なら`NaN`を返す |
-| `sort(list)` | リストをソートして返す（**現行は文字列表現で比較**）。<br>drift note: REV-017（semantic-decisions.md §17.8）で、全値型を覆う全順序 `TotalOrder`（数値は厳密数値順、`sort([3,10,2])` → `[2,3,10]`）へ変更する設計を確定した（revision 0.21）。**設計確定・未実装**で、実装が入るまで現行の規範挙動は文字列表現比較のまま。 |
+| `sort(list)` | リストをソートして返す。全値型を覆う単一の全順序 `TotalOrder` で比較する安定ソート（revision 0.21 で文字列表現比較から変更、REV-017 / semantic-decisions.md §17.8）。型帯順は `Null < Bool < 数値(Int/Float 統合) < Str < List < Dict < Fn < Error`。数値帯は厳密数値順で `sort([3,10,2])` → `[2,3,10]`、`NaN` は数値帯の末尾。List / Dict は同じ全順序で再帰する辞書式順（短い方が小さい、空は最小）。Fn / Error は帯内で等価とし、安定ソートが元順序を保つ。revision 0.20 以下を要求する script は従来の文字列表現比較で動く。 |
 | `reverse(list or str)` | リストまたは文字列を反転して返す |
 | `is_file(path)` | パスがファイルなら true |
 | `is_dir(path)` | パスがディレクトリなら true |

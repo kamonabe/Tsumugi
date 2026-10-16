@@ -10,7 +10,7 @@
 
 - **フェーズ:** Phase 2（deny-by-default capability）・Phase 3/4（包括的な実行予算・協調実行）を並行して進行中。
 - **現在の slice:** 決定性 Slice 1（規範的 primitive）＝Phase 5 の着手部分は実装完了（StableError を含む deterministic primitive が一通り揃った。VM parity・FakeHost gate・audit normalize は後続 slice）。
-- **次のタスク:** 包括 budget の残り（REV-001/REV-015、Phase 3/4）＝REV-001 の全順序化（REV-017。設計は §17.8 で確定済み、残りは実装）と残 I/O/host budget、Phase 6 audit への budget/event 伝播。状態・詳細は「ステータス一覧」の REV-001/REV-015/REV-017 と [実行予算・協調実行仕様](execution-control.md) を参照（決定性 Slice 1 の deterministic shared helpers・DeterminismRulesRevision/ModuleId 正規化・FunctionId＝AUD-048・StableError は実装完了済み）。
+- **次のタスク:** 包括 budget の残り（REV-001/REV-015、Phase 3/4）＝残 I/O/host budget と Phase 6 audit への budget/event 伝播。REV-001 の全順序化（REV-017）は revision 0.21 で実装済み。状態・詳細は「ステータス一覧」の REV-001/REV-015/REV-017 と [実行予算・協調実行仕様](execution-control.md) を参照（決定性 Slice 1 の deterministic shared helpers・DeterminismRulesRevision/ModuleId 正規化・FunctionId＝AUD-048・StableError は実装完了済み）。
 
 ## マイルストーン（Phase 0〜7）
 
@@ -37,7 +37,7 @@
 
 | ID | 一行概要 | 状態 | owning spec |
 |---|---|---|---|
-| REV-001 | 共有 DAG の比較・表示・join・sort を有限化（指数化対策は完結、全順序化は REV-017） | 🟡 | [実行予算・協調実行仕様](execution-control.md) |
+| REV-001 | 共有 DAG の比較・表示・join・sort を有限化（指数化対策は完結、全順序化は REV-017 で実装済み・revision 0.21。残りは包括 budget 側） | 🟡 | [実行予算・協調実行仕様](execution-control.md) |
 | REV-015 | source/string/heap/I-O/bulk work の包括 budget・deadline・cancel | 🟡 | [実行予算・協調実行仕様](execution-control.md) |
 | REV-007 | `ExecutionContext` の session state と run meter を request ごとに分離 | ⬜ | [実行予算・協調実行仕様](execution-control.md) |
 | REV-008 | 全 stable execution へ transaction を適用（REPL は AUD-024 で完了） | 🟡 | [組み込みAPI仕様](embedding-api.md)・[実行予算・協調実行仕様](execution-control.md) |
@@ -46,7 +46,7 @@
 | REV-012 | call 評価順の status / doc drift 解消（意味論正本は第5節＝AUD-017） | 🟡 | [次期意味論・実装決定](semantic-decisions.md) §17.5 |
 | REV-014 | sandbox/env/limits/stdio/clock を `EngineConfig`/`ExecutionRequest` へ移す | ⬜ | [Capability Model仕様](capability-model.md)・[組み込みAPI仕様](embedding-api.md) |
 | REV-016 | script からの Rc cycle による回収不能 heap（baseline 課金・clear・tenant 分離） | ⬜ | [設計](design.md) |
-| REV-017 | HumanDisplay/CanonicalRepr/TotalOrder の分離による sort/list_dir 全順序化（設計確定・実装未、REV-001 と連動） | 🟡 | [次期意味論・実装決定](semantic-decisions.md) §17.8 |
+| REV-017 | HumanDisplay/CanonicalRepr/TotalOrder の分離による sort/list_dir 全順序化（設計確定・実装済み、revision 0.21、REV-001 と連動） | ✅ | [次期意味論・実装決定](semantic-decisions.md) §17.8 |
 | REV-019 | `now()` の epoch 前/clock error と `u64 as i64` を clock capability + checked で扱う | ⬜ | [Capability Model仕様](capability-model.md)・[実行予算・協調実行仕様](execution-control.md) |
 | REV-022 | safe profile で denial と OS 失敗を区別（EOF/I-O error を Null/false へ畳まない） | ⬜ | [Capability Model仕様](capability-model.md)・[組み込みAPI仕様](embedding-api.md) |
 | REV-024 | MSRV 固定・action pin・release/fuzz/stress gate の段階導入 | 🟡 | [検証・リリース・運用設計](verification-release-operations.md) |
@@ -66,12 +66,14 @@
 
 先頭ほど優先。各ステップの状態は上記「ステータス一覧」の対応 ID を参照する（ここでは再掲しない）。
 
-1. **包括 budget の残り（REV-001/REV-015、Phase 3/4）** — REV-001 の全順序化（REV-017。設計確定済み §17.8、残りは `TotalOrder` の実装と sort/list_dir への接続）と残 I/O/host budget、Phase 6 audit への budget/event 伝播。正本: [実行予算・協調実行仕様](execution-control.md)、全順序化の設計は [次期意味論・実装決定](semantic-decisions.md) §17.8。
+1. **包括 budget の残り（REV-001/REV-015、Phase 3/4）** — 残 I/O/host budget と Phase 6 audit への budget/event 伝播。REV-001 の全順序化（REV-017）は revision 0.21 で実装済み（§17.8）。正本: [実行予算・協調実行仕様](execution-control.md)、全順序化の設計は [次期意味論・実装決定](semantic-decisions.md) §17.8。
 2. **Phase 1/2 の残り** — REPL の Engine API 統合（E7 残）、VM/E9 の import・resolver 統合（Phase 5）、CAP-AT-17 の budget N 境界（Phase 3/C11）。正本: [組み込みAPI仕様](embedding-api.md)・[Capability Model仕様](capability-model.md)。
 3. **Phase 6 audit の残り** — 他 6 event emission ほか。正本: [決定性・実行時監査仕様](determinism-and-audit.md)。
 4. **Phase 7 運用保証** — MSRV・release/install・artifact・OCI・運用資材。正本: [検証・リリース・運用設計](verification-release-operations.md)。
 
-> 完了（直近）: REV-017（全順序化）の設計を確定（[次期意味論・実装決定](semantic-decisions.md) §17.8）。sort / `list_dir` を文字列表現比較から全値型を覆う単一の全順序 `TotalOrder`（数値は REV-003 の `NumericOrder` を再利用した厳密数値順）へ移す破壊的変更を、採用判断・却下案・データモデル・tree/VM 変更箇所・budget 課金・error・移行・test・受入基準の 8 観点で設計確定した（revision 0.21 予定、実装は未着手）。§17.1.9 と language-spec.md の sort 行に drift note を入れ、本変更が §17.8 を正本とすることを明示した。
+> 完了（直近）: REV-017（全順序化）の実装が revision 0.21 で shipped（[次期意味論・実装決定](semantic-decisions.md) §17.8）。sort / `list_dir` を文字列表現比較から全値型（10 variant）を覆う単一の全順序 `TotalOrder`（数値は REV-003 の `NumericOrder` を再利用した厳密数値順、NaN は数値帯末尾、List/Dict は再帰辞書式）へ移した。`src/value.rs` に `TotalOrder`（純比較版と per-element 課金版）を新設、`LanguageRevision::V0_21`（`CURRENT`）を追加して sort/list_dir が revision で経路を分岐（0.20 以下は従来順を温存）、tree/VM に対称な `language_revision` を注入。unit test 12 件・golden fixture `total_order_sort`（tree/VM parity）・`tests/total_order_budget.rs` で固定、charge table は不変。language-spec.md の sort/list_dir 行と §17.1.9・§17.8.10 の drift / 実装状況を実装済みへ更新した。
+>
+> 完了（その前）: REV-017（全順序化）の設計を確定（[次期意味論・実装決定](semantic-decisions.md) §17.8）。sort / `list_dir` を文字列表現比較から全値型を覆う単一の全順序 `TotalOrder`（数値は REV-003 の `NumericOrder` を再利用した厳密数値順）へ移す破壊的変更を、採用判断・却下案・データモデル・tree/VM 変更箇所・budget 課金・error・移行・test・受入基準の 8 観点で設計確定した。この設計は上記のとおり revision 0.21 で実装された。
 >
 > 完了（その前）: 決定性 Slice 1 の残り＝StableError（`src/stable_error.rs`、tree 射影）を実装。これで Slice 1 の deterministic primitive（deterministic shared helpers・DeterminismRulesRevision/ModuleId 正規化・FunctionId＝AUD-048・StableError）は一通り揃った。VM parity・FakeHost gate・audit normalize は Slice 2〜6。
 
