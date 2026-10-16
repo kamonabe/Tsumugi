@@ -1652,6 +1652,10 @@ pub fn format_unix_timestamp(timestamp: i64, format: &str) -> String {
         .replace("%H", &format!("{:02}", hours))
         .replace("%M", &format!("{:02}", minutes))
         .replace("%S", &format!("{:02}", seconds))
+        // UTC 固定のタイムゾーンマーカー（semantic-decisions.md §20）。
+        // 置換値は定数リテラルで、chrono・システム TZ・ロケール・システムクロックに依存しない。
+        .replace("%z", "+0000")
+        .replace("%Z", "UTC")
 }
 
 fn is_leap_year(year: i64) -> bool {
