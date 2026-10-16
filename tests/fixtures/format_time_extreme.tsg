@@ -2,3 +2,11 @@
 print(format_time(9223372036854775807, "%Y-%m-%d %H:%M:%S"))
 let min_timestamp = -9223372036854775807 - 1
 print(format_time(min_timestamp, "%Y-%m-%d %H:%M:%S"))
+
+# UTC タイムゾーンマーカー（semantic-decisions.md §20）
+# %z は常に +0000、%Z は常に UTC という UTC 固定の定数へ展開される
+print(format_time(0, "%Y-%m-%dT%H:%M:%S%z"))
+print(format_time(0, "%Y-%m-%d %H:%M:%S %Z"))
+
+# 回帰: %z/%Z 以外の未知記号は置換されずそのまま残る（置換追加の副作用検出）
+print(format_time(0, "%Y %q %z"))

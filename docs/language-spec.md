@@ -1,8 +1,8 @@
 # Tsumugi 言語仕様
 
-バージョン: 0.20
+バージョン: 0.21
 
-最終更新: 2026-09-26
+最終更新: 2026-10-16
 
 この番号は言語仕様のrevisionであり、Cargo package / REPLの実装バージョン `0.1.0` とは独立して管理する。
 
@@ -849,7 +849,7 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 | `args()` | スクリプト引数を文字列リストで返す。process argv ではなく実行 context の snapshot を返し、CLIはSCRIPT（またはstdin `-`）より後ろのtokenを順序どおり渡す。埋め込み host は `ExecutionContext::set_script_args` で実行単位に注入する。引数がなければ空リスト（AUD-018） |
 | `input()` | 標準入力から1行読み取る。EOF なら null |
 | `now()` | 現在のUNIXタイムスタンプ（秒）を整数で返す |
-| `format_time(timestamp, format)` | タイムスタンプをUTCでフォーマット（%Y, %m, %d, %H, %M, %S）。`timestamp` は整数のみで、Floatは `builtin_type` エラー。タイムゾーン指定は提供しない |
+| `format_time(timestamp, format)` | タイムスタンプをUTC固定でフォーマット（%Y, %m, %d, %H, %M, %S, %z, %Z）。`timestamp` は整数のみで、Floatは `builtin_type` エラー。`%z` は常に `+0000`、`%Z` は常に `UTC` という UTC 固定の定数に展開し、OS・ロケール・TZ 設定に依存しない。これら以外の未知記号はそのまま出力に残る（revision 0.21 で `%z`/`%Z` を追加、semantic-decisions.md §20。従来の「タイムゾーン指定は提供しない」記述は撤回） |
 | `path_exists(path)` | パスが存在すれば true |
 | `path_join(parts...)` | パーツを結合してパス文字列を返す。全引数はStrである必要があり、非Strは左から順に検査して最初の1つで `builtin_type` エラー（結合は開始しない）。引数0個は空文字列。正規化・存在確認はせず、separator/absolute component/prefixの扱いは実行OSのRust `PathBuf` と同じ |
 | `mkdir(path)` | ディレクトリを再帰的に作成。成功で true |
