@@ -151,6 +151,11 @@ pub struct Vm {
     /// `Some(code)` を載せ catch 不可の `ProcessExit` 信号を伝播する。CLI が terminal で
     /// 読み取り実際の exit code へ写す。
     pending_exit: Option<u8>,
+
+    /// この実行の言語 revision（REV-017 §17.8.7）。sort / `list_dir` の整列が参照する全順序の
+    /// 既定/全順序切替をこれで分岐する。tree engine（`Evaluator`）と同一シグネチャで持ち、
+    /// backend 固有分岐を作らない。CLI/テストは既定 `CURRENT`（=0.21）で動く。
+    language_revision: crate::embedding::LanguageRevision,
 }
 
 impl Vm {
@@ -178,6 +183,8 @@ impl Vm {
             // frozen set を注入する。
             capabilities: crate::capability::CapabilitySet::empty(),
             pending_exit: None,
+            // 既定は現行 revision（=0.21）。埋め込み host が set_language_revision で上書きする。
+            language_revision: crate::embedding::LanguageRevision::CURRENT,
         }
     }
 
@@ -199,6 +206,8 @@ impl Vm {
             // で frozen set を注入する。
             capabilities: crate::capability::CapabilitySet::empty(),
             pending_exit: None,
+            // 既定は現行 revision（=0.21）。埋め込み host が set_language_revision で上書きする。
+            language_revision: crate::embedding::LanguageRevision::CURRENT,
         }
     }
 
@@ -212,6 +221,17 @@ impl Vm {
     /// と対称。
     pub fn set_capabilities(&mut self, capabilities: crate::capability::CapabilitySet) {
         self.capabilities = capabilities;
+    }
+
+    /// この実行の言語 revision を設定する（REV-017 §17.8.7）。`Evaluator::set_language_revision`
+    /// と対称。CLI の VM 経路/埋め込み統合が必要に応じて注入する。
+    pub fn set_language_revision(&mut self, revision: crate::embedding::LanguageRevision) {
+        self.language_revision = revision;
+    }
+
+    /// この実行の言語 revision を参照する（builtin dispatch から consult する）。
+    pub(crate) fn language_revision(&self) -> crate::embedding::LanguageRevision {
+        self.language_revision
     }
 
     /// terminal で記録済み `exit` コードを取り出す（C7、REV-023）。CLI が実際の exit code へ写す。
@@ -1987,12 +2007,14 @@ impl Vm {
         // C10: filesystem builtin は grant 有無に関わらず常に capability 経路を通す（tree engine
         // と同じ論理位置・同じ共有ロジック）。未 grant（filesystem() が None）なら dispatch_fs が
         // adapter/OS call 0 で単一の sandbox denial を返す。ambient std::fs fallback へは落ちない。
+        let language_revision = self.language_revision();
         let fs_capability_result = if crate::builtin_core::is_filesystem_builtin(name) {
             Some(crate::builtin_core::dispatch_fs(
                 name,
                 &args,
                 self.capabilities.filesystem(),
                 max_collection,
+                language_revision,
                 line,
             )?)
         } else {
@@ -2017,6 +2039,7 @@ impl Vm {
             Some(crate::builtin_core::builtin_sort_budgeted(
                 &args,
                 &mut self.budget,
+                language_revision,
                 line,
             )?)
         } else {

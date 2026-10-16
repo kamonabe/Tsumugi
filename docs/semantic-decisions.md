@@ -2123,7 +2123,7 @@ sort / 比較の per-element 課金は **execution-control.md の charge table�
 - **数値を含むリストを sort している script**: `sort([3, 10, 2])` が `[10, 2, 3]` から `[2, 3, 10]` へ変わる。桁数の異なる整数・Int と Float の混在で特に観測差が出る。
 - **異種混在リストを sort している script**: 従来は全要素の文字列描画のコードポイント順だったが、型帯順＋帯内全順序へ変わる（例: `Bool` と数値の相対位置が描画文字列順から帯順へ変わる）。
 - **list_dir の結果順に依存している script**: 名前は Str なので実効順序はコードポイント順のままで、観測差は想定しない（キー経路のみ全順序へ一本化）。
-- **sort の budget / fuel 消費に依存している script**: 全順序化で要素の文字列描画（`render_display` の per-item byte 課金）が sort 経路から外れるため、同じ入力でも sort の fuel / budget 消費が現行より減る。消費量は charge table の per-element 課金（値は不変）で引き続き有限に上限される。budget / fuel 消費は観測可能・監査対象（manifesto 原則5・原則7）であり、この消費差も順序差と同じく revision 境界で説明される観測差として扱う。revision 0.21 を要求する script にのみ適用される。
+- **sort の budget / fuel 消費に依存している script**: 全順序化で要素の文字列描画（`render_display` の per-item byte 課金）が sort 経路から外れ、代わりに全順序比較の再帰的要素走査へ charge table の per-element 課金（`1 / element`、値は不変）が載る。このため同じ入力でも sort の fuel / budget 消費が revision 境界で変わる。消費差の「向き」は入力の形で決まる（実装注記）: スカラ列の sort では 0.20 は複合ノードを持たず描画 fuel を積まないため 0.21 の per-element 走査課金のぶん 0.21 の方が多くなり得る一方、複合要素（ネスト List / Dict）を含む sort では 0.20 の描画が要素木を全走査するため 0.20 の方が多くなり得る。したがって本節は「0.21 で一律に減る」ことではなく「revision 境界で消費が決定的に変わり、各 revision 内では決定的」ことを観測差として固定する（§17.8.9 の消費差ピン）。いずれの revision でも消費量は charge table の per-element 課金で有限に上限される。budget / fuel 消費は観測可能・監査対象（manifesto 原則5・原則7）であり、この消費差も順序差と同じく revision 境界で説明される観測差として扱う。revision 0.21 を要求する script にのみ適用される。
 
 移行方針: revision 0.21 を要求する script は新しい全順序で、revision 0.20 以下を要求する script は従来の文字列表現順で動く（revision は link 時に検証される §3）。language-spec は実装が入るまで現行挙動（文字列表現比較）を記述し続け、本節への drift note で予告する（部分実装を『次 revision 対応』と表示しない運用規則に従う）。
 
@@ -2149,7 +2149,7 @@ DESIGN ONLY（本節はテストを記述しない。意図するテストを記
 - List / Dict が再帰的辞書式順（空・ネスト・prefix 規則を含む）で並ぶ。
 - 全順序の 3 性質（完全性・反対称性・推移性）を property / unit test が示す。
 - 安定ソートで同順位要素の元順序が保たれる。
-- charge table（execution-control.md）の課金値を変更していない。budget 超過で有限停止する。sort の per-element 課金は不変だが、描画 byte 課金が sort 経路から外れることによる budget / fuel 消費差を golden fixture の budget 消費比較で固定する。
+- charge table（execution-control.md）の課金値を変更していない。budget 超過で有限停止する。sort の per-element 課金は不変で、全順序比較の再帰的要素走査にも適用する（共有 DAG 要素の比較も per-element 走査課金で有限停止する）。描画 byte 課金が sort 経路から外れ比較走査課金が載ることによる revision 境界の budget / fuel 消費差は、tree / VM 間 fuel が byte-exact 一致しない（`tests/differential.rs` 不変量）ため、同一 backend（embedding tree engine）の 0.20 vs 0.21 比較で固定する（`tests/total_order_budget.rs`）。parity golden fixture（`total_order_sort`）は順序・error の tree / VM 観測一致を担保する。
 - revision が 0.20 → 0.21 へ上がり、language-spec は実装完了まで現行挙動を記述し続ける（drift note で予告）。
 
 #### 17.8.10 実装状況

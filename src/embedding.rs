@@ -48,27 +48,34 @@ pub enum Backend {
 
 /// 言語仕様 revision（仕様第3節 `LanguageRevision`）。
 ///
-/// 仕様文書の擬似コードは執筆時点の `V0_11` を例示するが、実装の現行 revision は 0.20 で
-/// あるため、実装は現行の `V0_20` を持つ。番号体系は Cargo package version（0.1.0）とは
+/// 仕様文書の擬似コードは執筆時点の `V0_11` を例示するが、実装の現行 revision は 0.21 で
+/// あるため、実装は現行の `V0_21` を持つ。番号体系は Cargo package version（0.1.0）とは
 /// 独立に管理する（`docs/roadmap.md`「バージョン番号の扱い」）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum LanguageRevision {
     /// language-spec revision 0.19。
     V0_19,
-    /// language-spec revision 0.20（現行）。`remove_dir` を空 directory のみへ変更し、再帰削除を
+    /// language-spec revision 0.20。`remove_dir` を空 directory のみへ変更し、再帰削除を
     /// 新規 builtin `remove_tree`（capability `RecursiveDelete`）へ分離した破壊的変更（REV-021）。
+    /// 0.20 以下は sort / `list_dir` の整列を従来の文字列表現比較で行う（REV-017 §17.8.7）。
     V0_20,
+    /// language-spec revision 0.21（現行）。sort / `list_dir` の整列を全値型を覆う単一の
+    /// 全順序 `TotalOrder` へ移した破壊的変更（REV-017 §17.8）。`sort([3, 10, 2])` が
+    /// `[10, 2, 3]`（文字列順）から `[2, 3, 10]`（数値順）へ変わる。新順序は revision 0.21 を
+    /// 要求する script にのみ適用し、0.20 以下は従来挙動のまま。
+    V0_21,
 }
 
 impl LanguageRevision {
     /// 現行の言語 revision。
-    pub const CURRENT: Self = Self::V0_20;
+    pub const CURRENT: Self = Self::V0_21;
 
-    /// revision の文字列表現（例: `"0.20"`）。
+    /// revision の文字列表現（例: `"0.21"`）。
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::V0_19 => "0.19",
             Self::V0_20 => "0.20",
+            Self::V0_21 => "0.21",
         }
     }
 }
@@ -2243,6 +2250,12 @@ impl Engine {
         // 引数 snapshot と frozen capability 集合を評価器へ注入する（AUD-018 / Phase 2 C1〜）。
         context.evaluator.set_script_args(request.arguments);
         context.evaluator.set_capabilities(request.capabilities);
+        // engine config の言語 revision を評価器へ注入する（REV-017 §17.8.7）。capability と同じ
+        // run-path 注入点で流し込み、sort / list_dir の整列が engine 既定の revision で動くように
+        // する。engine は build 後不変なので config から 1 回読んで載せる。
+        context
+            .evaluator
+            .set_language_revision(self.config.language_revision);
         // engine 単位の host function registry を実行前に注入する（E7、capability-model 第11.1節）。
         // 登録は engine 単位、grant は上の capability 集合（実行単位）という分離を保つ。
         context
@@ -2781,7 +2794,7 @@ mod tests {
         let config = EngineConfig::default();
         assert_eq!(config.backend, Backend::TreeWalk);
         assert_eq!(config.language_revision, LanguageRevision::CURRENT);
-        assert_eq!(config.language_revision.as_str(), "0.20");
+        assert_eq!(config.language_revision.as_str(), "0.21");
     }
 
     #[test]

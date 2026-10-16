@@ -155,6 +155,7 @@ impl Evaluator {
                         .map_err(|stop| self.control_stop_to_error(stop, line))?;
                 }
                 let max_collection = self.budget.max_collection_elements();
+                let language_revision = self.language_revision();
                 // REV-001: to_str / join は値を表示して文字列化するため、budget-aware な
                 // render_display 経由（fuel + per-item byte 上限）で有限化する。budget を
                 // 持てない builtin_core::dispatch へ入れず、境界で先に intercept する。
@@ -174,6 +175,7 @@ impl Evaluator {
                     Some(crate::builtin_core::builtin_sort_budgeted(
                         &evaluated,
                         &mut self.budget,
+                        language_revision,
                         line,
                     )?)
                 } else if crate::builtin_core::is_filesystem_builtin(name) {
@@ -185,6 +187,7 @@ impl Evaluator {
                         &evaluated,
                         self.capabilities().filesystem(),
                         max_collection,
+                        language_revision,
                         line,
                     )?)
                 } else {

@@ -454,6 +454,7 @@ fixture_tests!(
         slice_edge,
         sort_numeric,
         string_utils,
+        total_order_sort,
         try_break_continue,
         try_catch,
     ]
@@ -1922,31 +1923,30 @@ fn shared_dag_to_str_and_join_are_bounded_in_both_engines() {
 
 #[test]
 fn shared_dag_sort_is_bounded_in_both_engines() {
-    // REV-001: sort もソートキーを to_string で materialize するため、共有 DAG 要素で
-    // 指数化し得る。budget-aware な render_display 経由のキー生成（fuel + per-item byte
-    // 上限）へ移したので、共有 DAG 要素を含む List の sort は per-item string 上限で
-    // materialize 前に打ち切る。両 engine で検証する。順序意味論（文字列表現比較）は不変。
+    // REV-017（revision 0.21）: sort は全順序 TotalOrder で値どうしを直接比較する（描画キーを
+    // 作らない）。共有 DAG（1 つの List 値を多数の位置から参照して論理サイズが指数化した値）を
+    // 要素に持つ List の sort は、比較の再帰的要素走査ごとに per-element 走査課金（1 / element、
+    // charge table の値は不変）が有限に積み上がり、fuel（step）上限で停止する（§17.8.5 /
+    // §17.8.6）。描画 byte 上限ではなく fuel 上限が bound になる点が revision 0.20 との観測差。
+    // 両 engine で同一に停止することを検証する（manifesto: ホストの安定性）。
     let depth = 30;
     let mut source = String::from("let d0 = [1, 2, 3]\n");
     for i in 0..depth {
         source.push_str(&format!("let d{} = [d{}, d{}]\n", i + 1, i, i));
     }
-    // 共有 DAG を要素に持つ List を sort する（キー生成で指数展開しようとする）。
+    // 共有 DAG を要素に持つ List を sort する（比較で指数展開しようとする）。
     source.push_str(&format!("print(sort([d{depth}, d{depth}]))\n"));
 
     for use_vm in [false, true] {
-        let output = run_repl_process(
-            &source,
-            use_vm,
-            &[("TSUMUGI_MAX_SINGLE_STRING_BYTES", "1000")],
-        );
+        // default profile（revision 0.21）。fuel（step）上限が bound になる。
+        let output = run_repl_process(&source, use_vm, &[]);
         let (_stdout, stderr) = output_text(&output);
         let mode = if use_vm { "VM" } else { "tree" };
 
         assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
         assert!(
-            stderr.contains("文字列の長さが上限を超えました"),
-            "{mode}で共有 DAG の sort が string 上限で止まっていない: {stderr}"
+            stderr.contains("ステップ上限に達しました"),
+            "{mode}で共有 DAG の sort が fuel 上限で止まっていない: {stderr}"
         );
     }
 }
