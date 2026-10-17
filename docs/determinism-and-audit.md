@@ -1,8 +1,10 @@
 # Tsumugi 決定性・実行時監査仕様
 
-最終更新: 2026-10-14
+最終更新: 2026-10-15
 
-設計ステータス: **実装仕様確定・未実装**
+設計ステータス: **実装仕様確定・部分実装（Phase 6 A-1 subset ＋ `BudgetCharged` emission 実装済み）**
+
+> Phase 6 の A-1 subset（schema v1・8 event 型・logical journal・`AuditSink`・fail-closed・opt-in、tree-only）に加え、`BudgetCharged`（§7.2/§7.3）の emission を tree backend で実装済み。残りの 5 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished` / `Yielded` / `Resumed`）・redaction・strict CBOR・record/replay・VM 対応・sink 必須化は未実装。進捗の唯一の正本は [ロードマップ](roadmap.md)。
 
 ## 1. 位置づけ
 
