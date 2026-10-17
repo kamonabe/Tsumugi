@@ -884,6 +884,15 @@ impl Evaluator {
         self.budget.usage()
     }
 
+    /// 集約済み `BudgetCharged` 監査 event を drain して返す（Phase 6 REV-015、§7.3 / §8 規則 7）。
+    ///
+    /// embedding facade の監査経路は `BudgetLedger` を直接持たず `Evaluator` 経由でアクセスする
+    /// ため、[`crate::budget::BudgetLedger::drain_budget_charges`] への薄い委譲を提供する。
+    /// [`Self::budget_usage`] と対称。意味論・charge 挙動は変えない。
+    pub(crate) fn drain_budget_charges(&mut self) -> Vec<crate::audit::AuditEvent> {
+        self.budget.drain_budget_charges()
+    }
+
     /// 実行セッションを開始する（REV-015 Slice 3 PR-d-2、poll 経路の初回）。
     ///
     /// import を link し、source/import/AST heap を Link フェーズで課金し、REPL transaction を

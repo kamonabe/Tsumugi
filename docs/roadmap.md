@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-10-15
+最終更新: 2026-10-16
 
 > このロードマップは「進捗だけ」を追う。機能の詳細・採用/不採用の理由は各設計正本に置く
 > （ドキュメントの役割分担は [ドキュメント運用ガイド](documentation-guide.md) を参照）。
@@ -10,7 +10,7 @@
 
 - **フェーズ:** Phase 2（deny-by-default capability）・Phase 3/4（包括的な実行予算・協調実行）を並行して進行中。
 - **現在の slice:** 決定性 Slice 1（規範的 primitive）＝Phase 5 の着手部分は実装完了（StableError を含む deterministic primitive が一通り揃った。VM parity・FakeHost gate・audit normalize は後続 slice）。
-- **次のタスク:** 包括 budget の残り（REV-001/REV-015、Phase 3/4）＝残 I/O/host budget と Phase 6 audit への budget/event 伝播。REV-001 の全順序化（REV-017）は revision 0.21 で実装済み。状態・詳細は「ステータス一覧」の REV-001/REV-015/REV-017 と [実行予算・協調実行仕様](execution-control.md) を参照（決定性 Slice 1 の deterministic shared helpers・DeterminismRulesRevision/ModuleId 正規化・FunctionId＝AUD-048・StableError は実装完了済み）。
+- **次のタスク:** 包括 budget の残り（REV-001/REV-015、Phase 3/4）＝残 I/O/host budget と Phase 6 audit への budget/event 伝播。budget 本体は tree/VM 完了で、Phase 6 伝播のうち `BudgetCharged` emission は tree backend で実装済み。残る audit 伝播は他 5 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished` / `Yielded` / `Resumed`）の emission。REV-001 の全順序化（REV-017）は revision 0.21 で実装済み。状態・詳細は「ステータス一覧」の REV-001/REV-015/REV-017 と [実行予算・協調実行仕様](execution-control.md) を参照（決定性 Slice 1 の deterministic shared helpers・DeterminismRulesRevision/ModuleId 正規化・FunctionId＝AUD-048・StableError は実装完了済み）。
 
 ## マイルストーン（Phase 0〜7）
 
@@ -37,8 +37,8 @@
 
 | ID | 一行概要 | 状態 | owning spec |
 |---|---|---|---|
-| REV-001 | 共有 DAG の比較・表示・join・sort を有限化（指数化対策は完結、全順序化は REV-017 で実装済み・revision 0.21。残りは包括 budget 側） | 🟡 | [実行予算・協調実行仕様](execution-control.md) |
-| REV-015 | source/string/heap/I-O/bulk work の包括 budget・deadline・cancel | 🟡 | [実行予算・協調実行仕様](execution-control.md) |
+| REV-001 | 共有 DAG の比較・表示・join・sort を有限化（指数化対策は完結、全順序化は REV-017 で実装済み・revision 0.21。残りは包括 budget 側の Phase 6 伝播で、うち `BudgetCharged` emission は実装済み） | 🟡 | [実行予算・協調実行仕様](execution-control.md) |
+| REV-015 | source/string/heap/I-O/bulk work の包括 budget・deadline・cancel（budget 本体は tree/VM 完了、残りは Phase 6 への伝播。うち `BudgetCharged` emission は tree backend で実装済み） | 🟡 | [実行予算・協調実行仕様](execution-control.md) |
 | REV-007 | `ExecutionContext` の session state と run meter を request ごとに分離 | ⬜ | [実行予算・協調実行仕様](execution-control.md) |
 | REV-008 | 全 stable execution へ transaction を適用（REPL は AUD-024 で完了） | 🟡 | [組み込みAPI仕様](embedding-api.md)・[実行予算・協調実行仕様](execution-control.md) |
 | REV-010 | 32-bit target の `i64 as usize` wrap を `try_from`/checked へ | ⬜ | [実行予算・協調実行仕様](execution-control.md) |
@@ -59,19 +59,21 @@
 | AUD-045 | MSRV 1.97・stable/MSRV CI・install/release・artifact・署名/SBOM/OCI・運用 gate | 🟡 | [検証・リリース・運用設計](verification-release-operations.md) §3〜10・17〜18節 |
 | AUD-048 | 動的評価ごとの per-instance `FunctionId` による関数等価性 | ✅ | [次期意味論・実装決定](semantic-decisions.md) §12・[決定性・実行時監査仕様](determinism-and-audit.md) §4.7 |
 | Phase 5 残 | deterministic shared helpers（NaN canonicalization `0x7ff8_0000_0000_0000`・Float format）・DeterminismRulesRevision/ModuleId 正規化・StableError（`src/stable_error.rs`、tree 射影）は完了。Slice 1 の deterministic primitive は一通り揃った。残りは Slice 2〜6（HostBoundary/FakeHost・VM parity・audit normalize・record/replay 等） | 🟡 | [決定性・実行時監査仕様](determinism-and-audit.md) 第14節 Slice 1〜6 |
-| Phase 6 残 | 他 6 event emission・`AuditBackpressure` yield・redaction 本体・strict CBOR・record/replay・VM 対応・sink 必須化（A-1 は実装済み） | 🟡 | [決定性・実行時監査仕様](determinism-and-audit.md) §6〜12・14 Slice 5 |
+| Phase 6 残 | 他 5 event emission（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished` / `Yielded` / `Resumed`）・`AuditBackpressure` yield・redaction 本体・strict CBOR・record/replay・VM 対応・sink 必須化（A-1 ＋ `BudgetCharged` emission は実装済み） | 🟡 | [決定性・実行時監査仕様](determinism-and-audit.md) §6〜12・14 Slice 5 |
 | 品質改善 | 未着手の処理改善（`dispatch` の match 分割・`exec_stmt` 分割・sandbox `OnceLock` テスタビリティ・fuzzing 導入） | ⬜ | [設計](design.md) |
 
 ## 着手順（次に何をやるか）
 
 先頭ほど優先。各ステップの状態は上記「ステータス一覧」の対応 ID を参照する（ここでは再掲しない）。
 
-1. **包括 budget の残り（REV-001/REV-015、Phase 3/4）** — 残 I/O/host budget と Phase 6 audit への budget/event 伝播。REV-001 の全順序化（REV-017）は revision 0.21 で実装済み（§17.8）。正本: [実行予算・協調実行仕様](execution-control.md)、全順序化の設計は [次期意味論・実装決定](semantic-decisions.md) §17.8。
+1. **包括 budget の残り（REV-001/REV-015、Phase 3/4）** — 残 I/O/host budget と Phase 6 audit への budget/event 伝播。budget 本体は tree/VM 完了で、Phase 6 伝播のうち `BudgetCharged` emission は tree backend で実装済み。残りは他 5 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished` / `Yielded` / `Resumed`）の emission。REV-001 の全順序化（REV-017）は revision 0.21 で実装済み（§17.8）。正本: [実行予算・協調実行仕様](execution-control.md)、全順序化の設計は [次期意味論・実装決定](semantic-decisions.md) §17.8。
 2. **Phase 1/2 の残り** — REPL の Engine API 統合（E7 残）、VM/E9 の import・resolver 統合（Phase 5）、CAP-AT-17 の budget N 境界（Phase 3/C11）。正本: [組み込みAPI仕様](embedding-api.md)・[Capability Model仕様](capability-model.md)。
 3. **Phase 6 audit の残り** — 他 6 event emission ほか。正本: [決定性・実行時監査仕様](determinism-and-audit.md)。
 4. **Phase 7 運用保証** — MSRV・release/install・artifact・OCI・運用資材。正本: [検証・リリース・運用設計](verification-release-operations.md)。
 
-> 完了（直近）: REV-017（全順序化）の実装が revision 0.21 で shipped（[次期意味論・実装決定](semantic-decisions.md) §17.8）。sort / `list_dir` を文字列表現比較から全値型（10 variant）を覆う単一の全順序 `TotalOrder`（数値は REV-003 の `NumericOrder` を再利用した厳密数値順、NaN は数値帯末尾、List/Dict は再帰辞書式）へ移した。`src/value.rs` に `TotalOrder`（純比較版と per-element 課金版）を新設、`LanguageRevision::V0_21`（`CURRENT`）を追加して sort/list_dir が revision で経路を分岐（0.20 以下は従来順を温存）、tree/VM に対称な `language_revision` を注入。unit test 12 件・golden fixture `total_order_sort`（tree/VM parity）・`tests/total_order_budget.rs` で固定、charge table は不変。language-spec.md の sort/list_dir 行と §17.1.9・§17.8.10 の drift / 実装状況を実装済みへ更新した。
+> 完了（直近）: Phase 6 への budget/event 伝播の最初の一片として、`BudgetCharged` audit event の emission を tree backend で shipped（[決定性・実行時監査仕様](determinism-and-audit.md) §7.2/§7.3/§8）。既存の `AuditEvent::BudgetCharged`（CBOR tag 4）を A-1 の audited embedding facade に配線し、`BudgetChargeAccumulator`（§7.3、per-(resource, reason) 集約・256-charge cut・決定的 flush 順）で集計、`ExecutionStarted` と `Terminal` の間（§8 rule 7）に drain して emit する。opt-in・非破壊（sink なし経路は従来どおり drain せず、観測結果・output byte は不変）。新 event 型・VM 配線・charge table / revision の変更なし。残る audit 伝播は他 5 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished` / `Yielded` / `Resumed`）。
+>
+> 完了（その前）: REV-017（全順序化）の実装が revision 0.21 で shipped（[次期意味論・実装決定](semantic-decisions.md) §17.8）。sort / `list_dir` を文字列表現比較から全値型（10 variant）を覆う単一の全順序 `TotalOrder`（数値は REV-003 の `NumericOrder` を再利用した厳密数値順、NaN は数値帯末尾、List/Dict は再帰辞書式）へ移した。`src/value.rs` に `TotalOrder`（純比較版と per-element 課金版）を新設、`LanguageRevision::V0_21`（`CURRENT`）を追加して sort/list_dir が revision で経路を分岐（0.20 以下は従来順を温存）、tree/VM に対称な `language_revision` を注入。unit test 12 件・golden fixture `total_order_sort`（tree/VM parity）・`tests/total_order_budget.rs` で固定、charge table は不変。language-spec.md の sort/list_dir 行と §17.1.9・§17.8.10 の drift / 実装状況を実装済みへ更新した。
 >
 > 完了（その前）: REV-017（全順序化）の設計を確定（[次期意味論・実装決定](semantic-decisions.md) §17.8）。sort / `list_dir` を文字列表現比較から全値型を覆う単一の全順序 `TotalOrder`（数値は REV-003 の `NumericOrder` を再利用した厳密数値順）へ移す破壊的変更を、採用判断・却下案・データモデル・tree/VM 変更箇所・budget 課金・error・移行・test・受入基準の 8 観点で設計確定した。この設計は上記のとおり revision 0.21 で実装された。
 >
@@ -91,7 +93,7 @@
 - [x] bytecode 検証・API 封印（REV-006/004/005/018）: `VerifiedChunk`/verifier、per-instruction step 課金、`MakeClosure(proto_index)`+`CaptureDesc`、`patch_jump` fallible 化、`unstable-bytecode` feature 封印
 - [x] ステップ予算（ループ反復 + 関数呼び出しのカウント、無限ループ/再帰防止、tree/VM 両対応）→ 詳細は [実行予算・協調実行仕様](execution-control.md)
 - [x] 深層監査 AUD-001〜050 の大半（REPL transaction・collection 上限・深度制限・canonical error・COW collection・FunctionId ほか）→ 状態は「ステータス一覧」、詳細は各 spec
-- [x] Phase 6 実行時監査 A-1（schema v1・8 event 型・logical journal・`AuditSink`・fail-closed・opt-in、tree-only）→ 残件は「ステータス一覧」Phase 6 残
+- [x] Phase 6 実行時監査 A-1（schema v1・8 event 型・logical journal・`AuditSink`・fail-closed・opt-in、tree-only）＋ `BudgetCharged` emission（§7.2/§7.3/§8、tree backend、opt-in・非破壊）→ 残件は「ステータス一覧」Phase 6 残
 
 > 歴史的なベンチマーク測定値・検証スナップショットは [`docs/history/benchmarks.md`](history/benchmarks.md) に退避した。
 

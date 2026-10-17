@@ -2086,6 +2086,41 @@ impl Engine {
             },
         };
 
+        // 4.5 BudgetCharged を drain して Started(seq 0) と Terminal の間へ append（§7.3 / §8 規則7）。
+        // Terminal 直前に最終 flush を強制し、どの charge も取りこぼさない。drain は accumulator を
+        // 空にする軽量操作で、返った `BudgetCharged` を 1 件ずつ journal へ append_normal し、
+        // Started と同じ submit/Ack 規約（連続 sequence・同 execution の ack）で sink へ送る。
+        // append_normal が失敗したら Started 失敗と同じく fail-closed（§10.1: 監査が壊れた実行を
+        // 成功として報告しない）。sink 無し経路（run_guarded）はこの関数を通らないので drain せず、
+        // emission ゼロ・byte-for-byte 不変を保つ。
+        for charge_event in context.evaluator.drain_budget_charges() {
+            let seq = journal.next_sequence();
+            match journal.append_normal(&make_envelope(seq, charge_event.clone())) {
+                Ok(appended_seq) => {
+                    let batch: Arc<[AuditEnvelope]> =
+                        Arc::from(vec![make_envelope(appended_seq, charge_event)]);
+                    let delivered = matches!(
+                        sink.submit(batch, AuditWaker::noop()),
+                        AuditSubmit::Ack(ack)
+                            if ack.execution_id == execution_id
+                                && ack.through_sequence == appended_seq
+                    );
+                    if !delivered {
+                        return AuditedOutcome::AuditFailed {
+                            withheld: crate::audit::terminal_outcome_from(&outcome, None),
+                            failure: AuditFailure::Sink,
+                        };
+                    }
+                }
+                Err(failure) => {
+                    return AuditedOutcome::AuditFailed {
+                        withheld: crate::audit::terminal_outcome_from(&outcome, None),
+                        failure,
+                    };
+                }
+            }
+        }
+
         // 5. Terminal を予約 slot へ append → submit（§8 規則9/10）。
         // BudgetExceeded の resource は、評価器が畳む前に退避した原本を優先する（§7.2。
         // control_stop_to_error は細粒度 resource を粗い ErrorKind へ縮約するため、原本が無いと
@@ -3621,22 +3656,43 @@ mod tests {
     }
 
     /// sink の収集 envelope から最後の Terminal event の outcome を取り出す helper。
+    ///
+    /// BudgetCharged 挿入（§7.3）後は Started と Terminal の間に 0 件以上の BudgetCharged が
+    /// 挟まるため、件数を固定せず不変条件で検証する: 先頭 Started(seq 0) / 中間はすべて
+    /// BudgetCharged / 末尾は唯一の Terminal / sequence は 0 始まり gap なし（§8）。
     fn terminal_outcome_of(
         sink: &crate::audit::InMemoryAuditSink,
     ) -> crate::audit::TerminalOutcome {
         let envelopes = sink.snapshot();
-        assert_eq!(
-            envelopes.len(),
-            2,
-            "Started + Terminal の 2 件のはず: {envelopes:?}"
+        assert!(
+            envelopes.len() >= 2,
+            "少なくとも Started + Terminal の 2 件: {envelopes:?}"
         );
+        // 先頭 Started（seq 0）。
         assert_eq!(envelopes[0].sequence, 0);
         assert!(matches!(
             envelopes[0].event,
             crate::audit::AuditEvent::ExecutionStarted { .. }
         ));
-        assert_eq!(envelopes[1].sequence, 1);
-        match &envelopes[1].event {
+        // sequence 連続性（0 始まり gap/重複なし）。
+        for (i, env) in envelopes.iter().enumerate() {
+            assert_eq!(env.sequence as usize, i, "sequence は 0 始まり gap なし");
+        }
+        // 中間はすべて BudgetCharged（§8: Started と Terminal の間）。
+        for env in &envelopes[1..envelopes.len() - 1] {
+            assert!(
+                matches!(env.event, crate::audit::AuditEvent::BudgetCharged { .. }),
+                "中間 event は BudgetCharged のはず: {:?}",
+                env.event
+            );
+        }
+        // Terminal はちょうど 1 件で末尾。
+        let terminal_count = envelopes
+            .iter()
+            .filter(|e| matches!(e.event, crate::audit::AuditEvent::Terminal { .. }))
+            .count();
+        assert_eq!(terminal_count, 1, "Terminal は 1 件だけ");
+        match &envelopes.last().expect("non-empty").event {
             crate::audit::AuditEvent::Terminal { outcome, .. } => outcome.clone(),
             other => panic!("期待 Terminal, 実際 {other:?}"),
         }
