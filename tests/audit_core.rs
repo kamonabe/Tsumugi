@@ -121,7 +121,15 @@ fn with_sink_emits_started_then_terminal_in_order() {
     }
 
     let envelopes = sink.snapshot();
-    assert_eq!(envelopes.len(), 2, "Started と Terminal の 2 件のはず");
+    // fuel 等を charge する script なので、Started と Terminal の間に BudgetCharged が挟まる。
+    // 件数は固定しない: 不変条件（先頭 Started / 末尾 Terminal / 中間はすべて BudgetCharged /
+    // sequence が 0 始まり gap なし）で検証する（§7.3 / §8）。
+    assert!(
+        envelopes.len() >= 3,
+        "Started + BudgetCharged(>=1) + Terminal のはず（実際 {}）",
+        envelopes.len()
+    );
+    assert_journal_invariants(&envelopes, execution_id);
 
     // Started は sequence 0 に 1 件。
     assert_eq!(envelopes[0].sequence, 0);
@@ -134,10 +142,20 @@ fn with_sink_emits_started_then_terminal_in_order() {
         AuditEvent::ExecutionStarted { .. }
     ));
 
-    // Terminal は最後（sequence 1）に 1 件、gap/重複なし。
-    assert_eq!(envelopes[1].sequence, 1);
-    assert_eq!(envelopes[1].execution_id, execution_id);
-    match &envelopes[1].event {
+    // 中間はすべて BudgetCharged（§8: Started と Terminal の間に挟まる）。
+    for env in &envelopes[1..envelopes.len() - 1] {
+        assert!(
+            matches!(env.event, AuditEvent::BudgetCharged { .. }),
+            "中間 event は BudgetCharged のはず: {:?}",
+            env.event
+        );
+    }
+
+    // Terminal は最後の 1 件・最大 sequence。
+    let last = envelopes.last().expect("non-empty");
+    assert_eq!(last.sequence as usize, envelopes.len() - 1);
+    assert_eq!(last.execution_id, execution_id);
+    match &last.event {
         AuditEvent::Terminal {
             outcome,
             context_committed,
@@ -150,6 +168,40 @@ fn with_sink_emits_started_then_terminal_in_order() {
         }
         other => panic!("期待 Terminal, 実際 {other:?}"),
     }
+}
+
+/// journal 不変条件を検証する共有ヘルパ（§8）。
+///
+/// - 先頭は `ExecutionStarted`（sequence 0）、末尾は唯一の `Terminal`。
+/// - sequence は 0 始まり・gap/重複なし・昇順。
+/// - 全 envelope が同じ execution_id。
+/// - Terminal は 1 件だけ。
+fn assert_journal_invariants(envelopes: &[tsumugi::AuditEnvelope], execution_id: ExecutionId) {
+    assert!(!envelopes.is_empty(), "少なくとも Started/Terminal がある");
+    // 先頭 Started（seq 0）。
+    assert_eq!(envelopes[0].sequence, 0);
+    assert!(matches!(
+        envelopes[0].event,
+        AuditEvent::ExecutionStarted { .. }
+    ));
+    // sequence 連続性 + execution_id 一致。
+    for (i, env) in envelopes.iter().enumerate() {
+        assert_eq!(env.sequence as usize, i, "sequence は 0 始まり gap なし");
+        assert_eq!(env.execution_id, execution_id);
+    }
+    // Terminal はちょうど 1 件で末尾。
+    let terminal_count = envelopes
+        .iter()
+        .filter(|e| matches!(e.event, AuditEvent::Terminal { .. }))
+        .count();
+    assert_eq!(terminal_count, 1, "Terminal は 1 件だけ");
+    assert!(
+        matches!(
+            envelopes.last().expect("non-empty").event,
+            AuditEvent::Terminal { .. }
+        ),
+        "Terminal は末尾"
+    );
 }
 
 #[test]
@@ -170,8 +222,10 @@ fn with_sink_runtime_error_maps_to_runtime_error_terminal() {
     ));
 
     let envelopes = sink.snapshot();
-    assert_eq!(envelopes.len(), 2);
-    match &envelopes[1].event {
+    // link/run で source/fuel を charge するため、Started と Terminal の間に BudgetCharged が入る。
+    assert_journal_invariants(&envelopes, ExecutionId::new(7u128.try_into().unwrap()));
+    let last = envelopes.last().expect("non-empty");
+    match &last.event {
         AuditEvent::Terminal {
             outcome,
             error,
@@ -226,6 +280,155 @@ fn with_sink_pre_cancel_has_started_and_cancelled_terminal() {
         }
         other => panic!("期待 Terminal(Cancelled), 実際 {other:?}"),
     }
+}
+
+// --- §7.3 BudgetCharged end-to-end ---
+
+#[test]
+fn budget_charged_emitted_between_started_and_terminal() {
+    // fuel を複数回 charge する script。BudgetCharged が Started(seq 0) と Terminal の間に出て、
+    // 同 resource+reason は 1 件へ集約され charge_count > 1 になる（§7.3）。
+    let sink = Arc::new(InMemoryAuditSink::new());
+    let engine = EmbeddingEngine::builder()
+        .audit_sink(sink.clone() as Arc<dyn AuditSink>)
+        .build()
+        .expect("build");
+    // while ループは反復ごとに fuel を charge するため、同 (Fuel, Operation) が複数回集約される。
+    let script = link_source(&engine, "m", "let i = 0\nwhile i < 5\n    i = i + 1\nend\n");
+    let linked = engine.link(&script, link_request()).expect("link");
+    let mut ctx = EmbeddingContext::new(&engine);
+
+    let execution_id = ExecutionId::new(50u128.try_into().unwrap());
+    let request = {
+        let clock: Arc<dyn MonotonicClock> = Arc::new(FakeClock::new());
+        let budget = BudgetConfig::standard(clock.as_ref()).expect("standard budget");
+        EmbeddingRequest::new(budget, clock)
+            .expect("same domain")
+            .with_execution_id(execution_id)
+    };
+
+    let audited = engine.run_audited(&linked, &mut ctx, request);
+    assert!(matches!(
+        audited.outcome(),
+        Some(EmbeddingOutcome::Completed { .. })
+    ));
+
+    let envelopes = sink.snapshot();
+    assert_journal_invariants(&envelopes, execution_id);
+
+    // 中間はすべて BudgetCharged（§8）。最後の BudgetCharged は Terminal の直前にある
+    // （§8 規則 7: Terminal 直前 flush）。
+    let charged: Vec<&AuditEvent> = envelopes[1..envelopes.len() - 1]
+        .iter()
+        .map(|e| &e.event)
+        .collect();
+    assert!(
+        !charged.is_empty(),
+        "少なくとも 1 件の BudgetCharged が出るはず"
+    );
+    for event in &charged {
+        assert!(
+            matches!(event, AuditEvent::BudgetCharged { .. }),
+            "中間 event は BudgetCharged: {event:?}"
+        );
+    }
+    // 最後の BudgetCharged は Terminal の直前 sequence に来る（取りこぼしなし）。
+    let last_charged_idx = envelopes.len() - 2;
+    assert!(matches!(
+        envelopes[last_charged_idx].event,
+        AuditEvent::BudgetCharged { .. }
+    ));
+
+    // 集約: Fuel+Operation が複数回 charge されると 1 件に畳まれ charge_count > 1。
+    let fuel_charged: Vec<&AuditEvent> = charged
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AuditEvent::BudgetCharged {
+                    resource: tsumugi::BudgetResource::Fuel,
+                    reason: tsumugi::BudgetChargeReason::Operation,
+                    ..
+                }
+            )
+        })
+        .copied()
+        .collect();
+    assert_eq!(
+        fuel_charged.len(),
+        1,
+        "同 (Fuel, Operation) は 1 件へ集約されるはず（flush は 1 回）"
+    );
+    if let AuditEvent::BudgetCharged { charge_count, .. } = fuel_charged[0] {
+        assert!(
+            *charge_count > 1,
+            "複数文の fuel charge は charge_count > 1 に集約されるはず（実際 {charge_count}）"
+        );
+    }
+
+    // reconciliation: 全 BudgetCharged の committed_delta を resource ごとに合算した値が、
+    // Terminal の usage（対応する BudgetCounters フィールド）と一致する（§7.3）。
+    let terminal_usage = match &envelopes.last().expect("non-empty").event {
+        AuditEvent::Terminal { usage, .. } => *usage,
+        other => panic!("期待 Terminal, 実際 {other:?}"),
+    };
+    let fuel_committed: u64 = charged
+        .iter()
+        .filter_map(|e| match e {
+            AuditEvent::BudgetCharged {
+                resource: tsumugi::BudgetResource::Fuel,
+                committed_delta,
+                ..
+            } => Some(*committed_delta),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(
+        fuel_committed, terminal_usage.committed.fuel,
+        "Fuel の committed_delta 総和は Terminal usage の committed.fuel と一致するはず（§7.3）"
+    );
+    // usage_after は flush 時点（＝終了時点）の累積値なので、Fuel の最終 usage_after も committed.fuel。
+    if let Some(AuditEvent::BudgetCharged { usage_after, .. }) = fuel_charged.first().copied() {
+        assert_eq!(
+            *usage_after, terminal_usage.committed.fuel,
+            "Fuel の usage_after は終了時点の committed.fuel に一致するはず"
+        );
+    }
+
+    // per-item peak の reconciliation: HeapBytes の peak_after が Terminal usage の
+    // peak_heap_bytes（live heap の peak）と一致する（§7.3）。
+    let heap_peaks: Vec<u64> = charged
+        .iter()
+        .filter_map(|e| match e {
+            AuditEvent::BudgetCharged {
+                resource: tsumugi::BudgetResource::HeapBytes,
+                peak_after: Some(peak),
+                ..
+            } => Some(*peak),
+            _ => None,
+        })
+        .collect();
+    if let Some(max_peak) = heap_peaks.iter().copied().max() {
+        assert_eq!(
+            max_peak, terminal_usage.peak_heap_bytes,
+            "HeapBytes の peak_after は Terminal usage の peak_heap_bytes と一致するはず（§7.3）"
+        );
+    }
+}
+
+#[test]
+fn budget_charged_no_sink_emits_nothing_and_unchanged_outcome() {
+    // no-sink: 同じ charge する script を sink なしで走らせても emission ゼロ・outcome 不変。
+    let engine = EmbeddingEngine::builder().build().expect("build");
+    let script = link_source(&engine, "m", "let i = 0\nwhile i < 5\n    i = i + 1\nend\n");
+    let linked = engine.link(&script, link_request()).expect("link");
+    let mut ctx = EmbeddingContext::new(&engine);
+
+    let observer = InMemoryAuditSink::new();
+    let outcome = engine.run(&linked, &mut ctx, request_with_id(51));
+    assert!(matches!(outcome, EmbeddingOutcome::Completed { .. }));
+    // sink は未設定なので何も記録されない（opt-in、byte-for-byte 不変）。
+    assert!(observer.is_empty());
 }
 
 // --- (e) fail-closed ---

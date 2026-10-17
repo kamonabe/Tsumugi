@@ -976,6 +976,53 @@ pub struct BudgetLedger {
     /// per-drop release（案A）のため `Rc<RefCell<>>` 共有ハンドルにする。tracked
     /// collection へ [`HeapLedgerWeak`] を配り、その `Drop` から release させる。
     heap: HeapLedger,
+    /// `BudgetCharged` 監査 event の集約器（Phase 6 REV-015、§7.3）。
+    ///
+    /// charge/release funnel（[`Self::commit`] / [`Self::release_heap`]）から
+    /// [`crate::audit::BudgetChargeAccumulator::note_charge`] /
+    /// [`crate::audit::BudgetChargeAccumulator::note_release`] を呼んで集約する。加算は常に走る
+    /// 軽量操作で観測挙動を変えない。emission は embedding facade の監査経路だけが
+    /// [`Self::drain_budget_charges`]（＝ accumulator.flush）で drain して行う（§7.3 / §8 規則 7）。
+    accumulator: crate::audit::BudgetChargeAccumulator,
+}
+
+/// cumulative `BudgetResource` を §7.2 の [`crate::audit::BudgetChargeReason`] へ写す（§7.3）。
+///
+/// charge funnel（[`BudgetLedger::commit`]）が持つのは resource と amount だけで、現行の
+/// charge 点は細粒度の意味（Statement/Expression/Loop 等）を保持しない。そのため resource の
+/// 意味に素直に対応する reason を 1:1 で割り当てる。曖昧な汎用 fuel（`charge_fuel` 由来）は
+/// §7.3 の既定どおり `Operation` にする。
+///
+/// | resource | reason | 根拠 |
+/// |---|---|---|
+/// | `Fuel` | `Operation` | 汎用 step 課金。細分意味を持たないため既定 `Operation`（§7.3） |
+/// | `StringAllocations` | `Allocation` | String body 1 個の生成（§5.3） |
+/// | `StringBytes` | `BulkBytes` | String payload の byte 課金 |
+/// | `SourceCount` / `SourceBytes` | `Source` | source 読み込み（§5.3） |
+/// | `ImportCount` / `ImportBytes` | `Source` | import module の source |
+/// | `InputCalls` / `InputBytes` | `Input` | 入力 host call |
+/// | `OutputCalls` / `OutputBytes` | `Output` | 出力 host call |
+/// | `HostCalls` / `HostRequestBytes` / `HostResponseBytes` / `HostCallBytes` | `HostCall` | host function 呼び出し |
+/// | `HeapBytes` / `SingleStringBytes` / `SingleSourceBytes` / `CollectionElements` | `Allocation` | cumulative commit 経路では通知しない（release/per-item は別経路） |
+fn charge_reason_for(resource: BudgetResource) -> crate::audit::BudgetChargeReason {
+    use crate::audit::BudgetChargeReason as R;
+    match resource {
+        BudgetResource::Fuel => R::Operation,
+        BudgetResource::StringAllocations => R::Allocation,
+        BudgetResource::StringBytes => R::BulkBytes,
+        BudgetResource::SourceCount | BudgetResource::SourceBytes => R::Source,
+        BudgetResource::ImportCount | BudgetResource::ImportBytes => R::Source,
+        BudgetResource::InputCalls | BudgetResource::InputBytes => R::Input,
+        BudgetResource::OutputCalls | BudgetResource::OutputBytes => R::Output,
+        BudgetResource::HostCalls
+        | BudgetResource::HostRequestBytes
+        | BudgetResource::HostResponseBytes
+        | BudgetResource::HostCallBytes => R::HostCall,
+        BudgetResource::HeapBytes
+        | BudgetResource::SingleStringBytes
+        | BudgetResource::SingleSourceBytes
+        | BudgetResource::CollectionElements => R::Allocation,
+    }
 }
 
 impl BudgetLedger {
@@ -991,6 +1038,7 @@ impl BudgetLedger {
             peaks: BudgetPeaks::default(),
             cancellation,
             clock: None,
+            accumulator: crate::audit::BudgetChargeAccumulator::new(),
         }
     }
 
@@ -1367,9 +1415,23 @@ impl BudgetLedger {
     }
 
     /// reserve 済み量を commit する（§7-3）。`actual <= reserved_amount` を要求する。
+    ///
+    /// cumulative charge の単一 funnel。commit 確定後に `BudgetCharged` アキュムレータへ 1 件
+    /// 通知する（§7.3）。`actual == 0`（全額 refund 相当）は論理 charge ではないため通知しない。
     pub fn commit(&mut self, resource: BudgetResource, reserved_amount: u64, actual: u64) {
         debug_assert!(actual <= reserved_amount, "commit actual は reserved 以下");
-        self.move_to_committed(resource, reserved_amount, actual.min(reserved_amount));
+        let committed = actual.min(reserved_amount);
+        self.move_to_committed(resource, reserved_amount, committed);
+        if committed > 0 {
+            // commit 後の累積値を usage_after として渡す（§7.3）。
+            let usage_after = self.committed_of(resource);
+            self.accumulator.note_charge(
+                resource,
+                charge_reason_for(resource),
+                committed,
+                usage_after,
+            );
+        }
     }
 
     /// reserve 済み量を全額 refund する（§7-4）。operation 未開始時に使う。
@@ -2147,8 +2209,32 @@ impl BudgetLedger {
     /// object の最後の execution 内参照が消えたときに live heap を戻す（§5.2 / §7-6）。
     ///
     /// cumulative counter は減らさない。二重 release でも 0 未満へ回らない。
+    /// release 後の live/peak を `BudgetCharged` アキュムレータへ通知する（§7.3）。`bytes == 0`
+    /// は論理 release ではないため通知しない。
     pub fn release_heap(&mut self, bytes: u64) {
         self.heap.borrow_mut().release(bytes);
+        if bytes > 0 {
+            let (live, peak) = {
+                let heap = self.heap.borrow();
+                (heap.live_bytes(), heap.peak_bytes())
+            };
+            self.accumulator.note_release(
+                BudgetResource::HeapBytes,
+                charge_reason_for(BudgetResource::HeapBytes),
+                bytes,
+                live,
+                peak,
+            );
+        }
+    }
+
+    /// 集約済み `BudgetCharged` 監査 event を drain して返す（§7.3 / §8 規則 7）。
+    ///
+    /// アキュムレータを flush し、確定済み + 残り進行中グループを決定的順序で返して内部状態を
+    /// 空にする。embedding facade の監査経路が Terminal 直前に 1 回呼び、返った event を journal
+    /// へ `append_normal` する。sink 無し経路は呼ばない（emission ゼロ・挙動不変）。
+    pub(crate) fn drain_budget_charges(&mut self) -> Vec<crate::audit::AuditEvent> {
+        self.accumulator.flush()
     }
 
     /// 現在の live heap byte 数（REPL rollback の snapshot 用）。

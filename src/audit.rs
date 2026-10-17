@@ -444,6 +444,217 @@ pub fn budget_resource_from_error_kind(kind: crate::error::ErrorKind) -> Option<
 }
 
 // =============================================================================
+// §7.3 BudgetCharged の集約（accumulator）
+// =============================================================================
+
+/// `BudgetCharged`（§7.2 CBOR tag=4）を §7.3 どおり集約するアキュムレータ。
+///
+/// 同じ poll 内の同 `resource`・同 `reason` の charge/release を 1 グループへ足し、flush で
+/// 各グループを **既存の** [`AuditEvent::BudgetCharged`]（新 event 型は作らない）1 件へ畳む。
+/// 加算は常に走ってよい軽量操作で、観測挙動を変えない。emission するのは embedding facade の
+/// 監査経路（sink 設定時）だけで、[`Self::flush`] の結果を journal へ `append_normal` する。
+///
+/// # flush 点（§7.3）
+///
+/// 仕様の flush 点（host call 前・yield 前・pause 前・terminal 前・256 charge ごと）のうち、
+/// 「256 charge ごと」はグループ内部で [`Self::note_charge`] が確定 buffer へ切り出すことで、
+/// 残りの点は呼び出し側が [`Self::flush`] を呼ぶことで満たす。A-1 同期経路では embedding が
+/// Terminal 直前に 1 回 flush する（§8 規則 7）。
+///
+/// # 決定論的順序
+///
+/// flush の出力は `(resource 優先順位, reason 宣言順)` の安定キー順にソートし、確定 buffer を
+/// 先に、その後に残り進行中グループを置く。これにより backend 非依存の決定的 audit 列になる。
+#[derive(Debug, Default)]
+pub struct BudgetChargeAccumulator {
+    /// 進行中グループ: (resource, reason) → 集約中の running 値。
+    groups: Vec<ChargeGroup>,
+    /// 256 charge 到達等で確定した `BudgetCharged` レコード（emission 待ち）。
+    finalized: Vec<AuditEvent>,
+}
+
+/// 進行中の 1 (resource, reason) グループ（§7.3）。
+#[derive(Debug)]
+struct ChargeGroup {
+    resource: BudgetResource,
+    reason: BudgetChargeReason,
+    committed_delta: u64,
+    released_delta: u64,
+    usage_after: u64,
+    peak_after: Option<u64>,
+    charge_count: u64,
+}
+
+/// §7.3「256 charge ごとに flush」の閾値。
+const CHARGE_FLUSH_THRESHOLD: u64 = 256;
+
+impl ChargeGroup {
+    fn into_event(self) -> AuditEvent {
+        AuditEvent::BudgetCharged {
+            resource: self.resource,
+            committed_delta: self.committed_delta,
+            released_delta: self.released_delta,
+            usage_after: self.usage_after,
+            peak_after: self.peak_after,
+            charge_count: self.charge_count,
+            reason: self.reason,
+        }
+    }
+}
+
+impl BudgetChargeAccumulator {
+    /// 空のアキュムレータを作る。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 進行中・確定済みが共に空か（主にテスト・診断用）。
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty() && self.finalized.is_empty()
+    }
+
+    /// 進行中グループの index を (resource, reason) で引く。
+    fn position(&self, resource: BudgetResource, reason: BudgetChargeReason) -> Option<usize> {
+        self.groups
+            .iter()
+            .position(|g| g.resource == resource && g.reason == reason)
+    }
+
+    /// cumulative charge を 1 件通知する（§7.3）。
+    ///
+    /// 同 `(resource, reason)` グループへ `committed_delta` を加算し `charge_count` を +1、
+    /// `usage_after` を最新 committed 値で上書きする。グループの `charge_count` が
+    /// [`CHARGE_FLUSH_THRESHOLD`] に達したらそのグループを確定 buffer へ切り出す
+    /// （§7.3「256 charge ごと flush」）。
+    pub fn note_charge(
+        &mut self,
+        resource: BudgetResource,
+        reason: BudgetChargeReason,
+        committed_delta: u64,
+        usage_after: u64,
+    ) {
+        match self.position(resource, reason) {
+            Some(idx) => {
+                let g = &mut self.groups[idx];
+                g.committed_delta = g.committed_delta.saturating_add(committed_delta);
+                g.usage_after = usage_after;
+                g.charge_count = g.charge_count.saturating_add(1);
+                if g.charge_count >= CHARGE_FLUSH_THRESHOLD {
+                    let group = self.groups.remove(idx);
+                    self.finalized.push(group.into_event());
+                }
+            }
+            None => {
+                self.groups.push(ChargeGroup {
+                    resource,
+                    reason,
+                    committed_delta,
+                    released_delta: 0,
+                    usage_after,
+                    peak_after: None,
+                    charge_count: 1,
+                });
+            }
+        }
+    }
+
+    /// heap release を 1 件通知する（§7.3）。
+    ///
+    /// 同 `(resource, reason)` グループへ `released_delta` を加算し、`usage_after` を live、
+    /// `peak_after` を `Some(peak)` で記録する（live heap 系）。release も 1 論理 charge として
+    /// `charge_count` を +1 する。
+    pub fn note_release(
+        &mut self,
+        resource: BudgetResource,
+        reason: BudgetChargeReason,
+        released_delta: u64,
+        usage_after: u64,
+        peak_after: u64,
+    ) {
+        match self.position(resource, reason) {
+            Some(idx) => {
+                let g = &mut self.groups[idx];
+                g.released_delta = g.released_delta.saturating_add(released_delta);
+                g.usage_after = usage_after;
+                g.peak_after = Some(peak_after);
+                g.charge_count = g.charge_count.saturating_add(1);
+                if g.charge_count >= CHARGE_FLUSH_THRESHOLD {
+                    let group = self.groups.remove(idx);
+                    self.finalized.push(group.into_event());
+                }
+            }
+            None => {
+                self.groups.push(ChargeGroup {
+                    resource,
+                    reason,
+                    committed_delta: 0,
+                    released_delta,
+                    usage_after,
+                    peak_after: Some(peak_after),
+                    charge_count: 1,
+                });
+            }
+        }
+    }
+
+    /// 全進行中グループを畳み、確定 buffer と結合して決定的順序で返す（§7.3 / §8 規則 7）。
+    ///
+    /// 確定 buffer（256 charge 到達で先に切り出された分）を元の確定順で先頭に置き、その後に
+    /// 残り進行中グループを `(resource 優先順位, reason 宣言順)` の安定キー順で並べる。返した後は
+    /// 内部状態を空にする。
+    pub fn flush(&mut self) -> Vec<AuditEvent> {
+        let mut events = std::mem::take(&mut self.finalized);
+        let mut groups = std::mem::take(&mut self.groups);
+        groups.sort_by_key(|g| (resource_sort_key(g.resource), reason_sort_key(g.reason)));
+        events.extend(groups.into_iter().map(ChargeGroup::into_event));
+        events
+    }
+}
+
+/// resource の安定ソートキー（§7.2 の宣言順＝固定優先順位に沿う）。
+fn resource_sort_key(resource: BudgetResource) -> u8 {
+    match resource {
+        BudgetResource::Fuel => 0,
+        BudgetResource::HeapBytes => 1,
+        BudgetResource::SingleStringBytes => 2,
+        BudgetResource::StringAllocations => 3,
+        BudgetResource::StringBytes => 4,
+        BudgetResource::SingleSourceBytes => 5,
+        BudgetResource::SourceCount => 6,
+        BudgetResource::SourceBytes => 7,
+        BudgetResource::ImportCount => 8,
+        BudgetResource::ImportBytes => 9,
+        BudgetResource::CollectionElements => 10,
+        BudgetResource::InputCalls => 11,
+        BudgetResource::InputBytes => 12,
+        BudgetResource::OutputCalls => 13,
+        BudgetResource::OutputBytes => 14,
+        BudgetResource::HostCalls => 15,
+        BudgetResource::HostRequestBytes => 16,
+        BudgetResource::HostResponseBytes => 17,
+        BudgetResource::HostCallBytes => 18,
+    }
+}
+
+/// reason の安定ソートキー（§7.2 の宣言順）。
+fn reason_sort_key(reason: BudgetChargeReason) -> u8 {
+    match reason {
+        BudgetChargeReason::Statement => 0,
+        BudgetChargeReason::Expression => 1,
+        BudgetChargeReason::Operation => 2,
+        BudgetChargeReason::Function => 3,
+        BudgetChargeReason::Loop => 4,
+        BudgetChargeReason::HostCall => 5,
+        BudgetChargeReason::BulkElements => 6,
+        BudgetChargeReason::BulkBytes => 7,
+        BudgetChargeReason::Allocation => 8,
+        BudgetChargeReason::Source => 9,
+        BudgetChargeReason::Input => 10,
+        BudgetChargeReason::Output => 11,
+    }
+}
+
+// =============================================================================
 // §11 監査自体の予算（AuditBudget）と config 検証
 // =============================================================================
 
@@ -1508,6 +1719,172 @@ mod tests {
             journal.append_terminal(&terminal_envelope(id, 1, TerminalOutcome::Completed)),
             Ok(1)
         );
+    }
+
+    // --- §7.3 BudgetChargeAccumulator ---
+
+    /// `BudgetCharged` から集約フィールドを取り出すテストヘルパ。
+    fn as_charged(
+        event: &AuditEvent,
+    ) -> (
+        BudgetResource,
+        BudgetChargeReason,
+        u64,
+        u64,
+        u64,
+        Option<u64>,
+        u64,
+    ) {
+        match event {
+            AuditEvent::BudgetCharged {
+                resource,
+                committed_delta,
+                released_delta,
+                usage_after,
+                peak_after,
+                charge_count,
+                reason,
+            } => (
+                *resource,
+                *reason,
+                *committed_delta,
+                *released_delta,
+                *usage_after,
+                *peak_after,
+                *charge_count,
+            ),
+            other => panic!("期待 BudgetCharged, 実際 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accumulator_aggregates_same_resource_and_reason() {
+        let mut acc = BudgetChargeAccumulator::new();
+        // 同 (Fuel, Operation) を 3 回。usage_after は最新値で上書き。
+        acc.note_charge(BudgetResource::Fuel, BudgetChargeReason::Operation, 1, 1);
+        acc.note_charge(BudgetResource::Fuel, BudgetChargeReason::Operation, 2, 3);
+        acc.note_charge(BudgetResource::Fuel, BudgetChargeReason::Operation, 4, 7);
+        let events = acc.flush();
+        assert_eq!(events.len(), 1);
+        let (resource, reason, committed, released, usage_after, peak, count) =
+            as_charged(&events[0]);
+        assert_eq!(resource, BudgetResource::Fuel);
+        assert_eq!(reason, BudgetChargeReason::Operation);
+        assert_eq!(committed, 7); // 1 + 2 + 4
+        assert_eq!(released, 0);
+        assert_eq!(usage_after, 7); // 最新値
+        assert_eq!(peak, None); // cumulative は peak なし
+        assert_eq!(count, 3);
+        // flush で空になる。
+        assert!(acc.is_empty());
+    }
+
+    #[test]
+    fn accumulator_separates_distinct_reason_and_resource() {
+        let mut acc = BudgetChargeAccumulator::new();
+        acc.note_charge(BudgetResource::Fuel, BudgetChargeReason::Operation, 1, 1);
+        acc.note_charge(
+            BudgetResource::StringBytes,
+            BudgetChargeReason::BulkBytes,
+            10,
+            10,
+        );
+        // 同 resource でも reason が違えば別グループ。
+        acc.note_charge(BudgetResource::Fuel, BudgetChargeReason::Statement, 2, 3);
+        let events = acc.flush();
+        assert_eq!(events.len(), 3);
+        // 決定的順序: Fuel(0) が先。Fuel 内は reason 宣言順（Statement(0) < Operation(2)）。
+        let (r0, reason0, ..) = as_charged(&events[0]);
+        let (r1, reason1, ..) = as_charged(&events[1]);
+        let (r2, ..) = as_charged(&events[2]);
+        assert_eq!(r0, BudgetResource::Fuel);
+        assert_eq!(reason0, BudgetChargeReason::Statement);
+        assert_eq!(r1, BudgetResource::Fuel);
+        assert_eq!(reason1, BudgetChargeReason::Operation);
+        assert_eq!(r2, BudgetResource::StringBytes);
+    }
+
+    #[test]
+    fn accumulator_flushes_group_every_256_charges() {
+        let mut acc = BudgetChargeAccumulator::new();
+        // 256 回で確定 buffer へ切り出し、257 回目は新グループ（進行中）。
+        for i in 0..257u64 {
+            acc.note_charge(
+                BudgetResource::Fuel,
+                BudgetChargeReason::Operation,
+                1,
+                i + 1,
+            );
+        }
+        let events = acc.flush();
+        // 確定分 1 件（256 charge）+ 残り進行中 1 件（1 charge）。
+        assert_eq!(events.len(), 2);
+        let (_, _, committed0, _, _, _, count0) = as_charged(&events[0]);
+        assert_eq!(count0, 256);
+        assert_eq!(committed0, 256);
+        let (_, _, committed1, _, _, _, count1) = as_charged(&events[1]);
+        assert_eq!(count1, 1);
+        assert_eq!(committed1, 1);
+    }
+
+    #[test]
+    fn accumulator_records_release_with_peak() {
+        let mut acc = BudgetChargeAccumulator::new();
+        acc.note_release(
+            BudgetResource::HeapBytes,
+            BudgetChargeReason::Allocation,
+            64,
+            128,
+            256,
+        );
+        let events = acc.flush();
+        assert_eq!(events.len(), 1);
+        let (resource, reason, committed, released, usage_after, peak, count) =
+            as_charged(&events[0]);
+        assert_eq!(resource, BudgetResource::HeapBytes);
+        assert_eq!(reason, BudgetChargeReason::Allocation);
+        assert_eq!(committed, 0);
+        assert_eq!(released, 64);
+        assert_eq!(usage_after, 128); // live
+        assert_eq!(peak, Some(256)); // live heap は peak を載せる
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn accumulator_flush_order_is_deterministic() {
+        let mut acc = BudgetChargeAccumulator::new();
+        // 投入順をわざと resource 優先順位と逆にする。
+        acc.note_charge(
+            BudgetResource::OutputBytes,
+            BudgetChargeReason::Output,
+            1,
+            1,
+        );
+        acc.note_charge(
+            BudgetResource::StringBytes,
+            BudgetChargeReason::BulkBytes,
+            1,
+            1,
+        );
+        acc.note_charge(BudgetResource::Fuel, BudgetChargeReason::Operation, 1, 1);
+        let events = acc.flush();
+        let resources: Vec<BudgetResource> = events.iter().map(|e| as_charged(e).0).collect();
+        // resource 優先順位順: Fuel < StringBytes < OutputBytes。
+        assert_eq!(
+            resources,
+            vec![
+                BudgetResource::Fuel,
+                BudgetResource::StringBytes,
+                BudgetResource::OutputBytes,
+            ]
+        );
+    }
+
+    #[test]
+    fn accumulator_empty_flush_returns_nothing() {
+        let mut acc = BudgetChargeAccumulator::new();
+        assert!(acc.flush().is_empty());
+        assert!(acc.is_empty());
     }
 
     // --- (c)/(d) sink の挙動 ---
