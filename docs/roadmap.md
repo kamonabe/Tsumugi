@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-10-16
+最終更新: 2026-10-18
 
 > このロードマップは「進捗だけ」を追う。機能の詳細・採用/不採用の理由は各設計正本に置く
 > （ドキュメントの役割分担は [ドキュメント運用ガイド](documentation-guide.md) を参照）。
@@ -10,7 +10,8 @@
 
 - **フェーズ:** Phase 2（deny-by-default capability）・Phase 3/4（包括的な実行予算・協調実行）を並行して進行中。
 - **現在の slice:** 決定性 Slice 1（規範的 primitive）＝Phase 5 の着手部分は実装完了（StableError を含む deterministic primitive が一通り揃った。VM parity・FakeHost gate・audit normalize は後続 slice）。
-- **次のタスク:** 包括 budget の残り（REV-001/REV-015、Phase 3/4）＝残 I/O/host budget と Phase 6 audit への budget/event 伝播。budget 本体は tree/VM 完了で、Phase 6 伝播のうち `BudgetCharged`・host-call lifecycle の 3 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished`）・yield/resume lifecycle の 2 event（`Yielded` / `Resumed`）は tree backend で実装済み。これで着手順 1 の host-call + yield/resume audit 伝播は完了（tree-only・opt-in）。残る audit 伝播は `AuditBackpressure`-yield 配線と VM 対応（別フェーズ）。REV-001 の全順序化（REV-017）は revision 0.21 で実装済み。状態・詳細は「ステータス一覧」の REV-001/REV-015/REV-017 と [実行予算・協調実行仕様](execution-control.md) を参照（決定性 Slice 1 の deterministic shared helpers・DeterminismRulesRevision/ModuleId 正規化・FunctionId＝AUD-048・StableError は実装完了済み）。
+- **次のタスク:** 着手順 2＝Phase 1/2 の残り。REPL の Engine API 統合（E7 残）、VM/E9 の import・resolver 統合（Phase 5）、CAP-AT-17 の budget N 境界（Phase 3/C11）。正本は [組み込みAPI仕様](embedding-api.md)・[Capability Model仕様](capability-model.md)。
+- **直近完了:** 着手順 1 の Phase 6 audit への event 伝播が一区切り。`BudgetCharged`・host-call lifecycle の 3 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished`）・yield/resume lifecycle の 2 event（`Yielded` / `Resumed`）が tree backend で emission 済みで、§7.2 の 8 event 型のうち 7 event が tree backend で出る。budget 本体は tree/VM 完了。着手順 1 に残るのは I/O/host budget の残りと、`AuditBackpressure`-yield 配線・VM 対応（別フェーズ）。REV-001 の全順序化（REV-017）は revision 0.21 で実装済み。状態・詳細は「ステータス一覧」の REV-001/REV-015/REV-017 と [実行予算・協調実行仕様](execution-control.md) を参照（決定性 Slice 1 の deterministic shared helpers・DeterminismRulesRevision/ModuleId 正規化・FunctionId＝AUD-048・StableError は実装完了済み）。
 
 ## マイルストーン（Phase 0〜7）
 
