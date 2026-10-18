@@ -974,6 +974,51 @@ impl AuditJournal {
         Ok(seq)
     }
 
+    /// 次の host-call lifecycle triple を通常枠へ収められるかを事前判定する（§11 reserve）。
+    ///
+    /// §11 は host call 開始前に、`HostCallStarted`（通常 1 event / 最大 60 KiB）と、後続
+    /// `CapabilityDecision` + `HostCallFinished` の close reserve（2 events / 128 KiB）を atomic に
+    /// reserve することを要求する。A-1 は triple を post-run に drain する（§14）ため、ここでは
+    /// 「あと `host_call_close_reserve_events + 1` 件・`host_call_close_reserve_bytes + 60 KiB`
+    /// 相当を通常枠（Terminal 予約を除いた分）へ収められるか」の容量チェックとして実装する。
+    ///
+    /// A-1 では faithful な pre-effect reservation（reserve 失敗時に外部効果自体を拒否する）は
+    /// retry/backpressure スライスへ延期し、ここは drain 時の容量チェックとして機能する。収まら
+    /// なければ監査付き facade は triple を 1 件も出さず `AuditFailure::BudgetExceeded` へ落ちる。
+    pub fn can_reserve_host_call(&self) -> bool {
+        if self.terminated {
+            return false;
+        }
+        // 通常 event が使える event-count 上限（Terminal 予約を除く）。
+        let normal_event_limit = self
+            .budget
+            .max_events
+            .saturating_sub(self.budget.terminal_reserve_events);
+        // triple は Started 1 件 + close reserve 分（Decision + Finished）。
+        let needed_events = self.budget.host_call_close_reserve_events.saturating_add(1);
+        let projected_events = self.committed_events.saturating_add(needed_events);
+        if projected_events > normal_event_limit {
+            return false;
+        }
+
+        // 通常 byte 上限（Terminal 予約を除く）。
+        let normal_byte_limit = self
+            .budget
+            .max_encoded_bytes
+            .saturating_sub(self.budget.terminal_reserve_bytes);
+        // §11 の share: HostCallStarted ≤60 KiB + close reserve byte（既定 128 KiB）。
+        const HOST_CALL_STARTED_MAX_BYTES: u64 = 60 * KIB;
+        let needed_bytes = self
+            .budget
+            .host_call_close_reserve_bytes
+            .saturating_add(HOST_CALL_STARTED_MAX_BYTES);
+        let projected_bytes = self.committed_bytes.saturating_add(needed_bytes);
+        if projected_bytes > normal_byte_limit {
+            return false;
+        }
+        true
+    }
+
     /// Terminal を予約 slot を使って append し、割り当てた sequence を返す（§8 規則9/10）。
     ///
     /// Started 済みであれば通常上限を使い切っていても必ず成功する（Terminal 専用予約を使う）。
@@ -1719,6 +1764,62 @@ mod tests {
             journal.append_terminal(&terminal_envelope(id, 1, TerminalOutcome::Completed)),
             Ok(1)
         );
+    }
+
+    // --- §11 host-call reserve 容量チェック（can_reserve_host_call） ---
+
+    #[test]
+    fn can_reserve_host_call_true_with_default_budget() {
+        // 既定予算は 100,000 event / 16 MiB。Started 直後は triple を余裕で収められる。
+        let id = exec_id(1);
+        let mut journal = AuditJournal::open(AuditBudget::default());
+        journal.append_normal(&started_envelope(id, 0)).unwrap();
+        assert!(journal.can_reserve_host_call());
+    }
+
+    #[test]
+    fn can_reserve_host_call_false_when_only_started_fits_but_not_triple() {
+        // §15.3 境界: Started 1 件だけは収まるが triple（Started + close reserve 2 件）は収まらない
+        // event 数を作る。max_events=4, terminal_reserve=1 → 通常枠は 3 件。triple は 1+2=3 件
+        // 必要なので Started(1 件 commit) 後は残り 2 件で足りない → false。
+        let id = exec_id(1);
+        let budget = AuditBudget {
+            max_events: 4,
+            ..AuditBudget::default()
+        };
+        assert_eq!(budget.validate(), Ok(()));
+        let mut journal = AuditJournal::open(budget);
+        journal.append_normal(&started_envelope(id, 0)).unwrap();
+        // committed_events=1、通常枠=3。triple に必要な needed_events=3 → 1+3=4 > 3 で false。
+        assert!(!journal.can_reserve_host_call());
+    }
+
+    #[test]
+    fn can_reserve_host_call_false_when_byte_budget_too_small() {
+        // byte 枠が triple share（Started 60 KiB + close reserve 128 KiB）に満たない境界。
+        // terminal_reserve_bytes=64 KiB は固定なので、max_encoded_bytes を share ちょうど下回る値に。
+        let id = exec_id(1);
+        let budget = AuditBudget {
+            // 通常 byte 枠 = max_encoded_bytes - 64 KiB。share = 128 KiB + 60 KiB = 188 KiB。
+            // max_encoded_bytes = 64 KiB + 188 KiB - 1 にすると通常枠が share を 1 byte 下回る。
+            max_encoded_bytes: 64 * KIB + 188 * KIB - 1,
+            ..AuditBudget::default()
+        };
+        assert_eq!(budget.validate(), Ok(()));
+        let mut journal = AuditJournal::open(budget);
+        journal.append_normal(&started_envelope(id, 0)).unwrap();
+        assert!(!journal.can_reserve_host_call());
+    }
+
+    #[test]
+    fn can_reserve_host_call_false_after_terminal() {
+        let id = exec_id(1);
+        let mut journal = AuditJournal::open(AuditBudget::default());
+        journal.append_normal(&started_envelope(id, 0)).unwrap();
+        journal
+            .append_terminal(&terminal_envelope(id, 1, TerminalOutcome::Completed))
+            .unwrap();
+        assert!(!journal.can_reserve_host_call());
     }
 
     // --- §7.3 BudgetChargeAccumulator ---

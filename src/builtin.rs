@@ -147,13 +147,18 @@ impl Evaluator {
                 // 入る（副作用が始まる）前に課金する（§6.1、REV-015 Slice 2）。read 系は
                 // request 0 byte。
                 let is_host_call = crate::builtin_core::is_host_call_builtin(name);
-                if is_host_call {
+                // request byte 数は課金と、Phase 6 の host-call lifecycle 監査（HostCallStarted /
+                // request payload）で共有する。非 host-call は 0。
+                let request_bytes_for_audit = if is_host_call {
                     let request_bytes =
                         crate::builtin_core::host_call_request_bytes(name, &evaluated);
                     self.budget
                         .charge_host_call_request(request_bytes, ExecutionPhase::Run)
                         .map_err(|stop| self.control_stop_to_error(stop, line))?;
-                }
+                    request_bytes
+                } else {
+                    0
+                };
                 let max_collection = self.budget.max_collection_elements();
                 let language_revision = self.language_revision();
                 // REV-001: to_str / join は値を表示して文字列化するため、budget-aware な
@@ -182,14 +187,37 @@ impl Evaluator {
                     // C10: filesystem builtin は grant 有無に関わらず常に capability 経路を通す。
                     // 未 grant（filesystem() が None）なら dispatch_fs が adapter/OS call 0 で
                     // 単一の sandbox denial を返す。ambient std::fs fallback へは落ちない。
-                    Some(crate::builtin_core::dispatch_fs(
+                    let fs_result = crate::builtin_core::dispatch_fs(
                         name,
                         &evaluated,
                         self.capabilities().filesystem(),
                         max_collection,
                         language_revision,
                         line,
-                    )?)
+                    );
+                    // Phase 6（§7.2/§8）: filesystem は唯一の tree host-call 境界なので、ここで
+                    // host-call lifecycle triple（HostCallStarted → CapabilityDecision →
+                    // HostCallFinished）を監査バッファへ積む。buffer は監査付き facade が drain
+                    // するときだけ emission され、sink 無し経路は drain しない（opt-in、byte 不変）。
+                    // 既存の制御フロー（成功時 response byte 課金・error 伝播）は triple を積んだ後
+                    // も厳密に保つため、`fs_result` を `?` で畳む前に triple を構築・push する。
+                    if is_host_call {
+                        let response_bytes = match &fs_result {
+                            Ok(value) => crate::builtin_core::host_call_response_bytes(name, value),
+                            Err(_) => 0,
+                        };
+                        let op_id = self.alloc_host_call_operation_id(line)?;
+                        let triple = crate::builtin_core::host_call_triple(
+                            op_id,
+                            name,
+                            request_bytes_for_audit,
+                            &fs_result,
+                            response_bytes,
+                        );
+                        self.push_host_call_events(triple);
+                    }
+                    // ここで初めて error を伝播する（triple は deny/host-error でも push 済み）。
+                    Some(fs_result?)
                 } else {
                     crate::builtin_core::dispatch(name, &evaluated, max_collection, line)?
                 };
