@@ -181,7 +181,7 @@ pub use stable_error::{ErrorCode, ErrorMessageId, StableError, StableFrame};
 pub use audit::{
     AuditAck, AuditBudget, AuditConfigError, AuditEnvelope, AuditError, AuditErrorPayload,
     AuditEvent, AuditFailure, AuditFrame, AuditJournal, AuditPayload, AuditPayloadField, AuditSink,
-    AuditSinkError, AuditSubmit, AuditTicket, AuditWaker, BudgetChargeReason,
+    AuditSinkError, AuditSubmit, AuditTicket, AuditWaker, AuditYieldReason, BudgetChargeReason,
     CapabilityDecisionKind, EffectStatus, ExecutionMode, HostCallOutcome, HostTimestamp,
     InMemoryAuditSink, ScriptedAuditSink, ScriptedResponse, SyncAuditSink, TerminalOutcome,
 };

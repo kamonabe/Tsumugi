@@ -53,6 +53,44 @@ pub enum SliceOutcome {
     Terminal(Result<(), TsumugiError>),
 }
 
+/// yield した [`SliceOutcome`] を監査 event の [`AuditYieldReason`] へ写す（Phase 6、§7.2/§8）。
+///
+/// yield 事由（slice fuel 枯渇 / cooperative host-call pending / 明示 yield）だけが
+/// `Some(reason)` を返す。`Terminal` は yield ではないので `None`。この写像は純粋関数で、
+/// 評価器状態・課金・外部効果に触れない（意味論不変）。
+///
+/// 設計 §7.2 の `AuditYieldReason` のうち、ここで写すのは tree evaluator の `run_slice` が
+/// 返しうる 3 変種だけである。`AdmissionQueued` / `SchedulerPreempted` / `HostPaused` は
+/// engine-poll 経路（sink を持たない）でのみ生じ、A-1 監査付き facade では emission しない
+/// （`docs/determinism-and-audit.md` §14 の A-1 逸脱）。`HostPaused` は pause 経路から直接
+/// [`audit_yield_reason_for_pause`] で作る（公開 `YieldReason` へは追加しない、§8）。
+pub(crate) fn audit_yield_reason_from(
+    outcome: &SliceOutcome,
+) -> Option<crate::audit::AuditYieldReason> {
+    use crate::audit::AuditYieldReason;
+    match outcome {
+        SliceOutcome::YieldedSliceFuel => Some(AuditYieldReason::SliceFuelExhausted),
+        SliceOutcome::YieldedHostCall { call_id } => {
+            Some(AuditYieldReason::HostCallPending { call_id: *call_id })
+        }
+        SliceOutcome::YieldedExplicit => Some(AuditYieldReason::ExplicitYield),
+        SliceOutcome::Terminal(_) => None,
+    }
+}
+
+/// host pause（`ExecutionHandle::pause`）に対応する [`AuditYieldReason`]（§8）。
+///
+/// pause/resume は engine-poll 経路の操作で sink を持たないため、A-1 監査付き facade では
+/// emission されない（`docs/determinism-and-audit.md` §14 の A-1 逸脱）。写像の完全性と将来の
+/// 配線のために定義しておく。`HostPaused` を script 可視の公開 `YieldReason` へは追加しない。
+///
+/// A-1 監査付き facade からは呼ばれない（pause 経路に sink が無い、§14）。将来の sink-bearing
+/// pause 配線で使うため定義し、意図的な未使用を明示する。
+#[allow(dead_code)]
+pub(crate) fn audit_yield_reason_for_pause() -> crate::audit::AuditYieldReason {
+    crate::audit::AuditYieldReason::HostPaused
+}
+
 /// Pending 中の host-call（REV-015 Slice 5、設計 §4.7）。
 ///
 /// `run_slice` が `YieldedHostCall { call_id }` を返した時点で `Evaluator` が保持し、handle が
@@ -368,6 +406,24 @@ pub struct Evaluator {
     /// へ流す。sink 無し経路は drain しないため emission ゼロ・byte-for-byte 不変（§1.1 opt-in）。
     /// push は意味論・課金・外部効果へ影響しない軽量操作に保つ。
     host_call_events: Vec<crate::audit::AuditEvent>,
+    /// yield/resume lifecycle 監査 event（§7.2 CBOR tag 5/6）に発番する poll_index の次値
+    /// （Phase 6、設計 determinism-and-audit.md §7.2/§8）。execution ごとに 0 始まりで単調増加し、
+    /// 1 回の yield/resume pair（`Yielded` とその直後の `Resumed`）へ同値を使う。REPL 再利用で
+    /// 巻き戻さないよう `reset_budget` で 0 へ戻す。`next_host_operation_id` と同じ fail-closed 規律。
+    poll_index: u64,
+    /// 直前の slice が yield した事由（§8 規則8）。`run_slice` が yield 分岐で `Some(reason)` に
+    /// 設定し、次の `run_slice`（resume）の先頭で `take` して `Resumed { previous_reason }` を
+    /// 組む。resume ではない通常終了・terminal では `None`。
+    last_yield_reason: Option<crate::audit::AuditYieldReason>,
+    /// 直前の yield に発番した poll_index（§8）。`Yielded` と対になる `Resumed` が同じ値を使い、
+    /// golden test で `previous_reason`/poll_index が揃うようにする。
+    last_yield_poll_index: u64,
+    /// yield/resume lifecycle 監査 event の emission 待ちバッファ（§7.3 の `BudgetCharged` 蓄積・
+    /// host-call triple と同じ deferred-drain 規律）。`run_slice` が slice 境界で `Resumed`/
+    /// `Yielded` を temporal 順に push し、監査付き facade（`run_audited_inner`）だけが
+    /// [`Self::drain_yield_events`] で drain して journal へ流す。sink 無し経路は drain しないため
+    /// emission ゼロ・byte-for-byte 不変（§1.1 opt-in）。push は意味論・課金・外部効果へ影響しない。
+    yield_events: Vec<crate::audit::AuditEvent>,
     /// cooperative host-call の Pending により文/反復境界で yield を要求されたか（設計 §4.7）。
     ///
     /// `eval_call` が `Pending` を受けると `pending_host_call` を立ててこのフラグを `true` にし、
@@ -444,6 +500,11 @@ impl Evaluator {
             // host-call lifecycle 監査（Phase 6）。execution ごとに 0 始まり。
             next_host_operation_id: 0,
             host_call_events: Vec::new(),
+            // yield/resume lifecycle 監査（Phase 6）。execution ごとに 0 始まり。
+            poll_index: 0,
+            last_yield_reason: None,
+            last_yield_poll_index: 0,
+            yield_events: Vec::new(),
             yield_for_host_call: false,
             resumed_host_call: None,
             // 既定は現行 revision（=0.21）。埋め込み host が set_language_revision で上書きする。
@@ -475,6 +536,12 @@ impl Evaluator {
         // REPL 再利用で operation_id を巻き戻し、前実行の triple を持ち越さない（§7.2/§8）。
         self.next_host_operation_id = 0;
         self.host_call_events.clear();
+        // yield/resume lifecycle 監査（Phase 6）の poll_index と buffer も execution ごとに戻す。
+        // REPL 再利用で poll_index を巻き戻し、前実行の pending resume / yield event を持ち越さない。
+        self.poll_index = 0;
+        self.last_yield_reason = None;
+        self.last_yield_poll_index = 0;
+        self.yield_events.clear();
         // heap 台帳を作り直したので、cell 課金用のハンドルを Env へ配り直す（REV-015 PR-c）。
         self.env.set_heap_ledger(self.budget.heap_handle());
     }
@@ -949,6 +1016,30 @@ impl Evaluator {
         std::mem::take(&mut self.host_call_events)
     }
 
+    /// 1 つの yield/resume poll point へ監査 poll_index を発番する（Phase 6、§7.2/§8）。
+    ///
+    /// execution 内で 0 始まり単調増加。`checked_add` で overflow を fail-closed にし、通常運用で
+    /// 到達不能な overflow は [`Self::alloc_host_call_operation_id`] と同じく internal error
+    /// （terminal）へ写す。`Yielded` に新しい値を発番し、対になる `Resumed` は
+    /// `last_yield_poll_index` に退避した同値を再利用する。
+    fn alloc_poll_index(&mut self, line: usize) -> Result<u64, TsumugiError> {
+        let index = self.poll_index;
+        self.poll_index = self
+            .poll_index
+            .checked_add(1)
+            .ok_or_else(|| TsumugiError::internal(line, "yield poll_index を割り当てできません"))?;
+        Ok(index)
+    }
+
+    /// 蓄積済みの yield/resume lifecycle event を drain して返す（Phase 6、§8 規則7/8/9）。
+    ///
+    /// embedding facade の監査経路が Started と Terminal の間で呼ぶ。[`Self::drain_host_call_events`]
+    /// / [`Self::drain_budget_charges`] と対称で、返した後はバッファを空にする。sink 無し経路は
+    /// これを呼ばないため emission ゼロ・byte-for-byte 不変（§1.1 opt-in）。
+    pub(crate) fn drain_yield_events(&mut self) -> Vec<crate::audit::AuditEvent> {
+        std::mem::take(&mut self.yield_events)
+    }
+
     /// 実行セッションを開始する（REV-015 Slice 3 PR-d-2、poll 経路の初回）。
     ///
     /// import を link し、source/import/AST heap を Link フェーズで課金し、REPL transaction を
@@ -1037,6 +1128,21 @@ impl Evaluator {
             .as_ref()
             .expect("run_slice requires an active session")
             .base_depth;
+        // §8 規則8: resume 後の最初の semantic work より前に `Resumed` を buffer する（Phase 6）。
+        // 直前の slice が yield 事由を残していれば、その事由と pair の poll_index を再利用して
+        // `Resumed { previous_reason, poll_index, usage }` を yield_events へ積む。run_driver を
+        // 呼ぶ前（まだ 1 文も実行していない）に積むので §8 規則8 を満たす。sink 無し経路は drain
+        // しないため emission ゼロ・byte-for-byte 不変。
+        if let Some(previous_reason) = self.last_yield_reason.take() {
+            let usage = self.budget.usage();
+            let poll_index = self.last_yield_poll_index;
+            self.yield_events.push(crate::audit::AuditEvent::Resumed {
+                previous_reason,
+                poll_index,
+                usage,
+            });
+        }
+
         // この slice の fuel 予算を張り直す（slice ごとに 0 から数える）。
         self.slice_fuel_used = 0;
         self.slice_fuel_limit = Some(slice_fuel);
@@ -1056,12 +1162,42 @@ impl Evaluator {
                 // host-call pending が立っていれば HostCallPending、そうでなければ slice fuel 枯渇
                 // の yield（設計 §4.7）。host-call を Pending にする builtin dispatch は FEAT-003 で
                 // 載せるため、本 Slice では通常この分岐は `YieldedSliceFuel` を返す。
-                match self.pending_host_call.as_ref() {
+                let slice_outcome = match self.pending_host_call.as_ref() {
                     Some(pending) => SliceOutcome::YieldedHostCall {
                         call_id: pending.call_id,
                     },
                     None => SliceOutcome::YieldedSliceFuel,
+                };
+                // Phase 6（§7.2/§8 規則7）: この yield 境界で `Yielded` を buffer する。
+                // 規則7: `Yielded` の前に budget accumulator を flush する。flush 済みの
+                // `BudgetCharged` を yield_events へ先に積むことで、drain 時の stream が
+                // 「この slice の charges → Yielded」順になる（facade の最終 flush とは別に、
+                // 各 yield 境界で per-slice charges を Yielded の直前へ確定させる）。
+                if let Some(reason) = audit_yield_reason_from(&slice_outcome) {
+                    // 規則7: flush（この slice ぶんの BudgetCharged を確定）してから Yielded。
+                    let charges = self.drain_budget_charges();
+                    self.yield_events.extend(charges);
+                    // poll_index を新規発番し、pair の Resumed が再利用できるよう退避する。
+                    // overflow（通常到達不能）は fail-closed で terminal 化する。
+                    match self.alloc_poll_index(0) {
+                        Ok(poll_index) => {
+                            let usage = self.budget.usage();
+                            self.yield_events.push(crate::audit::AuditEvent::Yielded {
+                                reason: reason.clone(),
+                                poll_index,
+                                usage,
+                            });
+                            self.last_yield_reason = Some(reason);
+                            self.last_yield_poll_index = poll_index;
+                        }
+                        Err(e) => {
+                            // poll_index 枯渇は internal terminal。session を rollback して終了する。
+                            self.finalize_session(false);
+                            return SliceOutcome::Terminal(Err(e));
+                        }
+                    }
                 }
+                slice_outcome
             }
             Ok(DriveOutcome::Done(result)) => {
                 // 本体完了。EvalResult を terminal 結果へ写し、transaction / module を finalize。
@@ -4008,6 +4144,62 @@ mod tests {
             )
             .expect_err("empty registry");
             assert_eq!(err.error_type(), "name");
+        }
+    }
+
+    /// Phase 6: yield 事由 → `AuditYieldReason` 写像のユニットテスト（§7.2/§8）。
+    mod audit_yield_reason {
+        use super::super::{SliceOutcome, audit_yield_reason_for_pause, audit_yield_reason_from};
+        use crate::audit::AuditYieldReason;
+        use crate::error::TsumugiError;
+
+        #[test]
+        fn slice_fuel_maps_to_slice_fuel_exhausted() {
+            assert_eq!(
+                audit_yield_reason_from(&SliceOutcome::YieldedSliceFuel),
+                Some(AuditYieldReason::SliceFuelExhausted)
+            );
+        }
+
+        #[test]
+        fn host_call_maps_to_host_call_pending_with_call_id() {
+            assert_eq!(
+                audit_yield_reason_from(&SliceOutcome::YieldedHostCall { call_id: 42 }),
+                Some(AuditYieldReason::HostCallPending { call_id: 42 })
+            );
+        }
+
+        #[test]
+        fn explicit_maps_to_explicit_yield() {
+            assert_eq!(
+                audit_yield_reason_from(&SliceOutcome::YieldedExplicit),
+                Some(AuditYieldReason::ExplicitYield)
+            );
+        }
+
+        #[test]
+        fn terminal_ok_maps_to_none() {
+            assert_eq!(
+                audit_yield_reason_from(&SliceOutcome::Terminal(Ok(()))),
+                None
+            );
+        }
+
+        #[test]
+        fn terminal_err_maps_to_none() {
+            // terminal は yield ではないので、エラー terminal でも None（yield event を出さない）。
+            let err = TsumugiError::break_outside_loop(1);
+            assert_eq!(
+                audit_yield_reason_from(&SliceOutcome::Terminal(Err(err))),
+                None
+            );
+        }
+
+        #[test]
+        fn pause_maps_to_host_paused() {
+            // pause は engine-poll 経路（sink 無し）でのみ生じ、A-1 では emission しないが、
+            // 写像の完全性のため HostPaused を返す（§8、§14）。
+            assert_eq!(audit_yield_reason_for_pause(), AuditYieldReason::HostPaused);
         }
     }
 }

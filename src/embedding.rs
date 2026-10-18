@@ -178,6 +178,14 @@ pub struct EngineConfig {
     /// `Terminal` を journal 経由で emission する（§8/§10）。§1.1 の sink 必須ポリシーは
     /// 後続スライスへ延期する（opt-in の逸脱、`docs/determinism-and-audit.md` §14 参照）。
     pub audit_sink: Option<Arc<dyn crate::audit::AuditSink>>,
+    /// 監査付き run 経路（`run_transactional`）が 1 slice に許す fuel 上限（Phase 6、D3）。
+    ///
+    /// 既定 `None` は従来どおり `u64::MAX`（単一 slice で terminal まで回す）で、観測結果・出力
+    /// byte 列・課金は従来と完全一致する。小さい値を設定すると監査付き実行が複数 slice に分かれ、
+    /// 文/反復境界で実際に `Yielded(SliceFuelExhausted)` が起きて `Yielded`/`Resumed` 監査 event が
+    /// 流れる。これは実 yield を監査下で観測可能にするための非破壊な橋渡しであり、`run_guarded`
+    /// （sink 無し経路）には影響しない（そちらは常に `u64::MAX`、§1.1 opt-in）。
+    pub audit_slice_fuel: Option<u64>,
 }
 
 impl Default for EngineConfig {
@@ -190,6 +198,7 @@ impl Default for EngineConfig {
             backend: Backend::TreeWalk,
             language_revision: LanguageRevision::CURRENT,
             audit_sink: None,
+            audit_slice_fuel: None,
         }
     }
 }
@@ -208,6 +217,7 @@ impl std::fmt::Debug for EngineConfig {
                     "none"
                 },
             )
+            .field("audit_slice_fuel", &self.audit_slice_fuel)
             .finish()
     }
 }
@@ -350,6 +360,17 @@ impl EngineBuilder {
     /// [`Self::build`] すると [`ConfigError::AuditSinkWithExperimentalBackend`] を返す。
     pub fn audit_sink(mut self, sink: Arc<dyn crate::audit::AuditSink>) -> Self {
         self.config.audit_sink = Some(sink);
+        self
+    }
+
+    /// 監査付き run 経路の 1 slice あたり fuel 上限を設定する（Phase 6、D3、opt-in）。
+    ///
+    /// 既定（未設定）は `u64::MAX` 相当で、監査付き実行も単一 slice で terminal まで回す
+    /// （従来挙動・byte-for-byte 不変）。小さい値を設定すると監査付き実行が複数 slice に分かれ、
+    /// 文/反復境界で実際の `Yielded(SliceFuelExhausted)` が起き、`Yielded`/`Resumed` 監査 event が
+    /// Started と Terminal の間に流れる。sink 無し経路（`run_guarded`）はこの設定に影響されない。
+    pub fn audit_slice_fuel(mut self, slice_fuel: u64) -> Self {
+        self.config.audit_slice_fuel = Some(slice_fuel);
         self
     }
 
@@ -2140,6 +2161,44 @@ impl Engine {
             }
         }
 
+        // 4.45 Yielded/Resumed を drain して Started(seq 0) と Terminal の間へ append
+        // （§7.2/§8 規則7/8/9、Phase 6）。評価器は slice 境界で temporal 順に積んである:
+        // 各 yield 境界で「その slice ぶんの BudgetCharged（規則7 の flush）→ Yielded」、各 resume
+        // 境界で「Resumed（規則8、resume 後の最初の work の前）」。したがって drain した順に
+        // append すれば §8 の順序になる。固定 drain 順は host-call triple → BudgetCharged（最終
+        // flush、下記 4.5）→ Yielded/Resumed ではなく、yield_events を 4.5 の最終 flush より **前**
+        // に出す（yield_events が運ぶ charges は時間的に早い slice のもので、4.5 が運ぶのは最終
+        // slice の charges のため、temporal 順で yield_events が先）。append/submit の規約は
+        // BudgetCharged と同一（連続 sequence・同 execution の ack）。sink 無し経路（run_guarded）は
+        // drain しないので emission ゼロ・byte-for-byte 不変（§1.1 opt-in）。
+        for yield_event in context.evaluator.drain_yield_events() {
+            let seq = journal.next_sequence();
+            match journal.append_normal(&make_envelope(seq, yield_event.clone())) {
+                Ok(appended_seq) => {
+                    let batch: Arc<[AuditEnvelope]> =
+                        Arc::from(vec![make_envelope(appended_seq, yield_event)]);
+                    let delivered = matches!(
+                        sink.submit(batch, AuditWaker::noop()),
+                        AuditSubmit::Ack(ack)
+                            if ack.execution_id == execution_id
+                                && ack.through_sequence == appended_seq
+                    );
+                    if !delivered {
+                        return AuditedOutcome::AuditFailed {
+                            withheld: crate::audit::terminal_outcome_from(&outcome, None),
+                            failure: AuditFailure::Sink,
+                        };
+                    }
+                }
+                Err(failure) => {
+                    return AuditedOutcome::AuditFailed {
+                        withheld: crate::audit::terminal_outcome_from(&outcome, None),
+                        failure,
+                    };
+                }
+            }
+        }
+
         // 4.5 BudgetCharged を drain して Started(seq 0) と Terminal の間へ append（§7.3 / §8 規則7）。
         // Terminal 直前に最終 flush を強制し、どの charge も取りこぼさない。drain は accumulator を
         // 空にする軽量操作で、返った `BudgetCharged` を 1 件ずつ journal へ append_normal し、
@@ -2351,7 +2410,15 @@ impl Engine {
             .evaluator
             .set_host_registry(std::sync::Arc::clone(&self.host_registry));
 
-        let outcome = Self::run_transactional(context, program, root_source_bytes);
+        // Phase 6（D3）: 監査付き経路だけ、config の slice fuel で複数 slice に分けて回す。
+        // sink 無し経路（run_guarded）は常に u64::MAX で単一 slice のまま（byte-for-byte 不変）。
+        // 既定（audit_slice_fuel 未設定）は監査付きでも u64::MAX で、従来挙動と一致する。
+        let slice_fuel = if self.config.audit_sink.is_some() {
+            self.config.audit_slice_fuel.unwrap_or(u64::MAX)
+        } else {
+            u64::MAX
+        };
+        let outcome = Self::run_transactional(context, program, root_source_bytes, slice_fuel);
 
         // capability 集合も host function registry も reusable context に持ち越さない（仕様第15節
         // 規則5・6）。次 request の empty set か再注入まで、ambient 互換の既定へ戻す。
@@ -2368,6 +2435,7 @@ impl Engine {
         context: &mut ExecutionContext,
         program: &Program,
         root_source_bytes: u64,
+        slice_fuel: u64,
     ) -> ExecutionOutcome {
         // begin_execution → run_slice を terminal まで回す（engine.rs の poll と同じ手順）。
         // E4: transaction を全面適用する（transactional=true。AUD-024 / 仕様第10節 規則5）。
@@ -2386,12 +2454,13 @@ impl Engine {
         }
 
         loop {
-            // 大きな slice で 1 回ずつ回す（協調 yield の実効化は Phase 4）。同期実行なので
-            // terminal まで回し切る。
-            // run_slice は SliceOutcome を返す（REV-015 Slice 5、設計 §4.7）。同期経路は
-            // slice=u64::MAX のため yield は実質起きず、host-call pending も Ready フォールバック
-            // のため起きないが、型に合わせて全 yield 変種を continue で回し切る（観測挙動不変、§7）。
-            match context.evaluator.run_slice(u64::MAX) {
+            // slice fuel で 1 回ずつ回す（協調 yield の実効化は Phase 4）。同期実行なので
+            // terminal まで回し切る。`slice_fuel` は既定 u64::MAX（単一 slice で yield なし・
+            // 従来挙動）だが、監査付き経路で小さい値を渡すと実 `Yielded(SliceFuelExhausted)` が
+            // 起きて Yielded/Resumed 監査 event が流れる（Phase 6、D3）。
+            // run_slice は SliceOutcome を返す（REV-015 Slice 5、設計 §4.7）。全 yield 変種を
+            // continue で回し切る（観測結果は slice 分割に依らず不変、§3 metamorphic / §7）。
+            match context.evaluator.run_slice(slice_fuel) {
                 SliceOutcome::YieldedSliceFuel
                 | SliceOutcome::YieldedHostCall { .. }
                 | SliceOutcome::YieldedExplicit => continue,
@@ -2906,6 +2975,7 @@ mod tests {
             backend: Backend::VmExperimental,
             language_revision: LanguageRevision::CURRENT,
             audit_sink: None,
+            audit_slice_fuel: None,
         };
         let err = Engine::builder()
             .config(config.clone())
@@ -2931,6 +3001,7 @@ mod tests {
             backend: Backend::VmExperimental,
             language_revision: LanguageRevision::CURRENT,
             audit_sink: None,
+            audit_slice_fuel: None,
         };
         let err = Engine::builder()
             .config(config)
