@@ -356,6 +356,18 @@ pub struct Evaluator {
     can_yield_ctx: bool,
     /// host-call に発番する call_id の次値（REV-015 Slice 5、設計 §4.7）。単調増加。
     next_host_call_id: u64,
+    /// host-call lifecycle 監査 event（§7.2 CBOR tag 1/2/3）に発番する operation_id の次値
+    /// （Phase 6、設計 determinism-and-audit.md §7.2/§8）。execution ごとに 0 始まりで単調増加し、
+    /// 1 host call の triple（`HostCallStarted` / `CapabilityDecision` / `HostCallFinished`）へ
+    /// 同値を operation_id / call_id 兼用で使う。REPL 再利用で巻き戻さないよう `reset_budget` で
+    /// 0 へ戻す。`next_host_call_id`（cooperative host-call の call_id、Slice 5）とは別概念。
+    next_host_operation_id: u64,
+    /// host-call lifecycle 監査 event の emission 待ちバッファ（§7.3 の `BudgetCharged` 蓄積と
+    /// 同じ deferred-drain 規律）。host-call 境界が triple を emission 順で push し、監査付き
+    /// facade（`run_audited_inner`）だけが [`Self::drain_host_call_events`] で drain して journal
+    /// へ流す。sink 無し経路は drain しないため emission ゼロ・byte-for-byte 不変（§1.1 opt-in）。
+    /// push は意味論・課金・外部効果へ影響しない軽量操作に保つ。
+    host_call_events: Vec<crate::audit::AuditEvent>,
     /// cooperative host-call の Pending により文/反復境界で yield を要求されたか（設計 §4.7）。
     ///
     /// `eval_call` が `Pending` を受けると `pending_host_call` を立ててこのフラグを `true` にし、
@@ -429,6 +441,9 @@ impl Evaluator {
             // 既定は yield 不可（同期経路。run_driver が slice 開始時に設定する）。
             can_yield_ctx: false,
             next_host_call_id: 0,
+            // host-call lifecycle 監査（Phase 6）。execution ごとに 0 始まり。
+            next_host_operation_id: 0,
+            host_call_events: Vec::new(),
             yield_for_host_call: false,
             resumed_host_call: None,
             // 既定は現行 revision（=0.21）。埋め込み host が set_language_revision で上書きする。
@@ -456,6 +471,10 @@ impl Evaluator {
         self.budget.set_clock(clock);
         // 監査用の退避 resource も実行開始でクリアする（前実行の残骸を持ち越さない）。
         self.last_budget_resource.set(None);
+        // host-call lifecycle 監査（Phase 6）の id counter と buffer も execution ごとに戻す。
+        // REPL 再利用で operation_id を巻き戻し、前実行の triple を持ち越さない（§7.2/§8）。
+        self.next_host_operation_id = 0;
+        self.host_call_events.clear();
         // heap 台帳を作り直したので、cell 課金用のハンドルを Env へ配り直す（REV-015 PR-c）。
         self.env.set_heap_ledger(self.budget.heap_handle());
     }
@@ -891,6 +910,43 @@ impl Evaluator {
     /// [`Self::budget_usage`] と対称。意味論・charge 挙動は変えない。
     pub(crate) fn drain_budget_charges(&mut self) -> Vec<crate::audit::AuditEvent> {
         self.budget.drain_budget_charges()
+    }
+
+    /// 1 host call へ監査 operation_id を発番する（Phase 6、§7.2）。
+    ///
+    /// execution 内で 0 始まり単調増加。`checked_add` で overflow を fail-closed にし、通常運用で
+    /// 到達不能な overflow は [`allocate_function_id`](Self::allocate_function_id) と同じく
+    /// internal error（terminal）へ写す。発番した id は triple の operation_id / call_id に兼用する。
+    pub(crate) fn alloc_host_call_operation_id(
+        &mut self,
+        line: usize,
+    ) -> Result<u64, TsumugiError> {
+        let id = self.next_host_operation_id;
+        self.next_host_operation_id =
+            self.next_host_operation_id.checked_add(1).ok_or_else(|| {
+                TsumugiError::internal(line, "host-call operation_id を割り当てできません")
+            })?;
+        Ok(id)
+    }
+
+    /// host-call lifecycle triple を emission 待ちバッファへ積む（Phase 6、§8 規則3）。
+    ///
+    /// `BudgetCharged` の accumulator と同じく、push は常に走ってよい軽量操作で意味論・課金・
+    /// 外部効果を変えない。実際の emission は監査付き facade が [`Self::drain_host_call_events`]
+    /// で drain するときだけ行う（sink 無し経路は drain しない）。
+    pub(crate) fn push_host_call_events(
+        &mut self,
+        events: impl IntoIterator<Item = crate::audit::AuditEvent>,
+    ) {
+        self.host_call_events.extend(events);
+    }
+
+    /// 蓄積済みの host-call lifecycle event を drain して返す（Phase 6、§8 規則7）。
+    ///
+    /// embedding facade の監査経路が Started と Terminal の間で呼ぶ。[`Self::drain_budget_charges`]
+    /// と対称で、返した後はバッファを空にする。sink 無し経路はこれを呼ばないため emission ゼロ。
+    pub(crate) fn drain_host_call_events(&mut self) -> Vec<crate::audit::AuditEvent> {
+        std::mem::take(&mut self.host_call_events)
     }
 
     /// 実行セッションを開始する（REV-015 Slice 3 PR-d-2、poll 経路の初回）。

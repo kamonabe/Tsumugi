@@ -180,8 +180,8 @@ pub use stable_error::{ErrorCode, ErrorMessageId, StableError, StableFrame};
 // `EngineBuilder::audit_sink` で設定しない限り emission は起きない（§1.1 の sink 必須は後続）。
 pub use audit::{
     AuditAck, AuditBudget, AuditConfigError, AuditEnvelope, AuditError, AuditErrorPayload,
-    AuditEvent, AuditFailure, AuditFrame, AuditJournal, AuditSink, AuditSinkError, AuditSubmit,
-    AuditTicket, AuditWaker, BudgetChargeReason, CapabilityDecisionKind, EffectStatus,
-    ExecutionMode, HostCallOutcome, HostTimestamp, InMemoryAuditSink, ScriptedAuditSink,
-    ScriptedResponse, SyncAuditSink, TerminalOutcome,
+    AuditEvent, AuditFailure, AuditFrame, AuditJournal, AuditPayload, AuditPayloadField, AuditSink,
+    AuditSinkError, AuditSubmit, AuditTicket, AuditWaker, BudgetChargeReason,
+    CapabilityDecisionKind, EffectStatus, ExecutionMode, HostCallOutcome, HostTimestamp,
+    InMemoryAuditSink, ScriptedAuditSink, ScriptedResponse, SyncAuditSink, TerminalOutcome,
 };

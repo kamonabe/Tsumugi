@@ -1031,6 +1031,162 @@ pub fn host_call_response_bytes(name: &str, result: &Value) -> u64 {
     }
 }
 
+/// filesystem host call 1 件を監査 lifecycle triple（§7.2/§8）へ分類する純関数。
+///
+/// 設計正本は [`docs/determinism-and-audit.md`](../docs/determinism-and-audit.md) §7.2（event
+/// schema・`effect_status` 意味）/ §8（emission 順序）/ §9（redaction 既定）である。tree backend の
+/// host-call 境界（[`dispatch_fs`]）が返した `result` を受け取り、`HostCallStarted` →
+/// `CapabilityDecision` → `HostCallFinished` の順に 3 event を構築して返す。VM へは配線しない。
+///
+/// `id` は 1 host call へ発番した単調 operation id で、`operation_id` と `call_id`（fs 操作は
+/// host call なので `Some`）に同値で使う（§7.2 の triple ID 再利用）。
+///
+/// # 分類（§7.2）
+///
+/// - **Deny**: `dispatch_fs` が `filesystem_denied`（`ErrorKind::Sandbox`）を返した場合、または
+///   capability lookup 前の path lexical error（`ErrorKind::Argument`）。外部効果は発生していない。
+///   `CapabilityDecision.decision = Deny`、`HostCallFinished { outcome: Denied, effect_status: None }`。
+/// - **HostError**: adapter/OS call が失敗（`ErrorKind::Host`）。`decision = Allow`（認可は通り
+///   adapter まで到達した）、`HostCallFinished.outcome = HostError`。`effect_status` は方向依存:
+///     - read 系（`read_file` / `read_lines`）は mutation しないので `None`。
+///     - write 系（`write_file` / `append_file`）は部分適用があり得るため `Unknown`（§7.2
+///       「crash recovery で prepare だけ残る entry は Unknown 相当」の方針に合わせ、失敗時に
+///       副作用が残り得る方向を Unknown とする）。
+/// - **Success**: `Ok`。`decision = Allow`、`outcome = Success`。`effect_status` は方向依存:
+///     - read 系は外部 mutation がないので `None`。
+///     - write 系は commit 済みなので `Committed`。
+///
+/// # payload（§9 redaction 既定、A-1 は leak-free プレースホルダ）
+///
+/// A-1 は redaction 本体を実装しないため、payload には **原本 byte 長だけ** を載せる。path は
+/// Path class なので `Omitted`（生 path を漏らさない、§9 Path 既定 + deny event で path を
+/// leak しない規則）、request/response body も既定 omit で `Omitted`。`error_code` は安定
+/// `ErrorCode` 文字列（`ErrorKind::as_str`）であり、script 可視 message は載せない（§9 意図）。
+/// `capability` / `action` / `rule_id` は path/secret を含まない Identifier 文字列にする。
+pub fn host_call_triple(
+    id: u64,
+    name: &str,
+    request_bytes: u64,
+    result: &Result<Value, TsumugiError>,
+    response_bytes: u64,
+) -> [crate::audit::AuditEvent; 3] {
+    use crate::audit::{
+        AuditEvent, AuditPayload, AuditPayloadField, CapabilityDecisionKind, EffectStatus,
+        HostCallOutcome,
+    };
+    use crate::error::ErrorKind;
+
+    let is_write = matches!(name, "write_file" | "append_file");
+
+    // decision / outcome / effect_status / error_code / rule_id を result から分類する。
+    let (decision, outcome, effect_status, error_code, rule_id) = match result {
+        Ok(_) => (
+            CapabilityDecisionKind::Allow,
+            HostCallOutcome::Success,
+            if is_write {
+                EffectStatus::Committed
+            } else {
+                EffectStatus::None
+            },
+            None,
+            "mount-granted".to_string(),
+        ),
+        Err(error) => match error.kind() {
+            // adapter/OS 失敗。認可は通っており（Allow）、外部効果が write 系では残り得る。
+            Some(ErrorKind::Host) => (
+                CapabilityDecisionKind::Allow,
+                HostCallOutcome::HostError,
+                if is_write {
+                    EffectStatus::Unknown
+                } else {
+                    EffectStatus::None
+                },
+                Some(ErrorKind::Host.as_str().to_string()),
+                "mount-granted".to_string(),
+            ),
+            // path lexical error（capability lookup 前）。外部効果なし＝Deny 扱い。
+            Some(kind @ ErrorKind::Argument) => (
+                CapabilityDecisionKind::Deny,
+                HostCallOutcome::Denied,
+                EffectStatus::None,
+                Some(kind.as_str().to_string()),
+                "invalid-path".to_string(),
+            ),
+            // filesystem_denied（mount 未登録・op 未 grant・sandbox 範囲外）。既定の deny。
+            Some(kind) => (
+                CapabilityDecisionKind::Deny,
+                HostCallOutcome::Denied,
+                EffectStatus::None,
+                Some(kind.as_str().to_string()),
+                "deny-by-default".to_string(),
+            ),
+            // kind なし（parse error 等）は到達しない想定だが、fail-safe に deny 扱い。
+            None => (
+                CapabilityDecisionKind::Deny,
+                HostCallOutcome::Denied,
+                EffectStatus::None,
+                None,
+                "deny-by-default".to_string(),
+            ),
+        },
+    };
+
+    // A-1 の leak-free payload: path は Omitted（Path class）、body は原本 byte 長だけ。
+    let request_payload = AuditPayload {
+        fields: vec![(
+            "body".to_string(),
+            AuditPayloadField::Omitted {
+                original_bytes: request_bytes,
+            },
+        )],
+    };
+    let resource_payload = AuditPayload {
+        fields: vec![(
+            "path".to_string(),
+            AuditPayloadField::Omitted {
+                // path 原本 byte 長は A-1 では手元に無いので 0（class 情報のみ）。
+                original_bytes: 0,
+            },
+        )],
+    };
+    let response_payload = AuditPayload {
+        fields: vec![(
+            "body".to_string(),
+            AuditPayloadField::Omitted {
+                original_bytes: response_bytes,
+            },
+        )],
+    };
+
+    [
+        AuditEvent::HostCallStarted {
+            operation_id: id,
+            call_id: id,
+            function: name.to_string(),
+            request: request_payload,
+            request_bytes,
+        },
+        AuditEvent::CapabilityDecision {
+            operation_id: id,
+            call_id: Some(id),
+            capability: "filesystem".to_string(),
+            action: name.to_string(),
+            resource: resource_payload,
+            decision,
+            rule_id,
+        },
+        AuditEvent::HostCallFinished {
+            operation_id: id,
+            call_id: id,
+            outcome,
+            response: response_payload,
+            response_bytes,
+            error_code,
+            effect_status,
+        },
+    ]
+}
+
 // C10: ambient fs builtin（read_file/read_lines/write_file/append_file ほか 14 名）の
 // `sandbox::check_path` + 生 `std::fs` 実装は削除した。fs builtin は tree/VM の dispatch 境界で
 // 必ず capability 経路（[`dispatch_fs`] → [`dispatch_filesystem_capability`]）を通る。
@@ -1717,6 +1873,149 @@ pub fn format_unix_timestamp(timestamp: i64, format: &str) -> String {
 
 fn is_leap_year(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+#[cfg(test)]
+mod host_call_triple_tests {
+    //! `host_call_triple` の分類ユニットテスト（§7.2/§8）。full run を回さずに、deny/allow/
+    //! host-error × read/write の分類と triple の ID 再利用・emission 順序を固定する。
+    use super::host_call_triple;
+    use crate::audit::{AuditEvent, CapabilityDecisionKind, EffectStatus, HostCallOutcome};
+    use crate::error::{ErrorKind, TsumugiError};
+    use crate::value::Value;
+
+    /// triple を (operation_id, call_id, decision, outcome, effect_status, error_code) へ畳む。
+    #[allow(clippy::type_complexity)]
+    fn parts(
+        triple: &[AuditEvent; 3],
+    ) -> (
+        u64,
+        Option<u64>,
+        u64,
+        CapabilityDecisionKind,
+        HostCallOutcome,
+        EffectStatus,
+        Option<String>,
+    ) {
+        let (started_op, started_call) = match &triple[0] {
+            AuditEvent::HostCallStarted {
+                operation_id,
+                call_id,
+                ..
+            } => (*operation_id, *call_id),
+            other => panic!("期待 HostCallStarted, 実際 {other:?}"),
+        };
+        let (decision, dec_op, dec_call) = match &triple[1] {
+            AuditEvent::CapabilityDecision {
+                operation_id,
+                call_id,
+                decision,
+                ..
+            } => (*decision, *operation_id, *call_id),
+            other => panic!("期待 CapabilityDecision, 実際 {other:?}"),
+        };
+        let (outcome, effect_status, error_code, fin_op, fin_call) = match &triple[2] {
+            AuditEvent::HostCallFinished {
+                outcome,
+                effect_status,
+                error_code,
+                operation_id,
+                call_id,
+                ..
+            } => (
+                *outcome,
+                *effect_status,
+                error_code.clone(),
+                *operation_id,
+                *call_id,
+            ),
+            other => panic!("期待 HostCallFinished, 実際 {other:?}"),
+        };
+        // ID はすべて triple 内で同値（§7.2 の再利用）。
+        assert_eq!(started_op, started_call);
+        assert_eq!(dec_op, started_op);
+        assert_eq!(dec_call, Some(started_op));
+        assert_eq!(fin_op, started_op);
+        assert_eq!(fin_call, started_op);
+        (
+            started_op,
+            dec_call,
+            started_call,
+            decision,
+            outcome,
+            effect_status,
+            error_code,
+        )
+    }
+
+    #[test]
+    fn read_success_is_allow_success_none() {
+        let result = Ok(Value::str_constant("hello".to_string()));
+        let triple = host_call_triple(0, "read_file", 0, &result, 5);
+        let (_, _, _, decision, outcome, effect, code) = parts(&triple);
+        assert_eq!(decision, CapabilityDecisionKind::Allow);
+        assert_eq!(outcome, HostCallOutcome::Success);
+        assert_eq!(effect, EffectStatus::None);
+        assert_eq!(code, None);
+    }
+
+    #[test]
+    fn write_success_is_allow_success_committed() {
+        let result = Ok(Value::Bool(true));
+        let triple = host_call_triple(3, "write_file", 11, &result, 0);
+        let (op, call, _, decision, outcome, effect, code) = parts(&triple);
+        assert_eq!(op, 3);
+        assert_eq!(call, Some(3));
+        assert_eq!(decision, CapabilityDecisionKind::Allow);
+        assert_eq!(outcome, HostCallOutcome::Success);
+        assert_eq!(effect, EffectStatus::Committed);
+        assert_eq!(code, None);
+    }
+
+    #[test]
+    fn denied_is_deny_denied_none_with_pair_and_triple() {
+        // filesystem_denied（ErrorKind::Sandbox）。Deny/Denied/None の 3 event が揃う（§8 規則4）。
+        let result: Result<Value, TsumugiError> = Err(TsumugiError::filesystem_denied(1));
+        let triple = host_call_triple(0, "read_file", 0, &result, 0);
+        // 順序は Started → Decision → Finished。
+        assert!(matches!(triple[0], AuditEvent::HostCallStarted { .. }));
+        assert!(matches!(triple[1], AuditEvent::CapabilityDecision { .. }));
+        assert!(matches!(triple[2], AuditEvent::HostCallFinished { .. }));
+        let (_, _, _, decision, outcome, effect, code) = parts(&triple);
+        assert_eq!(decision, CapabilityDecisionKind::Deny);
+        assert_eq!(outcome, HostCallOutcome::Denied);
+        assert_eq!(effect, EffectStatus::None);
+        assert_eq!(code, Some(ErrorKind::Sandbox.as_str().to_string()));
+    }
+
+    #[test]
+    fn host_error_write_is_allow_hosterror_unknown() {
+        let result: Result<Value, TsumugiError> = Err(TsumugiError::host_adapter_failed(
+            1,
+            "write_file",
+            "filesystem",
+        ));
+        let triple = host_call_triple(1, "write_file", 4, &result, 0);
+        let (_, _, _, decision, outcome, effect, code) = parts(&triple);
+        assert_eq!(decision, CapabilityDecisionKind::Allow);
+        assert_eq!(outcome, HostCallOutcome::HostError);
+        assert_eq!(effect, EffectStatus::Unknown);
+        assert_eq!(code, Some(ErrorKind::Host.as_str().to_string()));
+    }
+
+    #[test]
+    fn host_error_read_is_allow_hosterror_none() {
+        let result: Result<Value, TsumugiError> = Err(TsumugiError::host_adapter_failed(
+            1,
+            "read_file",
+            "filesystem",
+        ));
+        let triple = host_call_triple(2, "read_file", 0, &result, 0);
+        let (_, _, _, decision, outcome, effect, _) = parts(&triple);
+        assert_eq!(decision, CapabilityDecisionKind::Allow);
+        assert_eq!(outcome, HostCallOutcome::HostError);
+        assert_eq!(effect, EffectStatus::None);
+    }
 }
 
 #[cfg(test)]

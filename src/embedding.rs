@@ -2086,6 +2086,60 @@ impl Engine {
             },
         };
 
+        // 4.4 host-call lifecycle triple を drain して Started(seq 0) と Terminal の間へ append
+        // （§7.2/§8 規則3・7、Phase 6）。stream 順序は FIX: host-call triple 群を先に出し、その後
+        // 4.5 の BudgetCharged flush を出す（golden fixture の再現性のため固定する）。triple は
+        // 評価器が host-call 境界で push 順（Started → Decision → Finished）に積んであるので、drain
+        // した順にそのまま append すれば §8 規則3 の順序になる。各 triple の append 前に §11 の
+        // 容量チェック（can_reserve_host_call）を行い、収まらなければ triple を 1 件も出さず
+        // fail-closed（AuditFailure::BudgetExceeded）にする。append/submit の規約は BudgetCharged と
+        // 同一（連続 sequence・同 execution の ack）。sink 無し経路（run_guarded）は drain しないので
+        // emission ゼロ・byte-for-byte 不変（§1.1 opt-in）。
+        {
+            let host_call_events = context.evaluator.drain_host_call_events();
+            // triple 単位（3 event ごと）で reserve チェックする。先頭が HostCallStarted。
+            let mut index = 0usize;
+            while index < host_call_events.len() {
+                if matches!(host_call_events[index], AuditEvent::HostCallStarted { .. })
+                    && !journal.can_reserve_host_call()
+                {
+                    // §11: triple を収められない → Started/外部効果を出さず AuditFailure（drain 時
+                    // 容量チェック、§14 の A-1 逸脱どおり）。
+                    return AuditedOutcome::AuditFailed {
+                        withheld: crate::audit::terminal_outcome_from(&outcome, None),
+                        failure: AuditFailure::BudgetExceeded,
+                    };
+                }
+                let event = host_call_events[index].clone();
+                let seq = journal.next_sequence();
+                match journal.append_normal(&make_envelope(seq, event.clone())) {
+                    Ok(appended_seq) => {
+                        let batch: Arc<[AuditEnvelope]> =
+                            Arc::from(vec![make_envelope(appended_seq, event)]);
+                        let delivered = matches!(
+                            sink.submit(batch, AuditWaker::noop()),
+                            AuditSubmit::Ack(ack)
+                                if ack.execution_id == execution_id
+                                    && ack.through_sequence == appended_seq
+                        );
+                        if !delivered {
+                            return AuditedOutcome::AuditFailed {
+                                withheld: crate::audit::terminal_outcome_from(&outcome, None),
+                                failure: AuditFailure::Sink,
+                            };
+                        }
+                    }
+                    Err(failure) => {
+                        return AuditedOutcome::AuditFailed {
+                            withheld: crate::audit::terminal_outcome_from(&outcome, None),
+                            failure,
+                        };
+                    }
+                }
+                index += 1;
+            }
+        }
+
         // 4.5 BudgetCharged を drain して Started(seq 0) と Terminal の間へ append（§7.3 / §8 規則7）。
         // Terminal 直前に最終 flush を強制し、どの charge も取りこぼさない。drain は accumulator を
         // 空にする軽量操作で、返った `BudgetCharged` を 1 件ずつ journal へ append_normal し、
