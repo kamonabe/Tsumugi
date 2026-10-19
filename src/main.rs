@@ -625,10 +625,12 @@ fn run_source_vm(source: &str, script_path: &str, script_args: Vec<String>, froz
 
 /// VMモードのREPL。
 ///
-/// tree REPL（[`run_repl`]）は E7 で embedding Engine API へ統合済みだが、VM REPL は**現状維持**で
-/// ある。VM 経路の Engine 統合（`link`/`run` の VM backend 配線）は VM が experimental の間に行う
-/// E9（Phase 5）に依存するため、本経路は `Compiler` + `Vm::new_repl()` + `ModuleLoader` を直接
-/// transaction 管理する従来実装のまま残す。VM の Engine API 統合は E9 で行う。
+/// VM file/stdin（[`execute_vm_with_path`]）は link 層の Engine resolver gate へ統合済みだが、
+/// VM REPL は**現状維持**である。tree REPL（[`run_repl`]）は E7 で `link_for_repl`/`run_for_repl`
+/// の gate 迂回保全（CWD 相対 import・固定エラー文字列）で統合されており、link 層の Denied gate を
+/// 意図的に適用しない。VM REPL はこの tree REPL と**対称**に、import 解決を評価器内蔵
+/// [`ModuleLoader`] に委ねる従来実装（`Compiler` + `Vm::new_repl()` + `ModuleLoader` を 1 つの
+/// transaction として管理）のまま残す。VM backend adapter 本体（run 経路の Engine 統合）は E9 残。
 fn run_repl_vm(frozen: CapabilitySet) {
     write_stdout(&format!(
         "Tsumugi v{} [VM mode] — 終了するには Ctrl+D\n",
@@ -737,12 +739,58 @@ fn run_repl_vm(frozen: CapabilitySet) {
 }
 
 /// VMモードの実行関数（ファイルパス付き）
+///
+/// import 解決の capability gate（link 層）は tree file/stdin（[`run_source`]）と同じ Engine
+/// resolver 経路へ統合済み（E9 / Phase 5 の一片）。実行本体の前に `Backend::TreeWalk` の
+/// [`EmbeddingEngine`] を gate 専用に build し、`compile`→`link` を通す。`link` は frozen
+/// capability の `module_resolver`（CLI が `--allow-import-root` から grant）で import を解決し、
+/// resolver 未 grant + import あり なら terminal `Denied`（exit 1、actionable 診断）になる。
+/// import 0 件の script は resolver 不問で gate を通過する。
+///
+/// gate 通過後の実際の import 展開と script 本体実行は依然 `Compiler` + `Vm` の alpha 経路で、
+/// run 層の import 解決は tree file/stdin と同じく評価器内蔵 [`ModuleLoader`] が担う（`@NAME/...`
+/// は run 層では未配線でリテラル相対扱い）。VM backend adapter 本体（run 経路の Engine 統合）は
+/// E9 残。これは tree file/stdin が「link gate は Engine、run 解決は ambient loader」で共存して
+/// いるのと対称。
 fn execute_vm_with_path(
     source: &str,
     path: &str,
     script_args: Vec<String>,
     frozen: CapabilitySet,
 ) -> Result<i32, Vec<TsumugiError>> {
+    // --- link 層 capability gate（tree file/stdin と対称）---
+    // VM backend adapter は作らず、gate 専用に TreeWalk engine を build して compile→link を
+    // 通す。gate は import の有無で分岐しない（import 0 件は空 graph で必ず通過）。gate 通過後は
+    // 従来の VM 実行経路（ModuleLoader + Compiler + Vm）をそのまま使う。
+    let engine = EmbeddingEngine::builder()
+        .build()
+        .expect("既定 backend の Engine build は失敗しない");
+    let source_id = source_id_for(path);
+    let options = CompileOptions {
+        retain_source: true,
+    };
+    let script = match engine.compile(EmbeddingSource::new(source_id, source), &options) {
+        Ok(script) => script,
+        Err(errors) => {
+            print_compile_errors(&errors);
+            std::process::exit(1);
+        }
+    };
+    // tree `run_source` と同一構成の clock/budget/cancellation/operation_id で LinkRequest を組む。
+    let clock: Arc<dyn tsumugi::MonotonicClock> = Arc::new(SystemMonotonicClock::new());
+    let budget = BudgetConfig::standard(clock.as_ref())
+        .expect("standard budget の生成は overflow しない限り成功する");
+    let cancellation = CancellationToken::new();
+    let operation_id = ExecutionId::new(std::num::NonZeroU128::new(1).expect("1 は非ゼロ"));
+    let link_request = LinkRequest::new(operation_id, frozen.clone(), budget)
+        .with_cancellation(cancellation.clone());
+    // gate 通過の確認だけに使い、LinkedScript は破棄する（run 層は従来どおり ModuleLoader で
+    // 解決するため import_graph は使わない。tree file/stdin と同じ）。
+    if let Err(error) = engine.link(&script, link_request) {
+        print_link_error(&error);
+        std::process::exit(1);
+    }
+
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize();
 

@@ -1,7 +1,7 @@
 # Tsumugi — Capability Model仕様
 
 最終更新: 2026-10-19
-設計ステータス: **実装仕様確定・実装進行中**（C1〜C10 実装済み。C6〔ModuleResolver／import 解決〕はPhase 2最小形としてtree経路のlink時解決を実装済み〔VM import統合はE9/Phase 5、tree REPLはE7でEngine API統合済みだがimport解決は評価器内蔵`ModuleLoader`に委ねresolver gateを迂回する——従来のCWD相対import・固定エラー文字列を保全する既知の設計で、REPLのimport gateを塞ぐならE8b以降の課題、budget N境界はC11/Phase 3〕。詳細は [ロードマップ](roadmap.md) Phase 2 を参照）
+設計ステータス: **実装仕様確定・実装進行中**（C1〜C10 実装済み。C6〔ModuleResolver／import 解決〕はPhase 2最小形としてtree経路のlink時解決を実装済み〔VM file/stdinのimportはC6-c/E9の一片としてlink層のEngine resolver gateへ統合済み——未grant + importはtreeと同じくterminal `Denied`、run層のimport展開は依然評価器内蔵`ModuleLoader`。VM backend adapter本体のconformanceはE9残。tree REPLはE7でEngine API統合済みだがimport解決は評価器内蔵`ModuleLoader`に委ねresolver gateを迂回する——従来のCWD相対import・固定エラー文字列を保全する既知の設計で、VM REPLはtree REPLと対称にalpha `ModuleLoader`を保全（gate迂回）。REPLのimport gateを塞ぐならE8b以降の課題、budget N境界はC11/Phase 3〕。詳細は [ロードマップ](roadmap.md) Phase 2 を参照）
 
 ## 1. 目的と規範範囲
 
@@ -726,7 +726,7 @@ OPTIONS:
 - `NAME`はMountName grammar。`OP`は`read|write|create|delete|metadata|list`。`import`は`--fs-op`では受理せずresolver optionだけで付与する。
 - `--fs-root NAME=PATH`と`--fs-op NAME=...`は1対1必須。CLIはroot directory handleをexecution作成前に開き、safe profileのsymlink policyを常に`DenyAll`とする。
 - scriptは`@NAME/...`でrootを選ぶ。unqualified pathにはNAME `default`が必要である。
-- `--allow-import-root NAME=PATH`はC6-cでfilesystem `ModuleResolver`を構築してsafe profileへgrantする（各NAMEをmount root、`SymlinkPolicy::DenyAll`で`OsDirectoryHandle`化）。これによりtree file/stdin経路のimportはlink時にEngine resolverで解決され、`@NAME/...`が実効化される（unqualified pathはmount `default`へrouting）。grantされるため`--allow-import-root`付きsafe setのCapabilitySetIdは`module_resolver` groupを含むように変わる。importがあるのに`--allow-import-root`を1つも渡さないtree実行は、resolver未grantでterminal `Denied`（exit 1、`--allow-import-root NAME=PATH`を促すactionable診断）になる——ambient相対パスimportは廃止した（原則2 明示的capability）。VM経路のimportはE9/Phase 5まで依然alpha `ModuleLoader`（`@NAME/...`未配線・リテラル相対扱い）で、import rootなしでも従来どおり動く（意図的なtree/VM既知差）。
+- `--allow-import-root NAME=PATH`はC6-cでfilesystem `ModuleResolver`を構築してsafe profileへgrantする（各NAMEをmount root、`SymlinkPolicy::DenyAll`で`OsDirectoryHandle`化）。これによりtree file/stdin経路のimportはlink時にEngine resolverで解決され、`@NAME/...`が実効化される（unqualified pathはmount `default`へrouting）。grantされるため`--allow-import-root`付きsafe setのCapabilitySetIdは`module_resolver` groupを含むように変わる。importがあるのに`--allow-import-root`を1つも渡さないtree実行は、resolver未grantでterminal `Denied`（exit 1、`--allow-import-root NAME=PATH`を促すactionable診断）になる——ambient相対パスimportは廃止した（原則2 明示的capability）。E9でVM file/stdinも同じlink層のEngine resolver gateへ統合され、未grant + importはtreeと同じくterminal `Denied`になる（`--allow-import-root`が`module_resolver`をgrantする経路もtree/VM共通）。run層のimport展開はtreeと同じく依然ambient `ModuleLoader`（`@NAME/...`未配線・リテラル相対扱い）のまま。VM REPLは従来どおりalpha `ModuleLoader`（import root不要）でtree REPLと対称。tree/VMの「既知差」はfile/stdinについては解消され、REPLにのみ残る。
 - capability optionはsafe profileだけで受理し、legacyとの同時指定はusage error 1とする。
 - `--allow-env KEY`はCLI execution作成時にprocess envのOS上のkey同一性で完全一致する値をsnapshotする。不存在はsnapshotへ入れずwarningなし。protected runtime keyは第5節のOS-aware判定でusage error 1とする。
 - `--allow-clock`はsystem clock、`--allow-script-stdin`はscript Input、`--allow-exit`はProcessExitをprofile builderへ明示grantする。
@@ -831,10 +831,10 @@ C1→C2、C3/C4/C5/C7を並行、C6はstream後、C8はBuiltinSpec衝突検査�
 | CAP-AT-20 | 2 | catalog/tree/VM/compiler/generated docsの名前・arity・metadata完全一致、重複build error |
 | CAP-AT-21 | 2/3 | callback success/catch可能host error/panicを分離。Phase 3でresult N+1 BudgetExceeded。link前host failureはterminal HostError |
 | CAP-AT-22 | 2/6 | Omit/TypeOnly/LengthOnly serializerにfake secret本文0。Phase 6でsink eventも同じ |
-| CAP-AT-23 | 2 | safe profileでroot source読込みとprofile builderが明示grantしたstdout以外ambient call 0。`--deny-stdout`時はstdout call 0。`--fs-op`は6トークン対応操作のみmapping一致（RecursiveDelete/ImportはCLI非対象で`remove_tree`は常にdeny）。C6-cで`--allow-import-root`は`module_resolver`をgrantするためset IDが変化し、tree経路の`@NAME/...`が実効化される（unqualifiedは`default`へrouting） |
+| CAP-AT-23 | 2 | safe profileでroot source読込みとprofile builderが明示grantしたstdout以外ambient call 0。`--deny-stdout`時はstdout call 0。`--fs-op`は6トークン対応操作のみmapping一致（RecursiveDelete/ImportはCLI非対象で`remove_tree`は常にdeny）。C6-cで`--allow-import-root`は`module_resolver`をgrantするためset IDが変化し、tree経路の`@NAME/...`がlink層で実効化される（unqualifiedは`default`へrouting。ここでの「実効化」はlink層の解決成功を指し、run層のend-to-end展開は`@NAME/...`未配線のため別。§10/`at_syntax_import_fails_in_both_engines`参照）。E9で同じgrant経路はVM file/stdinにも効く（VM safe setも`--allow-import-root`で`module_resolver` groupを含むset IDになる） |
 | CAP-AT-24 | 2/6 | legacy互換、empty sandbox/env allowはstderr warning各1。legacy symlinkは`FollowWithinRoot`、root選択曖昧はprofile構築error（exit 1）。Phase 6でも別eventを追加せずcanonical schemaとfail-closedを維持 |
 | CAP-AT-25 | N | 本revisionはN-1を飛ばしsafe既定（N相当）を採るため、golden は「無指定=safe」vs「`--profile legacy`」のprofile選択差2点へ縮退して固定する |
-| CAP-AT-26 | 2 | safeで旧環境変数変更がset ID/挙動へ影響0。射程はruntime fs/env/clock/stdin/exit/stdoutのcapability経路に限る。C6-cでtree経路のimport解決はEngine resolver（capability）へ移行し`sandbox.rs`/`TSUMUGI_SANDBOX`非依存になった（import側sandboxはVM/REPLのalpha `ModuleLoader`経路にのみ残る）。本fixtureは引き続きimportを含めない |
+| CAP-AT-26 | 2 | safeで旧環境変数変更がset ID/挙動へ影響0。射程はruntime fs/env/clock/stdin/exit/stdoutのcapability経路に限る。import解決はlink層（capability gate）とrun層（実import展開）の2層で動く。C6-cでtree file/stdinの、E9でVM file/stdinの**link層**import gateがEngine resolver（capability）へ移行し`sandbox.rs`/`TSUMUGI_SANDBOX`非依存になった。ただし**run層の実import展開はtreeもVMも依然評価器内蔵`ModuleLoader`**（→`sandbox.rs`/`TSUMUGI_SANDBOX`）を通る既知のギャップが残る。したがって`sandbox.rs`/`TSUMUGI_SANDBOX`依存（run層import解決）はtree/VM file/stdin・tree REPL・VM REPLの`ModuleLoader`経路に残る。本fixtureは引き続きimportを含めない |
 | CAP-AT-27 | 2 | adapter/CLI以外のprocess env、runtime fs、stdio、process exit、ambient clock直接利用0 |
 | CAP-AT-28 | 2 | CapabilitySetId/filesystem encodingのgolden bytes/hash固定 |
 | CAP-AT-29 | 2 | 複数mount qualified/default/missing/duplicateのroutingを完全一致検証 |

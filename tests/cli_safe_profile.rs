@@ -289,8 +289,9 @@ fn unqualified_path_requires_default_mount() {
 /// tree 経路では link 層の resolver が `@foo/bar.tsg` を mount `foo` へ routing して**解決は成功**する
 /// が、実行時の import 展開は依然 評価器内 `ModuleLoader`（ambient、`@mount` routing 未配線）が担う
 /// ため、`@foo/bar.tsg` をリテラル相対 path として扱い run 時 import error になる（link と run で
-/// resolver が別経路という既知の Phase 2 ギャップ。E9/E7 で統合）。VM 経路も ModuleLoader が
-/// `@foo/...` をリテラル扱いして未解決 import error になる。どちらも exit 1。
+/// resolver が別経路という既知の Phase 2 ギャップ）。E9 で VM 経路も link 層 gate を通る（resolver
+/// grant 済みなので link は成功する）が、run 層 ambient `ModuleLoader` が `@foo/...` をリテラル扱い
+/// して未解決 import error になる。どちらも exit 1（run 層の挙動が tree/VM で一致）。
 #[test]
 fn at_syntax_import_fails_in_both_engines() {
     for use_vm in [false, true] {
@@ -319,8 +320,8 @@ fn at_syntax_import_fails_in_both_engines() {
 /// C6-c で tree 経路は Engine resolver（capability）経由になり、resolver 未 grant + import は
 /// terminal `Denied`（exit 1）になる（設計 §4.5/§8、マニフェスト原則2 明示的 capability）。
 /// import root を渡せば `@default/...` routing で従来どおり解決・実行できる。
-/// VM 経路は E9/Phase 5 まで ModuleLoader に残るため従来どおり import root 無しで動く（意図的な
-/// tree/VM 既知差、設計 §4.4）。
+/// E9 で VM file/stdin も同じ link 層 gate を通すようになり、この要件は tree/VM 対称になった
+/// （VM 版は `relative_import_vm_requires_import_root`）。
 #[test]
 fn relative_import_tree_requires_import_root() {
     let dir = TestDir::new("relimp-tree");
@@ -359,13 +360,64 @@ fn relative_import_tree_requires_import_root() {
     assert!(stdout.contains("42"), "import した値: {stdout}");
 }
 
-/// VM 経路は E9/Phase 5 まで ModuleLoader に残るため、相対 import が従来どおり動く（import root 不要）。
+/// E9: VM file/stdin も tree と対称に `--allow-import-root` が必須になった。
+///
+/// E9 で VM file/stdin（`execute_vm_with_path`）は link 層の Engine resolver gate へ統合された。
+/// 旧挙動（VM は ModuleLoader に残り import root 無しで相対 import が動く、`relative_import_vm_
+/// still_works_without_import_root`）は**意図的に反転**し、resolver 未 grant + import は tree と同じく
+/// terminal `Denied`（exit 1、actionable 診断）になる。import root を grant すれば従来どおり
+/// `@default/...` routing で解決・実行できる（run 層は依然 ambient `ModuleLoader`）。
+/// tree 版 `relative_import_tree_requires_import_root` と対称。
 #[test]
-fn relative_import_vm_still_works_without_import_root() {
+fn relative_import_vm_requires_import_root() {
     let dir = TestDir::new("relimp-vm");
     std::fs::write(dir.path.join("lib.tsg"), "let helper = 42\n").unwrap();
     let main = dir.path.join("main.tsg");
     std::fs::write(&main, "import \"lib.tsg\"\nprint(helper)").unwrap();
+
+    // import root 無し → terminal Denied（exit 1、actionable 診断）。
+    let output = Command::new(tsumugi_bin())
+        .arg("--vm")
+        .arg(&main)
+        .output()
+        .expect("spawn");
+    assert!(
+        !output.status.success(),
+        "VM 相対 import は resolver 未 grant で拒否される"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--allow-import-root"),
+        "Denied 診断が対処方法を示す: {stderr}"
+    );
+
+    // import root 指定 → default routing で解決・実行できる。
+    let output = Command::new(tsumugi_bin())
+        .arg("--vm")
+        .arg("--allow-import-root")
+        .arg(format!("default={}", dir.as_str()))
+        .arg(&main)
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(
+        output.status.success(),
+        "import root 指定で VM 相対 import は動く: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("42"), "import した値: {stdout}");
+}
+
+/// E9: import 文の無い VM script は import root 無しでも gate を通過して実行できる。
+///
+/// link 層 gate は import の有無で分岐せず、import 0 件は resolver 不問で空 graph を返す。
+/// したがって import の無い VM file/stdin は `--allow-import-root` 無しでも従来どおり実行される
+/// （gate が import 0 件を通すことの回帰防止）。
+#[test]
+fn import_free_vm_runs_without_import_root() {
+    let dir = TestDir::new("import-free-vm");
+    let main = dir.path.join("main.tsg");
+    std::fs::write(&main, "print(7)").unwrap();
     let output = Command::new(tsumugi_bin())
         .arg("--vm")
         .arg(&main)
@@ -374,8 +426,8 @@ fn relative_import_vm_still_works_without_import_root() {
     let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
     assert!(
         output.status.success(),
-        "VM 相対 import は従来どおり動く: {}",
+        "import の無い VM script は import root 無しで動く: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("42"), "import した値: {stdout}");
+    assert!(stdout.contains("7"), "出力: {stdout}");
 }

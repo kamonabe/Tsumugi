@@ -3,17 +3,22 @@
 //! 環境変数 `TSUMUGI_SANDBOX` が設定されている場合、import 解決（`module.rs::ModuleLoader`）の
 //! 対象パスが許可リスト内に収まっているか検証する。未設定の場合はサンドボックス無効（全パス許可）。
 //!
-//! C6-c で **tree 経路の file/stdin import は Engine resolver（`ModuleResolver` capability）
-//! 経由へ移行**し、本モジュールを呼ばなくなった。本モジュールの `check_path` /
-//! `check_entry_path` を呼ぶのは、いまだ `ModuleLoader` を使う **VM import（E9/Phase 5）と
-//! tree REPL import だけ**である。tree REPL は E7 で Engine embedding API（`compile`→
-//! `link_for_repl`→`run_for_repl`）へ統合されたが、import 解決だけは従来どおり評価器内蔵の
-//! `ModuleLoader` に委ねる（resolver gate を迂回して CWD 相対 import・固定エラー文字列という
-//! 統合前の観測挙動を保全するため。詳細は `embedding.rs::Engine::link_for_repl` の doc）。
-//! そのため REPL import は引き続き本モジュールのサンドボックス検査を通る。これらが
-//! ModuleLoader を手放し Engine resolver へ統合されるまで、本モジュールは import 用に残す
-//! （設計 §3.5 の「撤去」は ModuleLoader の唯一の呼び出し元が消える前提に立っていたが、
-//! ModuleLoader は VM／REPL import 用に温存されるため、撤去はその統合まで保留する）。
+//! import 解決は **link 層**（capability gate）と **run 層**（実際の import 展開）の 2 層で動く。
+//! C6-c で tree file/stdin の、E9 で VM file/stdin の **link 層** import gate が Engine resolver
+//! （`ModuleResolver` capability）経由へ移行した。ただし **run 層の実 import 展開は tree も VM も
+//! 依然 評価器内蔵 `ModuleLoader`（`module.rs`）** が担い、本モジュールの `check_path` /
+//! `check_entry_path` を通る。したがって本モジュールを呼ぶのは次のとおり:
+//! - tree/VM file/stdin の **run 層** import 展開（link 層 gate は Engine resolver へ移行済みだが
+//!   run 層は `ModuleLoader` 依存）。
+//! - tree REPL / VM REPL の import（REPL は link 層 gate を意図的に迂回し、import 解決を評価器内蔵
+//!   `ModuleLoader` へ委ねる。tree REPL は E7 で `compile`→`link_for_repl`→`run_for_repl` へ統合済み
+//!   だが import 解決だけは従来どおり `ModuleLoader`——resolver gate を迂回して CWD 相対 import・
+//!   固定エラー文字列という統合前の観測挙動を保全するため。詳細は
+//!   `embedding.rs::Engine::link_for_repl` の doc。VM REPL は tree REPL と対称に現状維持）。
+//!
+//! これらが `ModuleLoader` を手放し run 層まで Engine resolver へ統合されるまで、本モジュールは
+//! import 用に残す（設計 §3.5 の「撤去」は `ModuleLoader` の唯一の呼び出し元が消える前提に立って
+//! いたが、`ModuleLoader` は run 層・REPL import 用に温存されるため、撤去はその統合まで保留する）。
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

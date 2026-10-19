@@ -1,7 +1,7 @@
 # Tsumugi — 組み込みAPI仕様
 
 最終更新: 2026-10-19
-設計ステータス: **実装仕様確定・実装進行中**（E1〜E6・E7〔tree REPL の Engine API 統合を含む〕・E8a・E11 実装済み。E8b・E9〔VM 経路統合、Phase 5〕・E10 は未実装。詳細は [ロードマップ](roadmap.md) Phase 1/2 を参照）
+設計ステータス: **実装仕様確定・実装進行中**（E1〜E6・E7〔tree REPL の Engine API 統合を含む〕・E8a・E11 実装済み。E9〔VM 経路統合、Phase 5〕のうち **VM file/stdin の import・resolver 統合（link 層 capability gate）は実装済み**で、残りの adapter/conformance（VM の charge parity・StableError・FunctionId・transaction 等）と experimental flag 除去は未実装＝**E9 は未完了**。E8b・E10 は未実装。詳細は [ロードマップ](roadmap.md) Phase 1/2 を参照）
 
 ## 1. 目的と規範範囲
 
@@ -512,7 +512,8 @@ tsumugi [OPTIONS] [SCRIPT [ARGS...]]
 - profile/capability optionの値検証とgrant構築は[Capability Model仕様](capability-model.md)第14節に従う。safe profileのstdout既定はbuilderによる明示`Stdout` grantでありambient accessではない。
 - **C9/C10時点のcapability注入経路**: CLIはprofileから組んだfrozen `CapabilitySet`を経路別に注入する——tree file/stdin（importの有無を問わず）はEngine API（`ExecutionRequest::with_capabilities`、link時は`LinkRequest.capabilities`）、tree REPLもE7でEngine API（session で1つ保持する`EmbeddingContext`を再利用し、各submissionの`ExecutionRequest::with_capabilities`へ同じfrozen setを載せる。REPLは`clear_user_state`やcapability clearを呼ばず持ち越す）、全VM経路は`Vm::set_capabilities`。tree file/stdinのimport解決はC6/E7でEngine resolverへ統合済み（`--allow-import-root`が`module_resolver`をgrant）。tree REPLはsession開始時に1回だけ注入した扱いを再現しつつ全submissionへ持ち越す。
   - **tree REPLのimport解決はresolver gateを通らない**: tree REPLは統合前から`--allow-import-root`無しでもCWD相対importを解決できる（評価器内蔵の`ModuleLoader`が解決し、固定のエラー文字列を出す）observable挙動を持つ。E7ではこの挙動を保全するため、REPL専用の内部入口（`link_for_repl`／`run_for_repl`、いずれも`#[doc(hidden)]`のcrate内部shim）がfile/stdinの`link`が課すresolver gateを通さず、import解決はrun側の評価器内蔵loaderに委ねる。これは新規のcapability緩和ではなく従来挙動の保全であり、file/stdin経路のresolver gate（未grant + importは terminal `Denied`）とは別物。REPLのimport gate迂回を将来capabilityで塞ぐならE8b/capability model側の課題。
-  - **tree REPLのbudgetライフサイクル**: REPLはsession全体で1本のbudget ledgerを共有し、submissionごとにfuel(step)だけresetしてcumulative counter（source/output/host/string/heap等）はsession累積を温存する（`run_for_repl`）。これも統合前tree REPLのobservable挙動の保全で、file/stdinのone-shot run（呼び出しごとにbudget config再構築）とは意図的に別経路。VMのEngine API統合はE9（Phase 5）。
+  - **tree REPLのbudgetライフサイクル**: REPLはsession全体で1本のbudget ledgerを共有し、submissionごとにfuel(step)だけresetしてcumulative counter（source/output/host/string/heap等）はsession累積を温存する（`run_for_repl`）。これも統合前tree REPLのobservable挙動の保全で、file/stdinのone-shot run（呼び出しごとにbudget config再構築）とは意図的に別経路。
+  - **VM file/stdinのimport gate**: E9でVM file/stdin（`execute_vm_with_path`）のimport解決を、link層のEngine resolver gate（`compile`→`link`、`LinkRequest.capabilities`の`module_resolver`。`--allow-import-root`がgrant）経由へ統合した。未grant + importはtreeと同じくterminal `Denied`、import 0件はresolver不問で通過、grant時は従来どおり解決・実行する。実際のimport展開とscript本体実行は依然`Compiler`+`Vm`（`Vm::set_capabilities`）のalpha経路で、run層のimport解決はtree file/stdinと同じく評価器内蔵`ModuleLoader`が担う（gate専用に`Backend::TreeWalk` engineをbuildする最小統合で、VM backend adapterは新設しない）。VM backend adapter本体（run経路のEngine統合）とconformanceはE9残。VM REPLは現状維持（tree REPLと対称にimport gateを迂回し評価器内蔵`ModuleLoader`に委ねる）。
 
 | 結果 | file/stdin mode | REPL |
 |---|---:|---|
@@ -557,9 +558,9 @@ compatibility shimもprocess exitやambient accessを復活させず、script操
 | E5 | 1 | Completed/Runtime/Internal/Cancelled(pre-run) channel | process継続、catch規則 |
 | E6 | 1 | compile/link/run panic隔離 | unwind test、fault ID |
 | E7 | 2 | capability/import graph/Denied/Exited/HostError/host function接続 | capability Phase 2基準 |
-| E8a | 1 | CLIがEngine APIだけを通る入口統合、基本引数転送（🟡 tree file/stdinはimportの有無を問わずEngine API経由で完了〔importはC6/E7〕。tree REPLもE7でEngine API統合済み〔import解決は評価器内蔵loaderに委ねる`link_for_repl`／`run_for_repl`経由〕。VMはE9で統合） | EMB-AT-15/16/17のPhase 1範囲、AUD-018 |
+| E8a | 1 | CLIがEngine APIだけを通る入口統合、基本引数転送（🟡 tree file/stdinはimportの有無を問わずEngine API経由で完了〔importはC6/E7〕。tree REPLもE7でEngine API統合済み〔import解決は評価器内蔵loaderに委ねる`link_for_repl`／`run_for_repl`経由〕。VM file/stdinのimport gateは統合済み〔E9の一片。link層resolver gate経由〕、VM backend adapter本体はE9残） | EMB-AT-15/16/17のPhase 1範囲、AUD-018 |
 | E8b | 2 | capability profile/options、safe/legacy移行 | EMB-AT-10/11/16、CAP-AT-23〜26、migration warning |
-| E9 | 5/7 | VM experimental adapter/conformance | 同API、差分0でstable化 |
+| E9 | 5/7 | VM experimental adapter/conformance（🟡 VM file/stdinのimport・resolver gateはEngine resolver〔`compile`→`link`、`module_resolver` capability〕経由へ統合済み。残りはadapter/conformance〔charge parity・StableError・FunctionId・transaction 他〕とstable化） | 同API、差分0でstable化 |
 | E10 | N-1/N | deprecation/migration | compile test |
 | E11 | 3 | budget/deadline/runtime cancel（🟡 tree範囲で実装。`EngineConfig.budget`で有限`BudgetConfig`、`ExecutionRequest::with_deadline_clock`でdeadline clock、`ExecutionContext::cancellation_token()`で実行中cancel。`ExecutionOutcome`に`BudgetExceeded`/`DeadlineExceeded`追加、budget/deadline/cancelをcatch不能terminal化（`ErrorKind::is_uncatchable`をtree/VM共有）。実system monotonic clock（`SystemMonotonicClock`）と全terminal variantへの`usage: BudgetUsage`同梱まで実装済み。さらに最終形移行Slice 1として`ExecutionRequest`を`new(budget, clock) -> Result<_, ConfigError>`へ移し有限`BudgetConfig`とdeadline clockを必須所有（`with_deadline_clock`独立経路と`EngineConfig.budget`二重管理を解消、deadlineは`budget.deadline`のみ、domain/revision/deadline検証を構築時へ前倒し）、CLI既定をoption B＝import なし経路でstandard有限budgetへ変更。`CancellationToken`必須所有も実装済み（`ExecutionRequest`が`cancellation`を所有し`.cancellation(value)`で設定、`Engine::run`が実行直前にinstall）。REV-015最終形移行は完了） | terminal variant境界test |
 | E12 | 4 | final state machineとpoll/pause/resume | `PollSlice` / `PollResult`、yield/pause/state test |
@@ -598,7 +599,7 @@ E1→E2→E3→E4→E5→E6→E8a、次にE7→E8b。E11以降をPhase 1/2完了
 ## 16. ロードマップ・監査項目との関係
 
 - **Phase 0:** fault非保証、panic/abort責任分界は[脅威モデル](threat-model.md)。
-- **Phase 1:** E1〜E6・E8a、EMB-AT-01〜09・13・15〜17を完了条件とする。E8aでCLIのtree/VM両経路をEngine APIだけへ統合し、基本引数転送を行う。現行tree-only facadeだけでは不足する。E8aの実装は、CLIのtree file/stdin実行のうちimportなしrootをEngine API（`compile`→`link`→`run`）だけへ統合し、`ExecutionRequest.arguments`で引数転送・`ExecutionOutcome`→exit code変換を第12節どおりに行うところまで。importを含むtree file/stdin rootはC6/E7でEngine API（`compile`→`link`→`run`）へ統合済み（`link`がresolver capabilityでimportを解決し、resolver未grant + importは terminal `Denied`）。tree REPL（入力間の状態継続とimport解決が必要）もE7でEngine API（`compile`→`link_for_repl`→`run_for_repl`、`EmbeddingContext`再利用）へ統合済み。ただしREPLはimport解決を評価器内蔵loaderに委ね（resolver gateを通さず従来のCWD相対import・固定エラー文字列を保全）、budgetはsession累積・fuelのみresetする（いずれも統合前の観測挙動の保全。詳細は第12節）。VM経路のEngine API統合はE9（Phase 5）。したがってEMB-AT-17はtree経路（file/stdin・REPL、importの有無を問わず）について満たし、残り（VM）はE9で満たす。
+- **Phase 1:** E1〜E6・E8a、EMB-AT-01〜09・13・15〜17を完了条件とする。E8aでCLIのtree/VM両経路をEngine APIだけへ統合し、基本引数転送を行う。現行tree-only facadeだけでは不足する。E8aの実装は、CLIのtree file/stdin実行のうちimportなしrootをEngine API（`compile`→`link`→`run`）だけへ統合し、`ExecutionRequest.arguments`で引数転送・`ExecutionOutcome`→exit code変換を第12節どおりに行うところまで。importを含むtree file/stdin rootはC6/E7でEngine API（`compile`→`link`→`run`）へ統合済み（`link`がresolver capabilityでimportを解決し、resolver未grant + importは terminal `Denied`）。tree REPL（入力間の状態継続とimport解決が必要）もE7でEngine API（`compile`→`link_for_repl`→`run_for_repl`、`EmbeddingContext`再利用）へ統合済み。ただしREPLはimport解決を評価器内蔵loaderに委ね（resolver gateを通さず従来のCWD相対import・固定エラー文字列を保全）、budgetはsession累積・fuelのみresetする（いずれも統合前の観測挙動の保全。詳細は第12節）。VM file/stdinのimport gateはE9でlink層のEngine resolver gate経由へ統合済み（未grant + importはtreeと同じくterminal `Denied`）だが、VM backend adapter本体（run経路のEngine統合）はE9残。したがってEMB-AT-17はtree経路（file/stdin・REPL、importの有無を問わず）とVM file/stdinのimport側について満たし、残り（VM backend adapter本体の統合とconformance）はE9で満たす。
 - **Phase 2:** E7・E8b、EMB-AT-10/11/16、CAP-AT-23〜26と[capability model](capability-model.md)のPhase 2基準を完了する。E8bでcapability profile/optionsとsafe/legacy移行を接続する。
 - **AUD-018:** process argvをExecutionRequest snapshotへ置換し、複数script引数とCLI syntaxを固定した。E8a/C6-cでtree file/stdin経路（importの有無を問わず）の引数転送を`EmbeddingRequest::with_arguments`→`Engine::run`経由へ載せ替えた。tree REPLはE7でEngine API（`compile`→`link_for_repl`→`run_for_repl`、`EmbeddingContext`再利用）へ統合済み（REPLはscript引数を持たないため`with_arguments`は使わない）。
 - **AUD-020:** Engineでpath文字列checkをせず、path-handle adapterへ委譲する。
