@@ -3966,6 +3966,93 @@ mod tests {
         }
     }
 
+    // --- CAP-AT-17: source/import 本数超過時の §7.2 primary BudgetResource ---
+    //
+    // `tests/integration.rs::cap_at_17_*_boundary_tree` は N+1 の observable（error_type /
+    // メッセージ / 1 文も実行しない）を固定するが、公開 `ExecutionError` は細粒度の
+    // `BudgetResource` を公開しない。ここでは crate-visible な `take_pending_budget_resource`
+    // を使い、N+1 で退避される primary resource が execution-control.md §7.2 の優先順位
+    // （`SingleSourceBytes < SourceCount < SourceBytes`、`ImportCount < ImportBytes`）どおり
+    // `SourceCount` / `ImportCount` であることを固定する。
+    //
+    // 観測経路: embedding resolver 経路（`Engine::run_audited`）は現状 source/import の count を
+    // 課金しない（count 上限適用は本 CAP-AT-17 が閉じる TODO）ため、tree の ambient `ModuleLoader`
+    // 経路（`Evaluator::run` + `set_base_dir` + tempdir に staging した `.tsg`）で観測する。
+    // standard budget を per-resource 上限 1 つだけ N に絞って回す。
+
+    /// CAP-AT-17 の source/import 境界用に import module を tempdir へ staging し、root path を返す。
+    fn stage_cap_at_17_graph(
+        tag: &str,
+        imports: &[(&str, &str)],
+        root: &str,
+    ) -> std::path::PathBuf {
+        let dir = unique_temp_path(tag);
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリの作成に失敗");
+        for (name, body) in imports {
+            std::fs::write(dir.join(name), body).expect("import module の作成に失敗");
+        }
+        let root_path = dir.join("main.tsg");
+        std::fs::write(&root_path, root).expect("root script の作成に失敗");
+        root_path
+    }
+
+    /// standard budget を 1 つの per-resource 上限だけ差し替えて作る。
+    fn cap_at_17_budget(mutate: impl FnOnce(&mut BudgetConfig)) -> BudgetConfig {
+        let clock = crate::budget::FakeClock::new();
+        let mut config = BudgetConfig::standard(&clock).expect("standard budget");
+        mutate(&mut config);
+        config
+    }
+
+    #[test]
+    fn cap_at_17_source_count_overflow_prefers_source_count_resource() {
+        // root + import 2 本（source 3 本）> max_source_count=2。
+        let root_path = stage_cap_at_17_graph(
+            "cap-at-17-src-resource",
+            &[("a.tsg", "let a1 = 1\n"), ("b.tsg", "let b1 = 2\n")],
+            "import \"a.tsg\"\nimport \"b.tsg\"\nlet root_marker = 0\n",
+        );
+        let root_source = std::fs::read_to_string(&root_path).expect("root の読み込み");
+        let program = parse_program(&root_source);
+
+        let mut eval = Evaluator::with_budget(cap_at_17_budget(|c| c.max_source_count = 2));
+        eval.set_capabilities(ambient_test_capabilities());
+        eval.set_base_dir(&root_path);
+        let result = eval.run(&program, root_source.len() as u64);
+
+        assert!(result.is_err(), "N+1（source 3 本）は失敗するはず");
+        assert_eq!(
+            eval.take_pending_budget_resource(),
+            Some(crate::budget::BudgetResource::SourceCount),
+            "§7.2 では source 本数超過の primary resource は SourceCount"
+        );
+    }
+
+    #[test]
+    fn cap_at_17_import_count_overflow_prefers_import_count_resource() {
+        // root（import ではない）+ import 2 本 → import_count 2 > max_import_count=1。
+        // tiny module なので §7.2 の ImportCount < ImportBytes 順どおり ImportCount が primary。
+        let root_path = stage_cap_at_17_graph(
+            "cap-at-17-imp-resource",
+            &[("a.tsg", "let a1 = 1\n"), ("b.tsg", "let b1 = 2\n")],
+            "import \"a.tsg\"\nimport \"b.tsg\"\nlet root_marker = 0\n",
+        );
+        let root_source = std::fs::read_to_string(&root_path).expect("root の読み込み");
+        let program = parse_program(&root_source);
+
+        let mut eval = Evaluator::with_budget(cap_at_17_budget(|c| c.max_import_count = 1));
+        eval.set_capabilities(ambient_test_capabilities());
+        eval.set_base_dir(&root_path);
+        let result = eval.run(&program, root_source.len() as u64);
+
+        assert!(result.is_err(), "N+1（import 2 本）は失敗するはず");
+        assert_eq!(
+            eval.take_pending_budget_resource(),
+            Some(crate::budget::BudgetResource::ImportCount),
+            "§7.2 では import 本数超過の primary resource は ImportCount"
+        );
+    }
+
     // --- C8: 登録 host function の tree engine 配線（CAP-AT-19/21）---
     mod host_functions {
         use super::*;

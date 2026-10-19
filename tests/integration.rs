@@ -895,7 +895,9 @@ fn import_outside_sandbox_is_blocked_in_both_engines() {
 /// なった。tree arm の file/stdin は embedding Engine API（standard budget）経由になり legacy env budget
 /// を参照しない（import なし script が既に option B で tree=standard budget になっていたのと同じ理由を、
 /// C6-c が import あり script へ広げた）。そのため本テストは VM arm のみを対象にする（意図的な
-/// tree/VM 既知差）。tree 経路の import budget 境界は Phase 3（CAP-AT-17）で embedding budget として扱う。
+/// tree/VM 既知差）。tree 経路（standard budget）の source/import 本数境界は CAP-AT-17 で担保する
+/// （`cap_at_17_source_count_boundary_tree` / `cap_at_17_import_count_boundary_tree` が in-process の
+/// `Evaluator::with_budget(standard)` で N-1/N 成功・N+1 を chunk 蓄積前に拒否することを固定する）。
 #[test]
 fn import_count_limit_gates_file_execution_vm() {
     let use_vm = true;
@@ -969,6 +971,208 @@ fn import_source_bytes_charged_allows_execution_within_limit_vm() {
     assert!(
         stdout.contains("7"),
         "{context}: import した値が使えていません\n--- stdout ---\n{stdout}"
+    );
+}
+
+// =============================================================================
+// CAP-AT-17: source / import 本数の N-1/N/N+1 境界（tree 経路・standard budget）
+// =============================================================================
+//
+// capability-model.md §19 CAP-AT-17: source 本数 N-1/N は成功し、N+1 は **N+1 番目の chunk を
+// 蓄積する前**に拒否される（1 文も実行しない・出力も無い）。execution-control.md §7.2 の固定
+// 優先順位（`SingleSourceBytes < SourceCount < SourceBytes`、`ImportCount < ImportBytes`）に従い、
+// source 本数超過は `SourceCount`、import 本数超過は `ImportCount` が primary resource になる。
+//
+// `import_count_limit_gates_file_execution_vm` が legacy env budget（VM arm）を見るのに対し、
+// 本テストは tree arm の standard budget 経路を in-process で直接駆動する。tree CLI は
+// `BudgetConfig::standard` を使い `TSUMUGI_MAX_*` を参照しないため、subprocess env 注入では tree arm
+// を駆動できない（調査済み）。代わりに `Evaluator::with_budget` + ambient `ModuleLoader`
+// （`set_base_dir` + tempdir に staging した `.tsg`）で standard budget をそのまま使う。
+// `TSUMUGI_SANDBOX` は process 全体の `OnceLock` で並列テストに敵対的なので設定しない
+// （未設定時の sandbox は許容的）。
+
+/// stdout 書き込みを buffer へ写す capturing な [`Output`]。root body が 1 文でも実行されれば
+/// buffer に `print` 出力が入るため、「N+1 で 1 文も実行していない」ことを buffer の空で観測できる。
+struct CapturingOutput {
+    pid: std::num::NonZeroU128,
+    buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl tsumugi::capability::Output for CapturingOutput {
+    fn policy_id(&self) -> std::num::NonZeroU128 {
+        self.pid
+    }
+    fn write_all(&self, bytes: &[u8]) -> Result<(), tsumugi::AdapterError> {
+        self.buffer
+            .lock()
+            .expect("buffer lock")
+            .extend_from_slice(bytes);
+        Ok(())
+    }
+    fn flush(&self) -> Result<(), tsumugi::AdapterError> {
+        Ok(())
+    }
+}
+
+/// stdout を grant した capability set と、その書き込み先 buffer を返す。
+fn capturing_stdout_capabilities() -> (
+    tsumugi::CapabilitySet,
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+) {
+    let pid = std::num::NonZeroU128::new(1).expect("non-zero");
+    let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let caps = tsumugi::CapabilitySet::builder()
+        .stdout(std::sync::Arc::new(CapturingOutput {
+            pid,
+            buffer: std::sync::Arc::clone(&buffer),
+        }))
+        .expect("stdout grant")
+        .build();
+    (caps, buffer)
+}
+
+/// standard budget を 1 つの per-resource 上限だけ差し替えて作る（他は standard のまま）。
+fn standard_budget_with(mutate: impl FnOnce(&mut tsumugi::BudgetConfig)) -> tsumugi::BudgetConfig {
+    let clock = tsumugi::FakeClock::new();
+    let mut config = tsumugi::BudgetConfig::standard(&clock).expect("standard budget");
+    mutate(&mut config);
+    config
+}
+
+/// `root_source` を tempdir に書き、`base_dir` を張った `Evaluator::with_budget(config)` で実行して
+/// `(結果, stdout buffer 文字列)` を返す。import は `imports`（ファイル名→本文）で staging する。
+fn run_tree_in_process(
+    label: &str,
+    config: tsumugi::BudgetConfig,
+    imports: &[(&str, &str)],
+    root_source: &str,
+) -> (Result<(), tsumugi::error::TsumugiError>, String) {
+    use tsumugi::eval::Evaluator;
+    use tsumugi::lexer::Lexer;
+    use tsumugi::parser::Parser;
+
+    let dir = TestDir::new(label);
+    for (name, body) in imports {
+        std::fs::write(dir.path.join(name), body).expect("import module の作成に失敗");
+    }
+    let root_path = dir.path.join("main.tsg");
+    std::fs::write(&root_path, root_source).expect("root script の作成に失敗");
+
+    let tokens = Lexer::new(root_source).tokenize();
+    let program = Parser::new(tokens).parse().expect("root のパースに失敗");
+
+    let (caps, buffer) = capturing_stdout_capabilities();
+    let mut evaluator = Evaluator::with_budget(config);
+    evaluator.set_base_dir(&root_path);
+    evaluator.set_capabilities(caps);
+
+    let result = evaluator.run(&program, root_source.len() as u64);
+    let printed =
+        String::from_utf8(buffer.lock().expect("buffer lock").clone()).expect("stdout は UTF-8");
+    (result, printed)
+}
+
+/// CAP-AT-17（source 本数）: `max_source_count = 2`（root が source #1、import 1 本で #2）。
+/// N-1（root のみ・import 0 本 = 1 本）と N（root + import 1 本 = 2 本）は成功し、N+1
+/// （root + import 2 本 = 3 本）は Link フェーズの `charge_source` で `SourceCount` を超過し、
+/// `exec_program` に到達せず 1 文も実行しない（stdout 空）。
+#[test]
+fn cap_at_17_source_count_boundary_tree() {
+    // N-1: root のみ（source 1 本 ≤ 2）。root body は 1 文実行して print する。
+    let (result, printed) = run_tree_in_process(
+        "cap-at-17-source-n-1",
+        standard_budget_with(|c| c.max_source_count = 2),
+        &[],
+        "print(\"ROOT\")\n",
+    );
+    assert!(
+        result.is_ok(),
+        "N-1（source 1 本）は成功するはず: {:?}",
+        result.err()
+    );
+    assert_eq!(printed, "ROOT\n", "N-1 では root body が実行されるはず");
+
+    // N: root + import 1 本（source 2 本 = 上限ちょうど）。
+    let (result, printed) = run_tree_in_process(
+        "cap-at-17-source-n",
+        standard_budget_with(|c| c.max_source_count = 2),
+        &[("a.tsg", "let a1 = 1\n")],
+        "import \"a.tsg\"\nprint(\"ROOT\")\n",
+    );
+    assert!(
+        result.is_ok(),
+        "N（source 2 本 = 上限）は成功するはず: {:?}",
+        result.err()
+    );
+    assert_eq!(printed, "ROOT\n", "N では root body が実行されるはず");
+
+    // N+1: root + import 2 本（source 3 本 > 2）。2 本目の import を蓄積する前に拒否され、
+    // 1 文も実行しない（stdout 空）。
+    let (result, printed) = run_tree_in_process(
+        "cap-at-17-source-n-plus-1",
+        standard_budget_with(|c| c.max_source_count = 2),
+        &[("a.tsg", "let a1 = 1\n"), ("b.tsg", "let b1 = 2\n")],
+        "import \"a.tsg\"\nimport \"b.tsg\"\nprint(\"ROOT\")\n",
+    );
+    let err = result.expect_err("N+1（source 3 本）は SourceCount 超過で失敗するはず");
+    assert_eq!(
+        err.error_type(),
+        "source_limit",
+        "SourceCount 超過は error_type source_limit を返すはず: {err:?}"
+    );
+    assert!(
+        err.message().contains("ソースの本数が上限を超えました"),
+        "source 本数超過のメッセージが出るはず: {}",
+        err.message()
+    );
+    assert_eq!(
+        printed, "",
+        "N+1 は chunk 蓄積前に拒否され 1 文も実行しない（stdout 空）はず: {printed:?}"
+    );
+}
+
+/// CAP-AT-17（import 本数）: `max_import_count = 1`。root は source だが import ではないため
+/// import 本数には数えない。import 1 本（import_count 1 = 上限）は成功し、import 2 本
+/// （import_count 2 > 1）は 2 本目の import を蓄積する前に `ImportCount` 超過で拒否される。
+/// §7.2 の `ImportCount < ImportBytes` 順序どおり、tiny module では `ImportCount` が primary。
+#[test]
+fn cap_at_17_import_count_boundary_tree() {
+    // N: import 1 本（import_count 1 = 上限）。
+    let (result, printed) = run_tree_in_process(
+        "cap-at-17-import-n",
+        standard_budget_with(|c| c.max_import_count = 1),
+        &[("a.tsg", "let a1 = 1\n")],
+        "import \"a.tsg\"\nprint(\"ROOT\")\n",
+    );
+    assert!(
+        result.is_ok(),
+        "N（import 1 本 = 上限）は成功するはず: {:?}",
+        result.err()
+    );
+    assert_eq!(printed, "ROOT\n", "N では root body が実行されるはず");
+
+    // N+1: import 2 本（import_count 2 > 1）。2 本目の import を蓄積する前に拒否され、1 文も
+    // 実行しない（stdout 空）。
+    let (result, printed) = run_tree_in_process(
+        "cap-at-17-import-n-plus-1",
+        standard_budget_with(|c| c.max_import_count = 1),
+        &[("a.tsg", "let a1 = 1\n"), ("b.tsg", "let b1 = 2\n")],
+        "import \"a.tsg\"\nimport \"b.tsg\"\nprint(\"ROOT\")\n",
+    );
+    let err = result.expect_err("N+1（import 2 本）は ImportCount 超過で失敗するはず");
+    assert_eq!(
+        err.error_type(),
+        "source_limit",
+        "ImportCount 超過は error_type source_limit を返すはず: {err:?}"
+    );
+    assert!(
+        err.message().contains("import の本数が上限を超えました"),
+        "import 本数超過のメッセージが出るはず: {}",
+        err.message()
+    );
+    assert_eq!(
+        printed, "",
+        "N+1 は chunk 蓄積前に拒否され 1 文も実行しない（stdout 空）はず: {printed:?}"
     );
 }
 

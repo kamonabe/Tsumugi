@@ -862,3 +862,147 @@ fn repl_continuation_nested_closure_charge_agrees() {
         release: Some((1, 2)),
     });
 }
+
+// =============================================================================
+// CAP-AT-17: source / import 本数会計の tree/VM parity（import graph staging）
+// =============================================================================
+//
+// CAP-AT-17（capability-model.md §19）の N-1/N/N+1 境界は、source/import **本数** という
+// engine 間不変軸（軸(A)）に効く。本 harness は「同じ import graph を tree と VM の両 engine で
+// link/charge したとき、`source_count` / `import_count` / `source_bytes` / `import_bytes` が
+// 完全一致する」ことを固定し、CAP-AT-17 の会計面で tree/VM 差を新たに生まないことを担保する。
+//
+// 上限注入経路の非対称性（上の「上限注入経路の非対称性」節）により、per-resource の count 上限を
+// VM に in-process 注入する public API は無い（`Vm::new` は `from_legacy_env` 既定固定）。よって
+// **本数の上限 trip（N+1 の BudgetExceeded）そのもの**は engine ごとに担保する:
+// - tree arm: `tests/integration.rs::cap_at_17_source_count_boundary_tree` /
+//   `cap_at_17_import_count_boundary_tree`（standard budget を in-process で N まで絞る）。
+// - VM arm: `tests/integration.rs::import_count_limit_gates_file_execution_vm`（legacy env budget）。
+// ここ（differential）が担保するのは、その両者が前提にする **会計の一致**（同じ graph なら同じ
+// count/bytes を積む）であり、trip 値そのものではない。これは §5.3 の「backend 間で揃えるのは
+// 課金の有無」という線引きと整合する。
+
+/// import graph を staging し、tree / VM 両 engine の link/charge 後 usage を突合する fixture。
+struct ImportGraphFixture {
+    label: &'static str,
+    /// tempdir に書き出す import module（ファイル名, 本文）。
+    imports: &'static [(&'static str, &'static str)],
+    /// root（`main.tsg`）の本文。import 文は相対ファイル名で書く。
+    root: &'static str,
+}
+
+/// tree/VM・テストごとに別パスを使う一時ディレクトリ（`integration.rs::TestDir` と同形の最小複製。
+/// cross-crate 共有は統合テストでは困難なため本 harness で必要な範囲だけ複製する）。
+struct ImportTestDir {
+    path: std::path::PathBuf,
+}
+
+impl ImportTestDir {
+    /// `label` は失敗メッセージ（`assert_invariant_axes`）側で使う識別子で、ディレクトリ名には
+    /// 使わない。label には日本語・コロン・括弧が含まれ、Windows ではコロンがパスの特殊文字扱い
+    /// となり `create_dir_all` が `NotADirectory` で失敗するため（OS 依存回避）、ディレクトリ名は
+    /// PID と連番だけで一意化する。
+    fn new(_label: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("tsumugi-diff-{}-{}", std::process::id(), unique));
+        std::fs::remove_dir_all(&path).ok();
+        std::fs::create_dir_all(&path).expect("一時ディレクトリの作成に失敗");
+        Self { path }
+    }
+}
+
+impl Drop for ImportTestDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+/// import graph を staging し、`(root_path, dir)` を返す。`dir` は返り値が生きている間ファイルを保つ。
+fn stage_import_graph(fixture: &ImportGraphFixture) -> (std::path::PathBuf, ImportTestDir) {
+    let dir = ImportTestDir::new(fixture.label);
+    for (name, body) in fixture.imports {
+        std::fs::write(dir.path.join(name), body).expect("import module の作成に失敗");
+    }
+    let root_path = dir.path.join("main.tsg");
+    std::fs::write(&root_path, fixture.root).expect("root script の作成に失敗");
+    (root_path, dir)
+}
+
+/// tree arm: `Evaluator::new()`（standard budget 相当の既定）を `set_base_dir` で張って `run`。
+/// ambient `ModuleLoader` が import を解決し `charge_link` が source/import を課金する。
+fn run_tree_import_graph(root_path: &std::path::Path, root_source: &str) -> BudgetUsage {
+    let tokens = Lexer::new(root_source).tokenize();
+    let program = Parser::new(tokens).parse().expect("root のパースに失敗");
+    let mut evaluator = Evaluator::new();
+    evaluator.set_capabilities(print_capabilities());
+    evaluator.set_base_dir(root_path);
+    evaluator
+        .run(&program, root_source.len() as u64)
+        .expect("tree 実行は成功するはず");
+    evaluator.budget_usage()
+}
+
+/// VM arm: `ModuleLoader` で import を expand し、linked program を compile。`Vm::new` +
+/// `vm.charge_link(root_bytes, &loaded)` で tree と対称に source/import を課金してから `run`。
+fn run_vm_import_graph(root_path: &std::path::Path, root_source: &str) -> BudgetUsage {
+    use tsumugi::module::ModuleLoader;
+
+    let tokens = Lexer::new(root_source).tokenize();
+    let program = Parser::new(tokens).parse().expect("root のパースに失敗");
+
+    // tree と同じ ambient loader で import を expand し、linked program と loaded 集合を得る。
+    let mut loader = ModuleLoader::new();
+    loader.set_base_dir(root_path);
+    let (linked, loaded) = loader
+        .link(&program)
+        .expect("VM arm の link は成功するはず");
+    let target = linked.as_ref().unwrap_or(&program);
+
+    let chunk = Compiler::new()
+        .compile(target)
+        .expect("linked program の compile に失敗");
+    let mut vm = Vm::new(chunk);
+    vm.set_capabilities(print_capabilities());
+    // tree の `charge_link` と対称に root source + 各 import を課金する。
+    vm.charge_link(root_source.len() as u64, &loaded)
+        .expect("VM arm の charge_link は成功するはず");
+    vm.run().expect("VM 実行は成功するはず");
+    vm.budget_usage()
+}
+
+/// import graph を両 engine で link/charge し、source/import 会計軸が一致することを突合する。
+fn assert_import_graph_parity(fixture: &ImportGraphFixture) {
+    let (root_path, _dir) = stage_import_graph(fixture);
+    let tree = run_tree_import_graph(&root_path, fixture.root);
+    let vm = run_vm_import_graph(&root_path, fixture.root);
+    // source_count / import_count / source_bytes / import_bytes は engine 間不変軸（軸(A)）。
+    assert_invariant_axes(fixture.label, &tree, &vm);
+}
+
+/// CAP-AT-17（source 本数）: root のみ（source 1 本）/ root + import 1 本（source 2 本）/
+/// root + import 2 本（source 3 本）の各 graph で、tree と VM が同じ source/import 会計を積む。
+/// standard 既定の上限（source_count=1_025 等）では trip しないため成功し、会計軸が一致する。
+#[test]
+fn cap_at_17_source_count_charge_parity() {
+    // N-1 相当: root のみ（source 1 本・import 0 本）。
+    assert_import_graph_parity(&ImportGraphFixture {
+        label: "CAP-AT-17: source 1 本（root のみ）の会計一致",
+        imports: &[],
+        root: "print(\"ROOT\")\n",
+    });
+    // N 相当: root + import 1 本（source 2 本・import 1 本）。
+    assert_import_graph_parity(&ImportGraphFixture {
+        label: "CAP-AT-17: source 2 本（root + import 1 本）の会計一致",
+        imports: &[("a.tsg", "let a1 = 1\n")],
+        root: "import \"a.tsg\"\nprint(\"ROOT\")\n",
+    });
+    // N+1 相当: root + import 2 本（source 3 本・import 2 本）。
+    assert_import_graph_parity(&ImportGraphFixture {
+        label: "CAP-AT-17: source 3 本（root + import 2 本）の会計一致",
+        imports: &[("a.tsg", "let a1 = 1\n"), ("b.tsg", "let b1 = 2\n")],
+        root: "import \"a.tsg\"\nimport \"b.tsg\"\nprint(\"ROOT\")\n",
+    });
+}
