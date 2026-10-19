@@ -1,3 +1,5 @@
 /target
 # ワークフロー/調査の中間成果物（コミット対象外、手元参照用に残す）
 /.agents
+# git worktree 作業ツリー（コミット対象外）
+/.worktrees
