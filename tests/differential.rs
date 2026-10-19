@@ -1006,3 +1006,87 @@ fn cap_at_17_source_count_charge_parity() {
         root: "import \"a.tsg\"\nimport \"b.tsg\"\nprint(\"ROOT\")\n",
     });
 }
+
+// =============================================================================
+// E9: VM file/stdin の import・resolver gate が tree file/stdin と観測一致する（CLI subprocess）
+// =============================================================================
+//
+// E9 で VM file/stdin（`execute_vm_with_path`）は link 層 capability gate（Engine resolver、
+// `module_resolver` capability、`--allow-import-root` で grant）へ統合された。本テストは同一の
+// import graph を tree と VM の CLI subprocess で実行し、観測挙動が一致することを固定する:
+//   (a) import root 無し → 両 engine とも exit≠0 かつ stderr に `--allow-import-root` の Denied 診断。
+//   (b) import root 指定 → 両 engine とも exit=0 かつ stdout 一致（import した値が使える）。
+// `@NAME/...` の両 engine exit 1 は `cli_safe_profile.rs::at_syntax_import_fails_in_both_engines`
+// が既にカバーしているため重複させない。
+
+/// 同一 script を tree/VM の CLI subprocess で実行し `Output` を返す。
+fn run_file_subprocess(
+    root_path: &std::path::Path,
+    use_vm: bool,
+    import_root: Option<&str>,
+) -> std::process::Output {
+    let mut command = Command::new(tsumugi_bin());
+    if use_vm {
+        command.arg("--vm");
+    }
+    if let Some(root) = import_root {
+        command.arg("--allow-import-root").arg(root);
+    }
+    command
+        .arg(root_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    command.output().expect("tsumugi プロセスの起動に失敗")
+}
+
+/// E9 差分 parity: 同一 import graph を tree/VM で実行したとき、未 grant の Denied と
+/// grant 時の成功・stdout が tree/VM で一致する。
+#[test]
+fn vm_import_gate_matches_tree_file_stdin() {
+    let dir = ImportTestDir::new("E9: VM import gate parity");
+    std::fs::write(dir.path.join("lib.tsg"), "let helper = 42\n")
+        .expect("import module の作成に失敗");
+    let root_path = dir.path.join("main.tsg");
+    std::fs::write(&root_path, "import \"lib.tsg\"\nprint(helper)\n")
+        .expect("root script の作成に失敗");
+
+    // (a) import root 無し → 両 engine terminal Denied（exit≠0、`--allow-import-root` 診断）。
+    let tree_denied = run_file_subprocess(&root_path, false, None);
+    let vm_denied = run_file_subprocess(&root_path, true, None);
+    let (_, tree_denied_err) = output_text(&tree_denied);
+    let (_, vm_denied_err) = output_text(&vm_denied);
+    assert!(
+        !tree_denied.status.success() && !vm_denied.status.success(),
+        "未 grant + import は tree/VM とも拒否される (tree={:?}, vm={:?})",
+        tree_denied.status,
+        vm_denied.status
+    );
+    assert!(
+        tree_denied_err.contains("--allow-import-root")
+            && vm_denied_err.contains("--allow-import-root"),
+        "両 engine の Denied 診断が対処方法を示す\n--- tree ---\n{tree_denied_err}\n--- vm ---\n{vm_denied_err}"
+    );
+    assert_eq!(
+        tree_denied_err, vm_denied_err,
+        "未 grant の Denied 診断は tree/VM で byte 一致する"
+    );
+
+    // (b) import root 指定 → 両 engine 成功・stdout 一致。
+    let import_root = format!("default={}", dir.path.to_str().expect("UTF-8 パス"));
+    let tree_ok = run_file_subprocess(&root_path, false, Some(&import_root));
+    let vm_ok = run_file_subprocess(&root_path, true, Some(&import_root));
+    let (tree_ok_out, tree_ok_err) = output_text(&tree_ok);
+    let (vm_ok_out, vm_ok_err) = output_text(&vm_ok);
+    assert!(
+        tree_ok.status.success() && vm_ok.status.success(),
+        "import root 指定で tree/VM とも成功する\n--- tree stderr ---\n{tree_ok_err}\n--- vm stderr ---\n{vm_ok_err}"
+    );
+    assert_eq!(
+        tree_ok_out, vm_ok_out,
+        "grant 時の import 実行結果（stdout）は tree/VM で一致する"
+    );
+    assert!(
+        tree_ok_out.contains("42"),
+        "import した値が使える: {tree_ok_out}"
+    );
+}

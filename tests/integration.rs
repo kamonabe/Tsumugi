@@ -221,14 +221,15 @@ fn fixture_needs_legacy(name: &str) -> bool {
     )
 }
 
-/// import を含む fixture（C6-c で tree 経路は Engine resolver 経由になった）。
+/// import を含む fixture（C6-c で tree 経路、E9 で VM 経路が Engine resolver gate を通る）。
 ///
 /// C6-c 以降、**tree 経路の file import は `module_resolver` capability が必須**になった（Q2 =
-/// Denied all-in、設計 §4.5/§8）。これらの fixture は bare-path import（`import "import_lib.tsg"`）
-/// を使い、fixtures ディレクトリ内の兄弟ファイルを import するため、tree arm では
-/// `--allow-import-root default=<fixtures_dir>` を付けて `default` mount へ routing する
-/// （bare → `@default/...` 正規化）。VM arm は E9/Phase 5 まで ModuleLoader 経路に残るため
-/// import root を付けず従来挙動のまま（意図的な tree/VM 既知差、設計 §4.4 blast radius）。
+/// Denied all-in、設計 §4.5/§8）。E9 で VM file/stdin も link 層 capability gate（Engine resolver）を
+/// 前置するようになり、未 grant + import は tree と同じく terminal `Denied` になる。これらの fixture は
+/// bare-path import（`import "import_lib.tsg"`）を使い、fixtures ディレクトリ内の兄弟ファイルを
+/// import するため、tree/VM 両 arm とも `--allow-import-root default=<fixtures_dir>` を付けて
+/// `default` mount へ routing する（bare → `@default/...` 正規化）。従来あった「VM arm は import root
+/// 不要」という tree/VM 既知差は E9 で解消された。
 fn fixture_has_import(name: &str) -> bool {
     matches!(
         name,
@@ -241,19 +242,6 @@ fn fixture_has_import(name: &str) -> bool {
             | "error_import_not_found"
             | "error_import_before_side_effects"
     )
-}
-
-/// fixture の実効 [`FixtureKind`]（arm 依存）。
-///
-/// `import_circular` は tree arm では link 層が循環を検出して `Cycle` terminal（exit 1、設計 §4.4）
-/// になるため **Error**、VM arm は ModuleLoader の resolved-skip で成功扱い（従来 A/B 出力）のため
-/// **Golden**。両 arm で kind が割れるのは意図的な既知差（設計 §4.4 blast radius、Q2 の帰結）。
-fn effective_fixture_kind(name: &str, kind: FixtureKind, use_vm: bool) -> FixtureKind {
-    if name == "import_circular" && !use_vm {
-        FixtureKind::Error
-    } else {
-        kind
-    }
 }
 
 /// fixture を1つ実行して stdout / stderr / 終了コードを検証する
@@ -271,10 +259,11 @@ fn run_fixture(name: &str, kind: FixtureKind, use_vm: bool) {
     if fixture_needs_legacy(name) {
         command.arg("--profile").arg("legacy");
     }
-    // C6-c: import を含む fixture の tree arm は `module_resolver` grant が必須（Q2）。
-    // bare-path import を fixtures ディレクトリ基準の `default` mount へ routing する。
-    // VM arm は ModuleLoader 経路（E9 まで）なので import root を付けない。
-    if fixture_has_import(name) && !use_vm {
+    // C6-c/E9: import を含む fixture は tree/VM 両 arm とも `module_resolver` grant が必須（Q2）。
+    // bare-path import を fixtures ディレクトリ基準の `default` mount へ routing する。E9 で VM
+    // file/stdin も link 層 capability gate（Engine resolver）を通すため、未 grant + import は tree と
+    // 同じく terminal `Denied` になる。したがって両 arm で同じ import root を grant する。
+    if fixture_has_import(name) {
         let import_root = format!("default={}", fixtures_dir().to_str().expect("UTF-8 パス"));
         command.arg("--allow-import-root").arg(import_root);
     }
@@ -286,7 +275,6 @@ fn run_fixture(name: &str, kind: FixtureKind, use_vm: bool) {
         command.env(key, value);
     }
 
-    let kind = effective_fixture_kind(name, kind, use_vm);
     let context = format!("{name} [{mode}]");
     let child = command
         .spawn()
@@ -352,9 +340,25 @@ fn run_script_process(
     envs: &[(&str, &str)],
     context: &str,
 ) -> std::process::Output {
+    run_script_process_with_args(script, use_vm, &[], envs, context)
+}
+
+/// [`run_script_process`] に script path より前へ渡す追加 CLI 引数（例: `--allow-import-root`）を
+/// 足した版。E9 以降、VM file/stdin も link 層 capability gate を通すため、import を含む bespoke
+/// テストは `module_resolver` を grant する必要がある。
+fn run_script_process_with_args(
+    script: &std::path::Path,
+    use_vm: bool,
+    extra_args: &[&str],
+    envs: &[(&str, &str)],
+    context: &str,
+) -> std::process::Output {
     let mut command = Command::new(tsumugi_bin());
     if use_vm {
         command.arg("--vm");
+    }
+    for arg in extra_args {
+        command.arg(arg);
     }
     command
         .arg(script)
@@ -435,7 +439,6 @@ fixture_tests!(
         hello,
         higher_order,
         import_basic,
-        import_circular,
         import_nested,
         import_static_resolution,
         index_assign_binding,
@@ -488,6 +491,7 @@ fixture_tests!(
         error_unknown_char,
         error_wrong_arg_count,
         error_zero_division,
+        import_circular,
     ]
 );
 
@@ -499,14 +503,6 @@ const CUSTOM_FIXTURES: &[&str] = &[
     // engine間でtrace frame数が異なる（AUD-017）ため専用テストで検証する
     "error_stack_overflow",
 ];
-
-/// tree/VM で kind が割れる fixture（arm 依存で Golden/Error が変わる、設計 §4.4）。
-///
-/// `import_circular` は VM arm が Golden（ModuleLoader の resolved-skip で A/B 出力）、tree arm が
-/// Error（Engine resolver が循環を `Cycle` terminal で検出）。そのため `.expected`（VM 用）と
-/// `.expected_err`（tree 用）の両方を持つ。宣言テーブルは代表 kind（Golden）に載せ、tree arm の
-/// Error 化は `effective_fixture_kind` が行う。directory 整合検査はこの fixture の二重 kind を許容する。
-const DUAL_KIND_FIXTURES: &[&str] = &["import_circular"];
 
 /// 他の fixture から import される補助ファイル（単体では実行しない）。
 const HELPER_FIXTURES: &[&str] = &[
@@ -551,10 +547,8 @@ fn fixture_declarations_match_directory() {
         ("エラー系", &error_files, ERROR_FIXTURES),
     ] {
         for file in files {
-            // dual-kind fixture は代表 kind のテーブルにだけ載る（もう一方の期待ファイルは
-            // arm 依存で参照される）。整合検査では代表 kind 以外の分類を免除する。
             assert!(
-                declared.contains(&file.as_str()) || DUAL_KIND_FIXTURES.contains(&file.as_str()),
+                declared.contains(&file.as_str()),
                 "{label} fixture `{file}` が宣言テーブルに登録されていません。\
                  fixture_tests! へ追加してください"
             );
@@ -809,13 +803,12 @@ fn cli_default_budget_allows_light_import_less_script_tree() {
 
 /// root 外への import が両 engine で拒否されることを検証する。
 ///
-/// C6-c で tree/VM の遮断 channel が意図的に分岐した（Q2 = Denied all-in、設計 §4.4/§8）:
-/// - **VM arm**: ModuleLoader 経路（E9 まで）。従来どおり `TSUMUGI_SANDBOX` の許可範囲外 import を
-///   `サンドボックス違反` の runtime error で遮断する。
-/// - **tree arm**: Engine resolver 経路。`--allow-import-root default=<dir>`（import 元ディレクトリ）
-///   を grant し、root 外の絶対 path import は resolver が `invalid_import_specifier`（絶対 path は
-///   malformed specifier、設計 §3.2 の 2 channel 分離）として link 段で拒否する。どちらも exit 1 で
-///   import 先コードは実行されない（"leaked" が漏れない）。
+/// E9 で VM file/stdin も link 層 capability gate（Engine resolver）を通すようになり、tree arm と
+/// 遮断 channel が一致した（従来 C6-c の意図的分岐は解消）。両 arm とも
+/// `--allow-import-root default=<dir>`（import 元ディレクトリ）を grant し、root 外の絶対 path import
+/// は resolver が `invalid_import_specifier`（絶対 path は malformed specifier、設計 §3.2 の 2 channel
+/// 分離）として link 段で拒否する。どちらも exit 1 で import 先コードは実行されない（"leaked" が
+/// 漏れない）。
 #[test]
 fn import_outside_sandbox_is_blocked_in_both_engines() {
     for use_vm in [false, true] {
@@ -841,16 +834,15 @@ fn import_outside_sandbox_is_blocked_in_both_engines() {
         .expect("スクリプトの作成に失敗");
 
         let context = format!("sandbox import [{mode}]");
+        // tree/VM とも resolver 経路。default mount は import 元 dir のみ。root 外絶対 path は
+        // resolver が link 段で拒否する（VM も link 層 gate を通すため tree と一致）。
         let mut command = Command::new(tsumugi_bin());
         if use_vm {
-            // VM arm: ModuleLoader 経路。TSUMUGI_SANDBOX の許可範囲は import 元 dir のみ。
-            command.arg("--vm").env("TSUMUGI_SANDBOX", dir.as_str());
-        } else {
-            // tree arm: resolver 経路。default mount は import 元 dir のみ。root 外絶対 path は拒否。
-            command
-                .arg("--allow-import-root")
-                .arg(format!("default={}", dir.as_str()));
+            command.arg("--vm");
         }
+        command
+            .arg("--allow-import-root")
+            .arg(format!("default={}", dir.as_str()));
         command
             .arg(&script)
             .stdout(std::process::Stdio::piped())
@@ -866,17 +858,10 @@ fn import_outside_sandbox_is_blocked_in_both_engines() {
             !output.status.success(),
             "{context}: 終了コード0で終了しました\n--- stderr ---\n{stderr}"
         );
-        if use_vm {
-            assert!(
-                stderr.contains("サンドボックス違反"),
-                "{context}: VM import のサンドボックスエラーが出ません\n--- stderr ---\n{stderr}"
-            );
-        } else {
-            assert!(
-                stderr.contains("invalid_import_specifier"),
-                "{context}: tree import の resolver 拒否が出ません\n--- stderr ---\n{stderr}"
-            );
-        }
+        assert!(
+            stderr.contains("invalid_import_specifier"),
+            "{context}: import の resolver 拒否が出ません\n--- stderr ---\n{stderr}"
+        );
         assert_eq!(
             stdout, "",
             "{context}: 許可外のimport先が実行されました\n--- stdout ---\n{stdout}"
@@ -898,6 +883,12 @@ fn import_outside_sandbox_is_blocked_in_both_engines() {
 /// tree/VM 既知差）。tree 経路（standard budget）の source/import 本数境界は CAP-AT-17 で担保する
 /// （`cap_at_17_source_count_boundary_tree` / `cap_at_17_import_count_boundary_tree` が in-process の
 /// `Evaluator::with_budget(standard)` で N-1/N 成功・N+1 を chunk 蓄積前に拒否することを固定する）。
+///
+/// E9 で VM file/stdin も link 層 capability gate（Engine resolver、standard budget）を通すように
+/// なったため、`--allow-import-root default=<dir>` で `module_resolver` を grant して gate を通す。
+/// legacy env budget（`TSUMUGI_MAX_IMPORT_COUNT`）は gate 通過後の run 層 `vm.charge_link` が参照する
+/// ため、import_count 上限 0 の課金エラーは従来どおり観測できる（gate は standard budget で import
+/// を解決するだけで legacy env budget を見ない）。
 #[test]
 fn import_count_limit_gates_file_execution_vm() {
     let use_vm = true;
@@ -909,9 +900,11 @@ fn import_count_limit_gates_file_execution_vm() {
     std::fs::write(&script, "import \"lib.tsg\"\nprint(\"AFTER\")\n").expect("main の作成に失敗");
 
     let context = "import count limit [VM]";
-    let output = run_script_process(
+    let import_root = format!("default={}", dir.as_str());
+    let output = run_script_process_with_args(
         &script,
         use_vm,
+        &["--allow-import-root", &import_root],
         &[
             ("TSUMUGI_SANDBOX", dir.as_str()),
             ("TSUMUGI_MAX_IMPORT_COUNT", "0"),
@@ -940,6 +933,8 @@ fn import_count_limit_gates_file_execution_vm() {
 ///
 /// `import_count_limit_gates_file_execution_vm` と同じ理由で、legacy env budget が効く VM arm のみを
 /// 対象にする（C6-c + option B で tree arm は standard budget へ移行、legacy env budget 非参照）。
+/// E9 で VM file/stdin も link 層 capability gate を通すため、`--allow-import-root` で
+/// `module_resolver` を grant して gate を通す（run 層の env budget 課金は従来どおり）。
 #[test]
 fn import_source_bytes_charged_allows_execution_within_limit_vm() {
     let use_vm = true;
@@ -951,9 +946,11 @@ fn import_source_bytes_charged_allows_execution_within_limit_vm() {
     std::fs::write(&script, "import \"lib.tsg\"\nprint(helper)\n").expect("main の作成に失敗");
 
     let context = "import bytes within limit [VM]";
-    let output = run_script_process(
+    let import_root = format!("default={}", dir.as_str());
+    let output = run_script_process_with_args(
         &script,
         use_vm,
+        &["--allow-import-root", &import_root],
         &[
             ("TSUMUGI_SANDBOX", dir.as_str()),
             // root + import の合計 byte 数を十分に上回る上限。

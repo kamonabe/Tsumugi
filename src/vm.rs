@@ -143,8 +143,10 @@ pub struct Vm {
     /// process argv ではなく実行 context に属する。
     script_args: Vec<String>,
 
-    /// この実行に付与された capability 集合（Phase 2 C1〜）。VM 経路の埋め込み統合は
-    /// E9（Phase 5）のため、現状は ambient 互換の既定 set（ProcessExit を grant）を使う。
+    /// この実行に付与された capability 集合（Phase 2 C1〜）。E9 で VM file/stdin の import gate は
+    /// Engine resolver（link 層 capability gate）へ統合済みだが、VM backend 本体の run 経路統合は
+    /// E9 残。既定 set は library 既定（deny-by-default の空 set）で、CLI の VM 経路が
+    /// [`Vm::set_capabilities`] で profile 由来の frozen set を注入する。
     capabilities: crate::capability::CapabilitySet,
 
     /// `exit()` の terminal 終了コード（Phase 2 C7、REV-023）。granted な `exit(code)` が
