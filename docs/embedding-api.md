@@ -35,12 +35,14 @@ pub enum Backend {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum LanguageRevision {
-    V0_11,
+    V0_19,
+    V0_20,
+    V0_21,
 }
 
 impl LanguageRevision {
-    pub const CURRENT: Self = Self::V0_11;
-    pub const fn as_str(self) -> &'static str; // "0.11"
+    pub const CURRENT: Self = Self::V0_21;
+    pub const fn as_str(self) -> &'static str; // 例: V0_21 => "0.21"
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
