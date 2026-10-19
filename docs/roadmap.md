@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-10-18
+最終更新: 2026-10-19
 
 > このロードマップは「進捗だけ」を追う。機能の詳細・採用/不採用の理由は各設計正本に置く
 > （ドキュメントの役割分担は [ドキュメント運用ガイド](documentation-guide.md) を参照）。
@@ -10,8 +10,9 @@
 
 - **フェーズ:** Phase 2（deny-by-default capability）・Phase 3/4（包括的な実行予算・協調実行）を並行して進行中。
 - **現在の slice:** 決定性 Slice 1（規範的 primitive）＝Phase 5 の着手部分は実装完了（StableError を含む deterministic primitive が一通り揃った。VM parity・FakeHost gate・audit normalize は後続 slice）。
-- **次のタスク:** 着手順 2＝Phase 1/2 の残り。REPL の Engine API 統合（E7 残）、VM/E9 の import・resolver 統合（Phase 5）、CAP-AT-17 の budget N 境界（Phase 3/C11）。正本は [組み込みAPI仕様](embedding-api.md)・[Capability Model仕様](capability-model.md)。
-- **直近完了:** 着手順 1 の Phase 6 audit への event 伝播が一区切り。`BudgetCharged`・host-call lifecycle の 3 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished`）・yield/resume lifecycle の 2 event（`Yielded` / `Resumed`）が tree backend で emission 済みで、§7.2 の 8 event 型のうち 7 event が tree backend で出る。budget 本体は tree/VM 完了。着手順 1 に残るのは I/O/host budget の残りと、`AuditBackpressure`-yield 配線・VM 対応（別フェーズ）。REV-001 の全順序化（REV-017）は revision 0.21 で実装済み。状態・詳細は「ステータス一覧」の REV-001/REV-015/REV-017 と [実行予算・協調実行仕様](execution-control.md) を参照（決定性 Slice 1 の deterministic shared helpers・DeterminismRulesRevision/ModuleId 正規化・FunctionId＝AUD-048・StableError は実装完了済み）。
+- **次のタスク:** 着手順 2＝Phase 1/2 の残り。REPL の Engine API 統合（E7 残）、VM/E9 の import・resolver 統合（Phase 5）。正本は [組み込みAPI仕様](embedding-api.md)・[Capability Model仕様](capability-model.md)。
+- **直近完了:** CAP-AT-17（§19）の source budget N 境界受入試験を shipped。tree 経路（standard budget を in-process 注入）で source/import の本数が N-1/N は成功し、N+1 は chunk 蓄積前（Link フェーズの `charge_source`/`charge_import`、`exec_program` 到達前）に拒否されて 1 文も実行しないことを固定した。`tests/integration.rs::cap_at_17_source_count_boundary_tree` / `cap_at_17_import_count_boundary_tree`（tree in-process・observable）、`tests/differential.rs::cap_at_17_source_count_charge_parity`（同 import graph の tree/VM source/import 会計一致）、`src/eval.rs` の unit test 2 件（§7.2 優先順位どおり primary resource が `SourceCount` / `ImportCount`）で担保。production 変更なし（会計は既に蓄積前拒否で正しいことを確認）。あわせて `import_count_limit_gates_file_execution_vm` の Phase 3 TODO コメントを done 参照へ更新。
+- **直近完了（その前）:** 着手順 1 の Phase 6 audit への event 伝播が一区切り。`BudgetCharged`・host-call lifecycle の 3 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished`）・yield/resume lifecycle の 2 event（`Yielded` / `Resumed`）が tree backend で emission 済みで、§7.2 の 8 event 型のうち 7 event が tree backend で出る。budget 本体は tree/VM 完了。着手順 1 に残るのは I/O/host budget の残りと、`AuditBackpressure`-yield 配線・VM 対応（別フェーズ）。REV-001 の全順序化（REV-017）は revision 0.21 で実装済み。状態・詳細は「ステータス一覧」の REV-001/REV-015/REV-017 と [実行予算・協調実行仕様](execution-control.md) を参照（決定性 Slice 1 の deterministic shared helpers・DeterminismRulesRevision/ModuleId 正規化・FunctionId＝AUD-048・StableError は実装完了済み）。
 
 ## マイルストーン（Phase 0〜7）
 
@@ -39,7 +40,7 @@
 | ID | 一行概要 | 状態 | owning spec |
 |---|---|---|---|
 | REV-001 | 共有 DAG の比較・表示・join・sort を有限化（指数化対策は完結、全順序化は REV-017 で実装済み・revision 0.21。残りは包括 budget 側の Phase 6 伝播で、うち `BudgetCharged`・host-call lifecycle 3 event・yield/resume 2 event emission は実装済み） | 🟡 | [実行予算・協調実行仕様](execution-control.md) |
-| REV-015 | source/string/heap/I-O/bulk work の包括 budget・deadline・cancel（budget 本体は tree/VM 完了、残りは Phase 6 への伝播。うち `BudgetCharged`・host-call lifecycle 3 event・yield/resume 2 event（`Yielded` / `Resumed`）emission は tree backend で実装済み） | 🟡 | [実行予算・協調実行仕様](execution-control.md) |
+| REV-015 | source/string/heap/I-O/bulk work の包括 budget・deadline・cancel（budget 本体は tree/VM 完了、CAP-AT-17 の source/import 本数 N 境界受入試験も tree 経路で完了。残りは Phase 6 への伝播。うち `BudgetCharged`・host-call lifecycle 3 event・yield/resume 2 event（`Yielded` / `Resumed`）emission は tree backend で実装済み） | 🟡 | [実行予算・協調実行仕様](execution-control.md) |
 | REV-007 | `ExecutionContext` の session state と run meter を request ごとに分離 | ⬜ | [実行予算・協調実行仕様](execution-control.md) |
 | REV-008 | 全 stable execution へ transaction を適用（REPL は AUD-024 で完了） | 🟡 | [組み込みAPI仕様](embedding-api.md)・[実行予算・協調実行仕様](execution-control.md) |
 | REV-010 | 32-bit target の `i64 as usize` wrap を `try_from`/checked へ | ⬜ | [実行予算・協調実行仕様](execution-control.md) |
@@ -68,7 +69,7 @@
 先頭ほど優先。各ステップの状態は上記「ステータス一覧」の対応 ID を参照する（ここでは再掲しない）。
 
 1. **包括 budget の残り（REV-001/REV-015、Phase 3/4）** — 残 I/O/host budget と Phase 6 audit への budget/event 伝播。budget 本体は tree/VM 完了で、Phase 6 伝播のうち `BudgetCharged`・host-call lifecycle の 3 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished`）・yield/resume lifecycle の 2 event（`Yielded` / `Resumed`）は tree backend で実装済み。これで host-call + yield/resume の audit 伝播は完了（tree-only・opt-in・非破壊）。残るのは `AuditBackpressure`-yield 配線（§10.2）と VM 対応で、どちらも別フェーズ。REV-001 の全順序化（REV-017）は revision 0.21 で実装済み（§17.8）。正本: [実行予算・協調実行仕様](execution-control.md)、全順序化の設計は [次期意味論・実装決定](semantic-decisions.md) §17.8。
-2. **Phase 1/2 の残り** — REPL の Engine API 統合（E7 残）、VM/E9 の import・resolver 統合（Phase 5）、CAP-AT-17 の budget N 境界（Phase 3/C11）。正本: [組み込みAPI仕様](embedding-api.md)・[Capability Model仕様](capability-model.md)。
+2. **Phase 1/2 の残り** — REPL の Engine API 統合（E7 残）、VM/E9 の import・resolver 統合（Phase 5）。CAP-AT-17 の budget N 境界（Phase 3/C11）は完了（上記「直近完了」）。正本: [組み込みAPI仕様](embedding-api.md)・[Capability Model仕様](capability-model.md)。
 3. **Phase 6 audit の残り** — `AuditBackpressure`-yield 配線・redaction 本体・strict CBOR・record/replay・VM 対応・sink 必須化ほか（`Yielded` / `Resumed` emission は shipped）。正本: [決定性・実行時監査仕様](determinism-and-audit.md)。
 4. **Phase 7 運用保証** — MSRV・release/install・artifact・OCI・運用資材。正本: [検証・リリース・運用設計](verification-release-operations.md)。
 
