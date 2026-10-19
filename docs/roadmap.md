@@ -95,7 +95,7 @@
 - [x] 組み込み関数（print, len, push, pop, keys, type, slice, contains, split, join, to_int, to_str, range ほか）
 - [x] ファイル I/O（read_file, read_lines, write_file, append_file）とサンドボックス
 - [x] REPL（複数行入力）・行番号付きエラー・スタックトレース
-- [x] バイトコード VM（Phase 0〜8）: OpCode/Chunk/Compiler/VM、変数、制御フロー、関数、クロージャ、組み込み関数 53 個、互換性修正、IEEE 754 統一
+- [x] バイトコード VM（Phase 0〜8）: OpCode/Chunk/Compiler/VM、変数、制御フロー、関数、クロージャ、組み込み関数 54 個、互換性修正、IEEE 754 統一
 - [x] bytecode 検証・API 封印（REV-006/004/005/018）: `VerifiedChunk`/verifier、per-instruction step 課金、`MakeClosure(proto_index)`+`CaptureDesc`、`patch_jump` fallible 化、`unstable-bytecode` feature 封印
 - [x] ステップ予算（ループ反復 + 関数呼び出しのカウント、無限ループ/再帰防止、tree/VM 両対応）→ 詳細は [実行予算・協調実行仕様](execution-control.md)
 - [x] 深層監査 AUD-001〜050 の大半（REPL transaction・collection 上限・深度制限・canonical error・COW collection・FunctionId ほか）→ 状態は「ステータス一覧」、詳細は各 spec

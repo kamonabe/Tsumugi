@@ -773,7 +773,9 @@ end
 
 上記は例であり、網羅ではない。`e["type"]` で得られる種別は次のとおり。
 
-`zero_division`, `type`, `index`, `name`, `limit`, `overflow`, `sandbox`, `import`, `argument`, `int_overflow`, `control_flow`, `collection_limit`, `string_limit`, `source_limit`, `heap_limit`, `io_limit`, `conversion`, `builtin_type`, `iteration`, `io`, `internal`, `runtime`
+`zero_division`, `type`, `index`, `name`, `limit`, `overflow`, `sandbox`, `import`, `argument`, `int_overflow`, `control_flow`, `collection_limit`, `string_limit`, `source_limit`, `heap_limit`, `io_limit`, `conversion`, `builtin_type`, `iteration`, `io`, `capability`, `host`, `internal`, `runtime`
+
+このうち `capability` / `host` は、host function や capability が配線された実行（埋め込み実行など）でのみ観測される。単体のスクリプト実行では生成経路を持たない。これらを catch 可能種別として扱う契約は[組み込みAPI仕様](embedding-api.md) 8.1 に従う。
 
 このうち `string_limit` / `source_limit` / `heap_limit` / `io_limit` は包括budget（REV-015 Slice 2）で追加した予算超過の種別である。既定の上限では通常のスクリプトから観測されず、対応するメッセージテンプレートは budget 実装の確定に伴って変わり得るため、下の正本表には載せていない（実装状態は[ロードマップ](roadmap.md)の REV-015 を参照）。
 
