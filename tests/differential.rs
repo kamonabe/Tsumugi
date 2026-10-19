@@ -898,16 +898,16 @@ struct ImportTestDir {
 }
 
 impl ImportTestDir {
-    fn new(label: &str) -> Self {
+    /// `label` は失敗メッセージ（`assert_invariant_axes`）側で使う識別子で、ディレクトリ名には
+    /// 使わない。label には日本語・コロン・括弧が含まれ、Windows ではコロンがパスの特殊文字扱い
+    /// となり `create_dir_all` が `NotADirectory` で失敗するため（OS 依存回避）、ディレクトリ名は
+    /// PID と連番だけで一意化する。
+    fn new(_label: &str) -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "tsumugi-diff-{}-{}-{}",
-            label,
-            std::process::id(),
-            unique
-        ));
+        let path =
+            std::env::temp_dir().join(format!("tsumugi-diff-{}-{}", std::process::id(), unique));
         std::fs::remove_dir_all(&path).ok();
         std::fs::create_dir_all(&path).expect("一時ディレクトリの作成に失敗");
         Self { path }
