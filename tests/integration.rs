@@ -221,14 +221,15 @@ fn fixture_needs_legacy(name: &str) -> bool {
     )
 }
 
-/// import を含む fixture（C6-c で tree 経路は Engine resolver 経由になった）。
+/// import を含む fixture（C6-c で tree 経路、E9 で VM 経路が Engine resolver gate を通る）。
 ///
 /// C6-c 以降、**tree 経路の file import は `module_resolver` capability が必須**になった（Q2 =
-/// Denied all-in、設計 §4.5/§8）。これらの fixture は bare-path import（`import "import_lib.tsg"`）
-/// を使い、fixtures ディレクトリ内の兄弟ファイルを import するため、tree arm では
-/// `--allow-import-root default=<fixtures_dir>` を付けて `default` mount へ routing する
-/// （bare → `@default/...` 正規化）。VM arm は E9/Phase 5 まで ModuleLoader 経路に残るため
-/// import root を付けず従来挙動のまま（意図的な tree/VM 既知差、設計 §4.4 blast radius）。
+/// Denied all-in、設計 §4.5/§8）。E9 で VM file/stdin も link 層 capability gate（Engine resolver）を
+/// 前置するようになり、未 grant + import は tree と同じく terminal `Denied` になる。これらの fixture は
+/// bare-path import（`import "import_lib.tsg"`）を使い、fixtures ディレクトリ内の兄弟ファイルを
+/// import するため、tree/VM 両 arm とも `--allow-import-root default=<fixtures_dir>` を付けて
+/// `default` mount へ routing する（bare → `@default/...` 正規化）。従来あった「VM arm は import root
+/// 不要」という tree/VM 既知差は E9 で解消された。
 fn fixture_has_import(name: &str) -> bool {
     matches!(
         name,
@@ -241,20 +242,6 @@ fn fixture_has_import(name: &str) -> bool {
             | "error_import_not_found"
             | "error_import_before_side_effects"
     )
-}
-
-/// fixture の実効 [`FixtureKind`]（arm 依存）。
-///
-/// `import_circular` は link 層が循環を検出して `Cycle` terminal（exit 1、設計 §4.4）になるため
-/// **Error**。E9 で VM file/stdin も link 層 capability gate（Engine resolver）を通すようになり、
-/// tree arm と同じく link 段で `Cycle` を検出する（run 層 ModuleLoader の resolved-skip へ到達しない）。
-/// そのため両 arm とも Error で一致する（従来の tree/VM 既知差は解消）。
-fn effective_fixture_kind(name: &str, kind: FixtureKind, _use_vm: bool) -> FixtureKind {
-    if name == "import_circular" {
-        FixtureKind::Error
-    } else {
-        kind
-    }
 }
 
 /// fixture を1つ実行して stdout / stderr / 終了コードを検証する
@@ -288,7 +275,6 @@ fn run_fixture(name: &str, kind: FixtureKind, use_vm: bool) {
         command.env(key, value);
     }
 
-    let kind = effective_fixture_kind(name, kind, use_vm);
     let context = format!("{name} [{mode}]");
     let child = command
         .spawn()
@@ -453,7 +439,6 @@ fixture_tests!(
         hello,
         higher_order,
         import_basic,
-        import_circular,
         import_nested,
         import_static_resolution,
         index_assign_binding,
@@ -506,6 +491,7 @@ fixture_tests!(
         error_unknown_char,
         error_wrong_arg_count,
         error_zero_division,
+        import_circular,
     ]
 );
 
@@ -517,14 +503,6 @@ const CUSTOM_FIXTURES: &[&str] = &[
     // engine間でtrace frame数が異なる（AUD-017）ため専用テストで検証する
     "error_stack_overflow",
 ];
-
-/// tree/VM で kind が割れる fixture（arm 依存で Golden/Error が変わる、設計 §4.4）。
-///
-/// `import_circular` は VM arm が Golden（ModuleLoader の resolved-skip で A/B 出力）、tree arm が
-/// Error（Engine resolver が循環を `Cycle` terminal で検出）。そのため `.expected`（VM 用）と
-/// `.expected_err`（tree 用）の両方を持つ。宣言テーブルは代表 kind（Golden）に載せ、tree arm の
-/// Error 化は `effective_fixture_kind` が行う。directory 整合検査はこの fixture の二重 kind を許容する。
-const DUAL_KIND_FIXTURES: &[&str] = &["import_circular"];
 
 /// 他の fixture から import される補助ファイル（単体では実行しない）。
 const HELPER_FIXTURES: &[&str] = &[
@@ -569,10 +547,8 @@ fn fixture_declarations_match_directory() {
         ("エラー系", &error_files, ERROR_FIXTURES),
     ] {
         for file in files {
-            // dual-kind fixture は代表 kind のテーブルにだけ載る（もう一方の期待ファイルは
-            // arm 依存で参照される）。整合検査では代表 kind 以外の分類を免除する。
             assert!(
-                declared.contains(&file.as_str()) || DUAL_KIND_FIXTURES.contains(&file.as_str()),
+                declared.contains(&file.as_str()),
                 "{label} fixture `{file}` が宣言テーブルに登録されていません。\
                  fixture_tests! へ追加してください"
             );
