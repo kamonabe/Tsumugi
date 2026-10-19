@@ -1067,6 +1067,72 @@ impl Engine {
         )
     }
 
+    /// REPL 専用の link 入口（crate 内部、E7 のハイブリッド統合）。
+    ///
+    /// engine ID → revision → backend の整合だけを検証し、**import の有無によらず常に空 graph の
+    /// [`LinkedScript`] を返す**。`link` と違い `module_resolver` capability の gate を通さない。
+    ///
+    /// # なぜ gate を迂回するのか（既知の設計、新規緩和ではない）
+    ///
+    /// REPL は統合前から、`--allow-import-root`（＝`module_resolver` grant）無しでも CWD 相対
+    /// import を解決できていた。これは評価器内蔵の [`ModuleLoader`](crate::module::ModuleLoader)
+    /// が import を解決し、固定のエラー文字列を出す従来からの **observable 挙動**である。
+    /// [`Engine::run`] は [`LinkedScript`] の `import_graph` を参照せず、`root()` の保持 source を
+    /// 再 parse して評価器の `begin_execution` に渡す（評価器が自前の loader で import を解決する）
+    /// ため、REPL では空 graph を渡しても import は従来どおり評価器側で解決される。
+    ///
+    /// したがってこの入口が resolver gate を迂回するのは、**REPL の従来 observable 挙動を Engine API
+    /// 上で保全するため**であって、capability model へ新しい緩和を導入するものではない。file/stdin
+    /// 経路（[`Engine::link`]）の resolver gate とは別物で、そちらは従来どおり未 grant + import を
+    /// [`LinkError::Denied`] で弾く。将来この REPL の import 緩さ（flag 無し CWD 相対 import）を
+    /// capability で塞ぐなら、E8b / capability model 側の課題として扱う。
+    ///
+    /// # 可視性（内部 shim であり公開契約ではない）
+    ///
+    /// この crate の binary（`src/main.rs` の REPL）は lib とは別 crate としてこれを呼ぶため、
+    /// Rust の言語制約上 `pub` にせざるを得ない。ただしこれは **CLI 内部専用の shim** であり、
+    /// 外部 embedder 向けの安定した公開契約ではない。その意図を明示するため `#[doc(hidden)]` を
+    /// 付け、rustdoc の公開 API には出さない。外部からは [`Engine::link`] を使うこと。
+    #[doc(hidden)]
+    pub fn link_for_repl(
+        &self,
+        script: &CompiledScript,
+        request: LinkRequest,
+    ) -> Result<LinkedScript, LinkError> {
+        catch_host_unwind(AssertUnwindSafe(|| {
+            self.link_for_repl_inner(script, request)
+        }))
+        .unwrap_or_else(|fault_id| {
+            Err(LinkError::InternalFailure {
+                fault_id,
+                safe_message: internal_fault_message(fault_id),
+            })
+        })
+    }
+
+    fn link_for_repl_inner(
+        &self,
+        script: &CompiledScript,
+        request: LinkRequest,
+    ) -> Result<LinkedScript, LinkError> {
+        if script.engine_id() != self.id() {
+            return Err(LinkError::EngineMismatch);
+        }
+        if script.language_revision() != self.config().language_revision {
+            return Err(LinkError::RevisionMismatch);
+        }
+        if script.backend() != self.config().backend {
+            return Err(LinkError::BackendMismatch);
+        }
+        // `link` と同じく engine/revision/backend 検証直後に cancel を観測する（§4.3 step 0）。
+        if request.cancellation.is_cancelled() {
+            return Err(LinkError::Cancelled);
+        }
+        // import の有無によらず空 graph を返す。実際の import 解決は run 側の評価器内蔵 loader が
+        // 行う（上記 doc 参照）。run は import_graph を参照しないので観測挙動は不変。
+        Ok(self.empty_linked_script(script, script.source_hash()))
+    }
+
     fn link_inner(
         &self,
         script: &CompiledScript,
@@ -1689,6 +1755,12 @@ pub enum ContextError {
 pub struct ExecutionContext {
     engine_id: EngineId,
     evaluator: Evaluator,
+    /// REPL run 入口（`run_for_repl`）が、この context で既に budget を install 済みか（E7）。
+    ///
+    /// `false`（初回 submission）なら通常の `reset_budget`（config 再構築）で install し、`true`
+    /// （2 回目以降）なら `rearm_budget_for_repl`（fuel のみ reset・cumulative 温存）で張り直す。
+    /// 通常の `run`（file/stdin one-shot）はこの field を参照しない。
+    repl_budget_installed: bool,
     /// InternalFailure で poison されたか（第10節 規則4）。true の間は実行・状態操作を拒否する。
     poisoned: bool,
     /// 実行中フラグ（第10節 規則: 同 context への再入は許さない）。
@@ -1717,6 +1789,7 @@ impl ExecutionContext {
         Self {
             engine_id: engine.id(),
             evaluator,
+            repl_budget_installed: false,
             poisoned: false,
             running: false,
             #[cfg(test)]
@@ -1843,7 +1916,7 @@ impl Engine {
         // [`Self::run_audited`] を使う（`ExecutionOutcome` は `AuditFailure` を表現できないため、
         // 既存の `InternalFailure` には畳まず別 surface で返す）。
         if self.config.audit_sink.is_none() {
-            let outcome = self.run_guarded(linked, context, request);
+            let outcome = self.run_guarded(linked, context, request, false);
             context.running = false;
             if matches!(outcome, ExecutionOutcome::InternalFailure { .. }) {
                 context.poisoned = true;
@@ -1859,6 +1932,52 @@ impl Engine {
             context.poisoned = true;
         }
         audited.into_execution_outcome()
+    }
+
+    /// REPL 専用の実行入口（crate 内部、E7 のハイブリッド統合）。
+    ///
+    /// 挙動は [`Self::run`] と同じ（transaction・poison・再入検査・import は評価器内蔵 loader・
+    /// capability 注入・`exit` 写像）だが、**budget のライフサイクルだけが異なる**:
+    ///
+    /// - REPL は session 全体で 1 本の budget ledger を共有する。同じ [`ExecutionContext`] を
+    ///   submission 間で再利用する前提で、初回 submission は通常どおり budget/clock/cancellation を
+    ///   install し、2 回目以降は config を**作り直さず** fuel(step) だけ reset して cumulative
+    ///   counter（source/output/host/string/heap など）は **session 累積を温存**する。
+    /// - これは統合前 tree REPL の observable 挙動の保全である。既存の REPL 統合テスト
+    ///   （`source_bytes_cumulative_limit_gates_across_inputs_in_both_engines` /
+    ///   `output_calls_limit_gates_print_in_both_engines` /
+    ///   `output_bytes_limit_gates_print_in_both_engines`）が、この「session 累積・fuel のみ reset」
+    ///   を byte 単位で固定している。
+    /// - file/stdin の one-shot [`Self::run`]（呼び出しごとに budget config を再構築）とは**意図的に
+    ///   別経路**であり、[`Self::run`] の挙動は一切変えない。
+    ///
+    /// # 可視性（内部 shim であり公開契約ではない）
+    ///
+    /// [`Self::link_for_repl`] と同じく、crate の binary（REPL）が lib とは別 crate として呼ぶため
+    /// `pub` にせざるを得ないが、CLI 内部専用の shim であって外部 embedder 向けの公開契約ではない。
+    /// その意図を明示するため `#[doc(hidden)]` を付ける。外部からは [`Engine::run`] を使うこと。
+    #[doc(hidden)]
+    pub fn run_for_repl(
+        &self,
+        linked: &LinkedScript,
+        context: &mut ExecutionContext,
+        request: ExecutionRequest,
+    ) -> ExecutionOutcome {
+        if context.poisoned {
+            return internal_failure("poison 済みの実行コンテキストは再利用できません");
+        }
+        if context.running {
+            return internal_failure("実行コンテキストが実行中です（再入は許可されません）");
+        }
+        context.running = true;
+        // REPL は監査 sink を使わない（engine builder に sink を設定しない）ため、常に no-sink の
+        // guarded 経路を通す。`repl=true` で budget ライフサイクルだけ REPL 用に切り替える。
+        let outcome = self.run_guarded(linked, context, request, true);
+        context.running = false;
+        if matches!(outcome, ExecutionOutcome::InternalFailure { .. }) {
+            context.poisoned = true;
+        }
+        outcome
     }
 
     /// 監査 sink を設定した engine 向けの実行入口（Phase 6 A-1、§8/§10）。
@@ -1895,7 +2014,7 @@ impl Engine {
         }
         context.running = true;
         let audited = if self.config.audit_sink.is_none() {
-            AuditedOutcome::Outcome(Box::new(self.run_guarded(linked, context, request)))
+            AuditedOutcome::Outcome(Box::new(self.run_guarded(linked, context, request, false)))
         } else {
             self.run_audited_inner(linked, context, request)
         };
@@ -1920,9 +2039,10 @@ impl Engine {
         linked: &LinkedScript,
         context: &mut ExecutionContext,
         request: ExecutionRequest,
+        repl: bool,
     ) -> ExecutionOutcome {
         match catch_host_unwind(AssertUnwindSafe(|| {
-            self.run_inner(linked, context, request)
+            self.run_inner(linked, context, request, repl)
         })) {
             Ok(outcome) => outcome,
             Err(fault_id) => ExecutionOutcome::InternalFailure {
@@ -1963,7 +2083,7 @@ impl Engine {
             // 呼び出し規約違反（sink 未設定で呼ばれた）。従来経路へフォールバック。
             None => {
                 return AuditedOutcome::Outcome(Box::new(
-                    self.run_guarded(linked, context, request),
+                    self.run_guarded(linked, context, request, false),
                 ));
             }
         };
@@ -2097,7 +2217,7 @@ impl Engine {
             if context.panic_in_run_for_test {
                 panic!("injected run-boundary panic (test only)");
             }
-            self.execute_program(context, &program, root_source_bytes, request)
+            self.execute_program(context, &program, root_source_bytes, request, false)
         })) {
             Ok(outcome) => outcome,
             Err(fault_id) => ExecutionOutcome::InternalFailure {
@@ -2298,6 +2418,7 @@ impl Engine {
         linked: &LinkedScript,
         context: &mut ExecutionContext,
         request: ExecutionRequest,
+        repl: bool,
     ) -> ExecutionOutcome {
         // 実行前の整合検証と Program 再構築（案 A）。失敗は precondition 由来の InternalFailure。
         let (program, root_source_bytes) = match self.prepare_program(linked, context) {
@@ -2312,7 +2433,7 @@ impl Engine {
             panic!("injected run-boundary panic (test only)");
         }
 
-        self.execute_program(context, &program, root_source_bytes, request)
+        self.execute_program(context, &program, root_source_bytes, request, repl)
     }
 
     /// 実行前の engine/context 整合検証と、保持 source からの Program 再構築（案 A）。
@@ -2368,6 +2489,7 @@ impl Engine {
         program: &Program,
         root_source_bytes: u64,
         request: ExecutionRequest,
+        repl: bool,
     ) -> ExecutionOutcome {
         // request は有限 budget・deadline clock・cancellation token を必須所有する
         // （REV-015 最終形移行 Slice 2）。実行直前に 3 つとも評価器へ install する。
@@ -2377,9 +2499,27 @@ impl Engine {
         // ため、host が run 前に `.cancellation(token.clone())` で載せた token は同一 Arc を共有し、
         // reset をまたいでも実行中に cancel が観測される（finding 1）。pre-run cancel 判定より前に
         // 置くことで、pre-cancel で返す usage も「この request の budget」に対するものになる。
-        context
-            .evaluator
-            .reset_budget(request.budget, request.clock, request.cancellation.clone());
+        //
+        // REPL 経路（`repl=true`）だけ budget ライフサイクルが異なる: 初回 submission は通常どおり
+        // reset_budget で install し、2 回目以降は cumulative counter を温存したまま fuel だけ
+        // reset する（`rearm_budget_for_repl`）。これは統合前 tree REPL の observable 挙動
+        // （session 累積・fuel のみ reset）の保全で、one-shot run とは別経路（`run_for_repl` の doc）。
+        if repl && context.repl_budget_installed {
+            context.evaluator.rearm_budget_for_repl(
+                request.budget,
+                request.clock,
+                request.cancellation.clone(),
+            );
+        } else {
+            context.evaluator.reset_budget(
+                request.budget,
+                request.clock,
+                request.cancellation.clone(),
+            );
+            if repl {
+                context.repl_budget_installed = true;
+            }
+        }
 
         // pre-run cancel（EMB-AT-12）: install 済み token が最初の poll より前に cancel 済みなら、
         // script 命令を1つも実行せずに Cancelled terminal を返す（"pre-cancel は命令0"）。

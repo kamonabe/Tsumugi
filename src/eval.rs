@@ -546,6 +546,35 @@ impl Evaluator {
         self.env.set_heap_ledger(self.budget.heap_handle());
     }
 
+    /// REPL の 2 回目以降の submission 向けに budget を張り直す（E7、embedding `run_for_repl`）。
+    ///
+    /// [`Self::reset_budget`] と違い budget ledger を**作り直さない**。fuel(step) だけ reset して
+    /// deadline（config）・clock・cancellation を submission 用に差し替え、cumulative counter
+    /// （source/output/host/string/heap）は session 累積を**温存**する。統合前 tree REPL が
+    /// session 全体で 1 本の ledger を使い回し、`reset_step_budget` で fuel だけ戻していた
+    /// observable 挙動の保全であり、one-shot run（[`Self::reset_budget`]）とは意図的に別経路。
+    ///
+    /// heap 台帳は作り直さないので Env へ配った heap handle もそのまま有効（live heap 課金を
+    /// 累積温存する）。監査系 buffer（host-call / yield）は submission 境界で戻す（前 submission の
+    /// pending event を持ち越さない。REPL は監査 sink を使わないので観測影響は無い）。
+    pub fn rearm_budget_for_repl(
+        &mut self,
+        config: crate::budget::BudgetConfig,
+        clock: std::sync::Arc<dyn crate::budget::MonotonicClock>,
+        cancellation: crate::budget::CancellationToken,
+    ) {
+        self.budget
+            .rearm_for_repl_submission(config, clock, cancellation);
+        self.last_budget_resource.set(None);
+        self.next_host_operation_id = 0;
+        self.host_call_events.clear();
+        self.poll_index = 0;
+        self.last_yield_reason = None;
+        self.last_yield_poll_index = 0;
+        self.yield_events.clear();
+        // heap 台帳は温存するので heap handle の再配布は不要（cumulative live heap を維持）。
+    }
+
     /// deadline 確認用の clock を注入する（REV-015 Slice 4）。
     ///
     /// 注入した clock が `config.deadline` に達すると、charge 前と文/反復境界で
