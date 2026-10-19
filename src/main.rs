@@ -411,16 +411,17 @@ fn run_repl(frozen: CapabilitySet) {
             continue;
         }
 
-        // submission を 1 件実行する。ステップ予算は submission ごとに独立する（各 submission が
-        // 独自の BudgetConfig::standard を持つため、明示的な reset は不要）。未捕捉エラーは入力が
-        // 変更した language-state を巻き戻す（AUD-024、embedding の transaction）。
+        // submission を 1 件実行する。budget は session 全体で 1 本の ledger を共有し、submission
+        // ごとに fuel(step) だけ reset して cumulative counter（source/output/host/string/heap 等）
+        // は累積を温存する（`run_for_repl` が実施、統合前 tree REPL の観測挙動を保全）。未捕捉
+        // エラーは入力が変更した language-state を巻き戻す（AUD-024、embedding の transaction）。
         execute_repl_submission(&engine, &input, &mut context, &frozen);
 
         input.clear();
     }
 }
 
-/// REPL の1入力を embedding Engine API（`compile`→`link_for_repl`→`run`）で実行する（E7）。
+/// REPL の1入力を embedding Engine API（`compile`→`link_for_repl`→`run_for_repl`）で実行する（E7）。
 ///
 /// frozen capability set を各 submission の request へ毎回載せて持ち越す（REPL は clear を呼ばない）。
 /// outcome を統合前と同じ観測挙動へ写す:
@@ -450,7 +451,9 @@ fn execute_repl_submission(
         }
     };
 
-    // submission ごとに独立した budget / clock / cancellation / operation_id を用意する。
+    // clock / cancellation / operation_id は submission ごとに用意する。budget config 自体は
+    // 初回 submission で `run_for_repl` が install し、2 回目以降は fuel だけ reset して cumulative
+    // を温存するため（session 累積）、ここで渡す budget は初回のみ実効となる。
     let clock: Arc<dyn tsumugi::MonotonicClock> = Arc::new(SystemMonotonicClock::new());
     let budget = repl_budget(clock.as_ref());
     let cancellation = CancellationToken::new();
