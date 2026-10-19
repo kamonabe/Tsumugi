@@ -11,11 +11,10 @@ use cli_capability::{
 };
 use tsumugi::{
     BudgetConfig, CancellationToken, CapabilitySet, CompileErrors, EmbeddingContext,
-    EmbeddingEngine, EmbeddingOutcome, EmbeddingRequest, EmbeddingTraceFrame, Engine,
-    ExecutionContext, ExecutionError, ExecutionId, LinkError, LinkRequest,
-    Source as EmbeddingSource, SourceId, SystemMonotonicClock, compiler::Compiler,
-    embedding::CompileOptions, error::TsumugiError, lexer::Lexer, module::ModuleLoader,
-    parser::Parser, token::Token, vm::Vm,
+    EmbeddingEngine, EmbeddingOutcome, EmbeddingRequest, EmbeddingTraceFrame, ExecutionError,
+    ExecutionId, LinkError, LinkRequest, Source as EmbeddingSource, SourceId, SystemMonotonicClock,
+    compiler::Compiler, embedding::CompileOptions, error::TsumugiError, lexer::Lexer,
+    module::ModuleLoader, parser::Parser, token::Token, vm::Vm,
 };
 
 fn main() {
@@ -174,7 +173,8 @@ fn read_stdin_source() -> String {
 /// import の有無によらず embedding Engine API（[`EmbeddingEngine`]）を通す。import があれば
 /// `link` が frozen capability の `module_resolver`（CLI が `--allow-import-root` から grant）で
 /// 解決する。resolver 未 grant + import あり は terminal `Denied`（exit 1、actionable 診断）。
-/// REPL は依然 alpha facade（`run_source_alpha`）を使う（Engine 統合は E7 残）。
+/// tree REPL も E7 で embedding Engine API へ統合済み（[`run_repl`] 参照。ただし REPL は import
+/// 解決を評価器内蔵 loader へ委ねる `link_for_repl` 経路を使う）。
 fn run_source(source: &str, script_path: &str, script_args: Vec<String>, frozen: CapabilitySet) {
     let engine = EmbeddingEngine::builder()
         .build()
@@ -361,22 +361,31 @@ fn print_link_error(error: &LinkError) {
     }
 }
 
-/// REPL（対話実行モード）。
+/// REPL（対話実行モード、tree-walk）。
 ///
-/// REPL は入力をまたいで language-state を保持し、import も解決する必要があるため、Phase 1
-/// では現行の alpha facade（`ModuleLoader` を持つ評価器）を使う。embedding Engine API は
-/// import なし root の一括実行のみを提供する（状態継続・import 解決は Phase 2/E7）。REPL の
-/// Engine API 統合は E7 で行う（E8a の Phase 1 範囲外）。
+/// E7 で Engine embedding API（[`EmbeddingEngine`]）へ統合済み。session で [`EmbeddingContext`] を
+/// 1 つ保持して submission 間で**再利用**することで language-state（変数・関数・import 解決状態）を
+/// 継続する（`clear_user_state` は呼ばない）。frozen capability set は session 変数として保持し、
+/// 各 submission の [`EmbeddingRequest::with_capabilities`] へ毎回載せることで「session 開始時に 1 回
+/// 注入して全 submission へ持ち越す」観測挙動を再現する（REPL は capability の clear を呼ばない、§1(f)）。
+/// transaction（エラー後の language-state 巻き戻し、AUD-024）と `exit()` 写像は embedding `run` が担う。
+///
+/// import 解決は、従来どおり評価器内蔵の [`ModuleLoader`](tsumugi::module::ModuleLoader) に委ねる
+/// （`link_for_repl` が resolver gate を通さず空 graph を返し、`run` が評価器側で解決する）。これは
+/// REPL が統合前から持つ observable 挙動（`--allow-import-root` 無しの CWD 相対 import・固定エラー
+/// 文字列）を保全するためで、新規の capability 緩和ではない。詳細は
+/// [`EmbeddingEngine::link_for_repl`] の doc を正本とする。
 fn run_repl(frozen: CapabilitySet) {
     write_stdout(&format!(
         "Tsumugi v{} — 終了するには Ctrl+D\n",
         env!("CARGO_PKG_VERSION")
     ));
-    let engine = Engine::new();
-    let mut context = ExecutionContext::new();
-    // C9/C10: session 開始時に frozen set を 1 回注入する。各 submission は同じ frozen set を
-    // 共有し（§1(f)）、REPL は clear_capabilities を呼ばないので持ち越される。
-    context.set_capabilities(frozen);
+    let engine = EmbeddingEngine::builder()
+        .build()
+        .expect("既定 backend の Engine build は失敗しない");
+    // session で 1 つの context を保持して再利用する（state 継続）。REPL は script path を
+    // 持たないので set_script_path は呼ばない（相対 import の基準は未設定＝統合前と同じ）。
+    let mut context = EmbeddingContext::new(&engine);
     let mut input = String::new();
 
     loop {
@@ -402,41 +411,144 @@ fn run_repl(frozen: CapabilitySet) {
             continue;
         }
 
-        // 実行。ステップ予算はREPL入力ごとに独立させる。
-        // 未捕捉エラーは入力が変更した language-state を巻き戻す（AUD-024）。
-        context.reset_step_budget();
-        if let Err(errors) = execute_repl(&engine, &input, &mut context) {
-            // C7（REV-023）: REPL 入力の exit() は REPL を終了コード付きで終える。
-            if errors
-                .iter()
-                .any(|e| matches!(e.kind(), Some(tsumugi::error::ErrorKind::ProcessExit)))
-            {
-                let code = context.take_pending_exit().unwrap_or(0);
-                std::process::exit(code as i32);
-            }
-            for e in &errors {
-                eprintln!("  エラー: {}", e);
-            }
-        }
+        // submission を 1 件実行する。ステップ予算は submission ごとに独立する（各 submission が
+        // 独自の BudgetConfig::standard を持つため、明示的な reset は不要）。未捕捉エラーは入力が
+        // 変更した language-state を巻き戻す（AUD-024、embedding の transaction）。
+        execute_repl_submission(&engine, &input, &mut context, &frozen);
 
         input.clear();
     }
 }
 
-/// REPL の1入力を実行する CLI 用アダプター（AUD-024）。
+/// REPL の1入力を embedding Engine API（`compile`→`link_for_repl`→`run`）で実行する（E7）。
 ///
-/// 未捕捉ランタイムエラーで終了した入力は、その入力が加えた language-state の変更を
-/// 入力開始時点へ巻き戻す。外部効果（stdout・ファイル書き込み等）は巻き戻さない。
-fn execute_repl(
-    engine: &Engine,
+/// frozen capability set を各 submission の request へ毎回載せて持ち越す（REPL は clear を呼ばない）。
+/// outcome を統合前と同じ観測挙動へ写す:
+/// - `Completed`: 何も出さず次入力へ。
+/// - `Exited { code }`: `std::process::exit(code)`（C7、REV-023）。
+/// - `RuntimeError`/`BudgetExceeded`/`DeadlineExceeded`/`Cancelled`: `"  エラー: ..."` を stderr へ
+///   出して次入力へ（language-state は run 側で rollback 済み）。
+/// - `InternalFailure`: 診断を stderr へ出して session を終了（exit 70。context は poison 済み）。
+/// - compile error: `"  エラー: ..."` を各行へ出して次入力へ（session 継続）。
+fn execute_repl_submission(
+    engine: &EmbeddingEngine,
     source: &str,
-    context: &mut ExecutionContext,
-) -> Result<(), Vec<TsumugiError>> {
-    let script = engine.compile(source)?;
-    engine
-        .execute_repl_submission(&script, context)
-        .map(|_| ())
-        .map_err(|error| vec![error])
+    context: &mut EmbeddingContext,
+    frozen: &CapabilitySet,
+) {
+    // REPL 用の固定表示名で compile する。run は保持 source を再 parse するため retain_source 必須。
+    let source_id = SourceId::new("<repl>")
+        .unwrap_or_else(|_| SourceId::new("<script>").expect("固定 fallback"));
+    let options = CompileOptions {
+        retain_source: true,
+    };
+    let script = match engine.compile(EmbeddingSource::new(source_id, source), &options) {
+        Ok(script) => script,
+        Err(errors) => {
+            report_repl_compile_errors(&errors);
+            return;
+        }
+    };
+
+    // submission ごとに独立した budget / clock / cancellation / operation_id を用意する。
+    let clock: Arc<dyn tsumugi::MonotonicClock> = Arc::new(SystemMonotonicClock::new());
+    let budget = repl_budget(clock.as_ref());
+    let cancellation = CancellationToken::new();
+    let operation_id = ExecutionId::new(std::num::NonZeroU128::new(1).expect("1 は非ゼロ"));
+
+    // REPL 用 link 入口: resolver gate を通さず空 graph を得る（import 解決は run 側の評価器）。
+    let link_request = LinkRequest::new(operation_id, frozen.clone(), budget)
+        .with_cancellation(cancellation.clone());
+    let linked = match engine.link_for_repl(&script, link_request) {
+        Ok(linked) => linked,
+        Err(error) => {
+            // REPL の import 解決は run 側で行うため、ここへ到達するのは engine/revision/backend
+            // 不一致や cancel 等の防御的経路のみ。診断を出して次入力へ（session は継続）。
+            eprintln!("  エラー: {}", format_link_error(&error));
+            return;
+        }
+    };
+
+    // C9/C10: frozen set を各 submission の request へ載せて持ち越す（REPL は clear を呼ばない）。
+    let request = EmbeddingRequest::new(budget, Arc::clone(&clock))
+        .expect("standard budget は自身を生成した clock と同 domain なので検証を通る")
+        .with_capabilities(frozen.clone())
+        .cancellation(cancellation);
+
+    match engine.run_for_repl(&linked, context, request) {
+        EmbeddingOutcome::Completed { .. } => {}
+        // C7（REV-023）: REPL 入力の exit() は REPL を終了コード付きで終える。
+        EmbeddingOutcome::Exited { code, .. } => std::process::exit(code as i32),
+        EmbeddingOutcome::RuntimeError { error, .. }
+        | EmbeddingOutcome::BudgetExceeded { error, .. } => report_repl_error(&error),
+        EmbeddingOutcome::DeadlineExceeded { .. } => {
+            eprintln!("  エラー: 実行 deadline を超過しました");
+        }
+        // REPL では通常 cancel は発生しないが、防御的に写す。
+        EmbeddingOutcome::Cancelled { .. } => {
+            eprintln!("  エラー: 実行がキャンセルされました");
+        }
+        // context は poison 済み。これ以上の継続は不整合になるため session を終了する
+        // （組み込みAPI仕様 §12 の REPL 列に従う）。
+        EmbeddingOutcome::InternalFailure { safe_message, .. } => {
+            eprintln!("{}", safe_message);
+            std::process::exit(70);
+        }
+        // `EmbeddingOutcome` は `#[non_exhaustive]`。将来 variant が増えても internal failure と
+        // 同じ扱い（session 終了・code 70）で拾う。
+        other => {
+            eprintln!("内部エラー: 未対応の実行結果です: {:?}", other);
+            std::process::exit(70);
+        }
+    }
+}
+
+/// REPL submission 用の budget を作る。
+///
+/// 統合前の tree REPL は評価器既定（`BudgetConfig::from_legacy_env`）の budget を使い、legacy 環境
+/// 変数（`TSUMUGI_MAX_STEPS` / `TSUMUGI_MAX_COLLECTION_SIZE` ほか）を上限として尊重していた。この
+/// observable 挙動を保つため、REPL は `::standard` ではなく legacy env 由来の上限を使う。ただし
+/// embedding の [`EmbeddingRequest::new`] は budget の deadline と注入 clock の domain 一致を要求する
+/// ため、`from_legacy_env` の合成 deadline を、実行に使う `clock` と同 domain の `now + 30s` へ差し替える
+/// （`::standard` と同じ deadline 方針）。legacy env が設定する fuel / collection / string / source /
+/// I-O の上限はそのまま引き継ぐ。
+fn repl_budget(clock: &dyn tsumugi::MonotonicClock) -> BudgetConfig {
+    let standard = BudgetConfig::standard(clock)
+        .expect("standard budget の生成は overflow しない限り成功する");
+    let mut budget = BudgetConfig::from_legacy_env();
+    // deadline だけ実 clock domain のものへ差し替える（他の上限は legacy env 由来を維持）。
+    budget.deadline = standard.deadline;
+    budget
+}
+
+/// REPL の runtime error を統合前と同じ `"  エラー: {line}行目: {message}"`（+ trace）で stderr へ出す。
+///
+/// file/stdin 経路（`exit_code_for_outcome`）が prefix 無しで出すのに対し、REPL は `"  エラー: "`
+/// prefix を付ける差だけが残るよう、整形本体は `format_execution_error` を共有する。
+fn report_repl_error(error: &ExecutionError) {
+    eprintln!("  エラー: {}", format_execution_error(error));
+}
+
+/// REPL の compile error を統合前と同じ `"  エラー: {line}行目: {message}"` で各行へ出す。
+fn report_repl_compile_errors(errors: &CompileErrors) {
+    for diagnostic in &errors.diagnostics {
+        eprintln!(
+            "  エラー: {}",
+            format_line_message(diagnostic.line, &diagnostic.safe_message)
+        );
+    }
+}
+
+/// REPL 経路で万一 `link_for_repl` が返す防御的 [`LinkError`] を安全な文字列へ整形する。
+///
+/// `link_for_repl` は import 解決を run 側へ委ねるため通常はここに到達しないが、engine/revision/
+/// backend 不一致・cancel 等の防御的経路のために最小限の写像を持つ。
+fn format_link_error(error: &LinkError) -> String {
+    match error {
+        LinkError::Cancelled => "リンクがキャンセルされました".to_string(),
+        LinkError::DeadlineExceeded => "リンクの deadline を超過しました".to_string(),
+        other => format!("リンクエラー: {:?}", other),
+    }
 }
 
 /// 入力が未完結か判定（if/fn/while/for が end で閉じられていない）
@@ -508,7 +620,12 @@ fn run_source_vm(source: &str, script_path: &str, script_args: Vec<String>, froz
     }
 }
 
-/// VMモードのREPL
+/// VMモードのREPL。
+///
+/// tree REPL（[`run_repl`]）は E7 で embedding Engine API へ統合済みだが、VM REPL は**現状維持**で
+/// ある。VM 経路の Engine 統合（`link`/`run` の VM backend 配線）は VM が experimental の間に行う
+/// E9（Phase 5）に依存するため、本経路は `Compiler` + `Vm::new_repl()` + `ModuleLoader` を直接
+/// transaction 管理する従来実装のまま残す。VM の Engine API 統合は E9 で行う。
 fn run_repl_vm(frozen: CapabilitySet) {
     write_stdout(&format!(
         "Tsumugi v{} [VM mode] — 終了するには Ctrl+D\n",

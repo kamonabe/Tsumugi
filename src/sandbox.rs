@@ -6,10 +6,14 @@
 //! C6-c で **tree 経路の file/stdin import は Engine resolver（`ModuleResolver` capability）
 //! 経由へ移行**し、本モジュールを呼ばなくなった。本モジュールの `check_path` /
 //! `check_entry_path` を呼ぶのは、いまだ `ModuleLoader` を使う **VM import（E9/Phase 5）と
-//! REPL import（E7 残）だけ**である。これらが ModuleLoader を手放し Engine resolver へ統合
-//! されるまで、本モジュールは import 用に残す（設計 §3.5 の「撤去」は ModuleLoader の唯一の
-//! 呼び出し元が消える前提に立っていたが、ModuleLoader は VM/REPL 用に C6 では温存されるため、
-//! 撤去はその統合まで保留する）。
+//! tree REPL import だけ**である。tree REPL は E7 で Engine embedding API（`compile`→
+//! `link_for_repl`→`run_for_repl`）へ統合されたが、import 解決だけは従来どおり評価器内蔵の
+//! `ModuleLoader` に委ねる（resolver gate を迂回して CWD 相対 import・固定エラー文字列という
+//! 統合前の観測挙動を保全するため。詳細は `embedding.rs::Engine::link_for_repl` の doc）。
+//! そのため REPL import は引き続き本モジュールのサンドボックス検査を通る。これらが
+//! ModuleLoader を手放し Engine resolver へ統合されるまで、本モジュールは import 用に残す
+//! （設計 §3.5 の「撤去」は ModuleLoader の唯一の呼び出し元が消える前提に立っていたが、
+//! ModuleLoader は VM／REPL import 用に温存されるため、撤去はその統合まで保留する）。
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

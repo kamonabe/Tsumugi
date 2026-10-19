@@ -1,7 +1,7 @@
 # Tsumugi — Capability Model仕様
 
-最終更新: 2026-10-07
-設計ステータス: **実装仕様確定・実装進行中**（C1〜C10 実装済み。C6〔ModuleResolver／import 解決〕はPhase 2最小形としてtree経路のlink時解決を実装済み〔VM import統合はE9/Phase 5、REPLはE7残、budget N境界はC11/Phase 3〕。詳細は [ロードマップ](roadmap.md) Phase 2 を参照）
+最終更新: 2026-10-19
+設計ステータス: **実装仕様確定・実装進行中**（C1〜C10 実装済み。C6〔ModuleResolver／import 解決〕はPhase 2最小形としてtree経路のlink時解決を実装済み〔VM import統合はE9/Phase 5、tree REPLはE7でEngine API統合済みだがimport解決は評価器内蔵`ModuleLoader`に委ねresolver gateを迂回する——従来のCWD相対import・固定エラー文字列を保全する既知の設計で、REPLのimport gateを塞ぐならE8b以降の課題、budget N境界はC11/Phase 3〕。詳細は [ロードマップ](roadmap.md) Phase 2 を参照）
 
 ## 1. 目的と規範範囲
 

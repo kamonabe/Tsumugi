@@ -1972,6 +1972,106 @@ fn tree_repl_retries_failed_import() {
     );
 }
 
+// =============================================================
+// E7: REPL の Engine embedding API 統合（観測挙動不変の担保）
+// =============================================================
+//
+// tree REPL は E7 で Engine embedding API（compile→link_for_repl→run_for_repl、EmbeddingContext
+// 再利用）へ載せ替えた。VM REPL は E9 まで現状維持。下記は統合前と同じ観測挙動を tree/VM 両方で
+// 固定する（既存 REPL テストと重複しない観点を 1 テスト 1 観点で）。
+
+#[test]
+fn repl_state_continues_across_submissions_in_both_engines() {
+    // 複数 submission をまたいだ変数 state の継続（EmbeddingContext 再利用 / VM は従来経路）。
+    let source = "let a = 2\nlet b = a + 3\nprint(b)\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(stderr.is_empty(), "{mode} REPLで予期しない診断: {stderr}");
+        assert!(
+            repl_visible_lines(&stdout, use_vm).contains(&"5"),
+            "{mode}で submission をまたいだ state 継続が効いていない: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn repl_imported_names_resolve_across_submissions_in_both_engines() {
+    // import した submission の後、別 submission から import 済み名を参照できること。
+    // specifier は worktree 相対（tree_repl_retries_failed_import と同形式）。
+    // import 失敗文字列の互換は tree_repl_retries_failed_import が担保するので、ここは
+    // 「import 済み名の submission 跨ぎ参照」という別観点に絞る。
+    let source = "import \"tests/fixtures/import_lib.tsg\"\n\
+                  print(add(3, 4))\n\
+                  print(greet(\"tsumugi\"))\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+        let visible = repl_visible_lines(&stdout, use_vm);
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(stderr.is_empty(), "{mode} REPLで予期しない診断: {stderr}");
+        assert!(
+            visible.contains(&"7"),
+            "{mode}で import 済み add が submission 跨ぎで解決されていない: {stdout}"
+        );
+        assert!(
+            visible.contains(&"hello, tsumugi"),
+            "{mode}で import 済み greet が submission 跨ぎで解決されていない: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn repl_capabilities_persist_across_submissions_in_both_engines() {
+    // session 開始時に 1 回注入した frozen capability set が submission 間で持ち越されること。
+    // safe profile 既定で print（Stdout grant）が最初と後続の submission の両方で機能する。
+    let source = "print(\"first\")\nprint(\"second\")\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+        let visible = repl_visible_lines(&stdout, use_vm);
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(stderr.is_empty(), "{mode} REPLで予期しない診断: {stderr}");
+        assert!(
+            visible.contains(&"first") && visible.contains(&"second"),
+            "{mode}で capability（Stdout grant）が submission 間で持ち越されていない: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn repl_continues_session_after_uncaught_error_in_both_engines() {
+    // 未捕捉エラーの submission の後、後続の正常な submission が実行されること
+    // （function_id_is_not_reused_after_repl_rollback と重複しない具体例）。
+    let source = "let x = 10\nprint(undefined_name)\nprint(x + 1)\n";
+
+    for use_vm in [false, true] {
+        let output = run_repl_process(source, use_vm, &[]);
+        let (stdout, stderr) = output_text(&output);
+        let mode = if use_vm { "VM" } else { "tree" };
+
+        assert!(output.status.success(), "{mode} REPLが異常終了: {stderr}");
+        assert!(
+            stderr.contains("未定義の変数または関数: undefined_name"),
+            "{mode}で未捕捉エラーの診断がない: {stderr}"
+        );
+        assert!(
+            repl_visible_lines(&stdout, use_vm).contains(&"11"),
+            "{mode}でエラー後のセッション継続（後続 submission 実行）が効いていない: {stdout}"
+        );
+    }
+}
+
 #[test]
 fn collection_limit_is_consistent_in_both_engines() {
     let source = "print([1, 2, 3])\n\
