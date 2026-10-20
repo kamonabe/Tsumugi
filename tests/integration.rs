@@ -1361,14 +1361,13 @@ fn windows_protected_env_keys_vm() {
 // リグレッションテスト: user function call validation順序
 // =============================================================
 
-/// step 予算が尽きたとき、guard された callee 本体の副作用が観測されないこと（REV-006）。
+/// step 予算が尽きたとき、guard された callee 本体の副作用が観測されないこと（REV-006）と、
+/// user function 呼び出しがちょうど 1 fuel であること（F1-AT-05）。
 ///
-/// REV-006 の per-instruction step 課金により「call = 1 step」という旧会計は廃止し、
-/// 全命令 dispatch ごとに 1 step 課金する。したがって旧テストの `MAX_STEPS=1` で
-/// 「call をちょうど 1 step」という検査は成立しない。ここでは per-instruction 課金でも
-/// 保たれる不変（予算枯渇時に callee 本体が実行されない・`limit` 診断が出る・十分な
-/// 予算では正常完了する）を検査する。step 到達点そのものは engine 間で異なり得るため
-/// 固定しない。
+/// REV-006 の per-instruction 課金で弱めていた「call = ちょうど 1 step」の検査を、F-1
+/// （execution-control §14）で fuel の課金点を tree と揃えたので復元する。上限 0 では呼び出し
+/// （`PrepareCall`）の課金で callee 評価より前に止まり、上限 1 では 1 回の呼び出しが成功する。
+/// 両 engine で stdout・stderr が一致する。
 #[test]
 fn call_budget_is_checked_before_callee_in_both_engines() {
     let rejected_source = concat!(
@@ -1393,10 +1392,8 @@ fn call_budget_is_checked_before_callee_in_both_engines() {
     for use_vm in [false, true] {
         let mode = if use_vm { "VM" } else { "tree" };
 
-        // 予算 0: 最初の命令で必ず尽きる。callee 本体は決して実行されない。
-        // per-instruction 課金では最初の submission（関数定義）で尽きるため、
-        // `limit` 診断は捕捉外（stderr）に出得る。捕捉/非捕捉は問わず、
-        // callee 副作用が出ないことと `limit` が観測されることを検査する。
+        // 予算 0: 呼び出しの課金で尽き、callee 本体は決して実行されない。fuel 超過は catch
+        // できないため、`limit` 診断は捕捉外（stderr）に出る。
         let rejected = run_repl_process(rejected_source, use_vm, &[("TSUMUGI_MAX_STEPS", "0")]);
         let (rejected_stdout, rejected_stderr) = output_text(&rejected);
 
@@ -1408,23 +1405,26 @@ fn call_budget_is_checked_before_callee_in_both_engines() {
             !rejected_stdout.contains("step-callee-ran"),
             "{mode}で予算枯渇時にcallee本体を実行した: {rejected_stdout}"
         );
-        let saw_limit = rejected_stdout.contains("limit")
-            || rejected_stderr.contains("ステップ上限に達しました");
         assert!(
-            saw_limit,
-            "{mode}で予算枯渇時に limit 診断が観測されない: stdout={rejected_stdout} stderr={rejected_stderr}"
+            !rejected_stdout.contains("limit"),
+            "{mode}で fuel 超過が catch された: {rejected_stdout}"
+        );
+        assert!(
+            // REPL の行番号は submission（try ブロック）内の行で数える。
+            rejected_stderr.contains("エラー: 2行目: ステップ上限に達しました (上限: 0)"),
+            "{mode}で呼び出し位置の limit 診断が観測されない: {rejected_stderr}"
         );
 
-        // 十分な予算: 正常完了し once 本体をちょうど 1 回実行する（二重実行なし）。
-        let normal = run_repl_process(normal_source, use_vm, &[]);
+        // 上限 1: once() の 1 回の呼び出しがちょうど 1 fuel で成功し、本体を 1 回だけ実行する。
+        let normal = run_repl_process(normal_source, use_vm, &[("TSUMUGI_MAX_STEPS", "1")]);
         let (normal_stdout, normal_stderr) = output_text(&normal);
         assert!(
             normal.status.success(),
             "{mode} REPLが異常終了: {normal_stderr}"
         );
         assert!(
-            normal_stderr.is_empty(),
-            "{mode}で正常実行に診断が出た: {normal_stderr}"
+            !normal_stderr.contains("ステップ上限"),
+            "{mode}で呼び出しが 1 fuel を超えて課金された: {normal_stderr}"
         );
         assert_eq!(
             normal_stdout.matches("once-body\n").count(),
@@ -3547,6 +3547,121 @@ fn heap_released_after_repl_rollback_in_both_engines() {
         assert!(
             visible.contains(&"100"),
             "{mode}: rollback 後に heap が release されず入力3 が失敗した疑い: stdout={stdout} stderr={stderr}"
+        );
+    }
+}
+
+// =============================================================
+// F-1: fuel parity（execution-control §14「F-1 実装スライス」）
+// =============================================================
+
+/// F1-AT-04: 既定上限（1,000,000）で、2 文ループ 1,000,000 反復は両 engine で成功し、
+/// 1,000,001 反復は両 engine で同じ診断で失敗する。fib(27) は両 engine で成功する。
+#[test]
+fn f1_default_fuel_limit_matches_in_both_engines() {
+    let dir = TestDir::new("f1-default-limit");
+    let loop_source = |n: u64| {
+        format!(
+            "let i = 0\nlet s = 0\nwhile i < {n}\n  s = s + i\n  i = i + 1\nend\nprint(\"done\")\n"
+        )
+    };
+    let fib = "fn fib(n)\n  if n < 2\n    return n\n  end\n  return fib(n - 1) + fib(n - 2)\nend\nprint(fib(27))\n";
+
+    let cases: Vec<(&str, String, Result<&str, &str>)> = vec![
+        ("loop 1,000,000", loop_source(1_000_000), Ok("done")),
+        (
+            "loop 1,000,001",
+            loop_source(1_000_001),
+            Err("3行目: ステップ上限に達しました (上限: 1000000)"),
+        ),
+        ("fib(27)", fib.to_string(), Ok("196418")),
+    ];
+    for (label, source, expected) in cases {
+        let script = dir.path.join("s.tsg");
+        std::fs::write(&script, &source).expect("スクリプトの作成に失敗");
+        for use_vm in [false, true] {
+            let context = format!("{label} [vm={use_vm}]");
+            let output = run_script_process(&script, use_vm, &[], &context);
+            let stdout = normalize(&String::from_utf8_lossy(&output.stdout));
+            let stderr = normalize(&String::from_utf8_lossy(&output.stderr));
+            match expected {
+                Ok(out) => {
+                    assert!(output.status.success(), "{context}: 失敗しました: {stderr}");
+                    assert_eq!(stdout, out, "{context}: 出力が一致しません");
+                }
+                Err(err) => {
+                    assert!(!output.status.success(), "{context}: 成功してしまいました");
+                    assert_eq!(stderr, err, "{context}: 診断が一致しません");
+                }
+            }
+        }
+    }
+}
+
+/// F1-AT-08: REPL では submission ごとに fuel と instruction watchdog が reset され、tree と VM で
+/// 同じ入力列が同じ出力になる。上限 5 で 5 回呼び出す submission を 20 回続けても、watchdog が
+/// 累積しないので VM も止まらない（累積すれば 20 × 6 tick が上限 5 × 2 + 16 を超える）。
+#[test]
+fn f1_repl_resets_fuel_and_watchdog_per_submission() {
+    let mut source = String::from("fn f()\n  return 1\nend\n");
+    for _ in 0..20 {
+        source.push_str("let r = f() + f() + f() + f() + f()\n");
+    }
+    // 6 回目の呼び出しで上限 5 を超える submission（両 engine で同じ診断）。
+    source.push_str("let over = f() + f() + f() + f() + f() + f()\n");
+    source.push_str("print(\"alive\")\n");
+
+    let mut outputs = Vec::new();
+    for use_vm in [false, true] {
+        let output = run_repl_process(&source, use_vm, &[("TSUMUGI_MAX_STEPS", "5")]);
+        let (stdout, stderr) = output_text(&output);
+        assert!(
+            output.status.success(),
+            "[vm={use_vm}] REPL が異常終了: {stderr}"
+        );
+        assert!(
+            stdout.contains("alive"),
+            "[vm={use_vm}] 後続の入力が実行されない: {stdout}"
+        );
+        assert_eq!(
+            stderr.matches("ステップ上限に達しました (上限: 5)").count(),
+            1,
+            "[vm={use_vm}] 上限超過は 6 回呼ぶ submission の 1 回だけのはず: {stderr}"
+        );
+        outputs.push((
+            stdout.replace("tsumugi:vm> ", "").replace("tsumugi> ", ""),
+            stderr,
+        ));
+    }
+    assert_eq!(
+        outputs[0].1, outputs[1].1,
+        "REPL の stderr が tree/VM で一致しません"
+    );
+}
+
+/// F1-AT-09: fuel の上限到達は try/catch で捕捉できない（両 engine）。
+#[test]
+fn f1_fuel_limit_is_not_catchable_in_both_engines() {
+    let dir = TestDir::new("f1-uncatchable");
+    let script = dir.path.join("s.tsg");
+    std::fs::write(
+        &script,
+        "try\n  while true\n  end\ncatch e\n  print(\"caught\")\nend\nprint(\"after\")\n",
+    )
+    .expect("スクリプトの作成に失敗");
+    for use_vm in [false, true] {
+        let context = format!("uncatchable [vm={use_vm}]");
+        let output = run_script_process(&script, use_vm, &[], &context);
+        let stdout = normalize(&String::from_utf8_lossy(&output.stdout));
+        let stderr = normalize(&String::from_utf8_lossy(&output.stderr));
+        assert!(!output.status.success(), "{context}: 正常終了しました");
+        assert_eq!(
+            stdout, "",
+            "{context}: catch された、または後続が実行された: {stdout}"
+        );
+        assert_eq!(
+            stderr, "2行目: ステップ上限に達しました (上限: 1000000)",
+            "{context}: 診断が一致しません"
         );
     }
 }

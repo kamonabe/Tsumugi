@@ -27,7 +27,9 @@ struct LoopState {
     continue_target: usize,
     /// break のジャンプ命令位置（ループ後にパッチする）
     breaks: Vec<usize>,
-    /// continue のジャンプ命令位置（for ループ用: インクリメント位置にパッチ）
+    /// continue の前方 `Jump` 命令位置（for ループ用: インクリメント位置にパッチ）。
+    /// `Loop` は back-edge 専用（fuel の課金点 F1、execution-control §14 F-1）なので、
+    /// for の continue は `Loop` ではなく前方 `Jump` で increment へ飛ばす。
     continues: Vec<usize>,
     /// ループ開始時のローカル変数数（break/continue 時のスタック巻き戻しに使う）
     locals_count: usize,
@@ -36,6 +38,9 @@ struct LoopState {
     /// ループ内で現在アクティブな try ブロックの深さ
     /// break/continue 時にこの数だけ TeardownTry を発行する
     try_depth: usize,
+    /// ループ文の行。while の continue が発行する back-edge `Loop` に付ける。fuel 上限に
+    /// 達したときの行を tree（ループ文の行で課金する）と揃えるため（execution-control §14 F-1）。
+    line: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -413,6 +418,7 @@ impl Compiler {
             locals_count: self.locals.len(),
             continue_resolved: true,
             try_depth: 0,
+            line,
         });
 
         // 条件式
@@ -479,6 +485,7 @@ impl Compiler {
             locals_count: self.locals.len(),
             continue_resolved: false,
             try_depth: 0,
+            line,
         });
 
         // 条件: index < len(collection)
@@ -507,6 +514,11 @@ impl Compiler {
         let increment_start = self.chunk.len();
         // LoopState の continue_target をパッチ
         self.loops.last_mut().unwrap().continue_target = increment_start;
+        // continue の前方 Jump をインクリメント位置（= 現在位置）へパッチする
+        let continues = std::mem::take(&mut self.loops.last_mut().unwrap().continues);
+        for cont_offset in continues {
+            self.patch_jump(cont_offset)?;
+        }
 
         // index = index + 1
         self.chunk.emit(OpCode::GetLocal(index_slot), line);
@@ -521,17 +533,10 @@ impl Compiler {
         // 脱出先パッチ
         self.patch_jump(exit_jump)?;
 
-        // break / continue パッチ
+        // break パッチ（continue はインクリメント位置で patch 済み）
         let loop_state = self.loops.pop().unwrap();
         for break_offset in loop_state.breaks {
             self.patch_jump(break_offset)?;
-        }
-        // continue のジャンプ先をインクリメント位置にパッチ
-        for cont_offset in loop_state.continues {
-            // Loop 命令のターゲットをパッチ
-            if let OpCode::Loop(ref mut target) = self.chunk.code[cont_offset] {
-                *target = increment_start;
-            }
         }
 
         // for スコープ終了（collection, index, var を pop）
@@ -574,6 +579,7 @@ impl Compiler {
             .ok_or_else(|| TsumugiError::continue_outside_loop(line))?;
         let continue_target = loop_state.continue_target;
         let continue_resolved = loop_state.continue_resolved;
+        let loop_line = loop_state.line;
 
         // continue 時にアクティブな try ハンドラを解除する
         let try_depth = loop_state.try_depth;
@@ -588,12 +594,12 @@ impl Compiler {
         }
 
         if continue_resolved {
-            // while: 飛び先が確定している
-            self.chunk.emit(OpCode::Loop(continue_target), line);
+            // while: 飛び先が確定している。back-edge はループ文の行で課金する（tree と同じ）。
+            self.chunk.emit(OpCode::Loop(continue_target), loop_line);
         } else {
-            // for: 飛び先が未確定なので仮で発行して後でパッチ
-            let offset = self.chunk.len();
-            self.chunk.emit(OpCode::Loop(0), line);
+            // for: 飛び先（インクリメント位置）は前方なので、前方 Jump を仮で発行して後でパッチ
+            // する。`Loop` は back-edge 専用（fuel の課金点 F1）。
+            let offset = self.chunk.emit_jump(OpCode::Jump(0), line);
             self.loops.last_mut().unwrap().continues.push(offset);
         }
         Ok(())

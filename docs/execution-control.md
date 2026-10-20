@@ -1147,8 +1147,8 @@ Slice 2で追加した上限のlegacy key（`TSUMUGI_MAX_SINGLE_STRING_BYTES` / 
         到達 payload（List / Dict / String body）は、entry の握る `Rc` が対象 backing の
         `Tracked` を生かし続けるため既に live heap に計上されており、ここで再課金しない
         （§5.2 の共有は 1 回課金）。tree は journal 記録経路を fallible 化して超過を伝播し、
-        VM は infallible な checkpoint 経路の超過を保留して次の per-instruction step 課金
-        境界で surface する。既定上限では観測挙動を変えない。
+        VM は infallible な checkpoint 経路の超過を保留して次の命令の dispatch 前に
+        surface する（F-1 以降は fuel 課金と切り離した全命令の `surface_pending_heap_stop`）。既定上限では観測挙動を変えない。
   - `charge_context_baseline`（全 heap object を 1 回ずつ論理課金する純関数）は、collection・
     String・cell・関数 header・AST・chunk・import record・journal がすべて per-drop 追跡された
     ことで engine の `charge_link` からは呼ばない（tracked 分を二重計上するため）。execution
@@ -1383,7 +1383,7 @@ VM charge parity（Slice 6）はこの slice の対象外で VM は cooperative 
   closure retain 課金は PR-6b で実装済みであり、**Slice 6 の残作業は §15.5 charge/budget
   parity matrix の自動化のみ**である（下記 §15.5 の PR-6c 線引きを参照）。
 
-- **fuel 課金差（未解消 → 下記「F-1 実装スライス」）**: Slice 6 で揃えたのは heap・string・
+- **fuel 課金差（✅ 解消済み：下記「F-1 実装スライス」）**: Slice 6 で揃えたのは heap・string・
   I-O の会計で、fuel は揃っていない（2026-10-20 判明）。tree はループ反復・user function
   呼び出し・callback 呼び出しごとに 1、VM は REV-006（[次期意味論・実装決定](semantic-decisions.md)
   §17.7）以降、全命令ごとに 1 を課金しており、同じ script が tree では成功して VM では step
@@ -1396,7 +1396,7 @@ VM charge parity（Slice 6）はこの slice の対象外で VM は cooperative 
 
 #### F-1 実装スライス（fuel parity：VM を tree の現行課金点へ、2 メーター化）
 
-> 状態: **定義済み・未実装**（2026-10-20）。§4.1 の課金表そのものの実装は後続の F-2（未定義）で扱う。
+> 状態: **実装済み**（2026-10-20）。実装上の注記は本小節末尾を参照。§4.1 の課金表そのものの実装は後続の F-2（未定義）で扱う。
 
 fuel を「論理量」と「停止性の安全網」の 2 つのメーターに分ける（[次期意味論・実装決定](semantic-decisions.md)
 §17.7 の 2026-10-20 改訂）。F-1 は、VM の fuel を tree の**現行の**課金点に合わせて tree/VM の
@@ -1470,6 +1470,23 @@ F-2 で行う（F-2 は既定 `total_fuel` の見直しと `language_revision` �
   停止性は `tests/defensive_vm.rs`、watchdog の内部不変条件は `src/vm.rs` の unit test。
 - **F-1 の範囲外**: §4.1 の課金表（F-2）、VM の deadline clock 注入、VM の audit、VM の
   cooperative 実行（いずれも既存の後続項目）。
+- **実装上の注記（2026-10-20）**:
+  - **消費 fuel の突合方法**: tree は成功 path で `committed.fuel` を 0 として snapshot する
+    （入力ごとに reset）ため、F1-AT-01/02 は usage の直接比較ではなく「成功する最小の fuel 上限 N」
+    を二分探索で求めて exact 突合する（`tests/differential.rs` の `assert_fuel_parity`）。同じ関数で
+    N−1 の terminal 全 field（F1-AT-03）と watchdog の tick 数 ≤ N + 1（F1-AT-07）も検査する。
+  - **`while` の `continue` の line**: `continue` が出す back-edge `Loop` には、`continue` 文ではなく
+    ループ文の line を付ける（`LoopState.line`）。tree はループ文の line で課金するため、付けないと
+    `continue` 直後に上限へ達したときの line が tree/VM で食い違う（F1-AT-03 で検出）。
+  - **保留中の heap 超過**: 改訂前の全命令 `count_step` は、rollback journal の heap 超過
+    （`pending_heap_stop`）を次の命令で表に出す役目も兼ねていた。fuel の課金点を減らしてもこの
+    検査は全命令で残す（`surface_pending_heap_stop`）。
+  - **watchdog**: `Vm::watchdog_ticks()` を診断・テスト用に公開した（`unstable-bytecode` の `vm`
+    module の一部）。frame を積む経路は `push_call_frame` に一本化した（`Call` と callback。REPL の
+    root frame は submission 開始時に watchdog と一緒に reset するため数えない）。
+  - **テスト配置**: F1-AT-01/02/03/07 は `tests/differential.rs`、F1-AT-04/05/08/09 は
+    `tests/integration.rs`（F1-AT-05 は `call_budget_is_checked_before_callee_in_both_engines` を
+    「呼び出し 1 回＝ちょうど 1 fuel」へ復元）、F1-AT-06/09（watchdog 側）は `tests/defensive_vm.rs`。
 
 ## 15. 境界受入テスト
 

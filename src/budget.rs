@@ -2164,6 +2164,11 @@ impl BudgetLedger {
         self.config.total_fuel = total_fuel;
     }
 
+    /// 現在の total fuel 上限（VM の instruction watchdog の上限計算に使う）。
+    pub fn total_fuel(&self) -> u64 {
+        self.config.total_fuel
+    }
+
     // -------------------------------------------------------------------------
     // heap accounting（§5.2、REV-015 Slice 2）
     // -------------------------------------------------------------------------

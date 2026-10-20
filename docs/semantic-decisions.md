@@ -1918,7 +1918,7 @@ remove_tree(path):
 
 > 設計ステータス: ✅ 実装済み。§17.2（REV-004）・§17.3（REV-005）・REV-018 と同一マイルストーンで実装した。`src/verifier.rs` に `VerifiedChunk`（生成は `verify` か信頼済み `from_trusted` のみ）と `verify`（V1〜V9 をプロトタイプ木へ再帰適用し、最初の違反を `ChunkVerifyError` として返す。`From<ChunkVerifyError> for TsumugiError` と `verify_or_internal_error` で `internal` へ写像）を新設。VM の `run_frames` は全命令 dispatch 直前で無条件に `count_step` する層1課金へ変更し、`Loop`/`PrepareCall`/`call_fn_value` の個別課金を廃止（深度上限は `PrepareCall` と `Call` の両方で検査）。`Vm::new` / `run_repl_chunk` は `VerifiedChunk` だけを受け取り、compiler 出力は `from_trusted` で昇格する。停止性は per-instruction 課金で verifier 非依存。本節はそれらが「範囲検証は verifier が担う」と委譲している検証層の正本である。
 >
-> **2026-10-20 改訂（2 メーター化）**: 層1 を「全命令で fuel（step）を課金する」から「fuel とは独立した VM instruction watchdog」へ改める。per-instruction の fuel 課金は、[実行予算・協調実行仕様](execution-control.md) §2・§4.1 の「fuel は backend 非依存の論理量で、VM opcode 数そのものではない」と矛盾し、同じ script が tree では成功して VM では step 上限に達する（ループで約 15 倍、再帰で約 11 倍の差）という観測差を生んでいた。改訂後は、**fuel は論理量として tree と同じ課金点で数え、停止性は watchdog が形状非依存に保証する**。層2（verifier・`VerifiedChunk`・API 封印）は変更しない。改訂部分（§17.7.1 層1・§17.7.3・§17.7.5〜§17.7.8）は未実装で、[実行予算・協調実行仕様](execution-control.md) §14「F-1 実装スライス」で実装する。
+> **2026-10-20 改訂（2 メーター化）**: 層1 を「全命令で fuel（step）を課金する」から「fuel とは独立した VM instruction watchdog」へ改める。per-instruction の fuel 課金は、[実行予算・協調実行仕様](execution-control.md) §2・§4.1 の「fuel は backend 非依存の論理量で、VM opcode 数そのものではない」と矛盾し、同じ script が tree では成功して VM では step 上限に達する（ループで約 15 倍、再帰で約 11 倍の差）という観測差を生んでいた。改訂後は、**fuel は論理量として tree と同じ課金点で数え、停止性は watchdog が形状非依存に保証する**。層2（verifier・`VerifiedChunk`・API 封印）は変更しない。改訂部分（§17.7.1 層1・§17.7.3・§17.7.5〜§17.7.8）は [実行予算・協調実行仕様](execution-control.md) §14「F-1 実装スライス」で実装済み（2026-10-20）。
 
 #### 17.7.1 採用判断
 
@@ -1994,7 +1994,7 @@ run_frames dispatch loop:
   dispatch(instruction)    # fuel は下記の論理課金点でだけ課金する
   if 同じ frame のまま ip <= ip_before:
       watchdog_tick(line)? # (W1) 後退・停滞
-push_frame(...):           # frame を積む唯一の経路（Call / callback / REPL root）
+push_call_frame(...):      # frame を積む唯一の経路（Call / callback。root frame は数えない）
   watchdog_tick(line)?     # (W2) frame の追加
 
 fuel の論理課金点（tree の現行課金点と同じ。各 1）:
