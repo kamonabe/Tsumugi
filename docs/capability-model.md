@@ -762,6 +762,8 @@ OPTIONS:
 
 **本revision（C9/C10一体実装）の採択**: ambient読みをcoreから全除去したうえでCLIを構築するため、N-1（旧envをcore/CLIが既定で読む段階）には戻れない。Tsumugiはalphaで後方互換を保証しないため、N-1を飛ばして**safe既定（N相当）**を採る。legacyは`--profile legacy`指定時のみCLI adapterが旧envをその場で1回読む（process-global OnceLock不使用）。この結果、CAP-AT-25のgoldenはrelease間default差ではなく「無指定=safe」vs「`--profile legacy`」の**profile選択差2点**に縮退する（N-1不在のため）。
 
+**migration warning（deprecation warning 段階）の正式 descope**: 上記のとおりN-1段階を飛ばすため、N-1でのみ意味を持つ起動時 deprecation / migration warning（legacy 既定を前提に safe への移行を促すメッセージ）は本 revision では役割がない。したがって migration warning は**実装しない（正式に descope する）**。これは[組み込みAPI仕様](embedding-api.md) 第14〜16節の E8b 受入項目「migration warning」の descope に対応し、E8b の Phase 2 受入条件は EMB-AT-10/11/16・CAP-AT-23〜26 へ縮退する（migration warning を外す）。legacy 選択時に移行を示す別警告は追加せず、legacy profile が既に出す全アクセス許可の security warning（§14.3、空 sandbox / 空 env-allow の各 1 件）で十分とする。legacy は safe が既定となった本 revision でも `--profile legacy` 明示時の互換 authority として機能し続けるため、「将来削除予定」を告げる deprecation は現時点では過剰である。
+
 ## 15. Clone、revoke、context再利用
 
 1. builderはbuildで消費、setはimmutable。
@@ -797,7 +799,7 @@ AUD-049のcontract testは、BuiltinSpec全entryのtree/VM/compiler/generated do
 | C6 | 2 | ModuleResolver/stream/link接続（実装済み。tree経路のimportをlink時resolverで解決、runtime resolver 0） | runtime resolver 0 |
 | C7 | 2 | ProcessExit | structured Exited |
 | C8 | 2 | HostFunctionRegistry metadata/grant | name/arity/redaction/panic |
-| C9 | 2 | CLI safe/legacy | AUD-018、migration warning |
+| C9 | 2 | CLI safe/legacy | AUD-018（migration warning は §14.4 の N-1 スキップ採択により正式に descope——不実装） |
 | C10 | 2 | ambient実装削除 | core直接OS access 0 |
 | C11 | 3 | finite meter/deadline/runtime cancel/cost | N境界、reservation |
 | C12 | 4 | cooperative adapter/ticket/waker | Ready/Pending、backpressure、cancel |
