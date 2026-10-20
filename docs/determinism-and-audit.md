@@ -4,7 +4,7 @@
 
 設計ステータス: **実装仕様確定・部分実装（Phase 6 A-1 subset ＋ `BudgetCharged` ＋ host-call lifecycle 3 event ＋ `Yielded` / `Resumed` emission 実装済み）**
 
-> Phase 6 の A-1 subset（schema v1・8 event 型・logical journal・`AuditSink`・fail-closed・opt-in、tree-only）に加え、`BudgetCharged`（§7.2/§7.3）、host-call lifecycle の 3 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished`）、yield/resume lifecycle の 2 event（`Yielded` / `Resumed`、§7.2 tag 5/6）、および `AuditBackpressure`-yield 配線（§10/§10.2、B-1、sink-Pending 由来）を tree backend で実装済み。これで §7.2 の 8 event 型が tree backend で emission される（backpressure も既存 `Yielded`/`Resumed` に `AuditYieldReason::AuditBackpressure` を載せる）。残りの redaction・strict CBOR・record/replay・VM 対応・sink 必須化、および §10.2 の audit drain queue byte 会計（B-2）は未実装。進捗の唯一の正本は [ロードマップ](roadmap.md)。
+> Phase 6 の A-1 subset（schema v1・8 event 型・logical journal・`AuditSink`・fail-closed・opt-in、tree-only）に加え、`BudgetCharged`（§7.2/§7.3）、host-call lifecycle の 3 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished`）、yield/resume lifecycle の 2 event（`Yielded` / `Resumed`、§7.2 tag 5/6）、`AuditBackpressure`-yield 配線（§10/§10.2、B-1、sink-Pending 由来）、および §10.2 の audit drain queue byte 会計（B-2、per-execution 上限のみ）を tree backend で実装済み。これで §7.2 の 8 event 型が tree backend で emission される（backpressure も既存 `Yielded`/`Resumed` に `AuditYieldReason::AuditBackpressure` を載せる）。残りの redaction・strict CBOR・record/replay・VM 対応・sink 必須化、および engine 全体の queue 上限（16 MiB）は未実装。進捗の唯一の正本は [ロードマップ](roadmap.md)。
 
 ## 1. 位置づけ
 
@@ -869,8 +869,12 @@ Slice 5 の最小縦切り（A-1）を tree engine にのみ実装した時点�
     監査付き driver を同期 loop（`run_transactional`）から **facade 内の単一 execution poll driver**
     （`run_audited_driver`）へ移行し、1 poll ステップ（`run_slice` 1 回）ごとに評価器 buffer を
     従来 drain 順で `AuditDelivery` 経由で submit する（§10.2 の sink round-trip を実行中に行うため）。
-    固定 drain 順は host-call triple → `Yielded`/`Resumed`（temporal 順）→ `BudgetCharged`（per-slice
-    flush）→ `Terminal` で変えない。backpressure が一度も起きない実行では、per-step drain の envelope
+    drain 順は「host-call triple・`Yielded`/`Resumed`・slice 境界で flush した `BudgetCharged` を
+    発生した temporal 順に並べた 1 本の列」→ accumulator に残る `BudgetCharged`（per-slice flush）→
+    `Terminal`。B-1 時点では host-call triple と `Yielded`/`Resumed` を別 buffer から「host-call 群 →
+    yield/resume 群」の固定順で drain しており、resume 後の slice で起きた host call が対の `Resumed`
+    より前に配送されて §8 規則8 に反していた（yield と host call が同じ実行で起きる場合だけ）。B-2 で
+    評価器 buffer を 1 本にまとめて修正した（下記「B-2 実装スライス」）。backpressure が一度も起きない実行では、per-step drain の envelope
     列は旧 post-run 一括 drain と完全一致する（評価器 buffer を同じ順で引くため。既存
     `tests/audit_yield_resume.rs` / `tests/audit_core.rs` を無改変で緑に保つ回帰条件で固定）。
   - **実 yield を起こす slice fuel の橋渡し（D3）**: 監査付き run 経路（poll driver）は
@@ -924,12 +928,12 @@ Slice 5 の最小縦切り（A-1）を tree engine にのみ実装した時点�
   `AuditYieldReason::AuditBackpressure` の Yielded/Resumed pair で満たされる（`tests/audit_backpressure.rs`）。
 - **未実装（意図的に含めない）**: redaction policy 本体（§9）、strict deterministic CBOR（§9.2、A-1 の
   `encoded_bytes` は naive 推定で後で差し替え可能に隔離）、record/replay（§6）、VM の変更、§10.2 の
-  audit drain queue byte 会計（B-2、設計確定・未実装。下記「B-2 実装スライス」）。`AdmissionQueued` / `SchedulerPreempted` / `HostPaused`
+  audit drain queue byte 会計のうち engine 全体の上限（per-execution 上限は B-2 で実装済み。下記「B-2 実装スライス」）。`AdmissionQueued` / `SchedulerPreempted` / `HostPaused`
   の yield emission（engine-poll 経路に sink が無い、上記）も後続スライスへ延期する。
 
 #### B-2 実装スライス（tree engine、opt-in、audit drain queue byte 会計）
 
-> 状態: **設計確定・未実装**（2026-10-20）。実装完了時にこの注記を実装済みへ更新する。
+> 状態: **実装済み**（2026-10-20、tree backend・opt-in）。実装上の注記は本小節末尾「実装上の注記」を参照。
 
 B-1 は sink の `Pending` 応答に由来する backpressure だけを配線し、§10.2 の
 「audit drain queue の byte 上限」は消費していない（`AuditBudget.max_pending_bytes` は未使用）。
@@ -1021,19 +1025,23 @@ B-2 はこの byte 会計を tree engine の監査付き poll driver へ入れ�
     sink 必須化（§1.1）のスライスへ延期する。
 
 - **変更箇所**:
-  - `src/eval.rs`: queue byte カウンタ（buffer への push 時に加算、drain 時に減算）、
-    `max_pending_bytes` の保持、トップレベル文/反復境界での判定（slice 内で 1 文以上実行済みの場合のみ）、
-    `SliceOutcome::YieldedAuditQueue`（crate 内部）、`audit_yield_reason_from` の写像追加
-    （→ `AuditYieldReason::AuditBackpressure`）。
-  - `src/builtin.rs`: `push_host_call_events` 経由で加算されることの確認（呼び出し側の変更は原則不要）。
-  - `src/budget.rs`: 確定済み `BudgetCharged` を buffer へ移す際の加算フック。
-  - `src/audit.rs`: `estimate_encoded_bytes` を envelope 固定部 ＋ event 本体へ分解し、
-    `estimate_event_bytes` を `pub(crate)` にする。`max_pending_bytes` の doc コメント
-    「A-1 では消費しない」を更新する。
-  - `src/embedding.rs`: `run_audited_driver` で `YieldedAuditQueue` を `continue` 扱いにし、
-    `flush_events` 後に queue が 0 に戻ることを assert（debug）。`AuditDelivery` の in-flight
-    batch byte を queue へ含める。`EngineBuilder::audit_budget_for_test` shim と、注入 budget の
-    `AuditJournal::open` への受け渡し。
+  - `src/eval.rs`: audit drain queue 計器（`AuditQueueMeter`。buffer への push 時に加算、sink の ack 時に
+    減算）、`max_pending_bytes` の保持（`set_audit_queue`、計器が無い経路では計上・判定なし）、
+    トップレベル文/反復境界での判定（slice 内で 1 文以上実行済みの場合のみ）、
+    `SliceOutcome::YieldedAuditQueue`、`audit_yield_reason_from` の写像追加
+    （→ `AuditYieldReason::AuditBackpressure`）。host-call triple 用と yield/resume 用の 2 本の buffer を
+    temporal 順の 1 本（`audit_events`）へ統合（下記「実装上の注記」）。
+  - `src/builtin.rs`: 変更なし（`push_host_call_events` 経由で計上される）。
+  - `src/budget.rs` / `src/audit.rs`: `BudgetChargeAccumulator` が確定済み（256-charge cut 済み）分の
+    event byte 合計を保持し、`BudgetLedger::audit_finalized_charge_bytes` で queue 判定へ渡す。
+  - `src/audit.rs`: `estimate_encoded_bytes` を envelope 固定部（`estimate_envelope_overhead_bytes`）＋
+    event 本体（`estimate_event_bytes`、`pub(crate)`）へ分解。`max_pending_bytes` の doc コメントを更新。
+  - `src/embedding.rs`: `run_audited_driver` で計器を張り、`YieldedAuditQueue` を `continue` 扱いにする。
+    `flush_events` は temporal 順の 1 本の列を deliver し、各 event を ack 時に queue から外す（in-flight を
+    含む）。flush 後に queue が 0 に戻ることを debug assert。`EngineBuilder::audit_budget_for_test` shim と、
+    注入 budget の `AuditJournal::open` への受け渡し。
+  - `src/engine.rs`: engine-poll 経路の `SliceOutcome` 写像に `YieldedAuditQueue` を追加（計器を張らない
+    ので到達しないが、到達時は通常の slice 境界 yield と同じ扱い）。
 
 - **受入基準（B-2）**:
   - **B2-AT-01**: `max_pending_bytes` を小さく注入し、**トップレベルのループから** host call を多数行う
@@ -1064,8 +1072,28 @@ B-2 はこの byte 会計を tree engine の監査付き poll driver へ入れ�
     append したときの `committed_bytes` の増分と一致する（推定関数の共有）。
   - VM は対象外（監査 sink と `VmExperimental` の同時設定は従来どおり build 時に拒否）。
 
-- **テスト配置案**: `tests/audit_queue_bytes.rs`（B2-AT-01〜06・08〜09）を新設する。B2-AT-10 は
-  `src/audit.rs` / `src/eval.rs` の unit test、B2-AT-07 は既存テストの無改変緑で担保する。
+- **テスト配置**: `tests/audit_queue_bytes.rs`（B2-AT-01〜09、および §8 規則8 の回帰
+  `slice_fuel_yield_with_host_calls_keeps_resumed_before_next_work`）。B2-AT-10 は `src/audit.rs`
+  （`b2_at_10_queue_estimate_matches_journal_committed_bytes` ほか）/ `src/eval.rs`（`audit_queue_meter`）の
+  unit test、B2-AT-07 は既存 `tests/audit_core.rs` / `tests/audit_hostcall.rs` /
+  `tests/audit_yield_resume.rs` / `tests/audit_backpressure.rs` の無改変緑で担保する。
+
+- **実装上の注記（B-2 実装時に判明・決定したもの）**:
+  - **§8 規則8 違反の修正（B-1 からの既存不具合）**: B-1 までは host-call triple と `Yielded`/`Resumed` を
+    評価器の別 buffer に積み、flush で「host-call 群 → yield/resume 群」の固定順に drain していた。この
+    ため yield（SliceFuel を含む）と host call が同じ実行で起きると、resume 後の slice の host call が対の
+    `Resumed` より前に配送されていた（既存テストは yield と host call を同時に起こさないため未検出）。
+    B2-AT-03 で顕在化したため、buffer を temporal 順の 1 本に統合して修正した。yield と host call が
+    同時に起きない実行の envelope 列は不変（既存テスト無改変で緑）。
+  - **`SliceOutcome` への variant 追加**: `SliceOutcome` は `pub mod eval` の公開 enum だが、crate 文書
+    （`src/lib.rs`）どおり個別モジュールはベンチ・テストツール互換のための公開で埋め込み API としての
+    安定性を保証しない。埋め込み入口（crate root re-export）には現れないため、`YieldedAuditQueue` の
+    追加は安定公開 API の破壊的変更として扱わない。
+  - **test 用 budget の保持場所**: `EngineConfig` は全 field 公開の公開構造体で、field 追加は外部の
+    literal 構築を壊すため、注入した `AuditBudget` は field 非公開の `EngineBuilder` / `Engine` に持たせる。
+  - **accumulator から直接 drain する `BudgetCharged`**: flush 時に accumulator から drain した分は、
+    drain で accumulator 側の合計から外れるため、その時点で queue へ計上し直し、ack 時に外す。queue の
+    判定は評価器の境界（flush 中ではない）で行うので、判定時点の queue に in-flight 分は現れない。
 
 ### Slice 6: VM conformance
 
