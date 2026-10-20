@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-10-20（fuel の 2 メーター化と F-1 slice を定義）
+最終更新: 2026-10-20（F-1 fuel parity を実装）
 
 > このロードマップは「進捗だけ」を追う。機能の詳細・採用/不採用の理由は各設計正本に置く
 > （ドキュメントの役割分担は [ドキュメント運用ガイド](documentation-guide.md) を参照）。
@@ -10,9 +10,10 @@
 
 - **フェーズ:** Phase 2（deny-by-default capability）・Phase 3/4（包括的な実行予算・協調実行）を並行して進行中。
 - **現在の slice:** 決定性 Slice 1（規範的 primitive）＝Phase 5 の着手部分は実装完了（StableError を含む deterministic primitive が一通り揃った。VM parity・FakeHost gate・audit normalize は後続 slice）。
-- **次のタスク:** F-1（fuel parity：VM を tree の現行課金点へ、2 メーター化）。正本は [実行予算・協調実行仕様](execution-control.md) §14「F-1 実装スライス」と [次期意味論・実装決定](semantic-decisions.md) §17.7（2026-10-20 改訂）。その後は着手順 3（Phase 6 audit の残り）から slice を選定する。
-- **直近完了:** legacy budget env（`TSUMUGI_MAX_*`）の CLI adapter 一本化（[実行予算・協調実行仕様](execution-control.md) §13）。tree file/stdin だけが env を無視していた tree/VM 差を解消し、library は env を読まなくなった。
-- **直近完了（その前）:** audit drain queue byte 会計（§10.2、B-2）を tree backend で完了（per-execution 上限・opt-in。engine 全体 16 MiB は E10 統合後）。あわせて yield と host call が同じ実行で起きるときの §8 規則8 違反（B-1 からの既存不具合）を修正。詳細は [決定性・実行時監査仕様](determinism-and-audit.md) §14「B-2 実装スライス」。
+- **次のタスク:** 着手順 3（Phase 6 audit の残り）から slice を選定する（受入基準・変更箇所を持つ slice 定義は未作成）。正本は [決定性・実行時監査仕様](determinism-and-audit.md) §14 Slice 5。§4.1 の課金表（F-2）は未定義。
+- **直近完了:** F-1 fuel parity（[実行予算・協調実行仕様](execution-control.md) §14「F-1 実装スライス」）。VM の fuel を tree と同じ課金点に揃え、停止性を fuel から独立した instruction watchdog へ移した（[次期意味論・実装決定](semantic-decisions.md) §17.7 改訂）。同じ script の成功・失敗と上限到達時の line が tree/VM で一致する。
+- **直近完了（その前）:** legacy budget env（`TSUMUGI_MAX_*`）の CLI adapter 一本化（[実行予算・協調実行仕様](execution-control.md) §13）。tree file/stdin だけが env を無視していた tree/VM 差を解消し、library は env を読まなくなった。
+- **直近完了（さらに前）:** audit drain queue byte 会計（§10.2、B-2）を tree backend で完了（per-execution 上限・opt-in。engine 全体 16 MiB は E10 統合後）。あわせて yield と host call が同じ実行で起きるときの §8 規則8 違反（B-1 からの既存不具合）を修正。詳細は [決定性・実行時監査仕様](determinism-and-audit.md) §14「B-2 実装スライス」。
 - **直近完了（さらに前）:** `AuditBackpressure`-yield 配線（§10.2、B-1、sink-Pending 由来）を tree backend で完了。A-1 監査付き driver を facade 内の単一 execution poll driver へ移行し、sink の `Pending` 応答で実際に `Yielded(AuditBackpressure)` へ遷移・ack で resume、永続 Pending→`AuditFailure::BackpressureDeadline`（script Deadline より優先）。公開 `YieldReason::AuditBackpressure` / `AuditFailure::BackpressureDeadline` を追加（破壊的・additive、roadmap 明記で受容）、`language_revision` bump なし、backpressure なし実行は envelope 列不変（詳細は下記「完了（直近）」）。
 - **直近完了（さらに前）:** E8b（capability profile/options の safe/legacy 移行）を完了。EMB-AT-10/11 を profile（safe）経由の subprocess named test で tree/VM 両 engine に固定した。`tests/cli_safe_profile.rs` に `safe_capability_deny_is_catchable_via_profile`（未 grant の exit/env/now を try/catch で catch でき、catch 後に後続処理が継続＝EMB-AT-10a/11c/11d）、`allow_exit_propagates_exit_code_via_profile`（`--allow-exit` + exit(0/42/255) → 実 process exit code 伝播＝EMB-AT-11a）、`allow_exit_out_of_range_maps_to_runtime_error_via_profile`（`--allow-exit` + exit(256)/exit(0 - 1) → RuntimeError 写像 exit 1・process は panic せず終了＝EMB-AT-11b）を追加。既存の tree 生 `CapabilitySet` 経由 unit test（`src/embedding.rs` の `c7_*`/`c3_*`）は outcome 種別レベルの正本として残す（profile 経由 subprocess test と補完関係）。受入 ID ↔ test の対応は [組み込みAPI仕様](embedding-api.md) 第16節 Phase 2 に明記。profile/options 配線（C9/C10/E7/E11）と migration warning の descope（§14.4）は先行完了済み。production コード変更なし（test と docs のみ）。
 - **さらに前（E9 の一片）:** VM file/stdin の import・resolver 統合（E9/Phase 5 の一片）を shipped。VM file/stdin（`src/main.rs::execute_vm_with_path`）の import 解決を、tree file/stdin と同じ Engine resolver gate（`compile`→`link`、`LinkRequest` の `module_resolver` capability、`--allow-import-root NAME=PATH` で grant）へ統合した。link 層の capability gate を VM 経路へ前置し、未 grant + import は tree と同じく terminal `Denied`（exit 1、actionable 診断）、import 0 件は resolver 不問で通過、grant 時は従来どおり解決・実行。実際の import 展開（run 層）は tree file/stdin と同じく評価器内蔵 `ModuleLoader` のまま保全する（gate 専用に `Backend::TreeWalk` engine を build する最小統合で、VM backend adapter は新設しない）。VM REPL（`run_repl_vm`）は tree REPL（E7 の `link_for_repl`/`run_for_repl` gate 迂回保全）と対称に現状維持（観測挙動不変、その旨をコードコメントに明記）。追加/差し替えテスト: `tests/cli_safe_profile.rs::relative_import_vm_requires_import_root`（旧 `relative_import_vm_still_works_without_import_root` を挙動反転で置き換え）・`import_free_vm_runs_without_import_root`、`tests/differential.rs::vm_import_gate_matches_tree_file_stdin`（tree/VM 差分 parity）。既存 VM import 系（`tests/integration.rs` の import fixture・`import_count_limit_gates_file_execution_vm`・`import_outside_sandbox_is_blocked_in_both_engines` ほか）を gate 通過の `--allow-import-root` grant へ更新。**E9 は未完了**（VM の charge parity・StableError・FunctionId・transaction 等 conformance と experimental flag 除去が残る）。
@@ -46,7 +47,7 @@
 | ID | 一行概要 | 状態 | owning spec |
 |---|---|---|---|
 | REV-001 | 共有 DAG の比較・表示・join・sort を有限化（指数化対策は完結、全順序化は REV-017 で実装済み・revision 0.21。残りは包括 budget 側の Phase 6 伝播で、うち `BudgetCharged`・host-call lifecycle 3 event・yield/resume 2 event emission は実装済み） | 🟡 | [実行予算・協調実行仕様](execution-control.md) |
-| REV-015 | source/string/heap/I-O/bulk work の包括 budget・deadline・cancel（budget 本体は tree/VM 完了。ただし fuel の課金点は tree/VM で異なり F-1 で揃える。§4.1 の課金表は未実装、CAP-AT-17 の source/import 本数 N 境界受入試験も tree 経路で完了。残りは Phase 6 への伝播。うち `BudgetCharged`・host-call lifecycle 3 event・yield/resume 2 event（`Yielded` / `Resumed`）emission は tree backend で実装済み） | 🟡 | [実行予算・協調実行仕様](execution-control.md) |
+| REV-015 | source/string/heap/I-O/bulk work の包括 budget・deadline・cancel（budget 本体は tree/VM 完了。fuel の課金点は F-1 で tree/VM を揃えた。§4.1 の課金表は未実装（F-2）、CAP-AT-17 の source/import 本数 N 境界受入試験も tree 経路で完了。残りは Phase 6 への伝播。うち `BudgetCharged`・host-call lifecycle 3 event・yield/resume 2 event（`Yielded` / `Resumed`）emission は tree backend で実装済み） | 🟡 | [実行予算・協調実行仕様](execution-control.md) |
 | REV-007 | `ExecutionContext` の session state と run meter を request ごとに分離 | ⬜ | [実行予算・協調実行仕様](execution-control.md) |
 | REV-008 | 全 stable execution へ transaction を適用（REPL は AUD-024 で完了） | 🟡 | [組み込みAPI仕様](embedding-api.md)・[実行予算・協調実行仕様](execution-control.md) |
 | REV-010 | 32-bit target の `i64 as usize` wrap を `try_from`/checked へ | ⬜ | [実行予算・協調実行仕様](execution-control.md) |

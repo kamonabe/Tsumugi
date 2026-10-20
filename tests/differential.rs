@@ -12,8 +12,8 @@
 //! `docs/execution-control.md` §5.3 が明記するとおり、A-1 で backend 間で揃えるのは
 //! **「課金の有無と release 寿命」** であって `live_heap` / `peak_heap` の byte 単位の数値一致
 //! ではない（byte-exact を狙う案 A-2 は却下済み）。tree は AST を・VM は bytecode chunk を
-//! 課金するため code artifact のサイズは engine 固有に異なってよい。fuel count も storage
-//! モデル差による既知差で engine 間で非可換（fixture により tree>VM にも VM>tree にもなる）。
+//! 課金するため code artifact のサイズは engine 固有に異なってよい。fuel は F-1
+//! （execution-control §14）で課金点を揃えたため、消費量を engine 間で exact 一致させる。
 //!
 //! よって本 harness は **軸ごとに比較ポリシーを変える**:
 //!
@@ -30,11 +30,10 @@
 //!     「課金の有無（>0 か）の向き」、REPL 継続では「入力間増減の符号」を両 engine で突合する。
 //!     byte 単位の絶対値一致は要求しない。既存 `scaling.rs`（線形性のみ突合）・`closure_retain.rs`
 //!     （符号の向きのみ突合）と同じ粒度。
-//!   - `committed.fuel`（step 課金）→ **向き・符号ですら engine 間で一致しない**。tree は成功 path で
-//!     committed.fuel=0 を snapshot する（fuel は入力ごとに reset され committed へ積まない）が
-//!     VM は実歩数を積む。さらに fuel 枯渇の terminal `line` も step 粒度差で tree/VM で異なる。
-//!     よって fuel parity は **fuel 境界 fixture（StepLimit terminal の kind/message observable 一致）**
-//!     と **step env subprocess 行**で担保し、usage の committed.fuel は比較対象から外す。
+//!   - `committed.fuel`（step 課金）→ usage では比較しない。tree は成功 path で committed.fuel=0 を
+//!     snapshot する（fuel は入力ごとに reset され committed へ積まない）ため。fuel 量そのものは
+//!     F-1（execution-control §14）で tree/VM の課金点を揃えたので、末尾「F-1: fuel parity」節で
+//!     「成功する最小の上限 N」を両 engine で exact 突合し、N−1 の terminal 全 field も一致させる。
 //!
 //! この軸別ポリシーは設計 §5.3 の A-1（byte-exact 一致は backend 間で成立しないため要求しない）
 //! と整合する。`docs/execution-control.md` Slice 6 / `docs/determinism-and-audit.md` §15.5 の
@@ -285,9 +284,8 @@ fn assert_single(fixture: &SingleFixture) {
     );
 
     // 注: `committed.fuel` は tree が成功 path で 0 を snapshot する（fuel は入力ごとに reset され
-    // committed へ積まない）のに対し VM は実歩数を積むため、**向き・符号ですら engine 間で一致
-    // しない**。fuel parity は fuel 境界 fixture（StepLimit terminal の一致）と step env subprocess
-    // 行で担保し、ここでは committed.fuel を比較対象から外す（設計 §5.3 A-1 の既知差）。
+    // committed へ積まない）ため、ここでは比較しない。fuel 量の exact 突合は末尾「F-1: fuel
+    // parity」節が「成功する最小の上限 N」で行う。
 }
 
 // =============================================================================
@@ -385,8 +383,8 @@ fn assert_repl(fixture: &ReplFixture) {
                 assert_invariant_axes(&format!("{} 入力{i}", fixture.label), t, v);
             }
             // (B) live_heap は入力間増減の向き（符号）を両 engine で突合する。
-            // committed.fuel は tree が成功 path で 0 を snapshot するため向きも非可換で、ここでは
-            // 比較しない（fuel parity は fuel 境界 fixture と step env 行で担保。設計 §5.3 A-1）。
+            // committed.fuel は tree が成功 path で 0 を snapshot するため、ここでは比較しない
+            // （fuel 量の exact 突合は末尾「F-1: fuel parity」節）。
             assert_heap_trend_agrees(fixture.label, &tree, &vm);
         }
     }
@@ -658,10 +656,8 @@ fn smoke_default_single_failure_agrees() {
 /// fuel 境界（exact-limit 成功）: in-process で fuel 上限を注入し、十分な上限なら両 engine が
 /// 成功して engine 間不変軸が一致する。集約元: integration.rs:1622。
 ///
-/// +1 失敗（StepLimit terminal）は **subprocess の step env 行**（`budget_boundary_step_env_subprocess`）
-/// で担保する。fuel 枯渇の terminal `line` は tree/VM で異なる（tree=2 / VM=3 等、step 粒度差に
-/// よる既知差）ため、in-process で terminal 全 field exact を要求せず、subprocess で kind/message
-/// の observable 一致を見る。これは軸(B)（fuel は engine 間非可換）と整合する線引き。
+/// N−1 での失敗（StepLimit terminal の全 field 一致）は、末尾「F-1: fuel parity」節の
+/// `assert_fuel_parity` が各 script について検査する（F-1 で tree/VM の課金点と line を揃えた）。
 #[test]
 fn budget_boundary_fuel_exact_limit_in_process() {
     // 既定上限で成功する基準（fuel を十分大きく取り、両 engine が成功 + 不変軸一致）。
@@ -1086,4 +1082,143 @@ fn vm_import_gate_matches_tree_file_stdin() {
         tree_ok_out.contains("42"),
         "import した値が使える: {tree_ok_out}"
     );
+}
+
+// =============================================================================
+// F-1: fuel parity（execution-control §14「F-1 実装スライス」）
+// =============================================================================
+//
+// VM の fuel は tree と同じ (F1) ループの back-edge・(F2) user function 呼び出し・(F3) callback で
+// だけ課金する。tree は成功 path で `committed.fuel` を 0 として snapshot する（入力ごとに reset）
+// ため、usage の直接比較ではなく「成功する最小の fuel 上限 N」を二分探索で求め、これを消費 fuel
+// として両 engine で exact 突合する。N では両 engine とも成功し、N−1 では両 engine とも同じ
+// `TsumugiError`（kind/message/line/trace の全 field）で止まることも確かめる（F1-AT-03）。
+
+/// in-process で VM を 1 回実行し、`(result, watchdog の tick 数)` を返す（F1-AT-07 用）。
+fn run_vm_with_watchdog(source: &str, fuel: u64) -> (Result<(), TsumugiError>, u64) {
+    let tokens = Lexer::new(source).tokenize();
+    let program = Parser::new(tokens).parse().expect("パースに失敗");
+    let chunk = Compiler::new().compile(&program).expect("compile に失敗");
+    let mut vm = Vm::new(chunk);
+    vm.set_capabilities(print_capabilities());
+    vm.set_max_steps(fuel);
+    let result = vm.run();
+    (result, vm.watchdog_ticks())
+}
+
+/// `run` が fuel 上限 `n` で成功する最小の `n` を二分探索で求める（上限 2^22 まで）。
+fn min_fuel(label: &str, run: impl Fn(u64) -> bool) -> u64 {
+    const MAX: u64 = 1 << 22;
+    assert!(run(MAX), "[{label}] fuel {MAX} でも成功しません");
+    if run(0) {
+        return 0;
+    }
+    let (mut lo, mut hi) = (0u64, MAX); // run(lo) == false, run(hi) == true
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if run(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    hi
+}
+
+/// F1-AT-01/02/03/07: 消費 fuel・上限境界・watchdog の非干渉を 1 script について検査する。
+fn assert_fuel_parity(label: &str, source: &str) {
+    let tree_ok = |n: u64| run_tree_single(source, Limits::Fuel(n)).1.is_ok();
+    let vm_ok = |n: u64| run_vm_single(source, Limits::Fuel(n)).1.is_ok();
+    let tree_fuel = min_fuel(&format!("{label} [tree]"), tree_ok);
+    let vm_fuel = min_fuel(&format!("{label} [vm]"), vm_ok);
+    assert_eq!(
+        tree_fuel, vm_fuel,
+        "[{label}] 消費 fuel が tree/VM で不一致 (F1-AT-01/02)"
+    );
+
+    // F1-AT-03: N で両方成功、N−1 で両方が同じ terminal で失敗する。
+    if tree_fuel > 0 {
+        let below = Limits::Fuel(tree_fuel - 1);
+        let tree_err = run_tree_single(source, below).1.err();
+        let vm_err = run_vm_single(source, below).1.err();
+        assert!(tree_err.is_some(), "[{label}] N−1 で tree が失敗しません");
+        assert_eq!(
+            tree_err, vm_err,
+            "[{label}] N−1 の terminal（kind/message/line/trace）が tree/VM で不一致 (F1-AT-03)"
+        );
+    }
+
+    // F1-AT-07: 正規 compiler 出力では watchdog の tick 数は「fuel 課金数 + root frame 数」以下。
+    let (result, ticks) = run_vm_with_watchdog(source, tree_fuel);
+    assert!(result.is_ok(), "[{label}] VM が N で成功しません");
+    assert!(
+        ticks <= tree_fuel + 1,
+        "[{label}] watchdog の tick 数 {ticks} が fuel 課金数 {tree_fuel} + 1 を超えています (F1-AT-07)"
+    );
+}
+
+/// F1-AT-01: ループ系の消費 fuel が tree/VM で一致する。
+#[test]
+fn f1_fuel_parity_loops() {
+    let cases: &[(&str, &str)] = &[
+        ("while", "let i = 0\nwhile i < 20\n  i = i + 1\nend\n"),
+        (
+            "for",
+            "let s = 0\nfor x in range(0, 20)\n  s = s + x\nend\n",
+        ),
+        (
+            "入れ子ループ",
+            "let s = 0\nfor x in range(0, 5)\n  let j = 0\n  while j < 4\n    s = s + j\n    j = j + 1\n  end\nend\n",
+        ),
+        (
+            "while + continue",
+            "let i = 0\nwhile i < 20\n  i = i + 1\n  if i % 2 == 0\n    continue\n  end\nend\n",
+        ),
+        (
+            "for + continue",
+            "let s = 0\nfor x in range(0, 20)\n  if x % 3 == 0\n    continue\n  end\n  s = s + x\nend\n",
+        ),
+        (
+            "break",
+            "let i = 0\nwhile true\n  i = i + 1\n  if i == 15\n    break\n  end\nend\n",
+        ),
+        (
+            "try 内のループ",
+            "try\n  let i = 0\n  while i < 10\n    i = i + 1\n  end\ncatch e\n  let x = 1\nend\n",
+        ),
+        ("ループなし", "let a = 1\nlet b = a + 2\n"),
+    ];
+    for (label, source) in cases {
+        assert_fuel_parity(label, source);
+    }
+}
+
+/// F1-AT-02: 呼び出し・callback 系の消費 fuel が tree/VM で一致する。
+#[test]
+fn f1_fuel_parity_calls_and_callbacks() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "再帰",
+            "fn fib(n)\n  if n < 2\n    return n\n  end\n  return fib(n - 1) + fib(n - 2)\nend\nlet r = fib(10)\n",
+        ),
+        (
+            "相互再帰",
+            "fn ev(n)\n  if n == 0\n    return true\n  end\n  return od(n - 1)\nend\nfn od(n)\n  if n == 0\n    return false\n  end\n  return ev(n - 1)\nend\nlet r = ev(12)\n",
+        ),
+        (
+            "closure",
+            "fn make(k)\n  return fn(x) x + k end\nend\nlet f = make(3)\nlet s = 0\nfor x in range(0, 6)\n  s = s + f(x)\nend\n",
+        ),
+        (
+            "map / filter / each",
+            "let xs = range(0, 12)\nlet ys = map(xs, fn(x) x * 2 end)\nlet zs = filter(ys, fn(x) x > 4 end)\neach(zs, fn(x) x end)\n",
+        ),
+        (
+            "callback 内の呼び出しとループ",
+            "fn sq(x)\n  return x * x\nend\nlet ys = map(range(0, 5), fn(x)\n  let t = 0\n  let i = 0\n  while i < x\n    t = t + sq(i)\n    i = i + 1\n  end\n  return t\nend)\n",
+        ),
+    ];
+    for (label, source) in cases {
+        assert_fuel_parity(label, source);
+    }
 }

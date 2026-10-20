@@ -113,6 +113,13 @@ pub struct Vm {
     /// て `count_step` で `BudgetExceeded(HeapBytes)` を返す。既定上限では発生しない。
     pending_heap_stop: Option<ControlStop>,
 
+    /// instruction watchdog の tick 数（semantic-decisions §17.7 層1、execution-control §14 F-1）。
+    ///
+    /// fuel とは独立した停止性の安全網で、fuel・`BudgetUsage`・audit には現れない。(W1) 同じ
+    /// frame で ip が後退・停滞したとき、(W2) call frame を積んだときに 1 進む。上限は
+    /// [`Self::watchdog_limit`]。1 execution（REPL では 1 submission）で 1 本を共有する。
+    watchdog_ticks: u64,
+
     /// 実行中に adopt した bytecode chunk 木（root + 全 prototype chunk）の §5.1
     /// bytecode chunk を live heap へ課金するトークン（REV-015 PR-d）。chunk は実行の
     /// あいだ生き続ける（root frame・prototype・`VmFn` が `Rc<Chunk>` を共有する）ため、
@@ -189,6 +196,7 @@ impl Vm {
             budget: BudgetLedger::with_config(config),
             try_handlers: Vec::new(),
             pending_heap_stop: None,
+            watchdog_ticks: 0,
             chunk_tokens: Vec::new(),
             retain_token_table: HashMap::new(),
             next_function_id: 0,
@@ -220,6 +228,7 @@ impl Vm {
             budget: BudgetLedger::with_config(config),
             try_handlers: Vec::new(),
             pending_heap_stop: None,
+            watchdog_ticks: 0,
             chunk_tokens: Vec::new(),
             retain_token_table: HashMap::new(),
             next_function_id: 0,
@@ -490,8 +499,9 @@ impl Vm {
             self.frames.truncate(1);
             self.frames[0] = frame;
         }
-        // fuel 予算はリセット（各入力で予算を全額使えるように）
+        // fuel 予算と instruction watchdog はリセット（各入力で予算を全額使えるように）
         self.budget.reset_fuel();
+        self.watchdog_ticks = 0;
 
         // 入力の bytecode chunk 木を live heap へ課金する（REV-015 PR-d）。REPL の
         // top-level chunk は入力完了後に言語状態へ retain されない（結果 binding だけが
@@ -544,6 +554,9 @@ impl Vm {
     fn run_frames(&mut self, stop_depth: usize) -> Result<Value, TsumugiError> {
         loop {
             let frame = self.frame(0)?;
+            // instruction watchdog (W1) の比較用に、dispatch 前の frame 深さと ip を控える。
+            let depth_before = self.frames.len();
+            let ip_before = frame.ip;
             if frame.ip >= frame.chunk.code.len() {
                 // フレームの命令が尽きた = 暗黙 null return
                 if self.frames.len() <= stop_depth + 1 {
@@ -575,13 +588,12 @@ impl Vm {
                 .ok_or_else(|| internal_error(0, "命令に対応する行番号がありません"))?;
             self.frame_mut(line)?.ip += 1;
 
-            // per-instruction step 課金（REV-006 層1）。
-            // fetch した全命令の dispatch 直前に無条件で 1 step 課金する。これにより、
-            // 検証を通っていない chunk が防御的に届いても、任意の命令列は有限 step で
-            // `limit` error になる（`Jump(0)` 自己ループも 1 周ごとに課金される）。
-            // step 上限到達エラーは、既存挙動どおり try/catch handler 経路を通す。
-            let result = match self.count_step(line) {
-                Err(step_error) => Err(step_error),
+            // fuel は論理課金点（Loop の back-edge・PrepareCall・callback）でだけ課金する
+            // （execution-control §14 F-1）。全命令ごとには、保留中の heap 超過を表に出す
+            // 検査だけを行う。停止性は fuel ではなく instruction watchdog が担う（下記 (W1)、
+            // および push_call_frame の (W2)）。
+            let result = match self.surface_pending_heap_stop(line) {
+                Err(heap_error) => Err(heap_error),
                 Ok(()) => match &instruction {
                     OpCode::ReturnValue => {
                         let return_value = self.pop(line)?;
@@ -677,17 +689,70 @@ impl Vm {
                     return Err(self.attach_trace(e));
                 }
             }
+
+            // (W1) 同じ frame のまま ip が dispatch 前以下になった（後退・停滞）。命令の種類は
+            // 見ない（semantic-decisions §17.7）。frame 深さが変わった命令は (W2) か frame の
+            // 減少なので、ここでは数えない。
+            if self.frames.len() == depth_before
+                && self.frames.last().is_some_and(|f| f.ip <= ip_before)
+                && let Err(e) = self.watchdog_tick(line)
+            {
+                return Err(self.attach_trace(e));
+            }
         }
         Ok(Value::Null)
     }
 
-    /// ステップ（fuel）を 1 課金し、上限チェックする（REV-015 Slice 1）。
-    fn count_step(&mut self, line: usize) -> Result<(), TsumugiError> {
-        // 直前の checkpoint 記録で rollback journal entry の heap 課金が上限を超えていた
-        // 場合、ここで surface する（REV-015 PR-d）。既定上限では発生しない。
-        if let Some(stop) = self.pending_heap_stop.take() {
-            return Err(Self::control_stop_to_error(&self.budget, stop, line));
+    /// 保留中の heap 超過を表に出す（REV-015 PR-d）。全命令の dispatch 前に呼ぶ。
+    ///
+    /// rollback journal entry の heap 課金は infallible な checkpoint 経路で起き、超過は
+    /// `pending_heap_stop` に退避される。fuel を課金しない命令でも次の命令で必ず表に出す。
+    fn surface_pending_heap_stop(&mut self, line: usize) -> Result<(), TsumugiError> {
+        match self.pending_heap_stop.take() {
+            Some(stop) => Err(Self::control_stop_to_error(&self.budget, stop, line)),
+            None => Ok(()),
         }
+    }
+
+    /// instruction watchdog の上限（`total_fuel × 2 + 16`、saturating）。
+    ///
+    /// 正規 compiler 出力では tick 数が「fuel 課金数 + root frame 数」を超えないため、常に fuel の
+    /// 上限が先に効く。現在の `total_fuel` から毎回計算し、`set_max_steps` や REPL の再設定に追従する。
+    fn watchdog_limit(&self) -> u64 {
+        self.budget
+            .total_fuel()
+            .saturating_mul(2)
+            .saturating_add(16)
+    }
+
+    /// instruction watchdog を 1 進める。上限を超えたら fuel の上限到達と同じ `limit` terminal
+    /// （catch 不可）にする（semantic-decisions §17.7.5）。
+    fn watchdog_tick(&mut self, line: usize) -> Result<(), TsumugiError> {
+        self.watchdog_ticks = self.watchdog_ticks.saturating_add(1);
+        if self.watchdog_ticks > self.watchdog_limit() {
+            return Err(TsumugiError::step_limit(line, self.budget.total_fuel()));
+        }
+        Ok(())
+    }
+
+    /// call frame を積む唯一の経路。(W2) として watchdog を 1 進めてから積む。
+    fn push_call_frame(&mut self, frame: CallFrame, line: usize) -> Result<(), TsumugiError> {
+        self.watchdog_tick(line)?;
+        self.frames.push(frame);
+        Ok(())
+    }
+
+    /// これまでの instruction watchdog の tick 数（テスト・診断用。fuel とは別の内部カウンタ）。
+    pub fn watchdog_ticks(&self) -> u64 {
+        self.watchdog_ticks
+    }
+
+    /// ステップ（fuel）を 1 課金し、上限チェックする（REV-015 Slice 1）。
+    ///
+    /// 課金点は tree と同じ (F1) `Loop` の back-edge・(F2) `PrepareCall`・(F3) callback
+    /// （execution-control §14 F-1）。
+    fn count_step(&mut self, line: usize) -> Result<(), TsumugiError> {
+        self.surface_pending_heap_stop(line)?;
         self.budget
             .charge_fuel(1, ExecutionPhase::Run)
             .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))
@@ -1329,7 +1394,9 @@ impl Vm {
                 }
             }
             OpCode::Loop(target) => {
-                // step 課金はメインループの per-instruction 課金へ一本化した（REV-006）。
+                // (F1) ループの back-edge で fuel を 1 課金する（tree の「本体 1 反復の完了後・
+                // 次反復の判定前」と同じ）。`Loop` は back-edge 専用（for の continue は前方 Jump）。
+                self.count_step(line)?;
                 self.set_ip(target, line)?;
             }
             OpCode::GetUpvalue(index) => {
@@ -1397,8 +1464,9 @@ impl Vm {
                 });
             }
             OpCode::PrepareCall => {
-                // step 課金は per-instruction 課金へ一本化した（REV-006）。深度上限は
-                // PrepareCall と Call の両方で検査する（raw Call でも迂回させない）。
+                // (F2) user function 呼び出しで fuel を 1 課金する（tree と同じく深度検査の前）。
+                // 深度上限は PrepareCall と Call の両方で検査する（raw Call でも迂回させない）。
+                self.count_step(line)?;
                 if self.active_user_frame_count() >= MAX_USER_CALL_DEPTH {
                     return Err(TsumugiError::call_depth_limit(line, MAX_USER_CALL_DEPTH));
                 }
@@ -1418,7 +1486,8 @@ impl Vm {
             }
             OpCode::Call(arg_count) => {
                 // PrepareCallを経由しない不正bytecodeでもframe上限を迂回させない。
-                // stepはPrepareCallだけで数え、ここでは二重countしない。
+                // fuel はPrepareCallだけで数え、ここでは二重課金しない。raw Call の停止性は
+                // push_call_frame の watchdog (W2) が担う。
                 if self.active_user_frame_count() >= MAX_USER_CALL_DEPTH {
                     return Err(TsumugiError::call_depth_limit(line, MAX_USER_CALL_DEPTH));
                 }
@@ -1444,13 +1513,16 @@ impl Vm {
                         return Err(TsumugiError::user_arity(line, &name, arity, arg_count));
                     }
                     let base = fn_pos;
-                    self.frames.push(CallFrame {
-                        chunk,
-                        ip: 0,
-                        base,
-                        upvalues,
-                        locals_cells: Vec::new(),
-                    });
+                    self.push_call_frame(
+                        CallFrame {
+                            chunk,
+                            ip: 0,
+                            base,
+                            upvalues,
+                            locals_cells: Vec::new(),
+                        },
+                        line,
+                    )?;
                 } else {
                     return Err(TsumugiError::not_callable(line, &fn_value));
                 }
@@ -2234,8 +2306,8 @@ impl Vm {
         args: Vec<Value>,
         line: usize,
     ) -> Result<Value, TsumugiError> {
-        // step 課金は per-instruction 課金へ一本化した（REV-006）。callback 本体の
-        // 各命令は run_frames で課金される。深度上限のみここで検査する。
+        // (F3) builtin の callback 呼び出しで fuel を 1 課金する（tree と同じく深度検査の前）。
+        self.count_step(line)?;
         if self.active_user_frame_count() >= MAX_USER_CALL_DEPTH {
             return Err(TsumugiError::call_depth_limit(line, MAX_USER_CALL_DEPTH));
         }
@@ -2259,13 +2331,16 @@ impl Vm {
                 self.stack.push(arg);
             }
             let target_depth = self.frames.len();
-            self.frames.push(CallFrame {
-                chunk,
-                ip: 0,
-                base,
-                upvalues,
-                locals_cells: Vec::new(),
-            });
+            self.push_call_frame(
+                CallFrame {
+                    chunk,
+                    ip: 0,
+                    base,
+                    upvalues,
+                    locals_cells: Vec::new(),
+                },
+                line,
+            )?;
             // run_frames で実行し、target_depth まで戻ったら値を返す
             self.run_frames(target_depth)
         } else {

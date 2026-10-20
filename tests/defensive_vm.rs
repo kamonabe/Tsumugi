@@ -157,11 +157,11 @@ fn try_opcode_reaching_dispatch_does_not_panic() {
     let _ = Vm::new(unverified(chunk)).run();
 }
 
-/// REV-006 層1: `Jump(0)` 自己ループが per-instruction 課金で有限 step 停止する。
+/// REV-006 層1 / F1-AT-06: `Jump(0)` 自己ループが instruction watchdog で有限停止する。
 ///
-/// 旧モデルでは Jump に課金がなく、`Jump(0)` の自己ループは step 予算を迂回して
-/// 無期限実行できた。per-instruction 課金では 1 周ごとに 1 命令以上 dispatch するため
-/// 必ず課金され、`limit` error で停止する。
+/// `Jump` は fuel を課金しない（fuel の課金点は back-edge `Loop`・`PrepareCall`・callback だけ。
+/// execution-control §14 F-1）。停止させるのは fuel ではなく watchdog の (W1)「同じ frame で ip が
+/// 後退・停滞」で、上限（`total_fuel × 2 + 16`）を超えると fuel と同じ `limit` error になる。
 #[test]
 fn jump_self_loop_halts_with_limit() {
     let mut chunk = Chunk::new();
@@ -182,9 +182,42 @@ fn jump_self_loop_halts_with_limit() {
         "想定外のメッセージ: {}",
         error.message()
     );
+    // fuel ではなく watchdog が止めたこと（fuel は 1 も消費していない）。
+    assert_eq!(
+        vm.budget_usage().committed.fuel,
+        0,
+        "Jump が fuel を課金した"
+    );
+    assert_eq!(
+        vm.watchdog_ticks(),
+        2 * 1000 + 16 + 1,
+        "watchdog の上限（total_fuel × 2 + 16）を超えた時点で止まっていない"
+    );
 }
 
-/// REV-006 層1: 後方 `Loop(0)` 迂回ループが per-instruction 課金で有限 step 停止する。
+/// F1-AT-09: watchdog の上限到達は try/catch で捕捉できない（fuel の上限到達と同じ terminal）。
+#[test]
+fn watchdog_limit_is_not_catchable() {
+    let mut chunk = Chunk::new();
+    chunk.emit(OpCode::SetupTry(2), 1); // 0: catch 先頭は 2
+    chunk.emit(OpCode::Jump(1), 1); // 1: 自己ループ（try の中）
+    chunk.emit(OpCode::Pop, 1); // 2: catch（捕捉された error 値を捨てる）
+    chunk.emit(OpCode::Return, 1); // 3
+    let mut vm = Vm::new(unverified(chunk));
+    vm.set_max_steps(100);
+    let error = vm
+        .run()
+        .expect_err("watchdog の上限到達が catch されて正常終了しました");
+    assert_eq!(
+        error.error_type(),
+        "limit",
+        "想定外の種別: {}",
+        error.message()
+    );
+}
+
+/// REV-006 層1 / F1-AT-06: 後方 `Loop(0)` 迂回ループが有限停止する（`Loop` は back-edge として
+/// fuel を課金するので fuel の上限で止まる。watchdog も同時に進む）。
 #[test]
 fn backward_loop_halts_with_limit() {
     let mut chunk = Chunk::new();
@@ -202,11 +235,10 @@ fn backward_loop_halts_with_limit() {
     );
 }
 
-/// REV-006 層1: `PrepareCall` を省いた raw `Call` の再帰ループが有限停止する。
+/// REV-006 層1 / F1-AT-06: `PrepareCall` を省いた raw `Call` の再帰ループが有限停止する。
 ///
-/// per-instruction 課金では `Call` 命令自体が 1 step 課金されるため、`PrepareCall` を
-/// 迂回しても課金を回避できない。深度上限（先に到達）または step 上限のいずれかで
-/// 必ず有限停止し、host panic しない。
+/// raw `Call` は fuel を課金しないが、frame を積むたびに watchdog の (W2) が進む。深度上限
+/// （先に到達）または watchdog の上限（`limit`）のいずれかで必ず有限停止し、host panic しない。
 #[test]
 fn prepare_call_less_recursion_halts() {
     let mut recursive = Chunk::new();
