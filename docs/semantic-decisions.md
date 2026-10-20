@@ -1,6 +1,6 @@
 # Tsumugi — 次期意味論・実装決定
 
-最終更新: 2026-10-16
+最終更新: 2026-10-20
 
 設計ステータス: **次期仕様確定・未実装**
 
@@ -1917,17 +1917,24 @@ remove_tree(path):
 ### 17.7 bytecode 検証と `VerifiedChunk`（REV-006）
 
 > 設計ステータス: ✅ 実装済み。§17.2（REV-004）・§17.3（REV-005）・REV-018 と同一マイルストーンで実装した。`src/verifier.rs` に `VerifiedChunk`（生成は `verify` か信頼済み `from_trusted` のみ）と `verify`（V1〜V9 をプロトタイプ木へ再帰適用し、最初の違反を `ChunkVerifyError` として返す。`From<ChunkVerifyError> for TsumugiError` と `verify_or_internal_error` で `internal` へ写像）を新設。VM の `run_frames` は全命令 dispatch 直前で無条件に `count_step` する層1課金へ変更し、`Loop`/`PrepareCall`/`call_fn_value` の個別課金を廃止（深度上限は `PrepareCall` と `Call` の両方で検査）。`Vm::new` / `run_repl_chunk` は `VerifiedChunk` だけを受け取り、compiler 出力は `from_trusted` で昇格する。停止性は per-instruction 課金で verifier 非依存。本節はそれらが「範囲検証は verifier が担う」と委譲している検証層の正本である。
+>
+> **2026-10-20 改訂（2 メーター化）**: 層1 を「全命令で fuel（step）を課金する」から「fuel とは独立した VM instruction watchdog」へ改める。per-instruction の fuel 課金は、[実行予算・協調実行仕様](execution-control.md) §2・§4.1 の「fuel は backend 非依存の論理量で、VM opcode 数そのものではない」と矛盾し、同じ script が tree では成功して VM では step 上限に達する（ループで約 15 倍、再帰で約 11 倍の差）という観測差を生んでいた。改訂後は、**fuel は論理量として tree と同じ課金点で数え、停止性は watchdog が形状非依存に保証する**。層2（verifier・`VerifiedChunk`・API 封印）は変更しない。改訂部分（§17.7.1 層1・§17.7.3・§17.7.5〜§17.7.8）は未実装で、[実行予算・協調実行仕様](execution-control.md) §14「F-1 実装スライス」で実装する。
 
 #### 17.7.1 採用判断
 
-VM が実行する bytecode を、**検証を通過した `VerifiedChunk` に限定する**。あわせて、任意の bytecode に対して停止性（step 予算での必ずの終了）が成り立つよう、**step 課金を「1 命令 dispatch ごとに 1」へ変更する**。この 2 層で REV-006 の 2 つの穴（`Jump(0)` 等による step 課金迂回、`PrepareCall` を省いた raw `Call` による call 課金迂回）を塞ぐ。
+VM が実行する bytecode を、**検証を通過した `VerifiedChunk` に限定する**。あわせて、任意の bytecode に対して停止性（予算での必ずの終了）が成り立つよう、**fuel とは独立した instruction watchdog** を置く（2026-10-20 改訂。改訂前は「step 課金を 1 命令 dispatch ごとに 1 へ変更する」だった）。この 2 層で REV-006 の 2 つの穴（`Jump(0)` 等による step 課金迂回、`PrepareCall` を省いた raw `Call` による call 課金迂回）を塞ぐ。
 
-- **層1（durable guarantee・bytecode 形状に非依存）**: VM のメインループは、fetch した全命令の dispatch 直前に無条件で `count_step` を呼ぶ。これにより、検証を通っていない chunk が防御的に VM へ届いた場合でも、任意の命令列は有限 step で `limit` error になる。`Jump(0)` の自己ループも 1 周ごとに 1 命令以上を dispatch するため必ず課金される。現行の Loop / PrepareCall / callback の 3 箇所だけの課金は廃止する（二重課金しない）。
+- **層1（durable guarantee・bytecode 形状に非依存）＝ instruction watchdog**: VM は execution ごとに、fuel・`BudgetUsage`・audit・slice yield のいずれにも現れない内部カウンタ（watchdog）を持つ。watchdog は命令の種別ではなく、次の 2 つの**一般的な条件**で 1 tick 進む。
+  - **(W1) 後退・停滞**: 命令を 1 つ dispatch した後、同じ frame のまま ip が dispatch 前の ip 以下になった。
+  - **(W2) frame の追加**: call frame が 1 つ積まれた（命令の種類や callback 経由かを問わず、frame を積む唯一の経路で数える）。
+
+  tick が上限に達したら実行を止める（§17.7.5）。停止性の論証: tick が起きない区間では、各 frame の ip は単調増加し、frame は減る一方なので、区間内に dispatch できる命令数は「frame 深さ上限 × chunk 木の最大 code 長」で有界になる。したがって watchdog の上限が有限なら、検証を通っていない chunk（`Jump(0)` の自己ループ、`PrepareCall` を省いた raw `Call` の再帰など）でも、命令列の形状によらず必ず有限で止まる。
+- **fuel（論理量）**: VM の fuel は、tree と同じ論理的な課金点で数える（§17.7.3）。per-instruction の fuel 課金は廃止する。
 - **層2（gate・早期拒否と不変条件の確立）**: `Chunk` を `VerifiedChunk` へ昇格させる際に static verifier を通す。verifier はホストが構築・改変した bytecode の構造的健全性を compile/link 時に一度だけ検査し、VM 実行時の防御的分岐（AUD-023 の `require_*` ヘルパー）が「起こり得るが正常運用では到達しない」経路として残る前提を確立する。
 
 VM の公開入口は `VerifiedChunk` だけを受け取る。raw `Chunk` から VM を直接動かす現行の公開経路（`tsumugi::vm::Vm::new(chunk)` / `run_repl_chunk(chunk)` と `pub mod chunk/opcode/vm`）は封印する（REV-018 と共通作業）。
 
-停止性の正本は層1（per-instruction 課金）とする。verifier は「早期拒否・不変条件の明文化・defense-in-depth」であって、停止性を verifier だけに依存させない。verifier を通していない chunk が防御的に実行されても、ホストは panic せず有限 step で停止しなければならない。
+停止性の正本は層1（instruction watchdog）とする。verifier は「早期拒否・不変条件の明文化・defense-in-depth」であって、停止性を verifier だけに依存させない。verifier を通していない chunk が防御的に実行されても、ホストは panic せず有限 step で停止しなければならない。
 
 #### 17.7.2 却下案
 
@@ -1935,7 +1942,9 @@ VM の公開入口は `VerifiedChunk` だけを受け取る。raw `Chunk` から
 - **後方ジャンプの到達可能性を解析して「課金経路を必ず通る」ことを保証する**: 一般の bytecode で「必ず charged 命令を通る」ことの静的証明は制御フロー解析が重く、生成器の変更に脆い。per-instruction 課金なら形状に依存せず自明に停止するため却下する。
 - **`Jump` にだけ課金を追加する**: `Jump` 以外の後方遷移（不正な `Loop` operand 等）や、分岐で自己参照する構成を取りこぼす。命令種別ごとの課金は網羅が難しいため却下する。
 - **raw `Chunk` 経路を公開したまま実行時チェックだけ足す**: 未検証 bytecode が VM 内部不変条件へ到達し続け、verifier で確立したい「VM は検証済み前提」を崩す。公開入口を `VerifiedChunk` へ限定する。
-- **1 命令 = 1 step で既存 fixture の step 予算が変わることを避けるため、命令に重み付けする**: 重み表が opcode 追加ごとに保守対象になり、観測挙動（`limit` 到達点）の説明が複雑化する。等重み（1 命令 1 step）とし、必要なら `TSUMUGI_MAX_STEPS` の既定値だけを調整する。
+- **1 命令 = 1 step で既存 fixture の step 予算が変わることを避けるため、命令に重み付けする**: 重み表が opcode 追加ごとに保守対象になり、観測挙動（`limit` 到達点）の説明が複雑化する。等重み（1 命令 1 step）とし、必要なら `TSUMUGI_MAX_STEPS` の既定値だけを調整する。（2026-10-20 改訂で per-instruction の fuel 課金自体を廃止したため、この却下理由は watchdog にだけ当てはまる。watchdog は命令の種別で重みを変えない）
+- **（2026-10-20 追加）1 つのカウンタで fuel と停止性を兼ねる（改訂前の層1）**: fuel を「VM opcode 数」にすると、[実行予算・協調実行仕様](execution-control.md) §2・§4.1 の「fuel は backend 非依存の論理量」に反し、同じ script の成功・失敗が backend で変わる。逆に fuel を論理量にして停止性も fuel に任せると、停止性が compiler の課金点配置（＝生成器の正しさ）に依存し、本節の「停止性を静的な正しさに依存させない」に反する。目的の違う 2 つを 1 つのカウンタで満たせないため、fuel と watchdog を分ける。
+- **（2026-10-20 追加）watchdog を「後方ジャンプ命令」だけで数える**: 上の「`Jump` にだけ課金を追加する」と同じく、命令種別の列挙は取りこぼしやすい。(W1)(W2) は ip と frame 数の変化だけを見るため、命令の追加・変更に影響されない。
 
 #### 17.7.3 データモデル / 状態遷移
 
@@ -1975,17 +1984,29 @@ ChunkVerifyError {
 }
 ```
 
-停止性（層1）の状態遷移:
+停止性（層1）と fuel の状態遷移（2026-10-20 改訂）:
 
 ```text
 run_frames dispatch loop:
+  (frame_before, ip_before) = (現在の frame, ip)
   fetch instruction at ip
   ip += 1
-  count_step(line)?        # ★ 全命令共通・無条件（REV-006）
-  dispatch(instruction)    # Loop / PrepareCall / callback では追加課金しない
+  dispatch(instruction)    # fuel は下記の論理課金点でだけ課金する
+  if 同じ frame のまま ip <= ip_before:
+      watchdog_tick(line)? # (W1) 後退・停滞
+push_frame(...):           # frame を積む唯一の経路（Call / callback / REPL root）
+  watchdog_tick(line)?     # (W2) frame の追加
+
+fuel の論理課金点（tree の現行課金点と同じ。各 1）:
+  (F1) ループの back-edge  : `Loop` 命令（`Loop` は back-edge 専用にする。`for` の
+                             `continue` は前方 `Jump` で increment へ飛ばす）
+  (F2) user function 呼出し: `PrepareCall`（呼び出し位置の line。深度検査の前）
+  (F3) builtin の callback : `call_fn_value`（builtin 呼び出しの line）
 ```
 
-`count_step` / `max_steps` / `TSUMUGI_MAX_STEPS` / `step_limit` error の定義は変更しない。変わるのは「どこで呼ぶか」だけ（3 箇所限定 → 全命令 1 回）。深度上限（`MAX_USER_CALL_DEPTH`）は現行どおり `PrepareCall` と `Call` の両方で検査し、call 課金は per-instruction 課金に吸収する（`Call` 命令自体が 1 step 課金されるため、`PrepareCall` を省いた raw `Call` でも課金を迂回できない）。
+`count_step` / `max_steps` / `TSUMUGI_MAX_STEPS` / `step_limit` error の定義は変更しない。fuel を課金するのは (F1)〜(F3) だけで、tree の課金点（ループ反復・user function 呼び出し・callback 呼び出し）と 1 対 1 に対応する（VM は host function に対応しないため、tree の host call 課金点に当たるものはない）。深度上限（`MAX_USER_CALL_DEPTH`）は現行どおり `PrepareCall` と `Call` の両方で検査する。`PrepareCall` を省いた raw `Call` は fuel を課金しないが、(W2) で watchdog が進むため停止性は保たれる。
+
+watchdog の上限は `total_fuel × 2 + 16` とする。正規 compiler 出力では、(W1) の後退は (F1) の back-edge、(W2) の frame 追加は (F2)・(F3) か root frame に必ず伴うため、tick 数は「fuel 課金数 + root frame 数」を超えない。よって正規 compiler 出力では常に fuel の上限が先に効き、watchdog の上限は検証を通っていない chunk に対してだけ働く（この不変条件はテストで固定する）。
 
 `VerifiedChunk` は VM・関数プロトタイプ・REPL 差し替えの各所で `Chunk` を置き換える。VM 内部の `require_*` ヘルパー（AUD-023）は削除せず defense-in-depth として残す。verifier を通した chunk では発火しないことをテストで確認する。
 
@@ -1995,7 +2016,7 @@ run_frames dispatch loop:
 - `src/chunk.rs`: `VerifiedChunk` の読み取り専用アクセサを定義し、builder（`emit` / `patch_jump` 等）は §17.2 に従い `pub(crate)` へ縮小する。
 - `src/opcode.rs`: §17.3 の `MakeClosure(proto_index)` と `FunctionPrototype` を導入する（同一マイルストーン）。
 - `src/vm.rs`:
-  - メインループの `count_step` を全命令 dispatch 前の 1 回へ移す。`Loop` / `PrepareCall` / `call_fn_value` の個別 `count_step` を削除する。
+  - メインループの `count_step` を全命令 dispatch 前の 1 回へ移す。`Loop` / `PrepareCall` / `call_fn_value` の個別 `count_step` を削除する。（2026-10-20 改訂で反転: 全命令の `count_step` を廃止し、(F1)〜(F3) の個別 `count_step` と (W1)(W2) の watchdog を置く。詳細は [実行予算・協調実行仕様](execution-control.md) §14「F-1 実装スライス」）
   - `Vm::new` / `run_repl_chunk` の受け取りを `VerifiedChunk` へ変更する。VM 内部が参照する code / constants / lines / prototypes を `VerifiedChunk` のアクセサ経由にする。
   - `require_*` ヘルパーは残す（防御的経路）。
 - `src/compiler.rs`: `compile` / `compile_repl_line` の戻り値を `VerifiedChunk` にする（生成直後に `verify` を通す）か、compiler が生成する chunk は不変条件を満たすため verify を skip して `VerifiedChunk` を直接構築する `pub(crate)` 経路を用意する。どちらでも「VM へ渡る型は `VerifiedChunk`」を守る。
@@ -2006,11 +2027,12 @@ run_frames dispatch loop:
 
 - verifier 拒否（compile/link 段）: 第3.4節「VM/Compiler 不変条件違反」の `internal` / `内部エラー: {stable_detail}` を用いる。`{stable_detail}` は `ChunkVerifyError.kind` に対応する固定文字列（例: `bytecode 検証に失敗しました: jump target が範囲外です`）とし、オフセットや operand の生値・スタック内容を含めない。script からは到達しないため trace は付けない。
 - 防御的に未検証 chunk が VM 実行時の `require_*` へ到達した場合: 従来どおり `internal`（AUD-023 の各メッセージ）を維持し、host panic させない。
-- step 上限到達: 既存の `limit` / `ステップ上限に達しました (上限: {limit})` を変更しない。per-instruction 課金化により到達点（step 数）は変わるが、kind・message template・line 規則は不変。
+- step 上限到達: 既存の `limit` / `ステップ上限に達しました (上限: {limit})` を変更しない。（2026-10-20 改訂）fuel の到達点・line・trace は tree と一致する（tree と同じ課金点・同じ line で課金するため）。
+- watchdog 上限到達（2026-10-20 追加）: fuel の上限到達と**同じ** terminal（kind `limit`、`ステップ上限に達しました (上限: {total_fuel})`、catch 不可、line は上限に達した命令の line）に写す。正規 compiler 出力では到達しないため、新しい error 種別を script・host へ見せない。
 
 #### 17.7.6 移行
 
-- `TSUMUGI_MAX_STEPS` の既定値と、step 数に依存する fixture（`error_step_limit` 等）は、per-instruction 課金で到達点が変わるため再調整する。観測される kind・message は変えない。
+- `TSUMUGI_MAX_STEPS` の既定値と、step 数に依存する fixture（`error_step_limit` 等）は、per-instruction 課金で到達点が変わるため再調整する。観測される kind・message は変えない。（2026-10-20 改訂: 既定値は調整されなかった。改訂後は VM の fuel が tree と同じ点で数えられるため既定値の再調整は不要になり、VM で step 上限に達していた script の一部は成功するようになる＝制限の緩和）
 - ホストが `tsumugi::chunk::Chunk` を raw 構築して `tsumugi::vm::Vm` へ渡していた利用は、封印により `unstable-bytecode` feature が必要になる。安定利用は `Engine` facade へ移行する。
 - `tests/defensive_vm.rs` は「未検証 chunk を防御的経路（`unstable-bytecode` またはテスト内部 API）で VM へ渡しても host panic しない」方針を維持する。加えて REV-006 の 2 ケース（`Jump(0)` 自己ループ・`PrepareCall` なし raw `Call` ループ）を追加し、いずれも `limit` error で有限停止することを固定する。
 
@@ -2018,11 +2040,13 @@ run_frames dispatch loop:
 
 | 軸 | ケース |
 |---|---|
-| 停止性（層1） | `Jump(0)` 自己ループ / 後方 `Loop` 迂回 / `PrepareCall` なし raw `Call` ループ / 巨大 operand なし純命令ループ。いずれも `limit` で有限停止 |
+| 停止性（層1） | `Jump(0)` 自己ループ / 後方 `Loop` 迂回 / `PrepareCall` なし raw `Call` ループ / 巨大 operand なし純命令ループ。いずれも `limit` で有限停止（2026-10-20 改訂後は watchdog によって） |
+| fuel parity（2026-10-20 追加） | ループ反復・再帰・callback・`for`+`continue`・`while`+`continue`・try 内ループで、tree と VM の `committed.fuel` が完全一致し、上限 N に対して成功・失敗の境界、line、trace が一致する |
+| watchdog の非干渉（2026-10-20 追加） | 正規 compiler 出力では、どの上限値でも fuel の上限が watchdog より先に効く |
 | verifier 拒否（層2） | V1〜V9 各違反を最低 1 ケース。最初の違反種別が `ChunkVerifyError` になる |
 | verifier 通過 | 正規 compiler 出力（if/while/for/関数/closure/try/f-string/builtin）が verify を通り、観測挙動が現行と一致 |
 | defense-in-depth | verify を通した chunk では `require_*` が発火しないこと（fault injection でのみ発火） |
-| backend | per-instruction 課金後の step 到達点を tree（該当する範囲）と VM で説明可能にし、VM の `limit` error が message/line 一致 |
+| backend | per-instruction 課金後の step 到達点を tree（該当する範囲）と VM で説明可能にし、VM の `limit` error が message/line 一致（2026-10-20 改訂で「fuel parity」行へ強化） |
 | 公開境界 | `unstable-bytecode` feature 無効時に raw `Chunk`→VM 経路がコンパイル不能／到達不能であること |
 
 全ケースで終了コード・stdout・stderr・kind・message・line を検査する。既存 golden の step 到達点変化は fixture 側で吸収し、backend 別期待値を新設しない。
@@ -2030,7 +2054,7 @@ run_frames dispatch loop:
 #### 17.7.8 受入基準
 
 - VM の公開入口が `VerifiedChunk` だけを受け取り、安定 API から raw `Chunk` を VM へ渡せない。
-- 全命令 dispatch ごとに 1 step 課金され、`Jump(0)` 自己ループ・`PrepareCall` なし raw `Call` ループが有限 step で `limit` error になる。
+- 全命令 dispatch ごとに 1 step 課金され、`Jump(0)` 自己ループ・`PrepareCall` なし raw `Call` ループが有限 step で `limit` error になる。（2026-10-20 改訂: 「全命令 dispatch ごとに 1 step 課金」は「(W1)(W2) で watchdog が進み、上限で `limit` error」へ置き換える。fuel は (F1)〜(F3) でだけ課金し、tree と `committed.fuel` が一致する）
 - verifier が V1〜V9 の構造違反を compile/link 段で `internal` として拒否する。
 - verifier を通していない chunk が防御的に実行されても host が panic せず有限停止する（停止性は verifier に依存しない）。
 - 正規 compiler 出力の観測挙動（step 到達点を除く）が変わらず、tree / VM で kind・message・line が一致する。

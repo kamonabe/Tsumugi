@@ -1164,6 +1164,9 @@ Phase 5/6実装完了には次をすべて自動化する。
 > release寿命の一致を突合する（byte-exact一致は§5.3のA-1どおりbackend間で成立しないため要求しない。
 > fuel枯渇のterminal `line`もstep粒度差でengine間に差があり、fuel parityはStepLimit terminalの
 > observable一致で担保する）。
+> **（2026-10-20 注記）** 両engineとも上限に達するscriptだけを比べていたため、「treeでは成功しVMでは
+> step上限」というobservable差を検出できなかった。fuelは[実行予算・協調実行仕様](execution-control.md)
+> §14「F-1 実装スライス」でtreeの課金点に揃え、`committed.fuel`のexact一致で突合する。
 >
 > 一方、**FakeHost effect logのbyte/順序比較・StableError生成履歴・`normalize_for_conformance`後の
 > audit payload・yield/fuelの完全一致・AUD-019/024/048 fixture・AUD-022生成matrix/fuzz**は

@@ -2,11 +2,11 @@
 
 最終更新: 2026-10-20
 
-設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は完了（string / source / import accounting、heap accounting 基盤（`AllocationLedger`・§5.1 論理サイズ）、collection（`List`/`Dict`）の per-drop release（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、tree/VM 両対応）、および String body の per-drop release（PR-b、`Value::Str` を `Rc<Tracked<RefCell<Value>>>` 化し `Value::Fn`/`VmFn` に header token を持たせる）、および AST / bytecode chunk / imported module record / rollback journal の per-drop 追跡（PR-d、`HeapToken = Tracked<()>` トークンで所有構造側から課金・release。tree は AST、VM は bytecode chunk を課金）、および string リテラル/連結/f-string 経路の課金（生成点で `track_result` を通し cumulative + live heap を課金、tree/VM 両対応）、および I-O accounting（input / output / host call の count + bytes を reserve/commit/refund で課金。stdio は host call として co-charge。host call 対象は filesystem read/write と stdio に限り、その他 host 境界 builtin は Phase 2）を実装済みで、これで Slice 2 は完了。VM の push/pop の full-clone や f-string リテラル部分の個別課金のため configured 上限で tree と live/peak・cumulative が食い違い得るが、charge trace の tree/VM 完全一致は第14節 Slice 6（VM が experimental の間）で解消する。Slice 3（explicit continuation）は blast radius が大きいため PR-a（公開 state-machine surface + poll-to-terminal core）→ PR-b（statement / block / loop の明示 frame）→ PR-c（関数呼び出し・try handler の明示 frame）→ PR-d（slice fuel + yield）へ分割する。PR-a（公開 state-machine surface + poll-to-terminal core）・PR-b（statement / block / loop の明示 frame stack。tree evaluator の `drive_body` driver ループ + `Frame`/cursor で `exec_program`/`exec_block`/ループ再帰を置換し、continuation_frame heap を配線）・PR-c（関数呼び出し・try handler の明示 frame。`eval_call` / callback の `call_fn_value` を `FrameKind::Call` を積む形へ変換し、共通 `run_driver` + `drive_call_body` で本体を駆動。VM の `CallFrame` をミラーし、`try` handler は PR-b の `FrameKind::Try` が VM の `TryHandler` をミラーする）を実装済み。PR-d（slice fuel + yield）も PR-d-1（continuation を Evaluator 所有の `'static` 永続 frame stack へ。AST ブロック本体を `Rc<[Stmt]>` 化）と PR-d-2（slice-fuel accounting・文/反復境界での `Yielded(SliceFuelExhausted)`・`begin_execution` / `run_slice` による resume）で実装済み。Slice 3 は完了。Slice 4（cancellation・pause・transaction）は `CancellationToken`・deadline checkpoint・pause/resume・AUD-024 rollback 規則・race linearization まで実装済みで完了。Slice 5（scheduler・host pending）も `SchedulerShared`/`AdmissionController` の bounded admission と run-turn FIFO backpressure、nonblocking host-call ticket（`HostCallTicket`/`ExecutionWaker`/`HostCallPoll`）と wake・deadline/cancel 伝播、独立上限の `AdapterExecutor` + `CooperativeAdapter`/`CapabilityCallContext.may_yield` まで実装済みで完了。Slice 6（VM charge parity）も完了。さらに最終形移行 Slice 1（`ExecutionRequest` の `BudgetConfig` 必須所有 + deadline を `BudgetConfig.deadline` へ統合 + CLI 既定の有限化＝option B）を実装済み＝`embedding::ExecutionRequest` を `new(budget, clock) -> Result<_, ConfigError>` へ移し有限 `BudgetConfig` と deadline clock を必須所有させ、`with_deadline_clock` 独立経路と `EngineConfig.budget` の二重管理を解消（deadline は `budget.deadline` のみ）、`Engine::run` は実行直前に `Evaluator::reset_budget`（cancellation token を引き継ぐ）で budget を据え直す。CLI 既定は import なし経路で単一 `SystemMonotonicClock` を共有し `BudgetConfig::standard`（30s + 標準上限）を渡す有限 budget（import あり経路は E7 で統合）。最終形の `BudgetConfig` 必須所有は実装済みで、`CancellationToken` 必須所有（Slice 2）も実装済み＝`ExecutionRequest` が `cancellation: CancellationToken` を必須所有し `.cancellation(value)` builder で設定、`Engine::run` が実行直前に request-owned token を評価器へ install する。REV-015 最終形移行（budget + cancellation 必須所有）は完了し、残りは Phase 6（audit）のみ。詳細は第14節 Slice 3/Slice 5 を参照）
+設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は完了（string / source / import accounting、heap accounting 基盤（`AllocationLedger`・§5.1 論理サイズ）、collection（`List`/`Dict`）の per-drop release（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、tree/VM 両対応）、および String body の per-drop release（PR-b、`Value::Str` を `Rc<Tracked<RefCell<Value>>>` 化し `Value::Fn`/`VmFn` に header token を持たせる）、および AST / bytecode chunk / imported module record / rollback journal の per-drop 追跡（PR-d、`HeapToken = Tracked<()>` トークンで所有構造側から課金・release。tree は AST、VM は bytecode chunk を課金）、および string リテラル/連結/f-string 経路の課金（生成点で `track_result` を通し cumulative + live heap を課金、tree/VM 両対応）、および I-O accounting（input / output / host call の count + bytes を reserve/commit/refund で課金。stdio は host call として co-charge。host call 対象は filesystem read/write と stdio に限り、その他 host 境界 builtin は Phase 2）を実装済みで、これで Slice 2 は完了。VM の push/pop の full-clone や f-string リテラル部分の個別課金のため configured 上限で tree と live/peak・cumulative が食い違い得るが、charge trace の tree/VM 完全一致は第14節 Slice 6（VM が experimental の間）で解消する。Slice 3（explicit continuation）は blast radius が大きいため PR-a（公開 state-machine surface + poll-to-terminal core）→ PR-b（statement / block / loop の明示 frame）→ PR-c（関数呼び出し・try handler の明示 frame）→ PR-d（slice fuel + yield）へ分割する。PR-a（公開 state-machine surface + poll-to-terminal core）・PR-b（statement / block / loop の明示 frame stack。tree evaluator の `drive_body` driver ループ + `Frame`/cursor で `exec_program`/`exec_block`/ループ再帰を置換し、continuation_frame heap を配線）・PR-c（関数呼び出し・try handler の明示 frame。`eval_call` / callback の `call_fn_value` を `FrameKind::Call` を積む形へ変換し、共通 `run_driver` + `drive_call_body` で本体を駆動。VM の `CallFrame` をミラーし、`try` handler は PR-b の `FrameKind::Try` が VM の `TryHandler` をミラーする）を実装済み。PR-d（slice fuel + yield）も PR-d-1（continuation を Evaluator 所有の `'static` 永続 frame stack へ。AST ブロック本体を `Rc<[Stmt]>` 化）と PR-d-2（slice-fuel accounting・文/反復境界での `Yielded(SliceFuelExhausted)`・`begin_execution` / `run_slice` による resume）で実装済み。Slice 3 は完了。Slice 4（cancellation・pause・transaction）は `CancellationToken`・deadline checkpoint・pause/resume・AUD-024 rollback 規則・race linearization まで実装済みで完了。Slice 5（scheduler・host pending）も `SchedulerShared`/`AdmissionController` の bounded admission と run-turn FIFO backpressure、nonblocking host-call ticket（`HostCallTicket`/`ExecutionWaker`/`HostCallPoll`）と wake・deadline/cancel 伝播、独立上限の `AdapterExecutor` + `CooperativeAdapter`/`CapabilityCallContext.may_yield` まで実装済みで完了。Slice 6（VM charge parity）も完了（heap・string・I-O の会計。fuel の課金差は未解消で、第14節「F-1 実装スライス」で扱う）。さらに最終形移行 Slice 1（`ExecutionRequest` の `BudgetConfig` 必須所有 + deadline を `BudgetConfig.deadline` へ統合 + CLI 既定の有限化＝option B）を実装済み＝`embedding::ExecutionRequest` を `new(budget, clock) -> Result<_, ConfigError>` へ移し有限 `BudgetConfig` と deadline clock を必須所有させ、`with_deadline_clock` 独立経路と `EngineConfig.budget` の二重管理を解消（deadline は `budget.deadline` のみ）、`Engine::run` は実行直前に `Evaluator::reset_budget`（cancellation token を引き継ぐ）で budget を据え直す。CLI 既定は import なし経路で単一 `SystemMonotonicClock` を共有し `BudgetConfig::standard`（30s + 標準上限）を渡す有限 budget（import あり経路は E7 で統合）。最終形の `BudgetConfig` 必須所有は実装済みで、`CancellationToken` 必須所有（Slice 2）も実装済み＝`ExecutionRequest` が `cancellation: CancellationToken` を必須所有し `.cancellation(value)` builder で設定、`Engine::run` が実行直前に request-owned token を評価器へ install する。REV-015 最終形移行（budget + cancellation 必須所有）は完了し、残りは Phase 6（audit）のみ。詳細は第14節 Slice 3/Slice 5 を参照）
 
 ## 1. 位置づけ
 
-本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleStringBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線し、さらに string リテラル・`+` 連結・f-string の生成点でも `track_result` で課金）と source / import accounting サブスライス（per-item `SingleSourceBytes`・cumulative `SourceCount`/`SourceBytes`・`ImportCount`/`ImportBytes` を Link フェーズで root と import へ tree/VM 共通で課金）、heap accounting 基盤サブスライス（`AllocationId`・`AllocationLedger`・§5.1 論理サイズ関数・`HeapBytes` reserve/超過写像）、collection（`List`/`Dict`）の per-drop release サブスライス（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、COW は delta 課金、tree/VM 両対応）、および String body の per-drop release サブスライス（PR-b、`Value::Str` を `Rc<Tracked<String>>` 化し、builtin 結果を dispatch 境界の `track_result` で live heap 課金・最後の参照 drop で release）、cell と tree/VM 関数 instance の per-drop release サブスライス（PR-c、cell 生成点で captured cell を課金し `Value::Fn`/`VmFn` の header token で function instance header を課金、drop で release）、および AST / bytecode chunk / imported module record / rollback journal の per-drop 追跡サブスライス（PR-d、所有構造側が `HeapToken = Tracked<()>` トークンで §5.1 論理サイズを課金し drop で release。§5.3「AST または bytecode」に従い tree は AST・VM は bytecode chunk を課金、import record は両 engine、rollback journal entry は両 engine で entry の固定 overhead を課金）、および string リテラル/連結/f-string 経路の課金サブスライス（生成点で `track_result` を通し cumulative + live heap を課金、tree/VM 両対応）、および I-O accounting サブスライス（input / output / host call の count + bytes を reserve/commit/refund（§7）で課金し、stdio を host call として co-charge。tree/VM の `print` / `input` / filesystem dispatch 境界へ共通配線）も実装済みで、Slice 2 は完了した。Slice 3 は PR-a（公開 state-machine surface + poll-to-terminal core）と PR-b（tree evaluator の statement / block / loop を明示 frame stack + driver ループへ変換し continuation_frame heap を配線）、PR-c（関数呼び出し・try handler の明示 frame。`eval_call` / `call_fn_value` を `FrameKind::Call` 化し、共通 `run_driver` + `drive_call_body` で本体を駆動。VM の `CallFrame` / `TryHandler` をミラー）、PR-d（slice fuel + yield。PR-d-1 で continuation を Evaluator 所有の `'static` 永続 frame stack へ移し、PR-d-2 で slice-fuel accounting と文/反復境界での `Yielded(SliceFuelExhausted)`・`begin_execution` / `run_slice` resume を実装）まで実装済みで、Slice 3 は完了した。cancel/pause（Slice 4）と scheduler・host pending（Slice 5）は実装済みである（Slice 5 は `SchedulerShared`/`AdmissionController` の bounded admission・run-turn FIFO backpressure、nonblocking host-call ticket〔`HostCallTicket`/`ExecutionWaker`/`HostCallPoll`〕と wake・queue 待ち/pause/host 待ち中の deadline/cancel 伝播、独立上限の `AdapterExecutor` + `CooperativeAdapter`/`CapabilityCallContext.may_yield`。`AuditBackpressure`-yield（sink-Pending 由来）は Phase 6 B-1 で facade の監査付き poll driver に配線済み〔§10.2、[決定性・実行時監査仕様](determinism-and-audit.md) §14〕。audit drain queue byte 会計〔§10.2〕は B-2 で per-execution 上限を同 driver に配線済み、engine 全体の上限は E10 統合後）。VM charge parity（Slice 6）も完了済みで、最終形移行のうち `BudgetConfig` 必須所有（Slice 1: `ExecutionRequest::new(budget, clock)`・deadline を `BudgetConfig.deadline` へ統合・`EngineConfig.budget` collapse・CLI 既定の有限化＝option B）は実装済みである。最終形の `CancellationToken` 必須所有（Slice 2: `ExecutionRequest` が `cancellation: CancellationToken` を必須所有し `.cancellation(value)` builder で設定、`Engine::run` が実行直前に request-owned token を評価器へ install）も実装済みで、REV-015 最終形移行（budget + cancellation 必須所有）は完了した。残りは Phase 6（audit）である。
+本文書は、[Tsumugi Manifesto](manifesto.md)と[ロードマップ](roadmap.md)のうち、マニフェスト実現ロードマップ Phase 3「包括的な実行予算」とPhase 4「協調実行と負荷制御」の実装仕様を定める。既存のstep上限、collection上限、call・AST・import深度上限を土台として再利用する。第14節 Slice 1（budget型・legacy adapter・共有BudgetLedger）は `src/budget.rs` に実装済みで、Slice 2 のうち string accounting サブスライス（per-item `SingleStringBytes`・cumulative `StringAllocations`/`StringBytes` の課金を共有 builtin handler へ tree/VM 共通で配線し、さらに string リテラル・`+` 連結・f-string の生成点でも `track_result` で課金）と source / import accounting サブスライス（per-item `SingleSourceBytes`・cumulative `SourceCount`/`SourceBytes`・`ImportCount`/`ImportBytes` を Link フェーズで root と import へ tree/VM 共通で課金）、heap accounting 基盤サブスライス（`AllocationId`・`AllocationLedger`・§5.1 論理サイズ関数・`HeapBytes` reserve/超過写像）、collection（`List`/`Dict`）の per-drop release サブスライス（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、COW は delta 課金、tree/VM 両対応）、および String body の per-drop release サブスライス（PR-b、`Value::Str` を `Rc<Tracked<String>>` 化し、builtin 結果を dispatch 境界の `track_result` で live heap 課金・最後の参照 drop で release）、cell と tree/VM 関数 instance の per-drop release サブスライス（PR-c、cell 生成点で captured cell を課金し `Value::Fn`/`VmFn` の header token で function instance header を課金、drop で release）、および AST / bytecode chunk / imported module record / rollback journal の per-drop 追跡サブスライス（PR-d、所有構造側が `HeapToken = Tracked<()>` トークンで §5.1 論理サイズを課金し drop で release。§5.3「AST または bytecode」に従い tree は AST・VM は bytecode chunk を課金、import record は両 engine、rollback journal entry は両 engine で entry の固定 overhead を課金）、および string リテラル/連結/f-string 経路の課金サブスライス（生成点で `track_result` を通し cumulative + live heap を課金、tree/VM 両対応）、および I-O accounting サブスライス（input / output / host call の count + bytes を reserve/commit/refund（§7）で課金し、stdio を host call として co-charge。tree/VM の `print` / `input` / filesystem dispatch 境界へ共通配線）も実装済みで、Slice 2 は完了した。Slice 3 は PR-a（公開 state-machine surface + poll-to-terminal core）と PR-b（tree evaluator の statement / block / loop を明示 frame stack + driver ループへ変換し continuation_frame heap を配線）、PR-c（関数呼び出し・try handler の明示 frame。`eval_call` / `call_fn_value` を `FrameKind::Call` 化し、共通 `run_driver` + `drive_call_body` で本体を駆動。VM の `CallFrame` / `TryHandler` をミラー）、PR-d（slice fuel + yield。PR-d-1 で continuation を Evaluator 所有の `'static` 永続 frame stack へ移し、PR-d-2 で slice-fuel accounting と文/反復境界での `Yielded(SliceFuelExhausted)`・`begin_execution` / `run_slice` resume を実装）まで実装済みで、Slice 3 は完了した。cancel/pause（Slice 4）と scheduler・host pending（Slice 5）は実装済みである（Slice 5 は `SchedulerShared`/`AdmissionController` の bounded admission・run-turn FIFO backpressure、nonblocking host-call ticket〔`HostCallTicket`/`ExecutionWaker`/`HostCallPoll`〕と wake・queue 待ち/pause/host 待ち中の deadline/cancel 伝播、独立上限の `AdapterExecutor` + `CooperativeAdapter`/`CapabilityCallContext.may_yield`。`AuditBackpressure`-yield（sink-Pending 由来）は Phase 6 B-1 で facade の監査付き poll driver に配線済み〔§10.2、[決定性・実行時監査仕様](determinism-and-audit.md) §14〕。audit drain queue byte 会計〔§10.2〕は B-2 で per-execution 上限を同 driver に配線済み、engine 全体の上限は E10 統合後）。VM charge parity（Slice 6）も heap・string・I-O の会計について完了済み（fuel の課金差は第14節「F-1 実装スライス」で扱う）で、最終形移行のうち `BudgetConfig` 必須所有（Slice 1: `ExecutionRequest::new(budget, clock)`・deadline を `BudgetConfig.deadline` へ統合・`EngineConfig.budget` collapse・CLI 既定の有限化＝option B）は実装済みである。最終形の `CancellationToken` 必須所有（Slice 2: `ExecutionRequest` が `cancellation: CancellationToken` を必須所有し `.cancellation(value)` builder で設定、`Engine::run` が実行直前に request-owned token を評価器へ install）も実装済みで、REV-015 最終形移行（budget + cancellation 必須所有）は完了した。残りは Phase 6（audit）である。
 
 本文書は次の既存仕様と一体で実装する。
 
@@ -1383,6 +1383,94 @@ VM charge parity（Slice 6）はこの slice の対象外で VM は cooperative 
   closure retain 課金は PR-6b で実装済みであり、**Slice 6 の残作業は §15.5 charge/budget
   parity matrix の自動化のみ**である（下記 §15.5 の PR-6c 線引きを参照）。
 
+- **fuel 課金差（未解消 → 下記「F-1 実装スライス」）**: Slice 6 で揃えたのは heap・string・
+  I-O の会計で、fuel は揃っていない（2026-10-20 判明）。tree はループ反復・user function
+  呼び出し・callback 呼び出しごとに 1、VM は REV-006（[次期意味論・実装決定](semantic-decisions.md)
+  §17.7）以降、全命令ごとに 1 を課金しており、同じ script が tree では成功して VM では step
+  上限に達する（既定 1,000,000 で、2 文ループの最大反復数は tree 1,000,000 / VM 66,665、
+  再帰 fib が通る最大 n は tree 27 / VM 22）。§15.5 の PR-6c 線引きは「fuel parity は StepLimit
+  terminal の observable 一致で担保する」としていたが、differential が両 engine とも上限に
+  達する script だけを比べていたため、この差を検出できなかった。§4.1 の課金表は tree・VM の
+  どちらにもまだ実装されていない（Slice 1 注記の「fuel 全 charge point の展開は Slice 2」は、
+  Slice 2 の項目に含まれないまま Slice 2 完了とされた）。
+
+#### F-1 実装スライス（fuel parity：VM を tree の現行課金点へ、2 メーター化）
+
+> 状態: **定義済み・未実装**（2026-10-20）。§4.1 の課金表そのものの実装は後続の F-2（未定義）で扱う。
+
+fuel を「論理量」と「停止性の安全網」の 2 つのメーターに分ける（[次期意味論・実装決定](semantic-decisions.md)
+§17.7 の 2026-10-20 改訂）。F-1 は、VM の fuel を tree の**現行の**課金点に合わせて tree/VM の
+fuel parity を回復し、停止性を fuel から独立した instruction watchdog へ移す。§4.1 の課金表
+（statement / expression / operation 単位の課金）への移行は、両 engine の fuel が一致した状態から
+F-2 で行う（F-2 は既定 `total_fuel` の見直しと `language_revision` の扱いを含むため別 slice とする）。
+
+- **fuel の課金点（tree は変更しない）**: VM は次の 3 点でだけ fuel を 1 課金し、全命令での課金を
+  やめる。いずれも tree の課金点と同じ順序・同じ line で課金する。
+  1. **(F1) ループの back-edge**: `OpCode::Loop`。line は loop 文の line（compiler が `Loop` に
+     付ける line）。tree の「本体 1 反復の完了後・次反復の判定前」に対応する。
+  2. **(F2) user function 呼び出し**: `OpCode::PrepareCall`。line は呼び出し位置。深度検査より前に
+     課金する（tree の `count_step` → 深度検査の順と同じ）。
+  3. **(F3) builtin の callback 呼び出し**: `Vm::call_fn_value`。line は builtin 呼び出しの line。
+     深度検査より前に課金する。
+
+  VM は host function に対応しないため、tree の host / cooperative host 呼び出しの課金点に当たる
+  ものはない。sort・比較・表示の per-element 課金は共有コードのため変更しない。
+- **`Loop` を back-edge 専用にする**: 現在の compiler は `for` の `continue` を `Loop` で
+  increment 位置（前方）へ飛ばしている。このままだと `for` で `continue` した反復が VM だけ 2 回
+  課金されるため、`for` の `continue` は前方 `Jump`（`break` と同じ patch 方式）へ変える。`while` の
+  `continue` は loop 先頭への後方 `Loop` のままでよい（1 反復につき back-edge は 1 回だけ実行される）。
+- **instruction watchdog**: [§17.7](semantic-decisions.md) の (W1)(W2) で tick する VM 内部カウンタ。
+  - fuel・`BudgetUsage`・audit・slice yield のどれにも現れない。
+  - 上限は `total_fuel × 2 + 16`（saturating）。tick のたびに現在の `total_fuel` から計算する
+    （`set_max_steps` や REPL の再設定に追従する）。
+  - REPL では fuel と同じく submission ごとに 0 へ戻す。callback の入れ子 `run_frames` を含め、
+    1 execution（REPL では 1 submission）で 1 本のカウンタを共有する。
+  - 上限に達したら、fuel の上限到達と同じ terminal（kind `limit`、`ステップ上限に達しました
+    (上限: {total_fuel})`、catch 不可）へ写す。
+- **観測される変化（VM のみ）**: fuel の消費量が tree と同じになり、VM で step 上限に達していた
+  script の一部が成功するようになる（制限の緩和）。step 上限エラーの line と trace が tree と
+  一致する（例: 呼び出しで上限に達したとき、VM も呼び出し位置の line で止まり、callee の trace は
+  付かない）。tree・既定経路の観測挙動は変えない。`language_revision` は bump しない
+  （language-spec は既に「tree と `--vm` は同じ観測挙動」と定めており、F-1 はその非適合の修正）。
+- **変更箇所**:
+  - `src/vm.rs`: メインループの全命令 `count_step` を削除し、(F1)〜(F3) で `count_step` する。
+    watchdog（counter・上限計算・(W1) の ip 比較・(W2) を数える frame push の一本化）を追加し、
+    REPL submission の境界で fuel と一緒に reset する。
+  - `src/compiler.rs`: `for` の `continue` を前方 `Jump` に変える。
+  - `src/verifier.rs`: 変更なし（`Loop` の target 範囲検査は従来どおり）。
+  - tests: 下記。
+  - docs: §17.7（改訂済み）、本小節、§15.5 の PR-6c 注記、[決定性・監査仕様](determinism-and-audit.md)
+    §15.5 の同注記、roadmap。
+- **受入基準（F-1）**:
+  - **F1-AT-01**（fuel 一致・ループ）: `while`・`for`・入れ子ループ・`while`+`continue`・
+    `for`+`continue`・`break` で、両 engine の `committed.fuel` が完全一致する（differential の
+    in-process 層で exact 比較）。
+  - **F1-AT-02**（fuel 一致・呼び出し）: 再帰・相互再帰・closure 呼び出し・`map`/`filter`/`sort`
+    の callback で、`committed.fuel` が完全一致する。
+  - **F1-AT-03**（上限の境界）: F1-AT-01/02 の各 script について、上限 N = 必要 fuel では両 engine
+    とも成功し、N − 1 では両 engine とも step 上限で失敗する。stdout・stderr（line・trace を含む）・
+    exit code が一致する。
+  - **F1-AT-04**（既定上限での一致）: 既定 1,000,000 で、2 文ループ 1,000,000 反復が両 engine で
+    成功し、1,000,001 反復が両 engine で失敗する。fib(27) が両 engine で成功する。
+  - **F1-AT-05**（呼び出しの 1 課金）: 上限 1 で `once()` を 1 回呼ぶ script が両 engine で成功し、
+    本体がちょうど 1 回実行される（REV-006 で弱めた `call_budget_is_checked_before_callee_in_both_engines`
+    の「call = ちょうど 1 step」検査を復元する）。
+  - **F1-AT-06**（watchdog による停止性）: `tests/defensive_vm.rs` の `Jump(0)` 自己ループ・後方 `Loop`
+    迂回・`PrepareCall` なし raw `Call` 再帰が、従来どおり `limit` で有限停止する。
+  - **F1-AT-07**（watchdog の非干渉）: F1-AT-01〜04 の全 script と既存の全 fixture で、watchdog の
+    上限に達する前に必ず fuel の上限に達する（テスト用に watchdog の tick 数を観測する内部 API で、
+    「tick 数 ≤ fuel 課金数 + root frame 数」を確認する）。
+  - **F1-AT-08**（REPL）: VM REPL で submission ごとに fuel と watchdog が reset され、
+    tree REPL と同じ入力列で同じ出力になる。
+  - **F1-AT-09**（catch 不可）: fuel・watchdog のどちらの上限到達も try/catch で捕捉できない
+    （両 engine）。
+  - 既存テストのうち、VM の per-instruction 課金を前提にした期待値（例: `call_budget_is_checked_before_callee_in_both_engines`
+    の弱めた検査、differential の「向き・符号」比較）は、F-1 の exact parity へ置き換える。
+- **テスト配置**: 境界・CLI は `tests/integration.rs`、exact fuel 比較は `tests/differential.rs`、
+  停止性は `tests/defensive_vm.rs`、watchdog の内部不変条件は `src/vm.rs` の unit test。
+- **F-1 の範囲外**: §4.1 の課金表（F-2）、VM の deadline clock 注入、VM の audit、VM の
+  cooperative 実行（いずれも既存の後続項目）。
+
 ## 15. 境界受入テスト
 
 実装完了には、通常unit testに加えて次をすべて自動化する。
@@ -1450,6 +1538,10 @@ VM charge parity（Slice 6）はこの slice の対象外で VM は cooperative 
 > heap（`live_heap`/`peak_heap`）は向き・符号・release 寿命の一致**で突合する（byte-exact 一致は
 > §5.3 の A-1 どおり backend 間で成立しないため要求しない。fuel 枯渇の terminal `line` も step
 > 粒度差で engine 間に差があり、fuel parity は StepLimit terminal の observable 一致で担保する）。
+> **（2026-10-20 注記）** この線引きは不十分だった: differential が両 engine とも上限に達する
+> script だけを比べていたため、「tree では成功し VM では step 上限」という observable 差を検出
+> できなかった。fuel は §14「F-1 実装スライス」で tree の課金点に揃え、`committed.fuel` の
+> exact 一致と上限 N−1/N の境界一致で突合する。
 >
 > **PR-6c-min 完了 = Slice 6 charge-parity-matrix 自動化の完了であって、VM の experimental 卒業
 > ではない。** 卒業 gate は determinism/audit conformance（§16・[決定性・監査仕様](determinism-and-audit.md)
