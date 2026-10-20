@@ -49,6 +49,13 @@ pub enum SliceOutcome {
     /// script / host の明示 yield（`ExplicitYield`）。本 Slice では trigger されない（§4.7）。
     /// 型として用意し、到達した場合 handle は通常 yield と同じ扱いにする。
     YieldedExplicit,
+    /// audit drain queue が `max_pending_bytes` に達し、トップレベルの文/反復境界で yield した
+    /// （Phase 6 B-2、`docs/determinism-and-audit.md` §10.2・§14「B-2 実装スライス」）。
+    ///
+    /// 監査付き facade が [`Evaluator::set_audit_queue`] で上限を設定した実行でだけ起きる。
+    /// facade は buffer を flush して queue を 0 へ戻し、次の `run_slice` で resume する。
+    /// 監査 event 上は `AuditBackpressure` の `Yielded`/`Resumed` として記録される。
+    YieldedAuditQueue,
     /// terminal に到達した（旧 `Some(result)` に相当）。transaction は commit / rollback 済み。
     Terminal(Result<(), TsumugiError>),
 }
@@ -74,6 +81,8 @@ pub(crate) fn audit_yield_reason_from(
             Some(AuditYieldReason::HostCallPending { call_id: *call_id })
         }
         SliceOutcome::YieldedExplicit => Some(AuditYieldReason::ExplicitYield),
+        // queue 由来の backpressure も sink Pending 由来と区別せず AuditBackpressure（§10.2、B-2）。
+        SliceOutcome::YieldedAuditQueue => Some(AuditYieldReason::AuditBackpressure),
         SliceOutcome::Terminal(_) => None,
     }
 }
@@ -400,12 +409,6 @@ pub struct Evaluator {
     /// 同値を operation_id / call_id 兼用で使う。REPL 再利用で巻き戻さないよう `reset_budget` で
     /// 0 へ戻す。`next_host_call_id`（cooperative host-call の call_id、Slice 5）とは別概念。
     next_host_operation_id: u64,
-    /// host-call lifecycle 監査 event の emission 待ちバッファ（§7.3 の `BudgetCharged` 蓄積と
-    /// 同じ deferred-drain 規律）。host-call 境界が triple を emission 順で push し、監査付き
-    /// facade（`run_audited_inner`）だけが [`Self::drain_host_call_events`] で drain して journal
-    /// へ流す。sink 無し経路は drain しないため emission ゼロ・byte-for-byte 不変（§1.1 opt-in）。
-    /// push は意味論・課金・外部効果へ影響しない軽量操作に保つ。
-    host_call_events: Vec<crate::audit::AuditEvent>,
     /// yield/resume lifecycle 監査 event（§7.2 CBOR tag 5/6）に発番する poll_index の次値
     /// （Phase 6、設計 determinism-and-audit.md §7.2/§8）。execution ごとに 0 始まりで単調増加し、
     /// 1 回の yield/resume pair（`Yielded` とその直後の `Resumed`）へ同値を使う。REPL 再利用で
@@ -426,12 +429,16 @@ pub struct Evaluator {
     /// yield の pair（SliceFuel Yielded↔Resumed）を壊さない。単一 batch の round-trip は
     /// yield→resume で閉じるため、ネストは深さ 1 に限られ 1 slot で足りる。
     saved_yield_before_backpressure: Option<(crate::audit::AuditYieldReason, u64)>,
-    /// yield/resume lifecycle 監査 event の emission 待ちバッファ（§7.3 の `BudgetCharged` 蓄積・
-    /// host-call triple と同じ deferred-drain 規律）。`run_slice` が slice 境界で `Resumed`/
-    /// `Yielded` を temporal 順に push し、監査付き facade（`run_audited_inner`）だけが
-    /// [`Self::drain_yield_events`] で drain して journal へ流す。sink 無し経路は drain しないため
+    /// 監査 event の emission 待ちバッファ（§7.3 の `BudgetCharged` 蓄積と同じ deferred-drain 規律）。
+    ///
+    /// host-call 境界が triple を、`run_slice` が slice 境界で `Resumed`/`Yielded`（と直前に flush
+    /// した `BudgetCharged`）を、発生した **temporal 順のまま 1 本の列へ** push する。監査付き facade
+    /// （`run_audited_inner`）だけが [`Self::drain_audit_events`] で drain して journal へ流す。
+    /// host-call と yield/resume を別 buffer に分けて「host-call 群 → yield/resume 群」の固定順で
+    /// drain すると、resume 後の slice で起きた host call が対の `Resumed` より前に配送され §8 規則8
+    /// に反するため、1 本にまとめている（Phase 6 B-2 で修正）。sink 無し経路は drain しないため
     /// emission ゼロ・byte-for-byte 不変（§1.1 opt-in）。push は意味論・課金・外部効果へ影響しない。
-    yield_events: Vec<crate::audit::AuditEvent>,
+    audit_events: Vec<crate::audit::AuditEvent>,
     /// cooperative host-call の Pending により文/反復境界で yield を要求されたか（設計 §4.7）。
     ///
     /// `eval_call` が `Pending` を受けると `pending_host_call` を立ててこのフラグを `true` にし、
@@ -444,11 +451,42 @@ pub struct Evaluator {
     /// host-call に到達したとき、adapter を二度 dispatch せずこの結果を式結果へ写す（Ok は値、
     /// Err(AdapterError) は §4.4 の写像で terminal/`host` error）。
     resumed_host_call: Option<(u64, Result<Value, crate::capability::AdapterError>)>,
+    /// audit drain queue の計器（Phase 6 B-2、§10.2）。
+    ///
+    /// 監査付き facade だけが [`Self::set_audit_queue`] で `Some` にする。`None`（sink 無し経路・
+    /// engine-poll 経路・REPL）では計上も判定も行わず、従来挙動と byte-for-byte 一致する。
+    audit_queue: Option<AuditQueueMeter>,
+    /// この slice で 1 文以上（または 1 反復以上）実行したか（B-2 の前進保証）。
+    ///
+    /// `run_slice` 先頭で `false` に戻し、driver が文/反復を進めるたびに `true` にする。queue 上限の
+    /// 判定はこれが `true` のときだけ行うので、上限がどんな値でも yield/resume だけを繰り返す
+    /// livelock は起きない。
+    audit_queue_progress: bool,
+    /// トップレベル境界で queue 上限による yield を要求したか（B-2）。`run_slice` の yield 分岐が
+    /// `take` して [`SliceOutcome::YieldedAuditQueue`] を返す。
+    yield_for_audit_queue: bool,
     /// この実行の言語 revision（REV-017 §17.8.7）。sort / `list_dir` の整列が参照する全順序の
     /// 既定/全順序切替をこれで分岐する。`set_capabilities` と対称に、埋め込み host が実行単位で
     /// 注入し（`set_language_revision`）、CLI/テストは既定 `CURRENT`（=0.21）で動く。
     /// backend 固有分岐を作らないため VM 側（`Vm`）と同一シグネチャで持つ。
     language_revision: crate::embedding::LanguageRevision,
+}
+
+/// audit drain queue の byte 計器（Phase 6 B-2、`docs/determinism-and-audit.md` §10.2）。
+///
+/// queue は「生成済みだが sink の ack をまだ得ていない通常 event」の推定 encoded byte 合計。
+/// `bytes` は評価器 buffer（host-call triple・`Yielded`/`Resumed`・buffer へ移った
+/// `BudgetCharged`）に積んだ時点で加算し、facade が sink の ack を得た時点で減算する（drain 済み・
+/// in-flight の event も ack まで queue に残る）。accumulator 内の確定済み `BudgetCharged` は
+/// [`crate::budget::BudgetLedger`] 側の合計を判定時に足す。
+#[derive(Debug, Clone, Copy)]
+struct AuditQueueMeter {
+    /// `AuditBudget.max_pending_bytes`（per-execution 上限）。
+    limit: u64,
+    /// envelope 固定部の推定 byte 数（`audit::estimate_envelope_overhead_bytes`）。
+    envelope_overhead: u64,
+    /// 評価器 buffer 由来の未 ack event の推定 byte 合計。
+    bytes: u64,
 }
 
 /// suspend / resume できる 1 回の実行セッション（REV-015 Slice 3 PR-d-2）。
@@ -507,15 +545,18 @@ impl Evaluator {
             next_host_call_id: 0,
             // host-call lifecycle 監査（Phase 6）。execution ごとに 0 始まり。
             next_host_operation_id: 0,
-            host_call_events: Vec::new(),
             // yield/resume lifecycle 監査（Phase 6）。execution ごとに 0 始まり。
             poll_index: 0,
             last_yield_reason: None,
             last_yield_poll_index: 0,
             saved_yield_before_backpressure: None,
-            yield_events: Vec::new(),
+            audit_events: Vec::new(),
             yield_for_host_call: false,
             resumed_host_call: None,
+            // audit drain queue 計器（Phase 6 B-2）は監査付き facade が実行ごとに設定する。
+            audit_queue: None,
+            audit_queue_progress: false,
+            yield_for_audit_queue: false,
             // 既定は現行 revision（=0.21）。埋め込み host が set_language_revision で上書きする。
             language_revision: crate::embedding::LanguageRevision::CURRENT,
         }
@@ -544,14 +585,16 @@ impl Evaluator {
         // host-call lifecycle 監査（Phase 6）の id counter と buffer も execution ごとに戻す。
         // REPL 再利用で operation_id を巻き戻し、前実行の triple を持ち越さない（§7.2/§8）。
         self.next_host_operation_id = 0;
-        self.host_call_events.clear();
         // yield/resume lifecycle 監査（Phase 6）の poll_index と buffer も execution ごとに戻す。
         // REPL 再利用で poll_index を巻き戻し、前実行の pending resume / yield event を持ち越さない。
         self.poll_index = 0;
         self.last_yield_reason = None;
         self.last_yield_poll_index = 0;
         self.saved_yield_before_backpressure = None;
-        self.yield_events.clear();
+        self.audit_events.clear();
+        // audit drain queue 計器（B-2）も execution ごとに外す。監査付き facade が install 後に
+        // `set_audit_queue` で張り直す（前実行の計上を持ち越さない）。
+        self.clear_audit_queue();
         // heap 台帳を作り直したので、cell 課金用のハンドルを Env へ配り直す（REV-015 PR-c）。
         self.env.set_heap_ledger(self.budget.heap_handle());
     }
@@ -577,12 +620,12 @@ impl Evaluator {
             .rearm_for_repl_submission(config, clock, cancellation);
         self.last_budget_resource.set(None);
         self.next_host_operation_id = 0;
-        self.host_call_events.clear();
         self.poll_index = 0;
         self.last_yield_reason = None;
         self.last_yield_poll_index = 0;
         self.saved_yield_before_backpressure = None;
-        self.yield_events.clear();
+        self.audit_events.clear();
+        self.clear_audit_queue();
         // heap 台帳は温存するので heap handle の再配布は不要（cumulative live heap を維持）。
     }
 
@@ -1039,21 +1082,95 @@ impl Evaluator {
     /// host-call lifecycle triple を emission 待ちバッファへ積む（Phase 6、§8 規則3）。
     ///
     /// `BudgetCharged` の accumulator と同じく、push は常に走ってよい軽量操作で意味論・課金・
-    /// 外部効果を変えない。実際の emission は監査付き facade が [`Self::drain_host_call_events`]
+    /// 外部効果を変えない。実際の emission は監査付き facade が [`Self::drain_audit_events`]
     /// で drain するときだけ行う（sink 無し経路は drain しない）。
     pub(crate) fn push_host_call_events(
         &mut self,
         events: impl IntoIterator<Item = crate::audit::AuditEvent>,
     ) {
-        self.host_call_events.extend(events);
+        for event in events {
+            self.push_audit_event(event);
+        }
     }
 
-    /// 蓄積済みの host-call lifecycle event を drain して返す（Phase 6、§8 規則7）。
+    /// 監査 event 1 件を temporal 順の buffer へ積み、audit drain queue へ計上する（Phase 6 B-2）。
+    /// `audit_events` への push はすべてここを通す。
+    fn push_audit_event(&mut self, event: crate::audit::AuditEvent) {
+        self.audit_queue_admit(&event);
+        self.audit_events.push(event);
+    }
+
+    /// accumulator を flush して確定した `BudgetCharged` を `audit_events` へ移す（§8 規則7）。
+    fn flush_charges_into_audit_events(&mut self) {
+        for charge in self.drain_budget_charges() {
+            self.push_audit_event(charge);
+        }
+    }
+
+    /// 監査付き実行の audit drain queue 上限を設定する（Phase 6 B-2、§10.2）。
     ///
-    /// embedding facade の監査経路が Started と Terminal の間で呼ぶ。[`Self::drain_budget_charges`]
-    /// と対称で、返した後はバッファを空にする。sink 無し経路はこれを呼ばないため emission ゼロ。
-    pub(crate) fn drain_host_call_events(&mut self) -> Vec<crate::audit::AuditEvent> {
-        std::mem::take(&mut self.host_call_events)
+    /// `limit` は `AuditBudget.max_pending_bytes`、`envelope_overhead` はこの実行の envelope
+    /// 固定部（`audit::estimate_envelope_overhead_bytes(language_revision)`）。監査付き facade が
+    /// budget install（[`Self::reset_budget`]、計器を外す）の後に呼ぶ。
+    pub(crate) fn set_audit_queue(&mut self, limit: u64, envelope_overhead: u64) {
+        self.audit_queue = Some(AuditQueueMeter {
+            limit,
+            envelope_overhead,
+            bytes: 0,
+        });
+        self.audit_queue_progress = false;
+        self.yield_for_audit_queue = false;
+    }
+
+    /// audit drain queue 計器を外す（sink 無し経路と同じ「計上・判定なし」へ戻す）。
+    fn clear_audit_queue(&mut self) {
+        self.audit_queue = None;
+        self.audit_queue_progress = false;
+        self.yield_for_audit_queue = false;
+    }
+
+    /// event 1 件を audit drain queue へ計上する（計器が無ければ no-op）。
+    ///
+    /// journal が append 時に使う推定（envelope 固定部 ＋ event 本体）と同じ部品で数える。
+    pub(crate) fn audit_queue_admit(&mut self, event: &crate::audit::AuditEvent) {
+        if let Some(meter) = self.audit_queue.as_mut() {
+            let bytes = meter
+                .envelope_overhead
+                .saturating_add(crate::audit::estimate_event_bytes(event));
+            meter.bytes = meter.bytes.saturating_add(bytes);
+        }
+    }
+
+    /// sink の ack を得た event 1 件を audit drain queue から外す（計器が無ければ no-op）。
+    pub(crate) fn audit_queue_release(&mut self, event: &crate::audit::AuditEvent) {
+        if let Some(meter) = self.audit_queue.as_mut() {
+            let bytes = meter
+                .envelope_overhead
+                .saturating_add(crate::audit::estimate_event_bytes(event));
+            meter.bytes = meter.bytes.saturating_sub(bytes);
+        }
+    }
+
+    /// 現在の audit drain queue の推定 byte 数（計器が無ければ `None`）。
+    ///
+    /// 評価器 buffer 由来の未 ack 分に、accumulator 内の確定済み `BudgetCharged` を足す。
+    pub(crate) fn audit_queue_bytes(&self) -> Option<u64> {
+        self.audit_queue.map(|meter| {
+            meter.bytes.saturating_add(
+                self.budget
+                    .audit_finalized_charge_bytes(meter.envelope_overhead),
+            )
+        })
+    }
+
+    /// トップレベル境界で queue 上限による yield が必要か（B-2）。
+    ///
+    /// この slice で 1 文以上実行済み（前進保証）かつ queue が上限以上のときだけ `true`。
+    fn audit_queue_exceeded(&self) -> bool {
+        match (self.audit_queue, self.audit_queue_bytes()) {
+            (Some(meter), Some(bytes)) => self.audit_queue_progress && bytes >= meter.limit,
+            _ => false,
+        }
     }
 
     /// 1 つの yield/resume poll point へ監査 poll_index を発番する（Phase 6、§7.2/§8）。
@@ -1071,17 +1188,18 @@ impl Evaluator {
         Ok(index)
     }
 
-    /// 蓄積済みの yield/resume lifecycle event を drain して返す（Phase 6、§8 規則7/8/9）。
+    /// 蓄積済みの監査 event（host-call triple・`Yielded`/`Resumed`・slice 境界で flush した
+    /// `BudgetCharged`）を temporal 順のまま drain して返す（Phase 6、§8 規則3/7/8/9）。
     ///
-    /// embedding facade の監査経路が Started と Terminal の間で呼ぶ。[`Self::drain_host_call_events`]
-    /// / [`Self::drain_budget_charges`] と対称で、返した後はバッファを空にする。sink 無し経路は
-    /// これを呼ばないため emission ゼロ・byte-for-byte 不変（§1.1 opt-in）。
-    pub(crate) fn drain_yield_events(&mut self) -> Vec<crate::audit::AuditEvent> {
-        std::mem::take(&mut self.yield_events)
+    /// embedding facade の監査経路が Started と Terminal の間で呼ぶ。[`Self::drain_budget_charges`]
+    /// と対称で、返した後はバッファを空にする。sink 無し経路はこれを呼ばないため emission ゼロ・
+    /// byte-for-byte 不変（§1.1 opt-in）。
+    pub(crate) fn drain_audit_events(&mut self) -> Vec<crate::audit::AuditEvent> {
+        std::mem::take(&mut self.audit_events)
     }
 
     /// facade の監査 poll driver が audit sink の `Pending` を観測したとき、
-    /// `Yielded(AuditBackpressure)` を yield_events buffer へ積む（Phase 6 B-1、§7.2/§8/§10.2）。
+    /// `Yielded(AuditBackpressure)` を audit_events buffer へ積む（Phase 6 B-1、§7.2/§8/§10.2）。
     ///
     /// backpressure は sink 応答由来で評価器の意味論を跨がない（設計 B-0 §5）。それでも
     /// poll_index の単調性・pair 共有（`last_yield_reason` / `last_yield_poll_index`）を既存
@@ -1099,8 +1217,7 @@ impl Evaluator {
             .take()
             .map(|reason| (reason, self.last_yield_poll_index));
         // 規則7: flush（確定済み BudgetCharged を先に）してから Yielded。
-        let charges = self.drain_budget_charges();
-        self.yield_events.extend(charges);
+        self.flush_charges_into_audit_events();
         let reason = crate::audit::AuditYieldReason::AuditBackpressure;
         let poll_index = match self.alloc_poll_index(0) {
             Ok(poll_index) => poll_index,
@@ -1114,7 +1231,7 @@ impl Evaluator {
             }
         };
         let usage = self.budget.usage();
-        self.yield_events.push(crate::audit::AuditEvent::Yielded {
+        self.push_audit_event(crate::audit::AuditEvent::Yielded {
             reason: reason.clone(),
             poll_index,
             usage,
@@ -1125,7 +1242,7 @@ impl Evaluator {
     }
 
     /// facade の監査 poll driver が backpressure から resume（ack 取得）したとき、
-    /// 対になる `Resumed(AuditBackpressure)` を yield_events buffer へ積む（Phase 6 B-1、§8 規則8）。
+    /// 対になる `Resumed(AuditBackpressure)` を audit_events buffer へ積む（Phase 6 B-1、§8 規則8）。
     ///
     /// 既存 `run_slice` 先頭の Resumed 生成と同一規律で、直前の `last_yield_reason` が
     /// `AuditBackpressure` のときだけ、退避した `last_yield_poll_index` を再利用して pair を張る。
@@ -1142,7 +1259,7 @@ impl Evaluator {
                 .expect("checked AuditBackpressure above");
             let usage = self.budget.usage();
             let poll_index = self.last_yield_poll_index;
-            self.yield_events.push(crate::audit::AuditEvent::Resumed {
+            self.push_audit_event(crate::audit::AuditEvent::Resumed {
                 previous_reason,
                 poll_index,
                 usage,
@@ -1246,13 +1363,13 @@ impl Evaluator {
             .base_depth;
         // §8 規則8: resume 後の最初の semantic work より前に `Resumed` を buffer する（Phase 6）。
         // 直前の slice が yield 事由を残していれば、その事由と pair の poll_index を再利用して
-        // `Resumed { previous_reason, poll_index, usage }` を yield_events へ積む。run_driver を
+        // `Resumed { previous_reason, poll_index, usage }` を audit_events へ積む。run_driver を
         // 呼ぶ前（まだ 1 文も実行していない）に積むので §8 規則8 を満たす。sink 無し経路は drain
         // しないため emission ゼロ・byte-for-byte 不変。
         if let Some(previous_reason) = self.last_yield_reason.take() {
             let usage = self.budget.usage();
             let poll_index = self.last_yield_poll_index;
-            self.yield_events.push(crate::audit::AuditEvent::Resumed {
+            self.push_audit_event(crate::audit::AuditEvent::Resumed {
                 previous_reason,
                 poll_index,
                 usage,
@@ -1262,6 +1379,9 @@ impl Evaluator {
         // この slice の fuel 予算を張り直す（slice ごとに 0 から数える）。
         self.slice_fuel_used = 0;
         self.slice_fuel_limit = Some(slice_fuel);
+        // B-2 の前進保証: この slice ではまだ 1 文も実行していない。resume 直後の境界では
+        // queue 上限を判定しない（Resumed を積んだだけで再 yield する livelock を防ぐ）。
+        self.audit_queue_progress = false;
 
         let outcome = self.run_driver(base_depth, true);
 
@@ -1278,27 +1398,29 @@ impl Evaluator {
                 // host-call pending が立っていれば HostCallPending、そうでなければ slice fuel 枯渇
                 // の yield（設計 §4.7）。host-call を Pending にする builtin dispatch は FEAT-003 で
                 // 載せるため、本 Slice では通常この分岐は `YieldedSliceFuel` を返す。
+                // queue 上限（B-2）の yield 要求は driver が立てたフラグで区別する。
+                let audit_queue_yield = std::mem::take(&mut self.yield_for_audit_queue);
                 let slice_outcome = match self.pending_host_call.as_ref() {
                     Some(pending) => SliceOutcome::YieldedHostCall {
                         call_id: pending.call_id,
                     },
+                    None if audit_queue_yield => SliceOutcome::YieldedAuditQueue,
                     None => SliceOutcome::YieldedSliceFuel,
                 };
                 // Phase 6（§7.2/§8 規則7）: この yield 境界で `Yielded` を buffer する。
                 // 規則7: `Yielded` の前に budget accumulator を flush する。flush 済みの
-                // `BudgetCharged` を yield_events へ先に積むことで、drain 時の stream が
+                // `BudgetCharged` を audit_events へ先に積むことで、drain 時の stream が
                 // 「この slice の charges → Yielded」順になる（facade の最終 flush とは別に、
                 // 各 yield 境界で per-slice charges を Yielded の直前へ確定させる）。
                 if let Some(reason) = audit_yield_reason_from(&slice_outcome) {
                     // 規則7: flush（この slice ぶんの BudgetCharged を確定）してから Yielded。
-                    let charges = self.drain_budget_charges();
-                    self.yield_events.extend(charges);
+                    self.flush_charges_into_audit_events();
                     // poll_index を新規発番し、pair の Resumed が再利用できるよう退避する。
                     // overflow（通常到達不能）は fail-closed で terminal 化する。
                     match self.alloc_poll_index(0) {
                         Ok(poll_index) => {
                             let usage = self.budget.usage();
-                            self.yield_events.push(crate::audit::AuditEvent::Yielded {
+                            self.push_audit_event(crate::audit::AuditEvent::Yielded {
                                 reason: reason.clone(),
                                 poll_index,
                                 usage,
@@ -1397,6 +1519,7 @@ impl Evaluator {
         self.pending_host_call = None;
         self.resumed_host_call = None;
         self.yield_for_host_call = false;
+        self.yield_for_audit_queue = false;
         // slice 制限を解除し、再利用 context が影響を受けないようにする。
         self.slice_fuel_limit = None;
     }
@@ -1594,6 +1717,14 @@ impl Evaluator {
                 return Ok(DriveOutcome::Yielded);
             }
 
+            // audit drain queue 上限（Phase 6 B-2、§10.2）。slice fuel と同じトップレベル境界だけで
+            // 判定する soft limit で、関数呼び出し・callback の本体（`can_yield = false`）の中では
+            // 判定しない。計器が無い経路（sink 無し・engine-poll・REPL）では常に false。
+            if can_yield && self.audit_queue_exceeded() {
+                self.yield_for_audit_queue = true;
+                return Ok(DriveOutcome::Yielded);
+            }
+
             // cancel / deadline checkpoint（REV-015 Slice 4、§8）。charge 経路は charge 前に
             // cancel と deadline を確認するが、fuel をほとんど消費しない反復では charge 境界に
             // 届かないことがある。文/反復境界でも確認し、要求されていれば catch 不能 terminal
@@ -1618,6 +1749,8 @@ impl Evaluator {
             // 最も近い try/catch へ渡す。従来はループ全体が try 本体で実行されたため、これらの
             // エラーも catch されていた（tree/VM parity）。
             if top.cursor >= top.stmts.len() {
+                // 反復境界を 1 つ進める（B-2 の前進保証）。
+                self.audit_queue_progress = true;
                 match self.advance_frame() {
                     Ok(()) => {}
                     Err(e) => {
@@ -1647,6 +1780,8 @@ impl Evaluator {
             let owner = top.stmts.clone();
             let index = top.cursor;
             top.cursor += 1;
+            // 文を 1 つ実行する（B-2 の前進保証）。
+            self.audit_queue_progress = true;
             let stmt = &owner[index];
             let step = self.exec_stmt(stmt, &owner, index);
             match step {
@@ -3245,7 +3380,8 @@ mod tests {
             match eval.run_slice(u64::MAX) {
                 SliceOutcome::YieldedSliceFuel
                 | SliceOutcome::YieldedHostCall { .. }
-                | SliceOutcome::YieldedExplicit => continue,
+                | SliceOutcome::YieldedExplicit
+                | SliceOutcome::YieldedAuditQueue => continue,
                 SliceOutcome::Terminal(result) => return result,
             }
         }
@@ -3309,7 +3445,8 @@ mod tests {
             match eval.run_slice(u64::MAX) {
                 SliceOutcome::YieldedSliceFuel
                 | SliceOutcome::YieldedHostCall { .. }
-                | SliceOutcome::YieldedExplicit => continue,
+                | SliceOutcome::YieldedExplicit
+                | SliceOutcome::YieldedAuditQueue => continue,
                 SliceOutcome::Terminal(result) => return result,
             }
         }
@@ -3377,7 +3514,8 @@ mod tests {
             match eval.run_slice(u64::MAX) {
                 SliceOutcome::YieldedSliceFuel
                 | SliceOutcome::YieldedHostCall { .. }
-                | SliceOutcome::YieldedExplicit => continue,
+                | SliceOutcome::YieldedExplicit
+                | SliceOutcome::YieldedAuditQueue => continue,
                 SliceOutcome::Terminal(result) => break result,
             }
         };
@@ -3410,7 +3548,8 @@ mod tests {
             match eval.run_slice(slice_fuel) {
                 SliceOutcome::YieldedSliceFuel
                 | SliceOutcome::YieldedHostCall { .. }
-                | SliceOutcome::YieldedExplicit => {
+                | SliceOutcome::YieldedExplicit
+                | SliceOutcome::YieldedAuditQueue => {
                     yields += 1;
                     assert!(yields < 1_000_000, "run_slice が terminal に到達しない");
                 }
@@ -4350,11 +4489,77 @@ mod tests {
         }
     }
 
+    /// Phase 6 B-2: audit drain queue 計器のユニットテスト（§10.2・B2-AT-10）。
+    mod audit_queue_meter {
+        use super::super::Evaluator;
+        use crate::audit::{
+            AuditEvent, AuditPayload, estimate_envelope_overhead_bytes, estimate_event_bytes,
+        };
+
+        fn started(operation_id: u64) -> AuditEvent {
+            AuditEvent::HostCallStarted {
+                operation_id,
+                call_id: operation_id,
+                function: "write_file".to_string(),
+                request: AuditPayload { fields: Vec::new() },
+                request_bytes: 5,
+            }
+        }
+
+        #[test]
+        fn without_meter_nothing_is_counted() {
+            // sink 無し経路と同じく計器が無ければ計上も判定もしない。
+            let mut eval = Evaluator::new();
+            eval.push_host_call_events([started(0)]);
+            assert_eq!(eval.audit_queue_bytes(), None);
+            assert!(!eval.audit_queue_exceeded());
+        }
+
+        #[test]
+        fn admit_and_release_use_journal_estimate() {
+            let overhead = estimate_envelope_overhead_bytes("0.21");
+            let mut eval = Evaluator::new();
+            eval.set_audit_queue(u64::MAX, overhead);
+            assert_eq!(eval.audit_queue_bytes(), Some(0));
+            let event = started(0);
+            let expected = overhead + estimate_event_bytes(&event);
+            eval.push_host_call_events([event.clone()]);
+            // B2-AT-10: push 時の計上値は envelope 固定部 ＋ event 本体（journal と同じ部品）。
+            assert_eq!(eval.audit_queue_bytes(), Some(expected));
+            // drain しても ack まで queue に残る（in-flight を含む）。
+            let drained = eval.drain_audit_events();
+            assert_eq!(drained, vec![event.clone()]);
+            assert_eq!(eval.audit_queue_bytes(), Some(expected));
+            eval.audit_queue_release(&event);
+            assert_eq!(eval.audit_queue_bytes(), Some(0));
+        }
+
+        #[test]
+        fn exceeded_requires_progress_in_slice() {
+            // 前進保証: 上限 0 でも、この slice で 1 文も進めていなければ yield しない。
+            let mut eval = Evaluator::new();
+            eval.set_audit_queue(0, estimate_envelope_overhead_bytes("0.21"));
+            eval.push_host_call_events([started(0)]);
+            assert!(!eval.audit_queue_exceeded(), "進捗なしでは判定しない");
+            eval.audit_queue_progress = true;
+            assert!(eval.audit_queue_exceeded(), "進捗ありで上限以上なら yield");
+        }
+    }
+
     /// Phase 6: yield 事由 → `AuditYieldReason` 写像のユニットテスト（§7.2/§8）。
     mod audit_yield_reason {
         use super::super::{SliceOutcome, audit_yield_reason_for_pause, audit_yield_reason_from};
         use crate::audit::AuditYieldReason;
         use crate::error::TsumugiError;
+
+        #[test]
+        fn audit_queue_maps_to_audit_backpressure() {
+            // queue 由来の backpressure も sink Pending 由来と区別しない（§10.2、B-2）。
+            assert_eq!(
+                audit_yield_reason_from(&SliceOutcome::YieldedAuditQueue),
+                Some(AuditYieldReason::AuditBackpressure)
+            );
+        }
 
         #[test]
         fn slice_fuel_maps_to_slice_fuel_exhausted() {
