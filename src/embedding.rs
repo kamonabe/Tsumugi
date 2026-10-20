@@ -1925,7 +1925,13 @@ impl Engine {
         }
 
         // 監査付き経路。audit 失敗でない限り本来の outcome を返す。
-        let audited = self.run_audited_inner(linked, context, request);
+        let audited = self.run_audited_inner(
+            linked,
+            context,
+            request,
+            #[cfg(test)]
+            None,
+        );
         context.running = false;
         let outcome = audited.outcome_for_poison();
         if matches!(outcome, ExecutionOutcome::InternalFailure { .. }) {
@@ -2016,7 +2022,13 @@ impl Engine {
         let audited = if self.config.audit_sink.is_none() {
             AuditedOutcome::Outcome(Box::new(self.run_guarded(linked, context, request, false)))
         } else {
-            self.run_audited_inner(linked, context, request)
+            self.run_audited_inner(
+                linked,
+                context,
+                request,
+                #[cfg(test)]
+                None,
+            )
         };
         context.running = false;
         if matches!(
@@ -2026,6 +2038,42 @@ impl Engine {
             context.poisoned = true;
         }
         audited
+    }
+
+    /// test 専用の facade-driver poll API（設計 §9(b)）。
+    ///
+    /// 監査付き経路を回し、facade poll driver が観測した公開 [`crate::engine::PollResult`] の列
+    /// （sink が `Pending` を返して execution が実際に `Yielded(AuditBackpressure)` へ遷移するたびに
+    /// 1 件積まれる）と、最終 [`AuditedOutcome`] を返す。これにより公開
+    /// [`crate::engine::YieldReason::AuditBackpressure`] が facade driver によって実際に構築・返却
+    /// される returnable variant であること（dead variant でないこと、設計 §5/§7.1）を、
+    /// `handle.poll()` 流儀の lib unit test
+    /// （`facade_driver_returns_audit_backpressure_yield_then_resumes_to_completed`）で固定できる。
+    /// 本番 API には露出しない（`#[cfg(test)]`）。
+    #[cfg(test)]
+    pub(crate) fn poll_audited_for_test(
+        &self,
+        linked: &LinkedScript,
+        context: &mut ExecutionContext,
+        request: ExecutionRequest,
+    ) -> (Vec<crate::engine::PollResult>, AuditedOutcome) {
+        assert!(
+            self.config.audit_sink.is_some(),
+            "poll_audited_for_test は audit sink 設定時のみ有効（§14）"
+        );
+        assert!(!context.poisoned, "poison 済み context は実行しない");
+        assert!(!context.running, "再入は許可されない");
+        context.running = true;
+        let mut trace = Vec::new();
+        let audited = self.run_audited_inner(linked, context, request, Some(&mut trace));
+        context.running = false;
+        if matches!(
+            audited.outcome_for_poison(),
+            ExecutionOutcome::InternalFailure { .. }
+        ) {
+            context.poisoned = true;
+        }
+        (trace, audited)
     }
 
     /// panic 捕捉付きで `run_inner` を回す（監査 wiring なしの従来経路）。
@@ -2072,6 +2120,9 @@ impl Engine {
         linked: &LinkedScript,
         context: &mut ExecutionContext,
         request: ExecutionRequest,
+        // facade poll driver が観測した公開 `PollResult`（AuditBackpressure yield）を収集する
+        // test 専用の sink。本番呼び出しは常に `None` を渡し、trace を一切作らない（§5/§7.1）。
+        #[cfg(test)] poll_trace: Option<&mut Vec<crate::engine::PollResult>>,
     ) -> AuditedOutcome {
         use crate::audit::{
             AuditBudget, AuditEnvelope, AuditEvent, AuditFailure, AuditJournal, AuditSubmit,
@@ -2211,148 +2262,68 @@ impl Engine {
             };
         }
 
+        // 配送ヘルパ（§10 / §10.2）。sink round-trip（Ack 検証 / backpressure round-trip）を
+        // 1 箇所へ集約し、host-call triple / Yielded・Resumed / BudgetCharged / Terminal の各
+        // submit 口が同じ規約を共有する（B-1 scope 5）。
+        // test 専用: poll_trace が要求されていれば AuditDelivery に空の収集 buffer を持たせ、
+        // backpressure 突入ごとに公開 PollResult::Yielded(AuditBackpressure) を積む。本番では None。
+        #[cfg(test)]
+        let collect_poll_trace = poll_trace.is_some();
+        let mut delivery = AuditDelivery {
+            sink: Arc::clone(&sink),
+            execution_id,
+            schema_version: 1,
+            source_hash,
+            language_revision: language_revision.clone(),
+            timestamp,
+            #[cfg(test)]
+            poll_trace: collect_poll_trace.then(Vec::new),
+            #[cfg(not(test))]
+            poll_trace: None,
+        };
+
         // 4. 実行本体（panic 捕捉付き）。Started 発行後なので pre-cancel も Started+Terminal を持つ。
-        let outcome = match catch_host_unwind(AssertUnwindSafe(|| {
+        // B-1: 同期 loop を poll driver へ置換し、各 poll ステップ境界で評価器 buffer を従来 drain
+        // 順（host-call triple → Yielded/Resumed → per-slice BudgetCharged）で deliver する。sink が
+        // Pending を返したら Yielded(AuditBackpressure) へ入り ack で resume する（§10.2）。実行本体
+        // 全体を 1 つの catch_host_unwind で包む粒度は従来どおり（設計 §4.4）。
+        let drive = match catch_host_unwind(AssertUnwindSafe(|| {
             #[cfg(test)]
             if context.panic_in_run_for_test {
                 panic!("injected run-boundary panic (test only)");
             }
-            self.execute_program(context, &program, root_source_bytes, request, false)
+            self.run_audited_driver(
+                context,
+                &program,
+                root_source_bytes,
+                request,
+                &mut journal,
+                &mut delivery,
+            )
         })) {
-            Ok(outcome) => outcome,
-            Err(fault_id) => ExecutionOutcome::InternalFailure {
+            Ok(drive) => drive,
+            Err(fault_id) => AuditDrive::Terminal(Box::new(ExecutionOutcome::InternalFailure {
                 fault_id,
                 safe_message: internal_fault_message(fault_id),
                 usage: context.evaluator.budget_usage(),
-            },
+            })),
         };
 
-        // 4.4 host-call lifecycle triple を drain して Started(seq 0) と Terminal の間へ append
-        // （§7.2/§8 規則3・7、Phase 6）。stream 順序は FIX: host-call triple 群を先に出し、その後
-        // 4.5 の BudgetCharged flush を出す（golden fixture の再現性のため固定する）。triple は
-        // 評価器が host-call 境界で push 順（Started → Decision → Finished）に積んであるので、drain
-        // した順にそのまま append すれば §8 規則3 の順序になる。各 triple の append 前に §11 の
-        // 容量チェック（can_reserve_host_call）を行い、収まらなければ triple を 1 件も出さず
-        // fail-closed（AuditFailure::BudgetExceeded）にする。append/submit の規約は BudgetCharged と
-        // 同一（連続 sequence・同 execution の ack）。sink 無し経路（run_guarded）は drain しないので
-        // emission ゼロ・byte-for-byte 不変（§1.1 opt-in）。
-        {
-            let host_call_events = context.evaluator.drain_host_call_events();
-            // triple 単位（3 event ごと）で reserve チェックする。先頭が HostCallStarted。
-            let mut index = 0usize;
-            while index < host_call_events.len() {
-                if matches!(host_call_events[index], AuditEvent::HostCallStarted { .. })
-                    && !journal.can_reserve_host_call()
+        // driver が mid-run で audit 失敗（sink / backpressure deadline / budget 超過）を確定した
+        // 場合は、保留された本来の terminal 種別を添えて AuditFailed を返す（Terminal は出さない）。
+        let outcome = match drive {
+            AuditDrive::Terminal(outcome) => *outcome,
+            AuditDrive::Failed { withheld, failure } => {
+                // test 専用: driver が観測した公開 PollResult(AuditBackpressure yield) を返す。
+                #[cfg(test)]
+                if let Some(out) = poll_trace
+                    && let Some(trace) = delivery.poll_trace.as_ref()
                 {
-                    // §11: triple を収められない → Started/外部効果を出さず AuditFailure（drain 時
-                    // 容量チェック、§14 の A-1 逸脱どおり）。
-                    return AuditedOutcome::AuditFailed {
-                        withheld: crate::audit::terminal_outcome_from(&outcome, None),
-                        failure: AuditFailure::BudgetExceeded,
-                    };
+                    out.extend(trace.iter().cloned());
                 }
-                let event = host_call_events[index].clone();
-                let seq = journal.next_sequence();
-                match journal.append_normal(&make_envelope(seq, event.clone())) {
-                    Ok(appended_seq) => {
-                        let batch: Arc<[AuditEnvelope]> =
-                            Arc::from(vec![make_envelope(appended_seq, event)]);
-                        let delivered = matches!(
-                            sink.submit(batch, AuditWaker::noop()),
-                            AuditSubmit::Ack(ack)
-                                if ack.execution_id == execution_id
-                                    && ack.through_sequence == appended_seq
-                        );
-                        if !delivered {
-                            return AuditedOutcome::AuditFailed {
-                                withheld: crate::audit::terminal_outcome_from(&outcome, None),
-                                failure: AuditFailure::Sink,
-                            };
-                        }
-                    }
-                    Err(failure) => {
-                        return AuditedOutcome::AuditFailed {
-                            withheld: crate::audit::terminal_outcome_from(&outcome, None),
-                            failure,
-                        };
-                    }
-                }
-                index += 1;
+                return AuditedOutcome::AuditFailed { withheld, failure };
             }
-        }
-
-        // 4.45 Yielded/Resumed を drain して Started(seq 0) と Terminal の間へ append
-        // （§7.2/§8 規則7/8/9、Phase 6）。評価器は slice 境界で temporal 順に積んである:
-        // 各 yield 境界で「その slice ぶんの BudgetCharged（規則7 の flush）→ Yielded」、各 resume
-        // 境界で「Resumed（規則8、resume 後の最初の work の前）」。したがって drain した順に
-        // append すれば §8 の順序になる。固定 drain 順は host-call triple → BudgetCharged（最終
-        // flush、下記 4.5）→ Yielded/Resumed ではなく、yield_events を 4.5 の最終 flush より **前**
-        // に出す（yield_events が運ぶ charges は時間的に早い slice のもので、4.5 が運ぶのは最終
-        // slice の charges のため、temporal 順で yield_events が先）。append/submit の規約は
-        // BudgetCharged と同一（連続 sequence・同 execution の ack）。sink 無し経路（run_guarded）は
-        // drain しないので emission ゼロ・byte-for-byte 不変（§1.1 opt-in）。
-        for yield_event in context.evaluator.drain_yield_events() {
-            let seq = journal.next_sequence();
-            match journal.append_normal(&make_envelope(seq, yield_event.clone())) {
-                Ok(appended_seq) => {
-                    let batch: Arc<[AuditEnvelope]> =
-                        Arc::from(vec![make_envelope(appended_seq, yield_event)]);
-                    let delivered = matches!(
-                        sink.submit(batch, AuditWaker::noop()),
-                        AuditSubmit::Ack(ack)
-                            if ack.execution_id == execution_id
-                                && ack.through_sequence == appended_seq
-                    );
-                    if !delivered {
-                        return AuditedOutcome::AuditFailed {
-                            withheld: crate::audit::terminal_outcome_from(&outcome, None),
-                            failure: AuditFailure::Sink,
-                        };
-                    }
-                }
-                Err(failure) => {
-                    return AuditedOutcome::AuditFailed {
-                        withheld: crate::audit::terminal_outcome_from(&outcome, None),
-                        failure,
-                    };
-                }
-            }
-        }
-
-        // 4.5 BudgetCharged を drain して Started(seq 0) と Terminal の間へ append（§7.3 / §8 規則7）。
-        // Terminal 直前に最終 flush を強制し、どの charge も取りこぼさない。drain は accumulator を
-        // 空にする軽量操作で、返った `BudgetCharged` を 1 件ずつ journal へ append_normal し、
-        // Started と同じ submit/Ack 規約（連続 sequence・同 execution の ack）で sink へ送る。
-        // append_normal が失敗したら Started 失敗と同じく fail-closed（§10.1: 監査が壊れた実行を
-        // 成功として報告しない）。sink 無し経路（run_guarded）はこの関数を通らないので drain せず、
-        // emission ゼロ・byte-for-byte 不変を保つ。
-        for charge_event in context.evaluator.drain_budget_charges() {
-            let seq = journal.next_sequence();
-            match journal.append_normal(&make_envelope(seq, charge_event.clone())) {
-                Ok(appended_seq) => {
-                    let batch: Arc<[AuditEnvelope]> =
-                        Arc::from(vec![make_envelope(appended_seq, charge_event)]);
-                    let delivered = matches!(
-                        sink.submit(batch, AuditWaker::noop()),
-                        AuditSubmit::Ack(ack)
-                            if ack.execution_id == execution_id
-                                && ack.through_sequence == appended_seq
-                    );
-                    if !delivered {
-                        return AuditedOutcome::AuditFailed {
-                            withheld: crate::audit::terminal_outcome_from(&outcome, None),
-                            failure: AuditFailure::Sink,
-                        };
-                    }
-                }
-                Err(failure) => {
-                    return AuditedOutcome::AuditFailed {
-                        withheld: crate::audit::terminal_outcome_from(&outcome, None),
-                        failure,
-                    };
-                }
-            }
-        }
+        };
 
         // 5. Terminal を予約 slot へ append → submit（§8 規則9/10）。
         // BudgetExceeded の resource は、評価器が畳む前に退避した原本を優先する（§7.2。
@@ -2376,31 +2347,20 @@ impl Engine {
             context_committed,
             host_effects_may_remain: false,
         };
-        match journal.append_terminal(&make_envelope(
-            journal.next_sequence(),
-            terminal_event.clone(),
-        )) {
+        let terminal_envelope = delivery.envelope(journal.next_sequence(), terminal_event);
+        let audited = match journal.append_terminal(&terminal_envelope) {
             Ok(terminal_seq) => {
-                let batch: Arc<[AuditEnvelope]> =
-                    Arc::from(vec![make_envelope(terminal_seq, terminal_event)]);
-                // Terminal の配送結果を評価する（§10.1）。配送が成立し（Ack）、かつ ack が
-                // この execution の Terminal sequence を正しく指しているときだけ監査成立とする。
-                // 配送失敗（Failed / 不正 ack / Pending）は fail-closed: journal 上の Terminal は
-                // 確定済み（§8 規則10）だが、監査が成立していないので success な outcome は返さず
-                // AuditFailed を返す（§10.1: 監査が壊れた実行を成功として報告しない）。
-                let delivered = matches!(
-                    sink.submit(batch, AuditWaker::noop()),
-                    AuditSubmit::Ack(ack)
-                        if ack.execution_id == execution_id
-                            && ack.through_sequence == terminal_seq
-                );
-                if delivered {
-                    AuditedOutcome::Outcome(Box::new(outcome))
-                } else {
-                    AuditedOutcome::AuditFailed {
+                // Terminal の配送結果を評価する（§10.1）。配送が成立し（Ack / backpressure 後の
+                // ack）たときだけ監査成立とする。配送失敗（Failed / 不正 ack / backpressure
+                // deadline）は fail-closed: journal 上の Terminal は確定済み（§8 規則10）だが、監査が
+                // 成立していないので success な outcome は返さず AuditFailed を返す（§10.1）。
+                let batch: Arc<[AuditEnvelope]> = Arc::from(vec![terminal_envelope]);
+                match delivery.deliver(context, &batch, terminal_seq) {
+                    Ok(()) => AuditedOutcome::Outcome(Box::new(outcome)),
+                    Err(failure) => AuditedOutcome::AuditFailed {
                         withheld: terminal_outcome,
-                        failure: AuditFailure::Sink,
-                    }
+                        failure,
+                    },
                 }
             }
             // sequence overflow 等で Terminal すら append できない → fail-closed。
@@ -2408,7 +2368,114 @@ impl Engine {
                 withheld: terminal_outcome,
                 failure,
             },
+        };
+
+        // test 専用: driver が観測した公開 PollResult(AuditBackpressure yield) を呼び出し元へ返す。
+        // Terminal 配送中に起きた backpressure も含め、全 yield observation をここで引き渡す。
+        #[cfg(test)]
+        if let Some(out) = poll_trace
+            && let Some(trace) = delivery.poll_trace.as_ref()
+        {
+            out.extend(trace.iter().cloned());
         }
+
+        audited
+    }
+
+    /// 監査付きの単一 execution poll driver（Phase 6 B-1、設計 §2.3 案 2b / §3.3）。
+    ///
+    /// `install_execution_state`（pre-cancel 判定込み）→ `begin_execution`（初回のみ）→
+    /// 「1 poll ステップ = `run_slice` を 1 回」を terminal まで回す状態機械。各ステップ境界で
+    /// 評価器 buffer を従来 drain 順で deliver する（[`AuditDelivery::flush_events`]）。sink が
+    /// `Pending` を返したら `Yielded(AuditBackpressure)` へ入り ack で resume する（§10.2）。
+    ///
+    /// 戻り値は [`AuditDrive`]: terminal まで回り切れば `Terminal(outcome)`（Terminal event は
+    /// 呼び出し元が最後に deliver する）、mid-run で audit 失敗が確定すれば `Failed`。
+    fn run_audited_driver(
+        &self,
+        context: &mut ExecutionContext,
+        program: &Program,
+        root_source_bytes: u64,
+        request: ExecutionRequest,
+        journal: &mut crate::audit::AuditJournal,
+        delivery: &mut AuditDelivery,
+    ) -> AuditDrive {
+        // budget/capability/registry install（pre-cancel は命令0 の Cancelled terminal）。
+        let slice_fuel = match self.install_execution_state(context, request, false) {
+            Ok(slice_fuel) => slice_fuel,
+            // pre-cancel: script work 0。評価器 buffer は空なので flush 不要。Terminal を出す。
+            Err(pre_cancel) => return AuditDrive::Terminal(pre_cancel),
+        };
+
+        // begin_execution（E4: transactional=true）。Link 失敗は専用 terminal へ写す。
+        if let Err((phase, error)) =
+            context
+                .evaluator
+                .begin_execution(program, root_source_bytes, true)
+        {
+            // Link フェーズで積まれた charge/yield があれば先に flush してから terminal を返す。
+            let outcome = match phase {
+                RunPhase::Link | RunPhase::Run => terminal_from_run_error(context, error),
+            };
+            if let Err(failure) = delivery.flush_events(context, journal) {
+                return AuditDrive::Failed {
+                    withheld: crate::audit::terminal_outcome_from(&outcome, None),
+                    failure,
+                };
+            }
+            // teardown（install_execution_state が注入した capability/registry を戻す）。
+            context.evaluator.clear_capabilities();
+            context.evaluator.clear_host_registry();
+            return AuditDrive::Terminal(Box::new(outcome));
+        }
+
+        // poll ステップ loop。1 ステップ = run_slice 1 回 → 評価器 buffer を flush。
+        let outcome = loop {
+            let slice = context.evaluator.run_slice(slice_fuel);
+            // §8 規則7/8/9 の順序で、この slice 境界までに確定した event を deliver する。
+            // backpressure（sink Pending）はこの flush の中で round-trip する（§10.2）。
+            if let Err(failure) = delivery.flush_events(context, journal) {
+                // mid-run の audit 失敗。評価器 session を畳んでから保留 terminal を推定する。
+                // run_slice が既に terminal を返していればその outcome、yield 途中なら Cancelled
+                // 相当の保守的な withheld を載せる（success を捏造しない）。
+                let withheld = match &slice {
+                    SliceOutcome::Terminal(result) => {
+                        let partial = match result {
+                            Ok(()) => ExecutionOutcome::Completed {
+                                usage: context.evaluator.budget_usage(),
+                            },
+                            Err(error) => terminal_from_run_error(context, error.clone()),
+                        };
+                        crate::audit::terminal_outcome_from(&partial, None)
+                    }
+                    _ => {
+                        context.evaluator.abort_session();
+                        crate::audit::TerminalOutcome::Cancelled
+                    }
+                };
+                context.evaluator.clear_capabilities();
+                context.evaluator.clear_host_registry();
+                return AuditDrive::Failed { withheld, failure };
+            }
+            match slice {
+                SliceOutcome::YieldedSliceFuel
+                | SliceOutcome::YieldedHostCall { .. }
+                | SliceOutcome::YieldedExplicit => continue,
+                SliceOutcome::Terminal(Ok(())) => {
+                    break ExecutionOutcome::Completed {
+                        usage: context.evaluator.budget_usage(),
+                    };
+                }
+                SliceOutcome::Terminal(Err(error)) => {
+                    break terminal_from_run_error(context, error);
+                }
+            }
+        };
+
+        // teardown（§15 規則5・6）: capability / host registry を持ち越さない。
+        context.evaluator.clear_capabilities();
+        context.evaluator.clear_host_registry();
+        AuditDrive::Terminal(Box::new(outcome))
     }
 
     /// [`Self::run`] の本体（precondition guard の後）。ここから返る InternalFailure は
@@ -2491,6 +2558,33 @@ impl Engine {
         request: ExecutionRequest,
         repl: bool,
     ) -> ExecutionOutcome {
+        // budget/capability/registry を install し slice_fuel を決める（pre-cancel は命令0 の
+        // Cancelled を返す）。no-sink 経路はここから従来どおり同期 loop で terminal まで回す。
+        let slice_fuel = match self.install_execution_state(context, request, repl) {
+            Ok(slice_fuel) => slice_fuel,
+            Err(pre_cancel) => return *pre_cancel,
+        };
+        let outcome = Self::run_transactional(context, program, root_source_bytes, slice_fuel);
+
+        // capability 集合も host function registry も reusable context に持ち越さない（仕様第15節
+        // 規則5・6）。次 request の empty set か再注入まで、ambient 互換の既定へ戻す。
+        context.evaluator.clear_capabilities();
+        context.evaluator.clear_host_registry();
+        outcome
+    }
+
+    /// 実行直前の install（budget / capability / host registry）と pre-cancel 判定を行い、
+    /// この実行の slice fuel を返す（Phase 6 B-1 で `execute_program` から抽出）。
+    ///
+    /// `Ok(slice_fuel)` で install 完了。`Err(outcome)` は pre-run cancel（命令0 の Cancelled）で、
+    /// 呼び出し元はそれを terminal として扱う。no-sink 経路（`execute_program`）と監査 poll driver
+    /// 経路（`run_audited_driver`）で共有し、install 手順の二重定義を避ける。本体挙動は従来不変。
+    fn install_execution_state(
+        &self,
+        context: &mut ExecutionContext,
+        request: ExecutionRequest,
+        repl: bool,
+    ) -> Result<u64, Box<ExecutionOutcome>> {
         // request は有限 budget・deadline clock・cancellation token を必須所有する
         // （REV-015 最終形移行 Slice 2）。実行直前に 3 つとも評価器へ install する。
         // domain / accounting revision / deadline(>now) は ExecutionRequest::new が構築時に
@@ -2530,9 +2624,9 @@ impl Engine {
         if request.cancellation.is_cancelled() {
             // 命令0なので usage は空（reset_budget 直後・baseline 課金前。committed/reserved/live
             // とも 0）。finding 3。
-            return ExecutionOutcome::Cancelled {
+            return Err(Box::new(ExecutionOutcome::Cancelled {
                 usage: context.evaluator.budget_usage(),
-            };
+            }));
         }
 
         // 引数 snapshot と frozen capability 集合を評価器へ注入する（AUD-018 / Phase 2 C1〜）。
@@ -2558,13 +2652,7 @@ impl Engine {
         } else {
             u64::MAX
         };
-        let outcome = Self::run_transactional(context, program, root_source_bytes, slice_fuel);
-
-        // capability 集合も host function registry も reusable context に持ち越さない（仕様第15節
-        // 規則5・6）。次 request の empty set か再注入まで、ambient 互換の既定へ戻す。
-        context.evaluator.clear_capabilities();
-        context.evaluator.clear_host_registry();
-        outcome
+        Ok(slice_fuel)
     }
 
     /// begin_execution → run_slice を terminal まで回す（transaction 適用、E4）。
@@ -2753,6 +2841,241 @@ impl AuditedOutcome {
     /// 監査が成立したか（`Outcome` なら true）。
     pub fn is_audited_ok(&self) -> bool {
         matches!(self, AuditedOutcome::Outcome(_))
+    }
+}
+
+/// 監査 poll driver（[`Engine::run_audited_driver`]）が terminal まで回した結果（Phase 6 B-1）。
+enum AuditDrive {
+    /// terminal まで回り切った。Terminal event は呼び出し元が最後に deliver する。
+    /// `ExecutionOutcome` は大きいので box する（variant サイズ平準化）。
+    Terminal(Box<ExecutionOutcome>),
+    /// mid-run で監査が fail-closed で失敗した（sink / backpressure deadline / budget 超過）。
+    Failed {
+        /// 監査が成立していれば報告されたはずの terminal 種別（参考情報）。
+        withheld: crate::audit::TerminalOutcome,
+        /// 監査失敗の理由（§10.1/§11/§10.2）。
+        failure: crate::audit::AuditFailure,
+    },
+}
+
+/// backpressure 中の resend 安全上限（Phase 6 B-1、§10.2 の deadline backstop）。
+///
+/// 通常は execution deadline（`checkpoint_deadline`）が永続 Pending を終わらせるが、clock 未注入
+/// 等で deadline が効かない構成でも無限ループしないよう、この回数を超えてなお Pending のままなら
+/// `AuditFailure::BackpressureDeadline` で fail-closed にする（success を捏造しない）。
+const AUDIT_BACKPRESSURE_MAX_RESENDS: u64 = 1_000_000;
+
+/// 監査 sink への配送（§10 / §10.2）を 1 箇所へ集約するヘルパ（Phase 6 B-1 scope 5）。
+///
+/// host-call triple / Yielded・Resumed / BudgetCharged / Terminal の各 submit 口が、同じ Ack
+/// 検証規約と backpressure round-trip を共有する。sink が `Pending` を返したら
+/// `Yielded(AuditBackpressure)` へ入り、同一 `Arc` batch を ack まで再送して resume する（§10.2
+/// 「再送も同一 byte 列」）。
+struct AuditDelivery {
+    sink: Arc<dyn crate::audit::AuditSink>,
+    execution_id: ExecutionId,
+    schema_version: u16,
+    source_hash: [u8; 32],
+    language_revision: String,
+    timestamp: crate::audit::HostTimestamp,
+    /// facade poll driver が観測した公開 `PollResult` の trace（Phase 6 B-1）。
+    ///
+    /// sink が `Pending` を返して execution が実際に `Yielded(AuditBackpressure)` へ遷移するたびに
+    /// `PollResult::Yielded { reason: YieldReason::AuditBackpressure, .. }` を 1 件積む。これにより
+    /// 公開 `engine::YieldReason::AuditBackpressure` は facade driver が実際に構築・返却する
+    /// returnable variant になり（dead variant ではない、設計 §5/§7.1）、`#[cfg(test)]` の
+    /// facade-driver poll API（[`Engine::poll_audited_for_test`]）がこの trace を observe できる。
+    /// 本番経路では `None` で、trace を一切作らない（挙動・emission への影響ゼロ）。
+    poll_trace: Option<Vec<crate::engine::PollResult>>,
+}
+
+impl AuditDelivery {
+    /// この execution 用の envelope を組む（全 envelope で共通 metadata を使う）。
+    fn envelope(
+        &self,
+        sequence: u64,
+        event: crate::audit::AuditEvent,
+    ) -> crate::audit::AuditEnvelope {
+        crate::audit::AuditEnvelope {
+            schema_version: self.schema_version,
+            execution_id: self.execution_id,
+            source_hash: self.source_hash,
+            language_revision: self.language_revision.clone(),
+            sequence,
+            timestamp: self.timestamp,
+            event,
+        }
+    }
+
+    /// ack がこの execution の連続 sequence（`through_seq`）を正しく指すか検証する（§10）。
+    fn ack_ok(&self, ack: &crate::audit::AuditAck, through_seq: u64) -> bool {
+        ack.execution_id == self.execution_id && ack.through_sequence == through_seq
+    }
+
+    /// backpressure で execution が `Yielded(AuditBackpressure)` へ遷移したことを、公開
+    /// `PollResult::Yielded { reason: YieldReason::AuditBackpressure, .. }` として trace へ積む
+    /// （設計 §5/§7.1: 公開 variant を facade driver が実際に構築・返却する returnable variant に
+    /// する）。`poll_trace` が無い本番経路では no-op で、emission にも挙動にも影響しない。
+    fn record_backpressure_poll_yield(&mut self, context: &ExecutionContext) {
+        if let Some(trace) = self.poll_trace.as_mut() {
+            trace.push(crate::engine::PollResult::Yielded {
+                reason: crate::engine::YieldReason::AuditBackpressure,
+                usage: context.evaluator.budget_usage(),
+            });
+        }
+    }
+
+    /// 単一 batch を sink へ配送する（§10 / §10.2）。Ack 検証と backpressure round-trip を担う。
+    ///
+    /// - `Ack(ack)`: 連続 sequence 一致なら `Ok(())`、違えば `Err(Sink)`（protocol 違反）。
+    /// - `Failed(_)`: `Err(Sink)`。
+    /// - `Pending(ticket)`: backpressure（§10.2）。`Yielded(AuditBackpressure)` を評価器へ記録 →
+    ///   waker 登録 → 各ステップ先頭で cancel→deadline checkpoint（`try_take` より先、§4.6
+    ///   linearization）→ `try_take` が ack を返すか、同一 `Arc` batch の再送が Ack されたら
+    ///   `Resumed(AuditBackpressure)` を記録して `Ok(())`。永続 Pending で deadline（または
+    ///   resend 上限）へ達したら `Err(BackpressureDeadline)`。
+    fn deliver(
+        &mut self,
+        context: &mut ExecutionContext,
+        batch: &Arc<[crate::audit::AuditEnvelope]>,
+        through_seq: u64,
+    ) -> Result<(), crate::audit::AuditFailure> {
+        use crate::audit::{AuditFailure, AuditSubmit, AuditWaker};
+
+        let waker = AuditWaker::noop();
+        match self.sink.submit(Arc::clone(batch), waker.clone()) {
+            AuditSubmit::Ack(ack) => {
+                if self.ack_ok(&ack, through_seq) {
+                    Ok(())
+                } else {
+                    Err(AuditFailure::Sink)
+                }
+            }
+            AuditSubmit::Failed(_) => Err(AuditFailure::Sink),
+            AuditSubmit::Pending(ticket) => {
+                // backpressure 突入（§10.2）。順序厳守（§4.6 linearization）:
+                // 1) Yielded(AuditBackpressure) を評価器の単一 poll_index カウンタで記録。
+                if context.evaluator.record_backpressure_yield().is_err() {
+                    // poll_index overflow（通常到達不能）は internal fail-closed。
+                    ticket.cancel();
+                    return Err(AuditFailure::Sink);
+                }
+                // facade driver が公開 YieldReason::AuditBackpressure を実際に産出する点（設計
+                // §5/§7.1）。execution が本当に Yielded(AuditBackpressure) へ遷移したことを、公開
+                // PollResult として trace へ記録する（本番経路では poll_trace=None で no-op）。
+                self.record_backpressure_poll_yield(context);
+                // 2) waker を ticket へ登録。
+                ticket.register_waker(waker.clone());
+                let mut ticket = ticket;
+                let mut resends: u64 = 0;
+                loop {
+                    // 3) 各ステップ先頭で cancel→deadline を try_take より先に評価する（§10.2/§4.6）。
+                    if context.evaluator.checkpoint_cancel().is_err()
+                        || context.evaluator.checkpoint_deadline().is_err()
+                    {
+                        // backpressure 中の cancel/deadline: ack が取れなかったので監査は未完了。
+                        // §10.2: script の Deadline より優先して BackpressureDeadline を確定する。
+                        ticket.cancel();
+                        return Err(AuditFailure::BackpressureDeadline);
+                    }
+                    // 4) try_take（async sink が out-of-band で ack を格納した場合の completion 路）。
+                    if let Some(result) = ticket.try_take() {
+                        match result {
+                            Ok(ack) if self.ack_ok(&ack, through_seq) => {
+                                context.evaluator.record_backpressure_resume();
+                                return Ok(());
+                            }
+                            _ => return Err(AuditFailure::Sink),
+                        }
+                    }
+                    // 5) 同一 Arc batch を再送する（§10「再送も同一 byte 列」）。scripted/同期 sink は
+                    //    この resend で Pending を減らし、尽きたら Ack を返す。
+                    match self.sink.submit(Arc::clone(batch), waker.clone()) {
+                        AuditSubmit::Ack(ack) if self.ack_ok(&ack, through_seq) => {
+                            context.evaluator.record_backpressure_resume();
+                            return Ok(());
+                        }
+                        AuditSubmit::Ack(_) => return Err(AuditFailure::Sink),
+                        AuditSubmit::Failed(_) => return Err(AuditFailure::Sink),
+                        AuditSubmit::Pending(next) => {
+                            next.register_waker(waker.clone());
+                            ticket = next;
+                        }
+                    }
+                    resends = resends.saturating_add(1);
+                    if resends >= AUDIT_BACKPRESSURE_MAX_RESENDS {
+                        // deadline が効かない構成の backstop（§10.2）。永続 Pending を success に
+                        // しない。
+                        ticket.cancel();
+                        return Err(AuditFailure::BackpressureDeadline);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 評価器 buffer（host-call triple → Yielded/Resumed → BudgetCharged）を従来 drain 順で
+    /// deliver する（§8 規則7/8/9）。backpressure で評価器へ追加された Yielded/Resumed も
+    /// buffer が空になるまで drain-and-deliver し切る。
+    ///
+    /// 各 poll ステップ境界で呼ぶ。backpressure が起きない実行では、評価器 buffer を terminal まで
+    /// 溜め、従来の post-run drain と同じ順序・同じ envelope 列になる（§4.2、byte-for-byte 不変）。
+    fn flush_events(
+        &mut self,
+        context: &mut ExecutionContext,
+        journal: &mut crate::audit::AuditJournal,
+    ) -> Result<(), crate::audit::AuditFailure> {
+        use crate::audit::{AuditEnvelope, AuditEvent, AuditFailure};
+
+        loop {
+            // host-call triple（§8 規則3）。triple 単位で §11 容量 reserve を確認する。
+            let host_call_events = context.evaluator.drain_host_call_events();
+            // Yielded/Resumed（§8 規則7/8/9、temporal 順）。
+            let yield_events = context.evaluator.drain_yield_events();
+            // BudgetCharged（§7.3 / §8 規則7、per-slice flush）。
+            let charges = context.evaluator.drain_budget_charges();
+
+            // backpressure deliver が評価器へ新しい Yielded/Resumed を積んだ場合に備え、全 buffer が
+            // 空になるまで繰り返す。この pass で何も drain できなければ終了。
+            if host_call_events.is_empty() && yield_events.is_empty() && charges.is_empty() {
+                break;
+            }
+
+            let mut index = 0usize;
+            while index < host_call_events.len() {
+                if matches!(host_call_events[index], AuditEvent::HostCallStarted { .. })
+                    && !journal.can_reserve_host_call()
+                {
+                    return Err(AuditFailure::BudgetExceeded);
+                }
+                let event = host_call_events[index].clone();
+                let seq = journal.next_sequence();
+                let appended_seq = journal.append_normal(&self.envelope(seq, event.clone()))?;
+                let batch: Arc<[AuditEnvelope]> =
+                    Arc::from(vec![self.envelope(appended_seq, event)]);
+                self.deliver(context, &batch, appended_seq)?;
+                index += 1;
+            }
+
+            for yield_event in yield_events {
+                let seq = journal.next_sequence();
+                let appended_seq =
+                    journal.append_normal(&self.envelope(seq, yield_event.clone()))?;
+                let batch: Arc<[AuditEnvelope]> =
+                    Arc::from(vec![self.envelope(appended_seq, yield_event)]);
+                self.deliver(context, &batch, appended_seq)?;
+            }
+
+            for charge_event in charges {
+                let seq = journal.next_sequence();
+                let appended_seq =
+                    journal.append_normal(&self.envelope(seq, charge_event.clone()))?;
+                let batch: Arc<[AuditEnvelope]> =
+                    Arc::from(vec![self.envelope(appended_seq, charge_event)]);
+                self.deliver(context, &batch, appended_seq)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -3918,6 +4241,62 @@ mod tests {
     /// 監査 execution_id 付きの standard request を作る helper。
     fn audited_request(id: u128) -> ExecutionRequest {
         standard_request().with_execution_id(ExecutionId::new(id.try_into().expect("nonzero")))
+    }
+
+    /// Phase 6 B-1 §9(b): facade poll driver が公開 `PollResult::Yielded { reason:
+    /// AuditBackpressure }` を実際に産出し、resume して `Completed` に至ることを固定する。
+    ///
+    /// これは公開 `engine::YieldReason::AuditBackpressure` が dead variant ではなく、facade
+    /// driver が構築・返却する returnable variant であること（設計 §5/§7.1）の直接の証拠になる。
+    /// `handle.poll()` 流儀（`tests/scheduler_api.rs`）に倣い、`poll_audited_for_test` が返す
+    /// trace から `PollResult::Yielded { reason, .. }` を観測する。
+    #[test]
+    fn facade_driver_returns_audit_backpressure_yield_then_resumes_to_completed() {
+        use crate::audit::{AuditSink, ScriptedAuditSink, ScriptedResponse};
+        use crate::engine::{PollResult, YieldReason};
+
+        // Started は Ack、次の envelope 配送で 1 回 Pending → 同一 batch 再送で Ack（resume）。
+        let sink = Arc::new(ScriptedAuditSink::new([
+            ScriptedResponse::AckCorrect,
+            ScriptedResponse::PendingThenAck { pending_times: 1 },
+        ]));
+        let engine = Engine::builder()
+            .audit_sink(sink.clone() as Arc<dyn AuditSink>)
+            .build()
+            .unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "let x = 1 + 2\n");
+
+        let (trace, audited) = engine.poll_audited_for_test(&linked, &mut ctx, audited_request(77));
+
+        // facade driver は公開 PollResult::Yielded { reason: AuditBackpressure } をちょうど 1 回返す。
+        let backpressure_yields = trace
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p,
+                    PollResult::Yielded {
+                        reason: YieldReason::AuditBackpressure,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            backpressure_yields, 1,
+            "facade driver が公開 YieldReason::AuditBackpressure を 1 回返す: {trace:?}"
+        );
+
+        // backpressure yield の後、resume して監査成立の Completed に至る。
+        assert!(
+            audited.is_audited_ok(),
+            "backpressure から resume して監査成立: {audited:?}"
+        );
+        assert!(
+            matches!(audited.outcome(), Some(ExecutionOutcome::Completed { .. })),
+            "次ステップで Completed へ resume: {:?}",
+            audited.outcome()
+        );
     }
 
     /// sink の収集 envelope から最後の Terminal event の outcome を取り出す helper。

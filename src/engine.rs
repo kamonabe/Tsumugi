@@ -437,10 +437,13 @@ pub enum ExecutionState {
 /// `AdmissionQueued`（admission queue 待ち）・`HostCallPending`（cooperative host-call 待ち）・
 /// `SchedulerPreempted`（run-turn で非 head）を配線する。
 ///
-/// `AuditBackpressure`（仕様 §9）は本 enum に **加えない**: audit event emission は Phase 6 で
-/// あり、backpressure を audit sink の詰まりへ変換する機構は audit sink が入って初めて意味を
-/// 持つ。variant を今足すと「返り得ない公開 variant」になり、「state と outcome で terminal
-/// 理由を二重定義しない」精神に反するため、依存機構が入る Phase 6 で追加する（設計 §4.6）。
+/// `AuditBackpressure`（仕様 §9 / §10.2）は Phase 6 B-1 で追加した: audit sink が batch を
+/// `Pending` にしたとき execution を実際に `Yielded(AuditBackpressure)` へ遷移させ、ack で
+/// resume する。この variant を返すのは **facade（`embedding.rs`）の監査付き poll driver** で
+/// あり（sink を持つのは facade だけ、`docs/determinism-and-audit.md` §14）、scheduler engine
+/// （本 `engine.rs::Engine`）の poll はまだ返さない。したがって「返り得ない公開 variant（dead
+/// variant）」ではなく、facade driver 経由で returnable な公開 variant である（設計 B-0 §5/§7）。
+/// scheduler engine 側で返すのは E10 統合後。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum YieldReason {
     /// admission queue で active slot の空きを待っている（Slice 5、設計 §4.1/§4.6）。
@@ -470,6 +473,14 @@ pub enum YieldReason {
     /// （Finding 4）。非 head poll は元の `Ready` / `Yielded(..)` を保ったまま、戻り値だけ
     /// `SchedulerPreempted` になる。run-turn 内の自分の位置も変えない（FR-3）。
     SchedulerPreempted,
+    /// audit sink が batch を `Pending` にしたため execution が停止している（§10.2、Phase 6 B-1）。
+    ///
+    /// 監査付き facade の poll driver が、sink の `AuditSubmit::Pending` を観測したときこの理由で
+    /// yield する。ack が ticket へ格納される（または同一 batch 再送で Ack される）と resume する。
+    /// deadline/cancel は backpressure 中も監視し、永久 `Pending` で deadline へ達した場合は
+    /// `AuditFailure::BackpressureDeadline` の terminal になる（§10.2、script の Deadline より優先）。
+    /// scheduler engine の poll は本 variant をまだ返さない（sink を持たない、§14）。
+    AuditBackpressure,
 }
 
 /// pause の理由（第9節 `PauseReason`）。PR-a では返さない骨格。
