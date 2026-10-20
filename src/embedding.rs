@@ -1925,7 +1925,13 @@ impl Engine {
         }
 
         // 監査付き経路。audit 失敗でない限り本来の outcome を返す。
-        let audited = self.run_audited_inner(linked, context, request);
+        let audited = self.run_audited_inner(
+            linked,
+            context,
+            request,
+            #[cfg(test)]
+            None,
+        );
         context.running = false;
         let outcome = audited.outcome_for_poison();
         if matches!(outcome, ExecutionOutcome::InternalFailure { .. }) {
@@ -2016,7 +2022,13 @@ impl Engine {
         let audited = if self.config.audit_sink.is_none() {
             AuditedOutcome::Outcome(Box::new(self.run_guarded(linked, context, request, false)))
         } else {
-            self.run_audited_inner(linked, context, request)
+            self.run_audited_inner(
+                linked,
+                context,
+                request,
+                #[cfg(test)]
+                None,
+            )
         };
         context.running = false;
         if matches!(
@@ -2026,6 +2038,42 @@ impl Engine {
             context.poisoned = true;
         }
         audited
+    }
+
+    /// test 専用の facade-driver poll API（設計 §9(b)）。
+    ///
+    /// 監査付き経路を回し、facade poll driver が観測した公開 [`crate::engine::PollResult`] の列
+    /// （sink が `Pending` を返して execution が実際に `Yielded(AuditBackpressure)` へ遷移するたびに
+    /// 1 件積まれる）と、最終 [`AuditedOutcome`] を返す。これにより公開
+    /// [`crate::engine::YieldReason::AuditBackpressure`] が facade driver によって実際に構築・返却
+    /// される returnable variant であること（dead variant でないこと、設計 §5/§7.1）を、
+    /// `handle.poll()` 流儀の lib unit test
+    /// （`facade_driver_returns_audit_backpressure_yield_then_resumes_to_completed`）で固定できる。
+    /// 本番 API には露出しない（`#[cfg(test)]`）。
+    #[cfg(test)]
+    pub(crate) fn poll_audited_for_test(
+        &self,
+        linked: &LinkedScript,
+        context: &mut ExecutionContext,
+        request: ExecutionRequest,
+    ) -> (Vec<crate::engine::PollResult>, AuditedOutcome) {
+        assert!(
+            self.config.audit_sink.is_some(),
+            "poll_audited_for_test は audit sink 設定時のみ有効（§14）"
+        );
+        assert!(!context.poisoned, "poison 済み context は実行しない");
+        assert!(!context.running, "再入は許可されない");
+        context.running = true;
+        let mut trace = Vec::new();
+        let audited = self.run_audited_inner(linked, context, request, Some(&mut trace));
+        context.running = false;
+        if matches!(
+            audited.outcome_for_poison(),
+            ExecutionOutcome::InternalFailure { .. }
+        ) {
+            context.poisoned = true;
+        }
+        (trace, audited)
     }
 
     /// panic 捕捉付きで `run_inner` を回す（監査 wiring なしの従来経路）。
@@ -2072,6 +2120,9 @@ impl Engine {
         linked: &LinkedScript,
         context: &mut ExecutionContext,
         request: ExecutionRequest,
+        // facade poll driver が観測した公開 `PollResult`（AuditBackpressure yield）を収集する
+        // test 専用の sink。本番呼び出しは常に `None` を渡し、trace を一切作らない（§5/§7.1）。
+        #[cfg(test)] poll_trace: Option<&mut Vec<crate::engine::PollResult>>,
     ) -> AuditedOutcome {
         use crate::audit::{
             AuditBudget, AuditEnvelope, AuditEvent, AuditFailure, AuditJournal, AuditSubmit,
@@ -2214,6 +2265,10 @@ impl Engine {
         // 配送ヘルパ（§10 / §10.2）。sink round-trip（Ack 検証 / backpressure round-trip）を
         // 1 箇所へ集約し、host-call triple / Yielded・Resumed / BudgetCharged / Terminal の各
         // submit 口が同じ規約を共有する（B-1 scope 5）。
+        // test 専用: poll_trace が要求されていれば AuditDelivery に空の収集 buffer を持たせ、
+        // backpressure 突入ごとに公開 PollResult::Yielded(AuditBackpressure) を積む。本番では None。
+        #[cfg(test)]
+        let collect_poll_trace = poll_trace.is_some();
         let mut delivery = AuditDelivery {
             sink: Arc::clone(&sink),
             execution_id,
@@ -2221,6 +2276,10 @@ impl Engine {
             source_hash,
             language_revision: language_revision.clone(),
             timestamp,
+            #[cfg(test)]
+            poll_trace: collect_poll_trace.then(Vec::new),
+            #[cfg(not(test))]
+            poll_trace: None,
         };
 
         // 4. 実行本体（panic 捕捉付き）。Started 発行後なので pre-cancel も Started+Terminal を持つ。
@@ -2255,6 +2314,13 @@ impl Engine {
         let outcome = match drive {
             AuditDrive::Terminal(outcome) => *outcome,
             AuditDrive::Failed { withheld, failure } => {
+                // test 専用: driver が観測した公開 PollResult(AuditBackpressure yield) を返す。
+                #[cfg(test)]
+                if let Some(out) = poll_trace
+                    && let Some(trace) = delivery.poll_trace.as_ref()
+                {
+                    out.extend(trace.iter().cloned());
+                }
                 return AuditedOutcome::AuditFailed { withheld, failure };
             }
         };
@@ -2282,7 +2348,7 @@ impl Engine {
             host_effects_may_remain: false,
         };
         let terminal_envelope = delivery.envelope(journal.next_sequence(), terminal_event);
-        match journal.append_terminal(&terminal_envelope) {
+        let audited = match journal.append_terminal(&terminal_envelope) {
             Ok(terminal_seq) => {
                 // Terminal の配送結果を評価する（§10.1）。配送が成立し（Ack / backpressure 後の
                 // ack）たときだけ監査成立とする。配送失敗（Failed / 不正 ack / backpressure
@@ -2302,7 +2368,18 @@ impl Engine {
                 withheld: terminal_outcome,
                 failure,
             },
+        };
+
+        // test 専用: driver が観測した公開 PollResult(AuditBackpressure yield) を呼び出し元へ返す。
+        // Terminal 配送中に起きた backpressure も含め、全 yield observation をここで引き渡す。
+        #[cfg(test)]
+        if let Some(out) = poll_trace
+            && let Some(trace) = delivery.poll_trace.as_ref()
+        {
+            out.extend(trace.iter().cloned());
         }
+
+        audited
     }
 
     /// 監査付きの単一 execution poll driver（Phase 6 B-1、設計 §2.3 案 2b / §3.3）。
@@ -2801,6 +2878,15 @@ struct AuditDelivery {
     source_hash: [u8; 32],
     language_revision: String,
     timestamp: crate::audit::HostTimestamp,
+    /// facade poll driver が観測した公開 `PollResult` の trace（Phase 6 B-1）。
+    ///
+    /// sink が `Pending` を返して execution が実際に `Yielded(AuditBackpressure)` へ遷移するたびに
+    /// `PollResult::Yielded { reason: YieldReason::AuditBackpressure, .. }` を 1 件積む。これにより
+    /// 公開 `engine::YieldReason::AuditBackpressure` は facade driver が実際に構築・返却する
+    /// returnable variant になり（dead variant ではない、設計 §5/§7.1）、`#[cfg(test)]` の
+    /// facade-driver poll API（[`Engine::poll_audited_for_test`]）がこの trace を observe できる。
+    /// 本番経路では `None` で、trace を一切作らない（挙動・emission への影響ゼロ）。
+    poll_trace: Option<Vec<crate::engine::PollResult>>,
 }
 
 impl AuditDelivery {
@@ -2824,6 +2910,19 @@ impl AuditDelivery {
     /// ack がこの execution の連続 sequence（`through_seq`）を正しく指すか検証する（§10）。
     fn ack_ok(&self, ack: &crate::audit::AuditAck, through_seq: u64) -> bool {
         ack.execution_id == self.execution_id && ack.through_sequence == through_seq
+    }
+
+    /// backpressure で execution が `Yielded(AuditBackpressure)` へ遷移したことを、公開
+    /// `PollResult::Yielded { reason: YieldReason::AuditBackpressure, .. }` として trace へ積む
+    /// （設計 §5/§7.1: 公開 variant を facade driver が実際に構築・返却する returnable variant に
+    /// する）。`poll_trace` が無い本番経路では no-op で、emission にも挙動にも影響しない。
+    fn record_backpressure_poll_yield(&mut self, context: &ExecutionContext) {
+        if let Some(trace) = self.poll_trace.as_mut() {
+            trace.push(crate::engine::PollResult::Yielded {
+                reason: crate::engine::YieldReason::AuditBackpressure,
+                usage: context.evaluator.budget_usage(),
+            });
+        }
     }
 
     /// 単一 batch を sink へ配送する（§10 / §10.2）。Ack 検証と backpressure round-trip を担う。
@@ -2861,6 +2960,10 @@ impl AuditDelivery {
                     ticket.cancel();
                     return Err(AuditFailure::Sink);
                 }
+                // facade driver が公開 YieldReason::AuditBackpressure を実際に産出する点（設計
+                // §5/§7.1）。execution が本当に Yielded(AuditBackpressure) へ遷移したことを、公開
+                // PollResult として trace へ記録する（本番経路では poll_trace=None で no-op）。
+                self.record_backpressure_poll_yield(context);
                 // 2) waker を ticket へ登録。
                 ticket.register_waker(waker.clone());
                 let mut ticket = ticket;
@@ -4138,6 +4241,62 @@ mod tests {
     /// 監査 execution_id 付きの standard request を作る helper。
     fn audited_request(id: u128) -> ExecutionRequest {
         standard_request().with_execution_id(ExecutionId::new(id.try_into().expect("nonzero")))
+    }
+
+    /// Phase 6 B-1 §9(b): facade poll driver が公開 `PollResult::Yielded { reason:
+    /// AuditBackpressure }` を実際に産出し、resume して `Completed` に至ることを固定する。
+    ///
+    /// これは公開 `engine::YieldReason::AuditBackpressure` が dead variant ではなく、facade
+    /// driver が構築・返却する returnable variant であること（設計 §5/§7.1）の直接の証拠になる。
+    /// `handle.poll()` 流儀（`tests/scheduler_api.rs`）に倣い、`poll_audited_for_test` が返す
+    /// trace から `PollResult::Yielded { reason, .. }` を観測する。
+    #[test]
+    fn facade_driver_returns_audit_backpressure_yield_then_resumes_to_completed() {
+        use crate::audit::{AuditSink, ScriptedAuditSink, ScriptedResponse};
+        use crate::engine::{PollResult, YieldReason};
+
+        // Started は Ack、次の envelope 配送で 1 回 Pending → 同一 batch 再送で Ack（resume）。
+        let sink = Arc::new(ScriptedAuditSink::new([
+            ScriptedResponse::AckCorrect,
+            ScriptedResponse::PendingThenAck { pending_times: 1 },
+        ]));
+        let engine = Engine::builder()
+            .audit_sink(sink.clone() as Arc<dyn AuditSink>)
+            .build()
+            .unwrap();
+        let mut ctx = ExecutionContext::new(&engine);
+        let linked = compile_link(&engine, "m", "let x = 1 + 2\n");
+
+        let (trace, audited) = engine.poll_audited_for_test(&linked, &mut ctx, audited_request(77));
+
+        // facade driver は公開 PollResult::Yielded { reason: AuditBackpressure } をちょうど 1 回返す。
+        let backpressure_yields = trace
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p,
+                    PollResult::Yielded {
+                        reason: YieldReason::AuditBackpressure,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            backpressure_yields, 1,
+            "facade driver が公開 YieldReason::AuditBackpressure を 1 回返す: {trace:?}"
+        );
+
+        // backpressure yield の後、resume して監査成立の Completed に至る。
+        assert!(
+            audited.is_audited_ok(),
+            "backpressure から resume して監査成立: {audited:?}"
+        );
+        assert!(
+            matches!(audited.outcome(), Some(ExecutionOutcome::Completed { .. })),
+            "次ステップで Completed へ resume: {:?}",
+            audited.outcome()
+        );
     }
 
     /// sink の収集 envelope から最後の Terminal event の outcome を取り出す helper。
