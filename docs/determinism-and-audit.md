@@ -4,7 +4,7 @@
 
 設計ステータス: **実装仕様確定・部分実装（Phase 6 A-1 subset ＋ `BudgetCharged` ＋ host-call lifecycle 3 event ＋ `Yielded` / `Resumed` emission 実装済み）**
 
-> Phase 6 の A-1 subset（schema v1・8 event 型・logical journal・`AuditSink`・fail-closed・opt-in、tree-only）に加え、`BudgetCharged`（§7.2/§7.3）、host-call lifecycle の 3 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished`）、および yield/resume lifecycle の 2 event（`Yielded` / `Resumed`、§7.2 tag 5/6）の emission を tree backend で実装済み。これで §7.2 の 8 event 型のうち 7 event（残りは backpressure 由来の yield のみ）が tree backend で emission される。残りの redaction・strict CBOR・record/replay・VM 対応・sink 必須化、および `AuditBackpressure`-yield 配線は未実装。進捗の唯一の正本は [ロードマップ](roadmap.md)。
+> Phase 6 の A-1 subset（schema v1・8 event 型・logical journal・`AuditSink`・fail-closed・opt-in、tree-only）に加え、`BudgetCharged`（§7.2/§7.3）、host-call lifecycle の 3 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished`）、yield/resume lifecycle の 2 event（`Yielded` / `Resumed`、§7.2 tag 5/6）、および `AuditBackpressure`-yield 配線（§10/§10.2、B-1、sink-Pending 由来）を tree backend で実装済み。これで §7.2 の 8 event 型が tree backend で emission される（backpressure も既存 `Yielded`/`Resumed` に `AuditYieldReason::AuditBackpressure` を載せる）。残りの redaction・strict CBOR・record/replay・VM 対応・sink 必須化、および §10.2 の audit drain queue byte 会計（B-2）は未実装。進捗の唯一の正本は [ロードマップ](roadmap.md)。
 
 ## 1. 位置づけ
 
@@ -795,8 +795,9 @@ Slice 5 の最小縦切り（A-1）を tree engine にのみ実装した時点�
   （`Yielded` / `Resumed`、§7.2 tag 5/6）。host-call 3 event は filesystem builtin
   （`read_file` / `read_lines` / `write_file` / `append_file`、tree 唯一の host-call 境界）で
   emission する。`Yielded` / `Resumed` は tree evaluator の slice 境界で emission する（下記
-  「yield/resume lifecycle 2 event を tree backend で emission」）。これで §7.2 の 8 event 型の
-  うち 7 event が tree backend で emission され、残るのは backpressure 由来の yield だけになった。
+  「yield/resume lifecycle 2 event を tree backend で emission」）。backpressure 由来の yield も
+  B-1 で facade の poll driver に配線済み（下記「`AuditBackpressure`-yield 配線」）。これで §7.2 の
+  8 event 型が tree backend で emission される。
 - **`capability_policy_hash` を実配線（§7.1）**: `ExecutionStarted.capability_policy_hash` には、
   実行を認可した frozen `CapabilitySet` の決定的な相関 ID（`CapabilitySet::id()` の 32 byte）を
   載せる。これにより deny-by-default（空 set）と stdout/filesystem/exit 等を grant した実行を監査上
@@ -863,12 +864,16 @@ Slice 5 の最小縦切り（A-1）を tree engine にのみ実装した時点�
   tree evaluator の slice 境界（`run_slice`）で `Yielded { reason, poll_index, usage }`（tag 5）と
   `Resumed { previous_reason, poll_index, usage }`（tag 6）を emission する。実装上の決定・逸脱は
   次のとおり。
-  - **deferred post-run drain**: `Yielded`/`Resumed` は `BudgetCharged`・host-call triple と同じく
-    実行中に評価器へ buffer し、監査付き facade（`run_audited_inner`）が Started と Terminal の間で
-    drain して emission する。A-1 facade は 1 回の `execute_program` 内で script 全体を同期実行し、
-    mid-execution の sink round-trip 配線を持たないためである。固定 drain 順は host-call triple →
-    `Yielded`/`Resumed`（temporal 順）→ 最終 `BudgetCharged` flush → `Terminal`。
-  - **実 yield を起こす slice fuel の橋渡し（D3）**: 監査付き run 経路（`run_transactional`）は
+  - **per-step drain（B-1 で poll driver 化、旧 deferred post-run drain から移行）**: `Yielded`/
+    `Resumed` は `BudgetCharged`・host-call triple と同じく実行中に評価器へ buffer する。B-1 で
+    監査付き driver を同期 loop（`run_transactional`）から **facade 内の単一 execution poll driver**
+    （`run_audited_driver`）へ移行し、1 poll ステップ（`run_slice` 1 回）ごとに評価器 buffer を
+    従来 drain 順で `AuditDelivery` 経由で submit する（§10.2 の sink round-trip を実行中に行うため）。
+    固定 drain 順は host-call triple → `Yielded`/`Resumed`（temporal 順）→ `BudgetCharged`（per-slice
+    flush）→ `Terminal` で変えない。backpressure が一度も起きない実行では、per-step drain の envelope
+    列は旧 post-run 一括 drain と完全一致する（評価器 buffer を同じ順で引くため。既存
+    `tests/audit_yield_resume.rs` / `tests/audit_core.rs` を無改変で緑に保つ回帰条件で固定）。
+  - **実 yield を起こす slice fuel の橋渡し（D3）**: 監査付き run 経路（poll driver）は
     従来 `run_slice(u64::MAX)` で単一 slice だったため監査下で実 yield が起きなかった。
     `EngineBuilder::audit_slice_fuel` で小さい slice fuel を与えると監査付き実行が複数 slice へ
     分かれ、文/反復境界で実 `Yielded(SliceFuelExhausted)` が起きて 2 event が流れる。既定（未設定＝
@@ -890,14 +895,36 @@ Slice 5 の最小縦切り（A-1）を tree engine にのみ実装した時点�
     へ写すが、`HostPaused` を script 可視の公開 `YieldReason` へは追加しない（§8）。
   - **tree-only / VM 未配線**: VM には scheduler/pause 経路が無く、yield/resume emission は tree-only。
     tree/VM 差は既知の受容済み差分（Slice 6 で解消予定）。
-  - **mapped-but-not-emitted（engine-poll 経路、A-1 逸脱）**: `AdmissionQueued` / `SchedulerPreempted`
-    / `HostPaused` の yield は `engine.rs::poll`（sink を持たない alpha facade）でのみ生じる。A-1 の
-    監査付き driver は `run_transactional`（slice-fuel yield だけを起こす）であり、これらの yield は
-    emission されない。sink-bearing な scheduler/pause 経路の配線は後続スライスへ延期する。
-- **未実装（A-1 では意図的に含めない）**: `AuditBackpressure` の yield 配線（§10.2）と
-  `engine.rs::YieldReason` の `AuditBackpressure` 変種、redaction policy 本体（§9）、
-  strict deterministic CBOR（§9.2、A-1 の `encoded_bytes` は naive 推定で後で差し替え可能に
-  隔離）、record/replay（§6）、VM の変更。`AdmissionQueued` / `SchedulerPreempted` / `HostPaused`
+  - **mapped-but-not-emitted（engine-poll 経路）**: `AdmissionQueued` / `SchedulerPreempted`
+    / `HostPaused` の yield は `engine.rs::poll`（sink を持たない alpha facade）でのみ生じる。
+    監査付き driver（facade の poll driver）は slice-fuel yield と backpressure yield を起こすが、
+    これら 3 reason は起こさないため emission されない。sink-bearing な scheduler/pause 経路の配線は
+    後続スライスへ延期する。
+- **`AuditBackpressure`-yield 配線（§10/§10.2、B-1、実装済み）**: audit sink が batch を
+  `AuditSubmit::Pending` にしたとき、facade の poll driver（`AuditDelivery::deliver`）が execution を
+  実際に `Yielded(AuditBackpressure)` へ遷移させ、ack（同一 `Arc` batch の再送で Ack される、または
+  `AuditTicket::try_take`）で `Resumed{previous_reason: AuditBackpressure}` へ resume する。§10 の
+  「次回 `ExecutionHandle::poll` が `try_take` して再開」は、A-1（tree-only・facade 内 driver）では
+  **facade の poll driver が round-trip を担う**形で実現する（scheduler engine は sink を持たない。
+  公開 `YieldReason::AuditBackpressure` は facade driver 経由で returnable な公開 variant になり、
+  scheduler engine 側で返すのは E10 統合後）。backpressure は sink 応答由来で評価器の意味論
+  （`SliceOutcome`）を跨がず、`Yielded`/`Resumed` の poll_index 発番・pair 共有は評価器の単一
+  `poll_index` カウンタに乗る（driver 独自カウンタなし）。backpressure yield が SliceFuel yield の
+  event 配送中に起きるとネスト（外側 SliceFuel の Resumed はまだ）するため、外側 yield の pair 情報を
+  退避し backpressure Resumed 後に復元する。各 poll ステップ先頭で cancel→deadline を `try_take` より
+  **先に** checkpoint し（§4.6 linearization）、永続 `Pending` のまま deadline へ達した場合は
+  `AuditFailure::BackpressureDeadline` の terminal にして script の `Deadline` より優先する（§10.2、
+  「実行結果は成功だが監査が欠ける」状態を作らない）。公開 API の破壊的変更は
+  `YieldReason::AuditBackpressure` / `AuditFailure::BackpressureDeadline` の追加（additive）で、
+  `language_revision` bump は無い（既存 tag 5/6 + 既存 `AuditYieldReason::AuditBackpressure`）。§10.2 の
+  audit drain queue byte 会計（per-execution 1 MiB / engine 全体 16 MiB・`AuditBudget.max_pending_bytes`
+  消費）は B-2 へ分離（sink-Pending 由来の backpressure だけ先行）。これにより §15.3 の受入基準
+  「永続 Pending で script が成功扱いにならず AuditFailure terminal になる」が sink-Pending 経路で
+  満たされ、§15.3「Yielded と Resumed が交互に対応し audit backpressure を区別できる」も
+  `AuditYieldReason::AuditBackpressure` の Yielded/Resumed pair で満たされる（`tests/audit_backpressure.rs`）。
+- **未実装（意図的に含めない）**: redaction policy 本体（§9）、strict deterministic CBOR（§9.2、A-1 の
+  `encoded_bytes` は naive 推定で後で差し替え可能に隔離）、record/replay（§6）、VM の変更、§10.2 の
+  audit drain queue byte 会計（B-2）。`AdmissionQueued` / `SchedulerPreempted` / `HostPaused`
   の yield emission（engine-poll 経路に sink が無い、上記）も後続スライスへ延期する。
 
 ### Slice 6: VM conformance
