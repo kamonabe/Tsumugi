@@ -418,6 +418,14 @@ pub struct Evaluator {
     /// 直前の yield に発番した poll_index（§8）。`Yielded` と対になる `Resumed` が同じ値を使い、
     /// golden test で `previous_reason`/poll_index が揃うようにする。
     last_yield_poll_index: u64,
+    /// backpressure（AuditBackpressure）yield が SliceFuel/Explicit yield の **内側で** 起きた
+    /// ときに、外側 yield の `last_yield_reason` / `last_yield_poll_index` を退避する slot
+    /// （Phase 6 B-1、§5.1）。backpressure は slice 境界の event 配送中に起き、外側 yield の
+    /// Resumed はまだ出ていない。`record_backpressure_yield` が退避し、
+    /// `record_backpressure_resume` が backpressure Resumed を出した後に復元することで、外側
+    /// yield の pair（SliceFuel Yielded↔Resumed）を壊さない。単一 batch の round-trip は
+    /// yield→resume で閉じるため、ネストは深さ 1 に限られ 1 slot で足りる。
+    saved_yield_before_backpressure: Option<(crate::audit::AuditYieldReason, u64)>,
     /// yield/resume lifecycle 監査 event の emission 待ちバッファ（§7.3 の `BudgetCharged` 蓄積・
     /// host-call triple と同じ deferred-drain 規律）。`run_slice` が slice 境界で `Resumed`/
     /// `Yielded` を temporal 順に push し、監査付き facade（`run_audited_inner`）だけが
@@ -504,6 +512,7 @@ impl Evaluator {
             poll_index: 0,
             last_yield_reason: None,
             last_yield_poll_index: 0,
+            saved_yield_before_backpressure: None,
             yield_events: Vec::new(),
             yield_for_host_call: false,
             resumed_host_call: None,
@@ -541,6 +550,7 @@ impl Evaluator {
         self.poll_index = 0;
         self.last_yield_reason = None;
         self.last_yield_poll_index = 0;
+        self.saved_yield_before_backpressure = None;
         self.yield_events.clear();
         // heap 台帳を作り直したので、cell 課金用のハンドルを Env へ配り直す（REV-015 PR-c）。
         self.env.set_heap_ledger(self.budget.heap_handle());
@@ -571,6 +581,7 @@ impl Evaluator {
         self.poll_index = 0;
         self.last_yield_reason = None;
         self.last_yield_poll_index = 0;
+        self.saved_yield_before_backpressure = None;
         self.yield_events.clear();
         // heap 台帳は温存するので heap handle の再配布は不要（cumulative live heap を維持）。
     }
@@ -1079,11 +1090,29 @@ impl Evaluator {
     /// その時点の BudgetCharged accumulator を flush する。overflow は `run_slice` と同様に
     /// fail-closed（`Err`）で、呼び出し元が internal terminal へ写す。
     pub(crate) fn record_backpressure_yield(&mut self) -> Result<(), TsumugiError> {
+        // backpressure は外側 yield（SliceFuel/Explicit）の Resumed がまだ出ていない段階で、
+        // slice 境界の event 配送中に起きうる。外側 yield の pair 情報（`last_yield_*`）を退避して
+        // おき、backpressure の Resumed を出した後に復元する（§5.1）。ネストは深さ 1（単一 batch の
+        // round-trip は yield→resume で閉じる）なので 1 slot で足りる。
+        self.saved_yield_before_backpressure = self
+            .last_yield_reason
+            .take()
+            .map(|reason| (reason, self.last_yield_poll_index));
         // 規則7: flush（確定済み BudgetCharged を先に）してから Yielded。
         let charges = self.drain_budget_charges();
         self.yield_events.extend(charges);
         let reason = crate::audit::AuditYieldReason::AuditBackpressure;
-        let poll_index = self.alloc_poll_index(0)?;
+        let poll_index = match self.alloc_poll_index(0) {
+            Ok(poll_index) => poll_index,
+            Err(e) => {
+                // 発番失敗。退避した外側 yield を復元してから fail-closed（呼び出し元が terminal 化）。
+                if let Some((reason, index)) = self.saved_yield_before_backpressure.take() {
+                    self.last_yield_reason = Some(reason);
+                    self.last_yield_poll_index = index;
+                }
+                return Err(e);
+            }
+        };
         let usage = self.budget.usage();
         self.yield_events.push(crate::audit::AuditEvent::Yielded {
             reason: reason.clone(),
@@ -1118,6 +1147,12 @@ impl Evaluator {
                 poll_index,
                 usage,
             });
+            // 退避しておいた外側 yield（SliceFuel/Explicit）の pair 情報を復元する。次の
+            // `run_slice` 先頭がこれを使って外側 yield の Resumed を出す（§5.1）。
+            if let Some((reason, index)) = self.saved_yield_before_backpressure.take() {
+                self.last_yield_reason = Some(reason);
+                self.last_yield_poll_index = index;
+            }
         }
     }
 
