@@ -977,6 +977,10 @@ impl ExecutionHandle<'_, '_, '_> {
             SliceOutcome::YieldedSliceFuel => SlicePoll::YieldedSliceFuel,
             SliceOutcome::YieldedHostCall { call_id } => SlicePoll::YieldedHostCall { call_id },
             SliceOutcome::YieldedExplicit => SlicePoll::YieldedExplicit,
+            // audit drain queue 上限の yield（Phase 6 B-2）は監査付き embedding facade が計器を
+            // 張った実行でだけ起きる。engine-poll 経路は計器を張らないので到達しないが、到達した
+            // 場合も slice 境界の通常 yield と同じく次の poll で resume させる。
+            SliceOutcome::YieldedAuditQueue => SlicePoll::YieldedSliceFuel,
             SliceOutcome::Terminal(Ok(())) => SlicePoll::Terminal(ExecutionOutcome::Completed),
             // 実行フェーズの失敗（transaction は commit/rollback を run_slice が済ませている）。
             // cancel / deadline は catch 不能 terminal 信号なので専用 outcome へ写し、

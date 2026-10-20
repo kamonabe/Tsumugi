@@ -2261,6 +2261,12 @@ impl BudgetLedger {
         self.accumulator.flush()
     }
 
+    /// 確定済み（256-charge cut 済み・未 drain）`BudgetCharged` が audit drain queue に占める
+    /// 推定 byte 数（Phase 6 B-2、§10.2）。進行中の未確定集約は数えない。
+    pub(crate) fn audit_finalized_charge_bytes(&self, envelope_overhead: u64) -> u64 {
+        self.accumulator.finalized_queue_bytes(envelope_overhead)
+    }
+
     /// 現在の live heap byte 数（REPL rollback の snapshot 用）。
     pub fn live_heap_bytes(&self) -> u64 {
         self.heap.borrow().live_bytes()

@@ -471,6 +471,12 @@ pub struct BudgetChargeAccumulator {
     groups: Vec<ChargeGroup>,
     /// 256 charge 到達等で確定した `BudgetCharged` レコード（emission 待ち）。
     finalized: Vec<AuditEvent>,
+    /// `finalized` の各 event の [`estimate_event_bytes`] 合計（Phase 6 B-2、§10.2）。
+    ///
+    /// 確定済み `BudgetCharged` は audit drain queue の一部として数える（未確定の進行中グループは
+    /// (resource, reason) ごとに 1 件で有界なので数えない）。envelope 固定部は呼び出し側が件数から
+    /// 足す（[`Self::finalized_queue_bytes`]）。[`Self::flush`] で 0 へ戻る。
+    finalized_event_bytes: u64,
 }
 
 /// 進行中の 1 (resource, reason) グループ（§7.3）。
@@ -541,7 +547,7 @@ impl BudgetChargeAccumulator {
                 g.charge_count = g.charge_count.saturating_add(1);
                 if g.charge_count >= CHARGE_FLUSH_THRESHOLD {
                     let group = self.groups.remove(idx);
-                    self.finalized.push(group.into_event());
+                    self.push_finalized(group.into_event());
                 }
             }
             None => {
@@ -580,7 +586,7 @@ impl BudgetChargeAccumulator {
                 g.charge_count = g.charge_count.saturating_add(1);
                 if g.charge_count >= CHARGE_FLUSH_THRESHOLD {
                     let group = self.groups.remove(idx);
-                    self.finalized.push(group.into_event());
+                    self.push_finalized(group.into_event());
                 }
             }
             None => {
@@ -597,6 +603,26 @@ impl BudgetChargeAccumulator {
         }
     }
 
+    /// 確定 buffer へ 1 件積み、audit drain queue 用の byte 合計を更新する（B-2）。
+    fn push_finalized(&mut self, event: AuditEvent) {
+        self.finalized_event_bytes = self
+            .finalized_event_bytes
+            .saturating_add(estimate_event_bytes(&event));
+        self.finalized.push(event);
+    }
+
+    /// 確定済み（emission 待ち）`BudgetCharged` が audit drain queue に占める推定 byte 数
+    /// （Phase 6 B-2、§10.2）。
+    ///
+    /// `envelope_overhead` は [`estimate_envelope_overhead_bytes`] の値で、確定済み 1 件ごとに
+    /// envelope 固定部として足す。journal が append 時に計上する [`estimate_encoded_bytes`] と
+    /// 同じ部品の和になる（§9.2: 別実装の size 推定を持たない）。
+    pub(crate) fn finalized_queue_bytes(&self, envelope_overhead: u64) -> u64 {
+        let count = self.finalized.len() as u64;
+        self.finalized_event_bytes
+            .saturating_add(count.saturating_mul(envelope_overhead))
+    }
+
     /// 全進行中グループを畳み、確定 buffer と結合して決定的順序で返す（§7.3 / §8 規則 7）。
     ///
     /// 確定 buffer（256 charge 到達で先に切り出された分）を元の確定順で先頭に置き、その後に
@@ -604,6 +630,7 @@ impl BudgetChargeAccumulator {
     /// 内部状態を空にする。
     pub fn flush(&mut self) -> Vec<AuditEvent> {
         let mut events = std::mem::take(&mut self.finalized);
+        self.finalized_event_bytes = 0;
         let mut groups = std::mem::take(&mut self.groups);
         groups.sort_by_key(|g| (resource_sort_key(g.resource), reason_sort_key(g.reason)));
         events.extend(groups.into_iter().map(ChargeGroup::into_event));
@@ -665,7 +692,9 @@ pub struct AuditBudget {
     pub max_events: u64,
     /// 最大 encoded byte 数（既定 16 MiB）。
     pub max_encoded_bytes: u64,
-    /// execution ごとの最大 pending byte 数（既定 1 MiB、A-1 では消費しない）。
+    /// execution ごとの最大 pending byte 数（既定 1 MiB）。audit drain queue（生成済み・未 ack の
+    /// 通常 event）がこの値に達すると、トップレベルの文/反復境界で `AuditBackpressure` yield する
+    /// （§10.2、Phase 6 B-2。engine 全体の上限は未実装）。
     pub max_pending_bytes: u64,
     /// Terminal 専用に予約する event 数（fixed 1）。
     pub terminal_reserve_events: u64,
@@ -763,17 +792,28 @@ impl AuditBudget {
 /// A-1 では §9.2 の deterministic CBOR を実装しないため、journal の byte 予算が課金できる概算を
 /// 返す。call site を 1 関数へ隔離し、後続スライスで §9.2 encoder へ差し替えられるようにする。
 /// 推定は保守的（固定 overhead + 可変 field の byte 長）で、厳密な CBOR 長とは一致しない。
+///
+/// 「envelope 固定部（`estimate_envelope_overhead_bytes`）＋ event 本体
+/// （`estimate_event_bytes`）」の和。Phase 6 B-2 の audit drain queue（§10.2）は envelope 化前
+/// （sequence 未確定）の event を同じ 2 部品で計上するため、journal と queue が同一の推定を
+/// 共有する（§9.2: 予算 byte counter が別実装の size 推定を持つことを禁止）。
 pub fn estimate_encoded_bytes(envelope: &AuditEnvelope) -> u64 {
-    // envelope 固定部: schema_version(2) + execution_id(16) + source_hash(32) + sequence(8)
-    // + timestamp(16) ＝ 74 bytes 程度。language_revision は可変。
-    let mut bytes: u64 = 74;
-    bytes = bytes.saturating_add(envelope.language_revision.len() as u64);
-    bytes = bytes.saturating_add(estimate_event_bytes(&envelope.event));
-    bytes
+    estimate_envelope_overhead_bytes(&envelope.language_revision)
+        .saturating_add(estimate_event_bytes(&envelope.event))
 }
 
-/// event 本体の naive 推定。
-fn estimate_event_bytes(event: &AuditEvent) -> u64 {
+/// envelope 固定部の naive 推定（Phase 6 B-2 で [`estimate_encoded_bytes`] から分離）。
+///
+/// schema_version(2) + execution_id(16) + source_hash(32) + sequence(8) + timestamp(16)
+/// ＝ 74 bytes 程度に可変長の language_revision を足す。sequence に依存しないので、sequence
+/// 確定前の event にも適用できる。§9.2 strict CBOR へ差し替えると sequence/timestamp の encode
+/// 長が値依存になるため、その時点では sequence を最大長とみなした上限値を返す。
+pub(crate) fn estimate_envelope_overhead_bytes(language_revision: &str) -> u64 {
+    74u64.saturating_add(language_revision.len() as u64)
+}
+
+/// event 本体の naive 推定（envelope 固定部を除く）。
+pub(crate) fn estimate_event_bytes(event: &AuditEvent) -> u64 {
     match event {
         AuditEvent::ExecutionStarted {
             engine_version,
@@ -1654,6 +1694,82 @@ mod tests {
                 host_effects_may_remain: false,
             },
         }
+    }
+
+    // --- B-2（§10.2・§9.2）: audit drain queue と journal が同じ byte 推定を共有する ---
+
+    /// B2-AT-10: envelope 化前の event を「envelope 固定部 ＋ event 本体」で計上した値が、同じ
+    /// event を journal へ append したときの `committed_bytes` の増分と一致する。
+    #[test]
+    fn b2_at_10_queue_estimate_matches_journal_committed_bytes() {
+        let id = exec_id(42);
+        let mut acc = BudgetChargeAccumulator::new();
+        acc.note_charge(BudgetResource::Fuel, BudgetChargeReason::Operation, 3, 3);
+        let charged = acc.flush().remove(0);
+        let events = vec![
+            AuditEvent::HostCallStarted {
+                operation_id: 0,
+                call_id: 0,
+                function: "write_file".to_string(),
+                request: AuditPayload { fields: Vec::new() },
+                request_bytes: 5,
+            },
+            AuditEvent::Yielded {
+                reason: AuditYieldReason::AuditBackpressure,
+                poll_index: 0,
+                usage: BudgetUsage::default(),
+            },
+            AuditEvent::Resumed {
+                previous_reason: AuditYieldReason::AuditBackpressure,
+                poll_index: 0,
+                usage: BudgetUsage::default(),
+            },
+            charged,
+        ];
+
+        let mut journal = AuditJournal::open(AuditBudget::default());
+        journal
+            .append_normal(&started_envelope(id, 0))
+            .expect("started");
+        for event in events {
+            let envelope = AuditEnvelope {
+                event: event.clone(),
+                sequence: journal.next_sequence(),
+                ..started_envelope(id, 0)
+            };
+            let queued = estimate_envelope_overhead_bytes(&envelope.language_revision)
+                .saturating_add(estimate_event_bytes(&event));
+            let before = journal.committed_bytes;
+            journal.append_normal(&envelope).expect("append");
+            assert_eq!(
+                journal.committed_bytes - before,
+                queued,
+                "queue の計上値と journal の committed_bytes 増分が一致する: {event:?}"
+            );
+            assert_eq!(estimate_encoded_bytes(&envelope), queued);
+        }
+    }
+
+    /// accumulator の確定済み（256-charge cut）分だけが queue byte に数えられ、flush で 0 に戻る。
+    #[test]
+    fn b2_finalized_charges_count_toward_queue_until_flush() {
+        let overhead = estimate_envelope_overhead_bytes("0.21");
+        let mut acc = BudgetChargeAccumulator::new();
+        // 進行中グループ（未確定）は数えない。
+        acc.note_charge(BudgetResource::Fuel, BudgetChargeReason::Operation, 1, 1);
+        assert_eq!(acc.finalized_queue_bytes(overhead), 0);
+        // 256 charge で確定 buffer へ切り出された 1 件を数える。
+        for n in 2..=CHARGE_FLUSH_THRESHOLD {
+            acc.note_charge(BudgetResource::Fuel, BudgetChargeReason::Operation, 1, n);
+        }
+        let finalized = acc.finalized.clone();
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(
+            acc.finalized_queue_bytes(overhead),
+            overhead + estimate_event_bytes(&finalized[0])
+        );
+        let _ = acc.flush();
+        assert_eq!(acc.finalized_queue_bytes(overhead), 0);
     }
 
     // --- (a) schema / mapping: ExecutionOutcome -> TerminalOutcome の 1:1 ---

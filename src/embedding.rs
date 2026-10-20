@@ -314,6 +314,10 @@ pub struct EngineBuilder {
     config: EngineConfig,
     allow_experimental_backend: bool,
     host_registry: std::sync::Arc<crate::host_function::HostFunctionRegistry>,
+    /// 監査付き run 経路が使う control-plane budget（§11）。既定は `AuditBudget::default()`。
+    /// 公開 setter は無く、test 専用 shim [`Self::audit_budget_for_test`] だけが差し替える
+    /// （Phase 6 B-2）。公開構造体 [`EngineConfig`] へは置かない（field 追加で literal 構築を壊さない）。
+    audit_budget: crate::audit::AuditBudget,
 }
 
 impl Default for EngineBuilder {
@@ -332,6 +336,7 @@ impl EngineBuilder {
             allow_experimental_backend: false,
             // 既定は空 registry（host function なし）。run-path 挙動は従来と同一。
             host_registry: std::sync::Arc::new(crate::host_function::HostFunctionRegistry::empty()),
+            audit_budget: crate::audit::AuditBudget::default(),
         }
     }
 
@@ -374,6 +379,27 @@ impl EngineBuilder {
         self
     }
 
+    /// **test 専用 shim**: 監査付き run 経路の control-plane budget（§11）を差し替える
+    /// （Phase 6 B-2、`docs/determinism-and-audit.md` §14「B-2 実装スライス」）。
+    ///
+    /// audit drain queue の境界テストで小さい `max_pending_bytes` を注入するためだけに置く。
+    /// 外部 embedder 向けの安定した公開契約ではない。その意図を明示するため `#[doc(hidden)]` を
+    /// 付ける（[`Engine::link_for_repl`] と同じ扱い）。公開 setter と `ConfigError` への
+    /// `AuditConfigError` 接続は sink 必須化（§1.1）のスライスへ延期している。
+    ///
+    /// # Panics
+    ///
+    /// `budget` が [`crate::audit::AuditBudget::validate`] を通らない場合（test 専用のため
+    /// config error 経路を持たない）。
+    #[doc(hidden)]
+    pub fn audit_budget_for_test(mut self, budget: crate::audit::AuditBudget) -> Self {
+        if let Err(error) = budget.validate() {
+            panic!("audit_budget_for_test: 不正な AuditBudget: {error:?}");
+        }
+        self.audit_budget = budget;
+        self
+    }
+
     /// build 済みの host function registry を engine へ登録する（Phase 2、E7、第11.1節）。
     ///
     /// registry は engine 単位の build-time 設定（link 時に name→ID を固定する）であり、実行ごとに
@@ -406,6 +432,7 @@ impl EngineBuilder {
             id: EngineId::allocate(),
             config: self.config,
             host_registry: self.host_registry,
+            audit_budget: self.audit_budget,
         })
     }
 }
@@ -423,6 +450,9 @@ pub struct Engine {
     /// [`EngineBuilder::host_functions`] で登録した registry（既定は空、E7）。実行時に
     /// `Engine::run` が evaluator へ注入する。
     host_registry: std::sync::Arc<crate::host_function::HostFunctionRegistry>,
+    /// 監査付き run 経路の control-plane budget（§11）。既定は `AuditBudget::default()`
+    /// （[`EngineBuilder::audit_budget_for_test`] でだけ差し替わる、Phase 6 B-2）。
+    audit_budget: crate::audit::AuditBudget,
 }
 
 impl Engine {
@@ -2125,8 +2155,8 @@ impl Engine {
         #[cfg(test)] poll_trace: Option<&mut Vec<crate::engine::PollResult>>,
     ) -> AuditedOutcome {
         use crate::audit::{
-            AuditBudget, AuditEnvelope, AuditEvent, AuditFailure, AuditJournal, AuditSubmit,
-            AuditWaker, ExecutionMode, HostTimestamp, TerminalOutcome,
+            AuditEnvelope, AuditEvent, AuditFailure, AuditJournal, AuditSubmit, AuditWaker,
+            ExecutionMode, HostTimestamp, TerminalOutcome,
         };
 
         let sink = match &self.config.audit_sink {
@@ -2193,7 +2223,7 @@ impl Engine {
             event,
         };
 
-        let mut journal = AuditJournal::open(AuditBudget::default());
+        let mut journal = AuditJournal::open(self.audit_budget);
 
         // 3. ExecutionStarted を sequence 0 へ append。
         let started_event = AuditEvent::ExecutionStarted {
@@ -2406,6 +2436,12 @@ impl Engine {
             // pre-cancel: script work 0。評価器 buffer は空なので flush 不要。Terminal を出す。
             Err(pre_cancel) => return AuditDrive::Terminal(pre_cancel),
         };
+        // audit drain queue の per-execution 上限を張る（Phase 6 B-2、§10.2）。install
+        // （reset_budget）が計器を外した後に、この実行の envelope 固定部と共に設定する。
+        context.evaluator.set_audit_queue(
+            self.audit_budget.max_pending_bytes,
+            crate::audit::estimate_envelope_overhead_bytes(&delivery.language_revision),
+        );
 
         // begin_execution（E4: transactional=true）。Link 失敗は専用 terminal へ写す。
         if let Err((phase, error)) =
@@ -2458,9 +2494,12 @@ impl Engine {
                 return AuditDrive::Failed { withheld, failure };
             }
             match slice {
+                // queue 上限（B-2）の yield も、上の flush_events で queue を 0 へ戻してから
+                // 次の run_slice（Resumed{AuditBackpressure} を積む）で resume する。
                 SliceOutcome::YieldedSliceFuel
                 | SliceOutcome::YieldedHostCall { .. }
-                | SliceOutcome::YieldedExplicit => continue,
+                | SliceOutcome::YieldedExplicit
+                | SliceOutcome::YieldedAuditQueue => continue,
                 SliceOutcome::Terminal(Ok(())) => {
                     break ExecutionOutcome::Completed {
                         usage: context.evaluator.budget_usage(),
@@ -2689,9 +2728,12 @@ impl Engine {
             // run_slice は SliceOutcome を返す（REV-015 Slice 5、設計 §4.7）。全 yield 変種を
             // continue で回し切る（観測結果は slice 分割に依らず不変、§3 metamorphic / §7）。
             match context.evaluator.run_slice(slice_fuel) {
+                // YieldedAuditQueue は audit drain queue 計器を張る監査付き driver でしか起きない
+                // （この同期経路は計器を張らない）。到達しても他の yield と同じく回し切る。
                 SliceOutcome::YieldedSliceFuel
                 | SliceOutcome::YieldedHostCall { .. }
-                | SliceOutcome::YieldedExplicit => continue,
+                | SliceOutcome::YieldedExplicit
+                | SliceOutcome::YieldedAuditQueue => continue,
                 SliceOutcome::Terminal(Ok(())) => {
                     // commit 済みの usage を同梱する（仕様第6・12節）。
                     let usage = context.evaluator.budget_usage();
@@ -3014,12 +3056,18 @@ impl AuditDelivery {
         }
     }
 
-    /// 評価器 buffer（host-call triple → Yielded/Resumed → BudgetCharged）を従来 drain 順で
-    /// deliver する（§8 規則7/8/9）。backpressure で評価器へ追加された Yielded/Resumed も
-    /// buffer が空になるまで drain-and-deliver し切る。
+    /// 評価器 buffer（host-call triple・Yielded/Resumed・slice 境界で flush した BudgetCharged を
+    /// temporal 順に並べた 1 本の列）→ accumulator に残る BudgetCharged の順で deliver する
+    /// （§8 規則3/7/8/9）。backpressure で評価器へ追加された Yielded/Resumed も buffer が空になるまで
+    /// drain-and-deliver し切る。
     ///
-    /// 各 poll ステップ境界で呼ぶ。backpressure が起きない実行では、評価器 buffer を terminal まで
-    /// 溜め、従来の post-run drain と同じ順序・同じ envelope 列になる（§4.2、byte-for-byte 不変）。
+    /// 各 poll ステップ境界で呼ぶ。yield が起きない実行では、評価器 buffer を terminal まで溜め、
+    /// 従来の post-run drain と同じ順序・同じ envelope 列になる（§4.2、byte-for-byte 不変）。
+    /// host-call と yield/resume を別 buffer から固定順で drain していた B-2 以前は、resume 後の
+    /// slice の host call が対の `Resumed` より前に配送され §8 規則8 に反していた（B-2 で修正）。
+    ///
+    /// 各 event は sink の ack を得た時点で audit drain queue から外す（§10.2、B-2: in-flight の
+    /// batch は ack まで queue に残る）。
     fn flush_events(
         &mut self,
         context: &mut ExecutionContext,
@@ -3028,53 +3076,44 @@ impl AuditDelivery {
         use crate::audit::{AuditEnvelope, AuditEvent, AuditFailure};
 
         loop {
-            // host-call triple（§8 規則3）。triple 単位で §11 容量 reserve を確認する。
-            let host_call_events = context.evaluator.drain_host_call_events();
-            // Yielded/Resumed（§8 規則7/8/9、temporal 順）。
-            let yield_events = context.evaluator.drain_yield_events();
-            // BudgetCharged（§7.3 / §8 規則7、per-slice flush）。
+            // host-call triple・Yielded/Resumed・slice 境界の BudgetCharged（temporal 順）。
+            let events = context.evaluator.drain_audit_events();
+            // accumulator に残る BudgetCharged（§7.3 / §8 規則7、per-slice flush）。accumulator から
+            // 直接 drain した分はここで audit drain queue へ計上し直す（B-2: 確定済み分は accumulator
+            // 側の合計で数えていたが、drain でそこから外れるため。ack 時に他の event と同様に外す）。
             let charges = context.evaluator.drain_budget_charges();
+            for charge in &charges {
+                context.evaluator.audit_queue_admit(charge);
+            }
 
             // backpressure deliver が評価器へ新しい Yielded/Resumed を積んだ場合に備え、全 buffer が
             // 空になるまで繰り返す。この pass で何も drain できなければ終了。
-            if host_call_events.is_empty() && yield_events.is_empty() && charges.is_empty() {
+            if events.is_empty() && charges.is_empty() {
                 break;
             }
 
-            let mut index = 0usize;
-            while index < host_call_events.len() {
-                if matches!(host_call_events[index], AuditEvent::HostCallStarted { .. })
+            for event in events.into_iter().chain(charges) {
+                // host-call triple 単位で §11 容量 reserve を確認する（§8 規則3）。
+                if matches!(event, AuditEvent::HostCallStarted { .. })
                     && !journal.can_reserve_host_call()
                 {
                     return Err(AuditFailure::BudgetExceeded);
                 }
-                let event = host_call_events[index].clone();
                 let seq = journal.next_sequence();
                 let appended_seq = journal.append_normal(&self.envelope(seq, event.clone()))?;
                 let batch: Arc<[AuditEnvelope]> =
-                    Arc::from(vec![self.envelope(appended_seq, event)]);
+                    Arc::from(vec![self.envelope(appended_seq, event.clone())]);
                 self.deliver(context, &batch, appended_seq)?;
-                index += 1;
-            }
-
-            for yield_event in yield_events {
-                let seq = journal.next_sequence();
-                let appended_seq =
-                    journal.append_normal(&self.envelope(seq, yield_event.clone()))?;
-                let batch: Arc<[AuditEnvelope]> =
-                    Arc::from(vec![self.envelope(appended_seq, yield_event)]);
-                self.deliver(context, &batch, appended_seq)?;
-            }
-
-            for charge_event in charges {
-                let seq = journal.next_sequence();
-                let appended_seq =
-                    journal.append_normal(&self.envelope(seq, charge_event.clone()))?;
-                let batch: Arc<[AuditEnvelope]> =
-                    Arc::from(vec![self.envelope(appended_seq, charge_event)]);
-                self.deliver(context, &batch, appended_seq)?;
+                // sink の ack を得たので audit drain queue から外す（B-2: in-flight は ack まで残る）。
+                context.evaluator.audit_queue_release(&event);
             }
         }
+        // 全 buffer を deliver し終えたので audit drain queue は 0 に戻っている（B-2、§10.2）。
+        debug_assert!(
+            matches!(context.evaluator.audit_queue_bytes(), None | Some(0)),
+            "flush 後の audit drain queue が 0 でない: {:?}",
+            context.evaluator.audit_queue_bytes()
+        );
         Ok(())
     }
 }
