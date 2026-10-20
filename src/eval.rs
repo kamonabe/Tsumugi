@@ -505,8 +505,12 @@ struct RunSession {
 }
 
 impl Evaluator {
+    /// §3.1 既定の上限（fuel / collection 各 1,000,000）で評価器を作る。
+    ///
+    /// process env は読まない（execution-control §14 Slice 1。legacy `TSUMUGI_MAX_*` の上書きは
+    /// CLI adapter だけが行う）。上限を変える host は [`Self::with_budget`] を使う。
     pub fn new() -> Self {
-        Self::with_budget(BudgetConfig::from_legacy_env())
+        Self::with_budget(BudgetConfig::for_legacy(1_000_000, 1_000_000))
     }
 
     /// 明示 `BudgetConfig` で評価器を作る（埋め込み host 向け）。

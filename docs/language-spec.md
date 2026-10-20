@@ -2,7 +2,7 @@
 
 バージョン: 0.21
 
-最終更新: 2026-10-16
+最終更新: 2026-10-20
 
 この番号は言語仕様のrevisionであり、Cargo package / REPLの実装バージョン `0.1.0` とは独立して管理する。
 
@@ -933,7 +933,9 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 
 ### ステップ予算
 
-環境変数 `TSUMUGI_MAX_STEPS` でループ反復 + 関数呼び出しの合計回数に上限を設定する。超過するとランタイムエラー。
+CLI では環境変数 `TSUMUGI_MAX_STEPS` でループ反復 + 関数呼び出しの合計回数に上限を設定する。超過するとランタイムエラー。デフォルト実行系と `--vm` の両方、ファイル・標準入力・REPL のすべての経路に同じく効く。
+
+この環境変数を含む `TSUMUGI_MAX_*` による上限の上書きは非推奨の互換入口であり、設定すると起動時に標準エラーへ警告が1回出る（[実行予算・協調実行仕様](execution-control.md)第13節）。数値として解釈できない値は無視され、既定値が使われる。組み込みAPIはこれらの環境変数を読まず、ホストが明示した予算を使う。
 
 - デフォルト: 1,000,000（百万ステップ）
 - REPLでは入力単位で予算をリセットする。1つの入力から呼ばれた関数・callback・importは同じ予算を共有する
@@ -941,7 +943,7 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 
 ### コレクションサイズ上限
 
-環境変数 `TSUMUGI_MAX_COLLECTION_SIZE` で、List/Dictの要素数とListを生成する操作の上限を設定する。超過すると `collection_limit` ランタイムエラーになる。
+CLI では環境変数 `TSUMUGI_MAX_COLLECTION_SIZE` で、List/Dictの要素数とListを生成する操作の上限を設定する（ステップ予算と同じく非推奨の互換入口）。超過すると `collection_limit` ランタイムエラーになる。
 
 - デフォルト: 1,000,000要素
 - 対象: List/Dictリテラル、`push`、辞書への新規キー追加、`range`、`split`、`read_lines`、`keys`/`values`、`map`/`filter`、`list_dir`、反復用List変換など

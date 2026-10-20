@@ -161,7 +161,19 @@ pub struct Vm {
 }
 
 impl Vm {
+    /// §3.1 既定の上限（fuel / collection 各 1,000,000）で VM を作る。
+    ///
+    /// process env は読まない（execution-control §14 Slice 1）。上限を変えるときは
+    /// [`Self::with_budget`] を使う。
     pub fn new(chunk: VerifiedChunk) -> Self {
+        Self::with_budget(chunk, BudgetConfig::for_legacy(1_000_000, 1_000_000))
+    }
+
+    /// 明示 `BudgetConfig` で VM を作る（[`crate::eval::Evaluator::with_budget`] と対称）。
+    ///
+    /// deadline clock は注入しないため、`config.deadline` はまだ確認しない（VM の deadline
+    /// checkpoint は Slice 6）。
+    pub fn with_budget(chunk: VerifiedChunk, config: BudgetConfig) -> Self {
         let frame = CallFrame {
             chunk: Rc::new(chunk.into_inner()),
             ip: 0,
@@ -174,7 +186,7 @@ impl Vm {
             stack: Vec::with_capacity(256),
             repl_stack_checkpoint: None,
             globals: HashMap::new(),
-            budget: BudgetLedger::with_config(BudgetConfig::from_legacy_env()),
+            budget: BudgetLedger::with_config(config),
             try_handlers: Vec::new(),
             pending_heap_stop: None,
             chunk_tokens: Vec::new(),
@@ -190,14 +202,22 @@ impl Vm {
         }
     }
 
-    /// REPL 用: 空のスタックで VM を生成（最初の run_repl_chunk で使用）
+    /// REPL 用: 空のスタックで VM を生成（最初の run_repl_chunk で使用）。上限は §3.1 既定。
     pub fn new_repl() -> Self {
+        Self::new_repl_with_budget(BudgetConfig::for_legacy(1_000_000, 1_000_000))
+    }
+
+    /// REPL 用: 明示 `BudgetConfig` で空のスタックの VM を生成する。
+    ///
+    /// fuel（step）は submission ごとに戻し、他の cumulative counter は session 全体で累積する
+    /// （従来の VM REPL と同じ）。
+    pub fn new_repl_with_budget(config: BudgetConfig) -> Self {
         Vm {
             frames: Vec::new(),
             stack: Vec::with_capacity(256),
             repl_stack_checkpoint: None,
             globals: HashMap::new(),
-            budget: BudgetLedger::with_config(BudgetConfig::from_legacy_env()),
+            budget: BudgetLedger::with_config(config),
             try_handlers: Vec::new(),
             pending_heap_stop: None,
             chunk_tokens: Vec::new(),
@@ -243,8 +263,7 @@ impl Vm {
 
     /// step（fuel）上限を明示的に設定する。
     ///
-    /// 既定は legacy 環境変数（`TSUMUGI_MAX_STEPS`）由来。process-global な env に
-    /// 依存せず停止性を検証したいテストや、ホストが実行単位で予算を与える場合に使う。
+    /// 既定は 1,000,000。停止性を検証したいテストや、ホストが実行単位で予算を与える場合に使う。
     pub fn set_max_steps(&mut self, max_steps: u64) {
         self.budget.set_total_fuel(max_steps);
     }

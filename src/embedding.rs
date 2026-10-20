@@ -1809,7 +1809,7 @@ impl ExecutionContext {
     ///
     /// budget は [`ExecutionRequest`] が必須所有し、[`Engine::run`] が実行直前に評価器へ据え直す
     /// （REV-015 最終形移行 Slice 1）。context 生成時点では budget を確定できないため、評価器は
-    /// bootstrap 用の既定（legacy env 由来）で作る。実際の実行で効く budget は常に request の
+    /// bootstrap 用の既定（§3.1 の上限。process env は読まない）で作る。実際の実行で効く budget は常に request の
     /// ものになる。cancellation token も [`ExecutionRequest`] が必須所有し、[`Engine::run`] が
     /// 実行直前に評価器へ install する（REV-015 最終形移行 Slice 2）。context 生成時点の評価器
     /// token は次 run が install するまでの bootstrap 値で、実際の実行で効く token は常に request

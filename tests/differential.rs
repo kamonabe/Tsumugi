@@ -63,17 +63,16 @@
 //! configured per-resource 上限の注入経路は engine 間で非対称:
 //! - tree は in-process で `Evaluator::with_budget(BudgetConfig)` で任意の per-resource 上限を
 //!   注入できる。
-//! - **VM は in-process で per-resource 上限を注入する public API が無い**（`Vm::new`/`new_repl`
-//!   が `BudgetConfig::from_legacy_env()` を内部固定呼び出し、公開 setter は `set_max_steps`
-//!   のみ）。
+//! - VM も `Vm::with_budget(chunk, BudgetConfig)` で in-process 注入できるが、本 harness は
+//!   既存の subprocess 層の行をそのまま維持している。
 //!
 //! よって:
 //! - 既定上限 + fuel だけで足りる行は **in-process 層**で usage 数値まで突合する（`Limits::Default`
-//!   / `Limits::Fuel`）。両 engine とも `from_legacy_env` 既定（fuel は `for_legacy`/`set_max_steps`
-//!   で対称に注入）で回せる。
+//!   / `Limits::Fuel`）。両 engine とも §3.1 既定（`for_legacy(1_000_000, 1_000_000)`。fuel は
+//!   `for_legacy`/`set_max_steps` で対称に注入）で回せる。
 //! - configured per-resource 上限（collection/string/source/I-O/heap など）を使う行は
-//!   **subprocess 層**で `TSUMUGI_MAX_*` env を注入する（env は `from_legacy_env` 経由で tree/VM
-//!   両方へ対称に効く唯一の経路）。`Limits::Env`。
+//!   **subprocess 層**で `TSUMUGI_MAX_*` env を注入する（env は CLI adapter（execution-control §13）
+//!   が tree/VM 両方へ対称に適用する）。`Limits::Env`。
 
 use std::process::Command;
 
@@ -107,7 +106,7 @@ fn print_capabilities() -> CapabilitySet {
 /// fixture に適用する実行予算上限と、それに対応する実行層。
 #[derive(Debug, Clone, Copy)]
 enum Limits {
-    /// 既定上限（`from_legacy_env`）。両 engine を in-process で回して usage を数値突合する。
+    /// §3.1 既定上限。両 engine を in-process で回して usage を数値突合する。
     Default,
     /// fuel 上限のみ注入。in-process で回す。tree は `with_budget(for_legacy(fuel, 1_000_000))`、
     /// VM は `new`/`new_repl` + `set_max_steps(fuel)`。collection 上限は既定（1_000_000）で両者一致。
@@ -153,7 +152,7 @@ fn run_tree_single(source: &str, limits: Limits) -> (BudgetUsage, Result<(), Tsu
     let program = Parser::new(tokens).parse().expect("パースに失敗");
     let mut evaluator = match limits {
         Limits::Default => Evaluator::new(),
-        // VM の `from_legacy_env` 既定 collection 上限（1_000_000）に合わせる。
+        // VM の既定 collection 上限（1_000_000）に合わせる。
         Limits::Fuel(fuel) => Evaluator::with_budget(BudgetConfig::for_legacy(fuel, 1_000_000)),
     };
     evaluator.set_capabilities(print_capabilities());
@@ -872,12 +871,10 @@ fn repl_continuation_nested_closure_charge_agrees() {
 // link/charge したとき、`source_count` / `import_count` / `source_bytes` / `import_bytes` が
 // 完全一致する」ことを固定し、CAP-AT-17 の会計面で tree/VM 差を新たに生まないことを担保する。
 //
-// 上限注入経路の非対称性（上の「上限注入経路の非対称性」節）により、per-resource の count 上限を
-// VM に in-process 注入する public API は無い（`Vm::new` は `from_legacy_env` 既定固定）。よって
-// **本数の上限 trip（N+1 の BudgetExceeded）そのもの**は engine ごとに担保する:
+// **本数の上限 trip（N+1 の BudgetExceeded）そのもの**は別テストで担保する:
 // - tree arm: `tests/integration.rs::cap_at_17_source_count_boundary_tree` /
 //   `cap_at_17_import_count_boundary_tree`（standard budget を in-process で N まで絞る）。
-// - VM arm: `tests/integration.rs::import_count_limit_gates_file_execution_vm`（legacy env budget）。
+// - CLI（tree/VM 両 arm）: `tests/integration.rs::import_count_limit_gates_file_execution`（legacy env budget）。
 // ここ（differential）が担保するのは、その両者が前提にする **会計の一致**（同じ graph なら同じ
 // count/bytes を積む）であり、trip 値そのものではない。これは §5.3 の「backend 間で揃えるのは
 // 課金の有無」という線引きと整合する。

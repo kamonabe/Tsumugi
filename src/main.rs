@@ -98,25 +98,102 @@ fn run() {
     // secure handle 不能・root 選択曖昧など）は usage error 相当で exit 1。
     let frozen = build_capabilities(&invocation);
 
+    // legacy budget 環境変数（execution-control §13）は起動時に 1 回だけ読み、全経路で共有する。
+    let budget_env = LegacyBudgetEnv::read();
+    budget_env.warn_if_used();
+
     match invocation.source {
         Source::Repl => match invocation.backend {
-            Backend::Tree => run_repl(frozen),
-            Backend::Vm => run_repl_vm(frozen),
+            Backend::Tree => run_repl(frozen, &budget_env),
+            Backend::Vm => run_repl_vm(frozen, &budget_env),
         },
         Source::Stdin => {
             let source = read_stdin_source();
             match invocation.backend {
-                Backend::Tree => run_source(&source, "<stdin>", invocation.script_args, frozen),
-                Backend::Vm => run_source_vm(&source, "<stdin>", invocation.script_args, frozen),
+                Backend::Tree => run_source(
+                    &source,
+                    "<stdin>",
+                    invocation.script_args,
+                    frozen,
+                    &budget_env,
+                ),
+                Backend::Vm => run_source_vm(
+                    &source,
+                    "<stdin>",
+                    invocation.script_args,
+                    frozen,
+                    &budget_env,
+                ),
             }
         }
         Source::File(ref path) => {
             let source = read_source_file(path);
             match invocation.backend {
-                Backend::Tree => run_source(&source, path, invocation.script_args, frozen),
-                Backend::Vm => run_source_vm(&source, path, invocation.script_args, frozen),
+                Backend::Tree => {
+                    run_source(&source, path, invocation.script_args, frozen, &budget_env)
+                }
+                Backend::Vm => {
+                    run_source_vm(&source, path, invocation.script_args, frozen, &budget_env)
+                }
             }
         }
+    }
+}
+
+/// legacy budget 環境変数（`TSUMUGI_MAX_*`）の CLI adapter（execution-control §13）。
+///
+/// 起動時に 1 回だけ process env を読んだ snapshot を持ち、各経路の [`BudgetConfig`] へ同じ
+/// 上書きを適用する。library（`Evaluator` / `Vm` / embedding）は env を読まず、この adapter だけが
+/// 旧環境変数の入口になる（§14 Slice 1）。`OnceLock` は使わず、execution ごとの config へ copy する。
+struct LegacyBudgetEnv {
+    values: Vec<(&'static str, String)>,
+}
+
+impl LegacyBudgetEnv {
+    /// [`BudgetConfig::LEGACY_OVERRIDE_KEYS`] の各 key を process env から読む。
+    fn read() -> Self {
+        let values = BudgetConfig::LEGACY_OVERRIDE_KEYS
+            .iter()
+            .filter_map(|&key| std_env::var(key).ok().map(|value| (key, value)))
+            .collect();
+        Self { values }
+    }
+
+    /// snapshot の上書きを `config` へ適用し、適用した key を返す。
+    fn apply(&self, config: &mut BudgetConfig) -> Vec<&'static str> {
+        config.apply_legacy_overrides(|key| {
+            self.values
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, value)| value.clone())
+        })
+    }
+
+    /// 上書きが 1 つでも効くなら deprecation warning を stderr へ 1 回出す（§13）。
+    fn warn_if_used(&self) {
+        let applied = self.apply(&mut BudgetConfig::for_legacy(0, 0));
+        if !applied.is_empty() {
+            eprintln!(
+                "警告: 環境変数 {} による実行予算の上書きは非推奨であり、将来のバージョンで削除されます",
+                applied.join(", ")
+            );
+        }
+    }
+
+    /// CLI の既定 budget（[`BudgetConfig::standard`]：30s deadline + 標準上限）に上書きを適用する。
+    /// deadline は `clock` と同 domain のまま（上書きは deadline を変えない）。
+    fn budget(&self, clock: &dyn tsumugi::MonotonicClock) -> BudgetConfig {
+        let mut budget = BudgetConfig::standard(clock)
+            .expect("standard budget の生成は overflow しない限り成功する");
+        self.apply(&mut budget);
+        budget
+    }
+
+    /// clock を持たない VM 経路向け。§3.1 既定の上限に上書きを適用する。
+    fn vm_budget(&self) -> BudgetConfig {
+        let mut budget = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+        self.apply(&mut budget);
+        budget
     }
 }
 
@@ -175,7 +252,13 @@ fn read_stdin_source() -> String {
 /// 解決する。resolver 未 grant + import あり は terminal `Denied`（exit 1、actionable 診断）。
 /// tree REPL も E7 で embedding Engine API へ統合済み（[`run_repl`] 参照。ただし REPL は import
 /// 解決を評価器内蔵 loader へ委ねる `link_for_repl` 経路を使う）。
-fn run_source(source: &str, script_path: &str, script_args: Vec<String>, frozen: CapabilitySet) {
+fn run_source(
+    source: &str,
+    script_path: &str,
+    script_args: Vec<String>,
+    frozen: CapabilitySet,
+    budget_env: &LegacyBudgetEnv,
+) {
     let engine = EmbeddingEngine::builder()
         .build()
         .expect("既定 backend の Engine build は失敗しない");
@@ -197,10 +280,9 @@ fn run_source(source: &str, script_path: &str, script_args: Vec<String>, frozen:
     // REV-015 最終形移行 Slice 1（option B）: CLI 経路の既定を有限 budget にする。
     // 単一の SystemMonotonicClock を 1 個だけ作り、BudgetConfig::standard の deadline 生成と
     // link/run request への clock 注入で同一 instance を共有する（clock_id を一致させ
-    // ForeignClock を避ける）。
+    // ForeignClock を避ける）。legacy `TSUMUGI_MAX_*` の上書きは §13 の CLI adapter が適用する。
     let clock: Arc<dyn tsumugi::MonotonicClock> = Arc::new(SystemMonotonicClock::new());
-    let budget = BudgetConfig::standard(clock.as_ref())
-        .expect("standard budget の生成は overflow しない限り成功する");
+    let budget = budget_env.budget(clock.as_ref());
     // 実行 1 回ぶんの cancellation token を 1 個生成し、link と run の両 request へ同じ clone を
     // 渡す（設計 §4.6。link 開始前 cancel が実 token で機能する）。CLI は別スレッド cancel を
     // 使わないが、link/run で同一計数系を共有する契約に揃える。
@@ -223,7 +305,7 @@ fn run_source(source: &str, script_path: &str, script_args: Vec<String>, frozen:
     context.set_script_path(script_path);
     // C9/C10: CLI が profile（safe/legacy）から組んだ frozen capability set を注入する。
     let request = EmbeddingRequest::new(budget, Arc::clone(&clock))
-        .expect("standard budget は自身を生成した clock と同 domain なので検証を通る")
+        .expect("CLI budget は自身を生成した clock と同 domain なので検証を通る")
         .with_arguments(script_args)
         .with_capabilities(frozen)
         .cancellation(cancellation);
@@ -375,7 +457,7 @@ fn print_link_error(error: &LinkError) {
 /// REPL が統合前から持つ observable 挙動（`--allow-import-root` 無しの CWD 相対 import・固定エラー
 /// 文字列）を保全するためで、新規の capability 緩和ではない。詳細は
 /// [`EmbeddingEngine::link_for_repl`] の doc を正本とする。
-fn run_repl(frozen: CapabilitySet) {
+fn run_repl(frozen: CapabilitySet, budget_env: &LegacyBudgetEnv) {
     write_stdout(&format!(
         "Tsumugi v{} — 終了するには Ctrl+D\n",
         env!("CARGO_PKG_VERSION")
@@ -415,7 +497,7 @@ fn run_repl(frozen: CapabilitySet) {
         // ごとに fuel(step) だけ reset して cumulative counter（source/output/host/string/heap 等）
         // は累積を温存する（`run_for_repl` が実施、統合前 tree REPL の観測挙動を保全）。未捕捉
         // エラーは入力が変更した language-state を巻き戻す（AUD-024、embedding の transaction）。
-        execute_repl_submission(&engine, &input, &mut context, &frozen);
+        execute_repl_submission(&engine, &input, &mut context, &frozen, budget_env);
 
         input.clear();
     }
@@ -436,6 +518,7 @@ fn execute_repl_submission(
     source: &str,
     context: &mut EmbeddingContext,
     frozen: &CapabilitySet,
+    budget_env: &LegacyBudgetEnv,
 ) {
     // REPL 用の固定表示名で compile する。run は保持 source を再 parse するため retain_source 必須。
     let source_id = SourceId::new("<repl>")
@@ -455,7 +538,7 @@ fn execute_repl_submission(
     // 初回 submission で `run_for_repl` が install し、2 回目以降は fuel だけ reset して cumulative
     // を温存するため（session 累積）、ここで渡す budget は初回のみ実効となる。
     let clock: Arc<dyn tsumugi::MonotonicClock> = Arc::new(SystemMonotonicClock::new());
-    let budget = repl_budget(clock.as_ref());
+    let budget = budget_env.budget(clock.as_ref());
     let cancellation = CancellationToken::new();
     let operation_id = ExecutionId::new(std::num::NonZeroU128::new(1).expect("1 は非ゼロ"));
 
@@ -474,7 +557,7 @@ fn execute_repl_submission(
 
     // C9/C10: frozen set を各 submission の request へ載せて持ち越す（REPL は clear を呼ばない）。
     let request = EmbeddingRequest::new(budget, Arc::clone(&clock))
-        .expect("standard budget は自身を生成した clock と同 domain なので検証を通る")
+        .expect("CLI budget は自身を生成した clock と同 domain なので検証を通る")
         .with_capabilities(frozen.clone())
         .cancellation(cancellation);
 
@@ -504,24 +587,6 @@ fn execute_repl_submission(
             std::process::exit(70);
         }
     }
-}
-
-/// REPL submission 用の budget を作る。
-///
-/// 統合前の tree REPL は評価器既定（`BudgetConfig::from_legacy_env`）の budget を使い、legacy 環境
-/// 変数（`TSUMUGI_MAX_STEPS` / `TSUMUGI_MAX_COLLECTION_SIZE` ほか）を上限として尊重していた。この
-/// observable 挙動を保つため、REPL は `::standard` ではなく legacy env 由来の上限を使う。ただし
-/// embedding の [`EmbeddingRequest::new`] は budget の deadline と注入 clock の domain 一致を要求する
-/// ため、`from_legacy_env` の合成 deadline を、実行に使う `clock` と同 domain の `now + 30s` へ差し替える
-/// （`::standard` と同じ deadline 方針）。legacy env が設定する fuel / collection / string / source /
-/// I-O の上限はそのまま引き継ぐ。
-fn repl_budget(clock: &dyn tsumugi::MonotonicClock) -> BudgetConfig {
-    let standard = BudgetConfig::standard(clock)
-        .expect("standard budget の生成は overflow しない限り成功する");
-    let mut budget = BudgetConfig::from_legacy_env();
-    // deadline だけ実 clock domain のものへ差し替える（他の上限は legacy env 由来を維持）。
-    budget.deadline = standard.deadline;
-    budget
 }
 
 /// REPL の runtime error を統合前と同じ `"  エラー: {line}行目: {message}"`（+ trace）で stderr へ出す。
@@ -609,8 +674,14 @@ fn finish_repl_at_eof(buffer: &str) -> ! {
 // =============================================
 
 /// VMモードで source を実行する（ファイル / stdin 共通）。
-fn run_source_vm(source: &str, script_path: &str, script_args: Vec<String>, frozen: CapabilitySet) {
-    match execute_vm_with_path(source, script_path, script_args, frozen) {
+fn run_source_vm(
+    source: &str,
+    script_path: &str,
+    script_args: Vec<String>,
+    frozen: CapabilitySet,
+    budget_env: &LegacyBudgetEnv,
+) {
+    match execute_vm_with_path(source, script_path, script_args, frozen, budget_env) {
         Ok(0) => {}
         // C7（REV-023）: VM の exit() は structured terminal。CLI 境界で実際の exit code へ写す。
         Ok(code) => std::process::exit(code),
@@ -631,14 +702,14 @@ fn run_source_vm(source: &str, script_path: &str, script_args: Vec<String>, froz
 /// 意図的に適用しない。VM REPL はこの tree REPL と**対称**に、import 解決を評価器内蔵
 /// [`ModuleLoader`] に委ねる従来実装（`Compiler` + `Vm::new_repl()` + `ModuleLoader` を 1 つの
 /// transaction として管理）のまま残す。VM backend adapter 本体（run 経路の Engine 統合）は E9 残。
-fn run_repl_vm(frozen: CapabilitySet) {
+fn run_repl_vm(frozen: CapabilitySet, budget_env: &LegacyBudgetEnv) {
     write_stdout(&format!(
         "Tsumugi v{} [VM mode] — 終了するには Ctrl+D\n",
         env!("CARGO_PKG_VERSION")
     ));
     let mut input = String::new();
     let mut compiler = Compiler::new();
-    let mut vm = Vm::new_repl();
+    let mut vm = Vm::new_repl_with_budget(budget_env.vm_budget());
     // C9/C10: session 開始時に frozen set を 1 回注入する（§1(f)）。
     vm.set_capabilities(frozen);
     let mut loader = ModuleLoader::new();
@@ -757,6 +828,7 @@ fn execute_vm_with_path(
     path: &str,
     script_args: Vec<String>,
     frozen: CapabilitySet,
+    budget_env: &LegacyBudgetEnv,
 ) -> Result<i32, Vec<TsumugiError>> {
     // --- link 層 capability gate（tree file/stdin と対称）---
     // VM backend adapter は作らず、gate 専用に TreeWalk engine を build して compile→link を
@@ -778,8 +850,7 @@ fn execute_vm_with_path(
     };
     // tree `run_source` と同一構成の clock/budget/cancellation/operation_id で LinkRequest を組む。
     let clock: Arc<dyn tsumugi::MonotonicClock> = Arc::new(SystemMonotonicClock::new());
-    let budget = BudgetConfig::standard(clock.as_ref())
-        .expect("standard budget の生成は overflow しない限り成功する");
+    let budget = budget_env.budget(clock.as_ref());
     let cancellation = CancellationToken::new();
     let operation_id = ExecutionId::new(std::num::NonZeroU128::new(1).expect("1 は非ゼロ"));
     let link_request = LinkRequest::new(operation_id, frozen.clone(), budget)
@@ -805,7 +876,7 @@ fn execute_vm_with_path(
 
     let compiler = Compiler::new();
     let chunk = compiler.compile(linked_program).map_err(|e| vec![e])?;
-    let mut vm = Vm::new(chunk);
+    let mut vm = Vm::with_budget(chunk, budget_env.vm_budget());
     // C9/C10: VM 経路へ frozen set を注入する（Vm::set_capabilities）。
     vm.set_capabilities(frozen);
     vm.set_script_args(script_args);
