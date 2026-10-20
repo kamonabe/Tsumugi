@@ -81,6 +81,37 @@ fn run_safe(use_vm: bool, extra: &[&str], source: &str) -> Run {
     }
 }
 
+/// `run_safe` と同じ起動だが、プロセスの実 exit code（`None` はシグナル終了）も返す。
+/// EMB-AT-11a の Exited→実 process exit code 伝播の観測に使う。
+fn run_safe_code(use_vm: bool, extra: &[&str], source: &str) -> (Option<i32>, String, String) {
+    let dir = TestDir::new("script-code");
+    let script = dir.path.join("s.tsg");
+    let mut f = std::fs::File::create(&script).expect("write script");
+    f.write_all(source.as_bytes()).expect("write");
+    drop(f);
+
+    let mut cmd = Command::new(tsumugi_bin());
+    if use_vm {
+        cmd.arg("--vm");
+    }
+    for a in extra {
+        cmd.arg(a);
+    }
+    cmd.arg(&script);
+    let output = cmd.output().expect("spawn tsumugi");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout)
+            .replace("\r\n", "\n")
+            .trim_end()
+            .to_string(),
+        String::from_utf8_lossy(&output.stderr)
+            .replace("\r\n", "\n")
+            .trim_end()
+            .to_string(),
+    )
+}
+
 #[test]
 fn safe_default_grants_only_stdout() {
     for use_vm in [false, true] {
@@ -430,4 +461,88 @@ fn import_free_vm_runs_without_import_root() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(stdout.contains("7"), "出力: {stdout}");
+}
+
+// =============================================================================
+// EMB-AT-10 / EMB-AT-11: profile（safe）経由の capability-deny catch 可能性・exit 写像
+//
+// 既存の embedding.rs 単体テスト（c7_*/c3_*）は「生 CapabilitySet + TreeWalk」経由で
+// outcome 種別レベルを固定する。下記は E8b 観点として、CLI safe profile が組む frozen
+// set 経由で tree/VM 両 engine の subprocess 挙動を固定する:
+//   - 追補1: 未 grant の capability-deny が script の try/catch で catch 可能であること
+//            （EMB-AT-10a / EMB-AT-11c）、catch 後に後続処理が走ること（EMB-AT-11d）。
+//   - 追補2: `--allow-exit` 経由で exit(N) が実 process exit code N に伝播すること
+//            （EMB-AT-11a）、範囲外 exit が RuntimeError 写像（exit 1）になり process が
+//            panic せず終了すること（EMB-AT-11b）。
+// 既存の tree 生 set unit test は outcome 種別の正本として残す（本テストは補完）。
+// =============================================================================
+
+/// EMB-AT-10a / EMB-AT-11c / EMB-AT-11d: safe profile 経由で未 grant の capability-deny が
+/// script の try/catch で catch 可能で、catch 後も後続処理（library process）が継続する。
+///
+/// safe 既定では exit / env / clock が未 grant。それぞれ try/catch で囲むと catch 可能な
+/// `capability` error になり、catch 節で `e["type"]` を出力してから `print("alive")` が走る。
+/// 正常終了（status_ok）と stdout（`capability` と `alive`）の両方を tree/VM で固定する。
+#[test]
+fn safe_capability_deny_is_catchable_via_profile() {
+    for use_vm in [false, true] {
+        // 未 grant 操作（exit / env / now）を try/catch で囲む。catch 節は error type を
+        // 出力し、その後に後続処理（library 継続）が走ることを "alive" で示す。
+        for deny_op in ["exit(0)", "env(\"HOME\")", "now()"] {
+            let source =
+                format!("try\n  {deny_op}\ncatch e\n  print(e[\"type\"])\nend\nprint(\"alive\")\n");
+            let r = run_safe(use_vm, &[], &source);
+            assert!(
+                r.status_ok,
+                "safe 既定で capability-deny を catch すれば正常終了する [vm={use_vm}] op={deny_op}: {}",
+                r.stderr
+            );
+            // catch 節が capability error を捕捉し、後続の print が走る（library 継続）。
+            assert_eq!(
+                r.stdout, "capability\nalive",
+                "catch で capability error type を得て後続処理が継続する [vm={use_vm}] op={deny_op}"
+            );
+        }
+    }
+}
+
+/// EMB-AT-11a: `--allow-exit` 経由の exit(N) が実 process exit code N へ伝播する（Exited 写像）。
+///
+/// `exit_code_for_outcome`（main.rs）は `Exited { code } => code as i32`。CLI safe profile で
+/// `--allow-exit` を付けて exit(N) を呼ぶと、process の実 exit code が N になることを tree/VM で固定。
+/// 境界値 0 / 255 と中間値 42 を確認する。
+#[test]
+fn allow_exit_propagates_exit_code_via_profile() {
+    for use_vm in [false, true] {
+        for code in [0u8, 42, 255] {
+            let source = format!("exit({code})\n");
+            let (got, _stdout, stderr) = run_safe_code(use_vm, &["--allow-exit"], &source);
+            assert_eq!(
+                got,
+                Some(i32::from(code)),
+                "--allow-exit で exit({code}) は実 process exit code {code} へ伝播する [vm={use_vm}]: {stderr}"
+            );
+        }
+    }
+}
+
+/// EMB-AT-11b: `--allow-exit` 経由でも範囲外 exit は RuntimeError 写像（exit 1）になり、
+/// process は panic せず正常にプロセス終了する。
+///
+/// `resolve_exit`（builtin_core.rs）は `0..=255` の範囲外を catch 可能な `argument` error にし、
+/// 未捕捉なら RuntimeError outcome → `exit_code_for_outcome` で exit 1。`exit(256)` と
+/// `exit(0 - 1)`（= -1）の両方で exit code が Some(1)（＝正常終了・シグナルでない）であることを
+/// tree/VM で固定する。
+#[test]
+fn allow_exit_out_of_range_maps_to_runtime_error_via_profile() {
+    for use_vm in [false, true] {
+        for source in ["exit(256)\n", "exit(0 - 1)\n"] {
+            let (got, _stdout, _stderr) = run_safe_code(use_vm, &["--allow-exit"], source);
+            assert_eq!(
+                got,
+                Some(1),
+                "範囲外 exit は RuntimeError 写像（exit 1）で正常終了する [vm={use_vm}] src={source:?}"
+            );
+        }
+    }
 }
