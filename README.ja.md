@@ -19,16 +19,29 @@ Tsumugiは、プログラミング言語処理系への理解を深めるため�
 
 現在のTsumugiはRuby風の文法を持つ動的型付け言語である。Lexer・Parser・ASTを共有し、デフォルトのツリーウォーク評価器、またはバイトコードコンパイラ + スタックVM（`--vm`）で実行する。
 
-現在は**教育・実験用途のalpha版**であり、言語仕様・組み込みAPI・CLIの後方互換性は保証していない。crate root には、デフォルトのツリーウォークを利用する最小の埋め込み facade（`Engine`、`CompiledScript`、`ExecutionContext`、`ExecutionOutcome`）がある。これはCLIも利用する入口だが、stable Engine APIからのVM利用、host I/Oの注入、deny-by-default capability、包括的な実行予算、監査 event は未実装である。`--vm`は処理系比較のための実験的backendで、未捕捉エラー後のREPL状態にデフォルト実行系との既知の差が残る。現在利用できる観測仕様は[言語仕様](docs/language-spec.md)、現行アーキテクチャは[設計ドキュメント](docs/design.md)を正本とする。Phase 0〜7の次期実装契約は後述の7設計正本で確定済みだが、設計確定は実装完了を意味しない。実装差の一覧と進捗は[ロードマップ](docs/roadmap.md)を参照すること。
+現在は**教育・実験用途のalpha版**であり、言語仕様・組み込みAPI・CLIの後方互換性は保証していない。Phase 0〜7の次期実装契約は後述の7設計正本で確定済みだが、設計確定は実装完了を意味しない。実装状況の概略は次のとおりで、各項目の正確な状態は[ロードマップ](docs/roadmap.md)の「ステータス一覧」を唯一の正本とする。
 
-組み込みのステップ上限やfilesystem制限はdefense-in-depthであり、非信頼コードを隔離するsecurity sandboxではない。CLIは`tsumugi [--vm] [SCRIPT [ARGS...]]`の形でスクリプト引数を受け取り、`args()`から参照できる（`SCRIPT`が`-`なら標準入力からソースを読む。AUD-018 E8a）。`--help` / `--version`とcapability profile/options（`--profile` / `--allow-*` / `--fs-*`）は未対応で、Phase 2で追加する。Cargo package / REPLの`0.1.0`と[言語仕様](docs/language-spec.md)の`0.19`は、それぞれ実装版と仕様revisionを表す独立した番号として管理している。
+- **CLI:** capability profile（既定 `safe` / 互換 `legacy`）と `--allow-*` / `--fs-*` / `--allow-import-root` などのオプションを持つ。`safe` 既定では標準出力以外の外部効果（ファイル操作・環境変数・`now()`・`input()`・`exit()`・import）をすべて拒否し、必要なものだけをオプションで付与する。
+- **組み込みAPI:** 2系統が併存する。CLIの入口でもある最小の alpha facade（`Engine`、`CompiledScript`、`ExecutionContext`、`ExecutionOutcome`）と、Phase 1/2 の組み込みAPI（`compile`→`link`→`run`。統合（E10）までは crate root で `EmbeddingEngine` / `EmbeddingContext` などの別名で公開）である。後者は capability set・host function registry・実行予算・audit sink を構成でき、`VmExperimental` backend も明示 opt-in で選べる。
+- **capability（Phase 2）:** deny-by-default の `CapabilitySet`（filesystem root・環境変数 snapshot・clock・stdin/stdout・process exit・module resolver）と host function registry を実装済み。Phase 2 の受入基準は一部未完了。
+- **実行予算・協調実行（Phase 3/4）:** fuel・collection・文字列・source/import 本数などの包括 budget と deadline・cancel は tree/VM の両方で動く。yield/resume・協調スケジューラ・cooperative host call は部分実装。
+- **実行時監査（Phase 6）:** 組み込みAPIで audit sink を設定した場合だけ（opt-in）、schema v1 の audit event を出す。対応は tree backend のみで、VM backend との併用は構成時に拒否される。CLI は audit を出さない。
 
-## 組み込み API（tree-walk）
+`--vm`は処理系比較のための実験的backendで、未捕捉エラー後のREPL状態にデフォルト実行系との既知の差が残る。現在利用できる観測仕様は[言語仕様](docs/language-spec.md)、現行アーキテクチャは[設計ドキュメント](docs/design.md)を正本とする。
 
-`Engine::compile` はソースをパースして再利用可能な `CompiledScript` を返し、`Engine::execute` は `ExecutionContext` 上で実行する。構文エラーは `Vec<TsumugiError>`、実行時エラーは単一の `TsumugiError` として区別される。import は `ExecutionContext` の状態とスクリプトパスに依存するためcompile時には解決せず、`Engine::execute`開始時に最初のscript文を実行する前に全件を解決する。これは現行APIの説明であり、次期APIのcompile/link分離は[組み込みAPI仕様](docs/embedding-api.md)を正本とする。
+組み込みのステップ上限やcapabilityによる制限はdefense-in-depthであり、非信頼コードを隔離するsecurity sandboxではない。CLIは`tsumugi [オプション] [SCRIPT [ARGS...]]`の形でスクリプト引数を受け取り、`args()`から参照できる（`SCRIPT`が`-`なら標準入力からソースを読む。AUD-018 E8a）。オプションの一覧は `tsumugi --help` で確認できる。Cargo package / REPLの`0.1.0`と[言語仕様](docs/language-spec.md)の`0.21`は、それぞれ実装版と仕様revisionを表す独立した番号として管理している。
+
+## 組み込み API（alpha facade）
+
+`Engine::compile` はソースをパースして再利用可能な `CompiledScript` を返し、`Engine::execute` は `ExecutionContext` 上で実行する。構文エラーは `Vec<TsumugiError>`、実行時エラーは単一の `TsumugiError` として区別される。import は `ExecutionContext` の状態とスクリプトパスに依存するためcompile時には解決せず、`Engine::execute`開始時に最初のscript文を実行する前に全件を解決する。compile/link を分離した Phase 1/2 の組み込みAPI（`EmbeddingEngine` ほか）は[組み込みAPI仕様](docs/embedding-api.md)を正本とする。
+
+`ExecutionContext` の capability set は既定で空（deny-by-default）であり、`print` を含むすべての外部効果が拒否される。スクリプトに許す操作は `context.set_capabilities(...)` で明示的に付与する。
 
 ```rust
-use tsumugi::{Engine, ExecutionContext, ExecutionOutcome};
+use std::num::NonZeroU128;
+use std::sync::Arc;
+
+use tsumugi::{CapabilitySet, Engine, ExecutionContext, ExecutionOutcome, SystemOutput};
 
 fn main() {
     let engine = Engine::new();
@@ -36,6 +49,13 @@ fn main() {
         .compile("let greeting = \"hello\"\nprint(greeting)\n")
         .expect("valid script");
     let mut context = ExecutionContext::new();
+
+    // print（stdout）だけを許可する。
+    let capabilities = CapabilitySet::builder()
+        .stdout(Arc::new(SystemOutput::new(NonZeroU128::new(1).unwrap())))
+        .expect("stdout grant")
+        .build();
+    context.set_capabilities(capabilities);
 
     assert_eq!(
         engine.execute(&script, &mut context).expect("runtime success"),
@@ -46,7 +66,7 @@ fn main() {
 
 同じ context を再利用すると、変数・関数・解決済みimportが実行間で維持される。相対importを使うファイルは実行前に `context.set_script_path("/absolute/path/to/rules.tsg")` を呼ぶ。REPL相当の入力単位ごとにステップ予算を独立させる場合は `context.reset_step_budget()` を呼ぶ。
 
-このAPIは caller のスレッド上で同期的にツリーウォーク評価を行う。`ExecutionContext` は別スレッドへ移動できないため、埋め込み先は十分なスタックを持つ同一スレッド内で context を生成・利用する（CLIは8 MiBの実行スレッドを使う）。`input` / `print` / `args` / `exit` はまだprocess-globalな既存挙動のままであり、特に `exit()` はホストプロセスを終了し得る。敵対的コードの隔離やホストI/Oの安全な注入には使わない。
+このAPIは caller のスレッド上で同期的にツリーウォーク評価を行う。`ExecutionContext` は別スレッドへ移動できないため、埋め込み先は十分なスタックを持つ同一スレッド内で context を生成・利用する（CLIは8 MiBの実行スレッドを使う）。`exit()` はホストプロセスを終了させない。process exit capability を付与した場合も実行が終わるだけで、終了コードは `context.take_pending_exit()` で取り出す。capability はdefense-in-depthであり、敵対的コードの隔離には使わない。
 
 ## クイックスタート
 
@@ -60,12 +80,23 @@ cargo run -- examples/hello.tsg
 # バイトコードVM モードで実行
 cargo run -- --vm examples/hello.tsg
 
-# import のデモ（examples/math.tsg を読み込む）
-cargo run -- examples/import_demo.tsg
+# import のデモ（examples/math.tsg を読み込む。import には import root の付与が必要）
+cargo run -- --allow-import-root default=examples examples/import_demo.tsg
+
+# 環境変数・時刻などを個別に許可して実行（safe profile 既定では拒否される）
+cargo run -- --allow-env HOME --allow-clock script.tsg
+
+# ディレクトリを mount して読み取りだけを許可（スクリプトからは "@data/a.txt" の形で参照する）
+cargo run -- --fs-root data=./data --fs-op data=read,list script.tsg
+
+# オプション一覧
+cargo run -- --help
 
 # REPL（対話モード）
 cargo run
 ```
+
+`--profile legacy` は旧来の環境変数（`TSUMUGI_SANDBOX` / `TSUMUGI_ENV_ALLOW`）に基づく互換挙動で、未設定時は広い権限を与える旨の警告を出す。新規の利用には safe profile（既定）を使う。
 
 ## サンプルコード
 
@@ -138,16 +169,16 @@ print(square(5))    # 25
 - for ループ (`for item in collection ... end`)
 - break / continue
 - モジュール / import (`import "path.tsg"`)
-- 組み込み関数 53個（文字列操作、リスト操作、高階関数、ファイルI/O、パス操作、環境変数、日時など）
+- 組み込み関数 54個（文字列操作、リスト操作、高階関数、ファイルI/O、パス操作、環境変数、日時など。一覧は[生成リファレンス](docs/generated/builtins.md)）
 - REPL（複数行入力対応）
 - ファイル実行
 - 行番号付きエラーメッセージ（パースエラー・ランタイムエラー両方）
 - パースエラーの回復（複数のエラーを一度にまとめて報告）
 - スタックトレース（関数呼び出し経路の表示）
-- ステップ予算（無限ループ・無限再帰の強制停止、環境変数 `TSUMUGI_MAX_STEPS` で上限変更可能）
-- コレクションサイズ上限（List/Dictの生成・拡張を制限、環境変数 `TSUMUGI_MAX_COLLECTION_SIZE` で変更可能）
-- ファイルI/Oサンドボックス（環境変数 `TSUMUGI_SANDBOX` でアクセス許可パスを制限、import含む全ファイル操作が対象）
-- 環境変数アクセス制御（環境変数 `TSUMUGI_ENV_ALLOW` で読み取り可能なキーを許可リスト制限）
+- 実行予算（ステップ・コレクション要素数・文字列・source/import 本数・deadline など。無限ループ・無限再帰も強制停止する）。CLI は既定の上限（ステップ 1,000,000 など）を使う。旧環境変数 `TSUMUGI_MAX_STEPS` / `TSUMUGI_MAX_COLLECTION_SIZE` は現状 REPL と `--vm` のファイル実行にだけ反映され、ツリーウォークのファイル/標準入力実行には反映されない
+- capability による外部効果の制御（deny-by-default。CLI では `--allow-*` / `--fs-*` / `--allow-import-root` で付与し、組み込みAPIでは `CapabilitySet` で付与）
+- legacy profile の互換制御（`--profile legacy` 時のみ、環境変数 `TSUMUGI_SANDBOX` / `TSUMUGI_ENV_ALLOW` でファイル操作と環境変数の許可リストを指定）
+- 実行時監査（組み込みAPIで audit sink を設定した場合のみ。tree backend のみ対応）
 
 ## エラーメッセージ
 
@@ -247,9 +278,11 @@ Windows固有の挙動（`TSUMUGI_*` 環境変数のcase-insensitive保護など
 ```
 src/
 ├── main.rs       # CLIエントリポイント（REPL / ファイル実行 / --vm 切り替え）
+├── cli_capability.rs # CLIの capability profile（safe / legacy）とオプション解析
 ├── lib.rs        # library crateのルート（埋め込みAPIと各モジュールを公開）
 ├── engine.rs     # tree-walk向け埋め込み facade（compile / execute / context）
 ├── embedding.rs  # Phase 1 埋め込みAPI（Engine / compile / link / run、crate rootへEmbedding*で公開）
+├── bin/gen_builtins_doc.rs # docs/generated/builtins.md の生成ツール
 │
 │  --- フロントエンド（両実行系で共有） ---
 ├── token.rs      # トークン型定義（Spanned: Token + 行番号）
@@ -273,11 +306,18 @@ src/
 ├── vm.rs         # スタックマシン VM + コンテキスト依存の組み込み関数
 │
 │  --- 実行時ガードレール（両実行系で共有） ---
-├── builtin_core.rs     # 組み込み関数の共通実装（47個）
+├── builtin_core.rs     # 組み込み関数の共通実装
 ├── builtin_registry.rs # builtin名・arity・context/pure分類の単一正本（BuiltinSpec）
+├── capability.rs       # deny-by-default の CapabilitySet・filesystem root・module resolver（Phase 2）
+├── host_function.rs    # host function registry（Phase 2）
 ├── budget.rs           # 実行予算（BudgetLedger、reserve/commitによるstep等の一元管理）
+├── scheduler.rs        # Engine 全体の協調制御（admission・同時実行上限）
+├── host_pending.rs     # ブロックしない host call の ticket / waker プロトコル
+├── audit.rs            # 実行時監査（schema v1 の event・sink・監査予算、Phase 6）
+├── determinism.rs      # Float / NaN の決定的な共有 helper
+├── stable_error.rs     # backend 非依存の構造化 error（StableError）
 ├── limits.rs           # 構造的上限（MAX_AST_DEPTH / MAX_IMPORT_DEPTH / MAX_USER_CALL_DEPTH）
-└── sandbox.rs          # ファイルI/Oと環境変数のallow-list検査
+└── sandbox.rs          # import 展開用のパス検査（TSUMUGI_SANDBOX、ModuleLoader 経路専用）
 
 tests/
 ├── integration.rs                # 統合テスト（ゴールデンテスト + stdin駆動REPL）
@@ -286,6 +326,9 @@ tests/
 ├── builtin_registry_contract.rs  # 単一BuiltinSpec registry（AUD-049）の正本性
 ├── scaling.rs                    # 計算量オーダーと解放漏れの回帰ゲート
 ├── defensive_vm.rs               # 不正な Chunk を公開APIへ渡してもホストが落ちないこと
+├── cli_*.rs                      # CLI の safe / legacy profile と capability オプションの挙動
+├── scheduler_api.rs              # 協調スケジューラ・host call pending の公開API
+├── audit_*.rs                    # 実行時監査（event・host call・backpressure・queue byte 会計）
 └── fixtures/                     # テスト用 .tsg + 期待出力ファイル
 
 benches/
@@ -315,7 +358,7 @@ LANG_GUIDE.md         # AIコード支援向けの言語ガイド（形式文法
 └── ci.yml            # CI 設定（lint / test 3 OS / msrv / coverage）
 ```
 
-実行予算とcapabilityのガードレールは `limits.rs`（コンパイル時定数）と `sandbox.rs`（環境変数ベースのallow-list）に集約している。コールフレーム深度上限は `limits.rs` の `MAX_USER_CALL_DEPTH` に一本化し、ツリーウォーク版・VM版とも root script frame を数えない active user frame 数で判定する（AUD-050 / AUD-017）。
+外部効果の許可は `capability.rs`（実行単位の `CapabilitySet`）、実行予算は `budget.rs`、構造的上限は `limits.rs`（コンパイル時定数）が担う。コールフレーム深度上限は `limits.rs` の `MAX_USER_CALL_DEPTH` に一本化し、ツリーウォーク版・VM版とも root script frame を数えない active user frame 数で判定する（AUD-050 / AUD-017）。
 
 ## ドキュメント
 
