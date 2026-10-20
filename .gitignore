@@ -3,3 +3,4 @@
 /.agents
 # git worktree 作業ツリー（コミット対象外）
 /.worktrees
+reports/
