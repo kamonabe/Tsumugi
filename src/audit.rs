@@ -829,6 +829,12 @@ pub enum AuditFailure {
     /// journal は §8 の no-gap / no-duplicate / exactly-one-Terminal を自ら強制するため、
     /// debug/release を問わず（debug_assert ではなく）この失敗で fail-closed にする。
     InvariantViolation,
+    /// backpressure 中に sink が永久に `Pending` のまま execution deadline へ達した（§10.2）。
+    ///
+    /// `Yielded(AuditBackpressure)` で待機中に deadline/cancel checkpoint が立ち、ack が
+    /// 取れなかった場合の fail-closed 信号。§10.2 の規定どおり script の `Deadline` より優先し、
+    /// 「実行結果は成功だが監査が欠ける」状態を作らない。
+    BackpressureDeadline,
 }
 
 /// per-execution の bounded logical journal（§8/§10.1/§11）。
@@ -1087,22 +1093,64 @@ pub enum AuditSinkError {
     Reentrant,
 }
 
-/// backpressure 時の wake ハンドル（§10）。A-1 では型のみ（`wake` は no-op）。
+/// [`AuditTicket`] の共有内部（§10）。result slot + 登録 waker + cancel flag を 1 つの
+/// `Mutex` 下で守り、lock-free fast path 用に `ready` を別持ちする。
+///
+/// 雛形は [`crate::host_pending`] の `TicketShared`（host-call ticket）。lost-wake を避けるため、
+/// `complete` は result 格納後に `ready` を waker 読み取りより先に store し、`register_waker` は
+/// waker 保存後に `ready` を再確認する（§10 / Finding 1）。
+struct AuditTicketShared {
+    /// result / waker / cancelled を 1 つの `Mutex` 下で守る。
+    state: Mutex<AuditTicketState>,
+    /// store-waker → recheck-ready の lock-free fast path（§10）。
+    ready: std::sync::atomic::AtomicBool,
+}
+
+/// [`AuditTicketShared`] の `Mutex` が守る可変状態。
+struct AuditTicketState {
+    /// 一度だけ格納される ack/error（`complete` が `None` のときだけ書き込む）。
+    result: Option<Result<AuditAck, AuditSinkError>>,
+    /// 登録済み waker（最後の `register_waker` が置換）。
+    waker: Option<AuditWaker>,
+    /// cancel / drop 済みか。cancel 後は格納済み / 遅着 result を破棄する。
+    cancelled: bool,
+}
+
+/// backpressure 時の wake ハンドル（§10）。`Arc<dyn Wake>` を包み `Send + Sync`・`Clone`。
+///
+/// sink の completer が ack/error を [`AuditTicket`] へ格納したとき `wake()` を呼び、作成 thread
+/// の次回 poll を促す。A-1 の同期 driver では poll が `register_waker` 後に `try_take` を
+/// ポーリングするため wake が無くても前進できるが（scope 3）、将来の非同期 sink 連携のため
+/// [`crate::host_pending::Wake`] 雛形の実配線を持つ。
 #[derive(Clone)]
 pub struct AuditWaker {
-    _inner: Arc<()>,
+    inner: Arc<dyn crate::host_pending::Wake>,
 }
 
 impl AuditWaker {
-    /// A-1 の同期経路用の no-op waker を作る。
+    /// `Arc<dyn Wake>` から waker を作る。
+    pub fn new(wake: Arc<dyn crate::host_pending::Wake>) -> Self {
+        Self { inner: wake }
+    }
+
+    /// 何もしない waker を作る（A-1 同期 driver は `try_take` ポーリングで足りる）。
     pub fn noop() -> Self {
         Self {
-            _inner: Arc::new(()),
+            inner: Arc::new(NoopWake),
         }
     }
 
-    /// pending の sink を wake する（§10.2）。A-1 では no-op。
-    pub fn wake(&self) {}
+    /// pending の sink を wake する（§10.2）。登録先 `Wake` へ委譲する。
+    pub fn wake(&self) {
+        self.inner.wake();
+    }
+}
+
+/// 何もしない [`Wake`](crate::host_pending::Wake)（[`AuditWaker::noop`] 用）。
+struct NoopWake;
+
+impl crate::host_pending::Wake for NoopWake {
+    fn wake(&self) {}
 }
 
 impl std::fmt::Debug for AuditWaker {
@@ -1111,30 +1159,67 @@ impl std::fmt::Debug for AuditWaker {
     }
 }
 
-/// pending batch の ticket（§10）。A-1 では型のみ（同期 sink は Pending を返さない）。
+/// pending batch の ticket（§10）。sink が `Pending` を返したとき facade driver が保持する。
+///
+/// 雛形は [`crate::host_pending::HostCallTicket`]。facade driver は backpressure 進入時に
+/// [`Self::register_waker`] し、各 poll ステップで [`Self::try_take`] を駆動する。sink 側は
+/// 対になる [`AuditCompleter`] で ack/error を一度だけ格納する。
 #[derive(Clone)]
 pub struct AuditTicket {
-    _inner: Arc<Mutex<Option<Result<AuditAck, AuditSinkError>>>>,
+    shared: Arc<AuditTicketShared>,
 }
 
 impl AuditTicket {
-    /// 空の ticket を作る（A-1 では使われない）。
+    /// 空の ticket を作る（completer を伴わない孤立 ticket。主に型の互換用）。
     pub fn new() -> Self {
         Self {
-            _inner: Arc::new(Mutex::new(None)),
+            shared: Arc::new(AuditTicketShared {
+                state: Mutex::new(AuditTicketState {
+                    result: None,
+                    waker: None,
+                    cancelled: false,
+                }),
+                ready: std::sync::atomic::AtomicBool::new(false),
+            }),
         }
     }
 
-    /// ack/error 格納時に wake する waker を登録する（§10）。A-1 では no-op。
-    pub fn register_waker(&self, _waker: AuditWaker) {}
-
-    /// 格納済みの ack/error を取り出す（§10）。A-1 では常に `None`。
-    pub fn try_take(&self) -> Option<Result<AuditAck, AuditSinkError>> {
-        self._inner.lock().expect("audit ticket poisoned").take()
+    /// ack/error 格納時に wake する waker を登録する（§10、lost-wake 回避）。
+    ///
+    /// 1. `Mutex` を取り waker を保存（置換）する。
+    /// 2. lock 解放後に `ready` を再確認し、ready なら即 wake する（complete が先行していた場合）。
+    pub fn register_waker(&self, waker: AuditWaker) {
+        {
+            let mut st = self.shared.state.lock().expect("audit ticket poisoned");
+            st.waker = Some(waker.clone());
+        }
+        if self.shared.ready.load(std::sync::atomic::Ordering::Acquire) {
+            waker.wake();
+        }
     }
 
-    /// ticket を取り消す（§10）。A-1 では no-op。
-    pub fn cancel(&self) {}
+    /// 格納済みの ack/error を 1 回取り出す（§10）。
+    ///
+    /// `ready` が立っていて cancel されていなければ、格納済み `result` を `take()` して返す。
+    /// cancel 済みなら格納済み / 遅着 result を破棄して `None`。未 ready も `None`。
+    pub fn try_take(&self) -> Option<Result<AuditAck, AuditSinkError>> {
+        if !self.shared.ready.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let mut st = self.shared.state.lock().expect("audit ticket poisoned");
+        if st.cancelled {
+            st.result = None;
+            return None;
+        }
+        st.result.take()
+    }
+
+    /// ticket を取り消し、以後の result を破棄する（§10）。
+    pub fn cancel(&self) {
+        let mut st = self.shared.state.lock().expect("audit ticket poisoned");
+        st.cancelled = true;
+        st.result = None;
+    }
 }
 
 impl Default for AuditTicket {
@@ -1145,7 +1230,7 @@ impl Default for AuditTicket {
 
 impl PartialEq for AuditTicket {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self._inner, &other._inner)
+        Arc::ptr_eq(&self.shared, &other.shared)
     }
 }
 
@@ -1155,6 +1240,74 @@ impl std::fmt::Debug for AuditTicket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuditTicket").finish_non_exhaustive()
     }
+}
+
+/// sink が ack/error を [`AuditTicket`] へ書き戻すハンドル（§10）。
+///
+/// 雛形は [`crate::host_pending::HostCallCompleter`]。sink 実装（例: [`ScriptedAuditSink`]）が
+/// `Pending` を返すとき、対の completer を保持し、後続の同一 batch 再送で ack を格納する。
+pub struct AuditCompleter {
+    shared: Arc<AuditTicketShared>,
+}
+
+impl AuditCompleter {
+    /// ack/error を一度だけ格納し、登録済み waker を wake する（§10、lost-wake 回避）。
+    ///
+    /// 1. `Mutex` を取り `result` が `None` のときだけ格納する（二度目は破棄）。
+    /// 2. `ready.store(true, Release)` を **waker 読み取りより先に** 行う。
+    /// 3. 保存済み waker を退避し、lock 解放後に wake する。
+    pub fn complete(self, result: Result<AuditAck, AuditSinkError>) {
+        {
+            let mut st = self.shared.state.lock().expect("audit ticket poisoned");
+            if st.result.is_some() {
+                return;
+            }
+            st.result = Some(result);
+        }
+        self.shared
+            .ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        let waker = {
+            let st = self.shared.state.lock().expect("audit ticket poisoned");
+            st.waker.clone()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// cancel 済みか（sink 側が協調停止を観測する）。
+    pub fn is_cancelled(&self) -> bool {
+        self.shared
+            .state
+            .lock()
+            .map(|st| st.cancelled)
+            .unwrap_or(true)
+    }
+}
+
+impl std::fmt::Debug for AuditCompleter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditCompleter").finish_non_exhaustive()
+    }
+}
+
+/// ticket と completer のペアを作る（§10）。両者が内部状態を共有する。
+pub fn new_audit_ticket() -> (AuditTicket, AuditCompleter) {
+    let shared = Arc::new(AuditTicketShared {
+        state: Mutex::new(AuditTicketState {
+            result: None,
+            waker: None,
+            cancelled: false,
+        }),
+        ready: std::sync::atomic::AtomicBool::new(false),
+    });
+    (
+        AuditTicket {
+            shared: Arc::clone(&shared),
+        },
+        AuditCompleter { shared },
+    )
 }
 
 /// 監査 sink（§10）。batch を submit し、ack/pending/failed を返す。`Send + Sync`。
@@ -1273,6 +1426,18 @@ pub struct ScriptedAuditSink {
     plan: Mutex<std::collections::VecDeque<ScriptedResponse>>,
     tail: ScriptedResponse,
     envelopes: Mutex<Vec<AuditEnvelope>>,
+    /// 進行中の backpressure episode（§10.2 テスト用）。`Some` の間は plan を進めず、
+    /// 同一 batch の再送に対して `remaining` 回だけ `Pending` を返し続ける。
+    pending: Mutex<PendingEpisode>,
+}
+
+/// [`ScriptedAuditSink`] の進行中 backpressure episode（決定的テスト用）。
+#[derive(Default)]
+struct PendingEpisode {
+    /// 残りの `Pending` 回数（`Some(0)` は「次の submit で Ack」）。`None` は episode 無し。
+    remaining: Option<u32>,
+    /// `PendingForever`（ack を決して格納しない、deadline テスト用）。
+    forever: bool,
 }
 
 /// [`ScriptedAuditSink`] の 1 submit あたりの応答指示。
@@ -1286,6 +1451,15 @@ pub enum ScriptedResponse {
     AckWrongId,
     /// batch 末尾 +1 の sequence で Ack を返す（未送信 sequence の ack、protocol 違反）。
     AckWrongSequence,
+    /// `pending_times` 回だけ `Pending` を返し、その後（同一 batch の再送で）正しい Ack を
+    /// 返す（§10.2 backpressure テスト用）。`pending_times == 0` は即 Ack と等価。
+    PendingThenAck {
+        /// `Pending` を返す回数。
+        pending_times: u32,
+    },
+    /// 決して Ack を格納せず常に `Pending` を返す（§10.2 永続 Pending→BackpressureDeadline
+    /// テスト用）。
+    PendingForever,
 }
 
 impl ScriptedAuditSink {
@@ -1295,6 +1469,7 @@ impl ScriptedAuditSink {
             plan: Mutex::new(plan.into_iter().collect()),
             tail: ScriptedResponse::AckCorrect,
             envelopes: Mutex::new(Vec::new()),
+            pending: Mutex::new(PendingEpisode::default()),
         }
     }
 
@@ -1317,40 +1492,92 @@ impl ScriptedAuditSink {
     }
 }
 
+impl ScriptedAuditSink {
+    /// batch を 1 回だけ記録する（同一 batch の再送では重複記録しない）。Ack 成立時に呼ぶ。
+    fn record(&self, batch: &Arc<[AuditEnvelope]>) {
+        self.envelopes
+            .lock()
+            .expect("audit sink poisoned")
+            .extend(batch.iter().cloned());
+    }
+}
+
 impl AuditSink for ScriptedAuditSink {
     fn submit(&self, batch: Arc<[AuditEnvelope]>, _waker: AuditWaker) -> AuditSubmit {
+        let last = match batch.last() {
+            Some(last) => (last.execution_id, last.sequence),
+            None => return AuditSubmit::Failed(AuditSinkError::Protocol),
+        };
+        let ack = AuditSubmit::Ack(AuditAck {
+            execution_id: last.0,
+            through_sequence: last.1,
+        });
+
+        // 進行中の backpressure episode を先に処理する（plan は進めない、同一 batch 再送）。
+        {
+            let mut episode = self.pending.lock().expect("audit sink poisoned");
+            if episode.forever {
+                // 永続 Pending: 決して ack せず、記録もしない。
+                return AuditSubmit::Pending(AuditTicket::new());
+            }
+            if let Some(remaining) = episode.remaining {
+                if remaining > 0 {
+                    episode.remaining = Some(remaining - 1);
+                    return AuditSubmit::Pending(AuditTicket::new());
+                }
+                // 残り 0: episode 終了 → この再送で Ack（初回の 1 回だけ記録）。
+                episode.remaining = None;
+                drop(episode);
+                self.record(&batch);
+                return ack;
+            }
+        }
+
+        // episode 無し: plan から次の応答を取り出す。
         let response = self
             .plan
             .lock()
             .expect("audit sink poisoned")
             .pop_front()
             .unwrap_or(self.tail);
-        let last = match batch.last() {
-            Some(last) => (last.execution_id, last.sequence),
-            None => return AuditSubmit::Failed(AuditSinkError::Protocol),
-        };
-        // 記録は Fail 以外で行う（Fail は配送なしとして扱い、何も残さない）。
-        if !matches!(response, ScriptedResponse::Fail) {
-            self.envelopes
-                .lock()
-                .expect("audit sink poisoned")
-                .extend(batch.iter().cloned());
-        }
         match response {
             ScriptedResponse::Fail => AuditSubmit::Failed(AuditSinkError::Permanent),
-            ScriptedResponse::AckCorrect => AuditSubmit::Ack(AuditAck {
-                execution_id: last.0,
-                through_sequence: last.1,
-            }),
-            ScriptedResponse::AckWrongId => AuditSubmit::Ack(AuditAck {
-                // 必ず batch の id と異なる値（nonzero 保証のため wrapping_add(1) を使う）。
-                execution_id: wrong_execution_id(last.0),
-                through_sequence: last.1,
-            }),
-            ScriptedResponse::AckWrongSequence => AuditSubmit::Ack(AuditAck {
-                execution_id: last.0,
-                through_sequence: last.1.wrapping_add(1),
-            }),
+            ScriptedResponse::AckCorrect => {
+                self.record(&batch);
+                ack
+            }
+            ScriptedResponse::AckWrongId => {
+                self.record(&batch);
+                AuditSubmit::Ack(AuditAck {
+                    // 必ず batch の id と異なる値（nonzero 保証のため wrapping_add(1) を使う）。
+                    execution_id: wrong_execution_id(last.0),
+                    through_sequence: last.1,
+                })
+            }
+            ScriptedResponse::AckWrongSequence => {
+                self.record(&batch);
+                AuditSubmit::Ack(AuditAck {
+                    execution_id: last.0,
+                    through_sequence: last.1.wrapping_add(1),
+                })
+            }
+            ScriptedResponse::PendingThenAck { pending_times } => {
+                if pending_times == 0 {
+                    // Pending 0 回 = 即 Ack。
+                    self.record(&batch);
+                    ack
+                } else {
+                    // episode 開始: 残り pending_times 回 Pending を返す。
+                    let mut episode = self.pending.lock().expect("audit sink poisoned");
+                    episode.remaining = Some(pending_times - 1);
+                    AuditSubmit::Pending(AuditTicket::new())
+                }
+            }
+            ScriptedResponse::PendingForever => {
+                let mut episode = self.pending.lock().expect("audit sink poisoned");
+                episode.forever = true;
+                AuditSubmit::Pending(AuditTicket::new())
+            }
         }
     }
 }
@@ -2025,5 +2252,152 @@ mod tests {
             AuditSubmit::Failed(_)
         ));
         assert!(failing.is_empty());
+    }
+
+    // --- AuditTicket / AuditCompleter（host_pending パターン、§10 / B-1）---
+
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// wake 回数を数える fake `Wake`（決定的に lost-wake 回避を検証する）。
+    struct CountingWake {
+        count: Arc<AtomicUsize>,
+    }
+
+    impl crate::host_pending::Wake for CountingWake {
+        fn wake(&self) {
+            self.count.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    fn counting_waker() -> (AuditWaker, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let waker = AuditWaker::new(Arc::new(CountingWake {
+            count: Arc::clone(&count),
+        }));
+        (waker, count)
+    }
+
+    fn sample_ack() -> AuditAck {
+        AuditAck {
+            execution_id: exec_id(7),
+            through_sequence: 3,
+        }
+    }
+
+    #[test]
+    fn audit_ticket_try_take_returns_result_after_ready() {
+        let (ticket, completer) = new_audit_ticket();
+        assert!(ticket.try_take().is_none(), "未完了は None");
+        completer.complete(Ok(sample_ack()));
+        match ticket.try_take() {
+            Some(Ok(ack)) => assert_eq!(ack, sample_ack()),
+            other => panic!("Ok(ack) を期待したが {other:?}"),
+        }
+        assert!(ticket.try_take().is_none(), "2 回目は take 済みで None");
+    }
+
+    #[test]
+    fn audit_ticket_cancel_discards_late_result() {
+        let (ticket, completer) = new_audit_ticket();
+        ticket.cancel();
+        completer.complete(Ok(sample_ack()));
+        assert!(
+            ticket.try_take().is_none(),
+            "cancel 済み ticket は遅着 result を返さない"
+        );
+    }
+
+    #[test]
+    fn audit_ticket_lost_wake_avoided_register_after_complete() {
+        // (a) register-after-complete: complete を先に、register_waker を後に。
+        let (ticket, completer) = new_audit_ticket();
+        let (waker, count) = counting_waker();
+        completer.complete(Ok(sample_ack()));
+        assert_eq!(
+            count.load(AtomicOrdering::SeqCst),
+            0,
+            "register 前は wake されない"
+        );
+        ticket.register_waker(waker);
+        assert_eq!(
+            count.load(AtomicOrdering::SeqCst),
+            1,
+            "register が ready を観測して即 wake する"
+        );
+    }
+
+    #[test]
+    fn audit_ticket_lost_wake_avoided_complete_after_register() {
+        // (b) complete-after-register: register_waker を先に、complete を後に。
+        let (ticket, completer) = new_audit_ticket();
+        let (waker, count) = counting_waker();
+        ticket.register_waker(waker);
+        assert_eq!(
+            count.load(AtomicOrdering::SeqCst),
+            0,
+            "complete 前は wake されない"
+        );
+        completer.complete(Ok(sample_ack()));
+        assert_eq!(
+            count.load(AtomicOrdering::SeqCst),
+            1,
+            "complete が保存済み waker を wake する"
+        );
+    }
+
+    #[test]
+    fn audit_ticket_complete_is_stored_only_once() {
+        let (ticket, completer) = new_audit_ticket();
+        completer.complete(Ok(sample_ack()));
+        assert!(matches!(ticket.try_take(), Some(Ok(_))));
+    }
+
+    #[test]
+    fn audit_waker_and_ticket_are_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AuditWaker>();
+        assert_send_sync::<AuditTicket>();
+        assert_send_sync::<AuditCompleter>();
+    }
+
+    // --- ScriptedAuditSink の Pending 系応答（§10.2 テスト facade）---
+
+    #[test]
+    fn scripted_pending_then_ack_pends_then_acks_on_resend() {
+        let id = exec_id(9);
+        let sink = ScriptedAuditSink::new([ScriptedResponse::PendingThenAck { pending_times: 2 }]);
+        let batch: Arc<[AuditEnvelope]> = Arc::from(vec![started_envelope(id, 0)]);
+        // 1 回目・2 回目は Pending（同一 batch の再送）。
+        assert!(matches!(
+            sink.submit(Arc::clone(&batch), AuditWaker::noop()),
+            AuditSubmit::Pending(_)
+        ));
+        assert!(matches!(
+            sink.submit(Arc::clone(&batch), AuditWaker::noop()),
+            AuditSubmit::Pending(_)
+        ));
+        // 3 回目の再送で Ack。記録はこの 1 回だけ（Pending 中は記録しない）。
+        match sink.submit(Arc::clone(&batch), AuditWaker::noop()) {
+            AuditSubmit::Ack(ack) => {
+                assert_eq!(ack.execution_id, id);
+                assert_eq!(ack.through_sequence, 0);
+            }
+            other => panic!("Ack を期待したが {other:?}"),
+        }
+        assert_eq!(sink.len(), 1, "Ack 成立時に 1 回だけ記録");
+    }
+
+    #[test]
+    fn scripted_pending_forever_never_acks() {
+        let id = exec_id(9);
+        let sink = ScriptedAuditSink::new([ScriptedResponse::PendingForever]);
+        let batch: Arc<[AuditEnvelope]> = Arc::from(vec![started_envelope(id, 0)]);
+        for _ in 0..5 {
+            assert!(matches!(
+                sink.submit(Arc::clone(&batch), AuditWaker::noop()),
+                AuditSubmit::Pending(_)
+            ));
+        }
+        assert!(sink.is_empty(), "永続 Pending は決して記録しない");
     }
 }

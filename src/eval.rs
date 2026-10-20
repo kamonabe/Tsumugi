@@ -1069,6 +1069,58 @@ impl Evaluator {
         std::mem::take(&mut self.yield_events)
     }
 
+    /// facade の監査 poll driver が audit sink の `Pending` を観測したとき、
+    /// `Yielded(AuditBackpressure)` を yield_events buffer へ積む（Phase 6 B-1、§7.2/§8/§10.2）。
+    ///
+    /// backpressure は sink 応答由来で評価器の意味論を跨がない（設計 B-0 §5）。それでも
+    /// poll_index の単調性・pair 共有（`last_yield_reason` / `last_yield_poll_index`）を既存
+    /// SliceFuel yield と同一の単一カウンタで保つため、発番と buffer への push は本メソッドで
+    /// 評価器内に閉じる（driver 独自カウンタは作らない、§5.1）。§8 規則7 どおり、Yielded の前に
+    /// その時点の BudgetCharged accumulator を flush する。overflow は `run_slice` と同様に
+    /// fail-closed（`Err`）で、呼び出し元が internal terminal へ写す。
+    pub(crate) fn record_backpressure_yield(&mut self) -> Result<(), TsumugiError> {
+        // 規則7: flush（確定済み BudgetCharged を先に）してから Yielded。
+        let charges = self.drain_budget_charges();
+        self.yield_events.extend(charges);
+        let reason = crate::audit::AuditYieldReason::AuditBackpressure;
+        let poll_index = self.alloc_poll_index(0)?;
+        let usage = self.budget.usage();
+        self.yield_events.push(crate::audit::AuditEvent::Yielded {
+            reason: reason.clone(),
+            poll_index,
+            usage,
+        });
+        self.last_yield_reason = Some(reason);
+        self.last_yield_poll_index = poll_index;
+        Ok(())
+    }
+
+    /// facade の監査 poll driver が backpressure から resume（ack 取得）したとき、
+    /// 対になる `Resumed(AuditBackpressure)` を yield_events buffer へ積む（Phase 6 B-1、§8 規則8）。
+    ///
+    /// 既存 `run_slice` 先頭の Resumed 生成と同一規律で、直前の `last_yield_reason` が
+    /// `AuditBackpressure` のときだけ、退避した `last_yield_poll_index` を再利用して pair を張る。
+    /// SliceFuel 由来の Resumed は従来どおり `run_slice` 先頭が積むので、ここでは backpressure 由来
+    /// だけを扱う（二重積みを避ける）。
+    pub(crate) fn record_backpressure_resume(&mut self) {
+        if matches!(
+            self.last_yield_reason,
+            Some(crate::audit::AuditYieldReason::AuditBackpressure)
+        ) {
+            let previous_reason = self
+                .last_yield_reason
+                .take()
+                .expect("checked AuditBackpressure above");
+            let usage = self.budget.usage();
+            let poll_index = self.last_yield_poll_index;
+            self.yield_events.push(crate::audit::AuditEvent::Resumed {
+                previous_reason,
+                poll_index,
+                usage,
+            });
+        }
+    }
+
     /// 実行セッションを開始する（REV-015 Slice 3 PR-d-2、poll 経路の初回）。
     ///
     /// import を link し、source/import/AST heap を Link フェーズで課金し、REPL transaction を
