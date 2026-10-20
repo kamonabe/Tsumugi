@@ -1,6 +1,6 @@
 # Tsumugi 決定性・実行時監査仕様
 
-最終更新: 2026-10-16
+最終更新: 2026-10-20
 
 設計ステータス: **実装仕様確定・部分実装（Phase 6 A-1 subset ＋ `BudgetCharged` ＋ host-call lifecycle 3 event ＋ `Yielded` / `Resumed` emission 実装済み）**
 
