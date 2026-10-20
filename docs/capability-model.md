@@ -1,6 +1,6 @@
 # Tsumugi — Capability Model仕様
 
-最終更新: 2026-10-19
+最終更新: 2026-10-20
 設計ステータス: **実装仕様確定・実装進行中**（C1〜C10 実装済み。C6〔ModuleResolver／import 解決〕はPhase 2最小形としてtree経路のlink時解決を実装済み〔VM file/stdinのimportはC6-c/E9の一片としてlink層のEngine resolver gateへ統合済み——未grant + importはtreeと同じくterminal `Denied`、run層のimport展開は依然評価器内蔵`ModuleLoader`。VM backend adapter本体のconformanceはE9残。tree REPLはE7でEngine API統合済みだがimport解決は評価器内蔵`ModuleLoader`に委ねresolver gateを迂回する——従来のCWD相対import・固定エラー文字列を保全する既知の設計で、VM REPLはtree REPLと対称にalpha `ModuleLoader`を保全（gate迂回）。REPLのimport gateを塞ぐならE8b以降の課題、budget N境界はC11/Phase 3〕。詳細は [ロードマップ](roadmap.md) Phase 2 を参照）
 
 ## 1. 目的と規範範囲
@@ -846,7 +846,7 @@ C1→C2、C3/C4/C5/C7を並行、C6はstream後、C8はBuiltinSpec衝突検査�
 
 - **Phase 0:** security boundaryではないこと、OS責任、residual riskは[脅威モデル](threat-model.md)。
 - **Phase 1:** `CapabilitySet`は[実行予算・協調実行仕様](execution-control.md)のfinite `ExecutionRequest`へmoveし、terminal outcomeは[組み込みAPI仕様](embedding-api.md)、catch規則は[次期意味論・実装決定](semantic-decisions.md)に従う。
-- **Phase 2:** C1〜C10とPhase 2のCAP-ATを完了条件とする。環境変数allow-listや現行sandboxだけでは完了でない。C10でruntime fs builtinはcapability経路へ全面移行し、`sandbox.rs`はimport解決（C6）専用に縮退した（runtime fsのambient `std::fs`直呼びはcore/builtinから0）。budget env（`from_legacy_env`、`TSUMUGI_MAX_*`）はC9/C10対象外（Phase 3/REV-015）でCAP-AT-27の静的auditの除外リストに入る。
+- **Phase 2:** C1〜C10とPhase 2のCAP-ATを完了条件とする。環境変数allow-listや現行sandboxだけでは完了でない。C10でruntime fs builtinはcapability経路へ全面移行し、`sandbox.rs`はimport解決（C6）専用に縮退した（runtime fsのambient `std::fs`直呼びはcore/builtinから0）。budget env（`TSUMUGI_MAX_*`）はC9/C10対象外（Phase 3/REV-015）。2026-10-20以降はCLI adapter（`main.rs`）だけが読み、`budget.rs`はCAP-AT-27の静的auditの除外リストから外れた（[実行予算・協調実行仕様](execution-control.md)第13節）。
 - **Phase 3/4:** finite budget/controlとcooperative `Pending`は[実行予算・協調実行仕様](execution-control.md)を正本とし、Phase 2同期traitを置換しない。
 - **Phase 6:** event enum、redaction、bounded journal、sink failureは[決定性・実行時監査仕様](determinism-and-audit.md)を正本とし、`FailClosed`以外や別event名を追加しない。
 - **AUD-020:** canonicalize/check/useをportable path-handleへ置換し、dangling symlink、TOCTOU、存在oracleをCAP-AT-10〜14で検証。

@@ -129,10 +129,9 @@ fn fixture_envs(name: &str, test_dir: &str) -> Vec<(String, String)> {
         // local_utils は任意の絶対パスの path_exists（範囲外は false）を検証するため、
         // sandbox を設定せず unrestricted（/ 全体を default mount）で実行する。空 sandbox 警告が
         // stderr に 1 件出るのは許容する（run_fixture の golden stderr 判定が legacy 警告を許す）。
-        // 無限ループを短い予算で止める。REV-015 最終形移行 Slice 1（option B）以降、
-        // tree CLI 経路は legacy env を参照せず standard budget（total_fuel=1,000,000）で停止する
-        // ため上限値が異なる（tree=1000000 / VM=env 100）。VM は従来どおり legacy env を見るので
-        // この env を維持し、期待は `.expected_err`（tree）/ `.expected_err.vm`（VM）で分ける。
+        // 無限ループを短い予算で止める。legacy env は CLI adapter（execution-control §13）が
+        // tree/VM の全経路へ同じく適用するため、期待は共通の `.expected_err`（上限 100）で、
+        // 先頭に deprecation warning が 1 行出る。
         "error_step_limit" => {
             envs.push(("TSUMUGI_MAX_STEPS".to_string(), "100".to_string()));
         }
@@ -742,18 +741,14 @@ fn user_call_depth_limit_applies_to_all_call_forms() {
 // REV-015 最終形移行 Slice 1: CLI 既定 budget の有限化（option B）
 // =============================================================
 
-/// option B の回帰固定: import なし CLI script は既定で有限 budget（standard の
-/// total_fuel=1,000,000）を受け取り、それを超える重いループは step 上限で停止して exit 1 に
-/// なる。legacy の unbounded/ambient 既定へ戻っていないことを subprocess で確認する。
-///
-/// この有限化は Engine API を通る tree 経路（`run_source`）にのみ効く。VM（`run_source_vm`）は
-/// legacy env 既定で別経路のため、本テストは tree（`use_vm=false`）に限定する。import あり root
-/// は `run_source_alpha`（legacy 既定）へフォールバックし option B を通らないため、import なし
-/// script に限る（設計 §3.1 / §11.2 finding 2）。30s 実時間 deadline は踏ませない（FakeClock
-/// ユニットで担保済み）。
+/// option B の回帰固定: CLI script は既定で有限 budget（standard の total_fuel=1,000,000）を
+/// 受け取り、それを超える重いループは step 上限で停止して exit 1 になる。legacy の
+/// unbounded/ambient 既定へ戻っていないことを subprocess で確認する。legacy env を設定しない
+/// ので deprecation warning も出ない（execution-control §13）。30s 実時間 deadline は踏ませない
+/// （FakeClock ユニットで担保済み）。
 #[test]
-fn cli_default_budget_is_finite_for_import_less_script_tree() {
-    // 1,000,000 fuel を確実に超える import なしの重いループ。
+fn cli_default_budget_is_finite_in_both_engines() {
+    // 1,000,000 fuel を確実に超える重いループ。
     let dir = TestDir::new("cli-option-b-heavy");
     let script = dir.path.join("heavy.tsg");
     std::fs::write(
@@ -762,20 +757,96 @@ fn cli_default_budget_is_finite_for_import_less_script_tree() {
     )
     .expect("重いスクリプトの作成に失敗");
 
-    let context = "cli option-b heavy [tree-walk]";
-    let output = run_script_process(&script, false, &[], context);
-    let stdout = normalize(&String::from_utf8_lossy(&output.stdout));
-    let stderr = normalize(&String::from_utf8_lossy(&output.stderr));
+    for use_vm in [false, true] {
+        let context = format!("cli option-b heavy [vm={use_vm}]");
+        let output = run_script_process(&script, use_vm, &[], &context);
+        let stdout = normalize(&String::from_utf8_lossy(&output.stdout));
+        let stderr = normalize(&String::from_utf8_lossy(&output.stderr));
 
-    assert!(
-        !output.status.success(),
-        "{context}: 既定 budget が無制限に戻っています（重いループが停止しませんでした）\n--- stderr ---\n{stderr}"
-    );
-    assert_eq!(stdout, "", "{context}: 予期しないstdout: {stdout}");
-    assert!(
-        stderr.contains("ステップ上限に達しました"),
-        "{context}: step 上限で停止していません\n--- stderr ---\n{stderr}"
-    );
+        assert!(
+            !output.status.success(),
+            "{context}: 既定 budget が無制限に戻っています（重いループが停止しませんでした）\n--- stderr ---\n{stderr}"
+        );
+        assert_eq!(stdout, "", "{context}: 予期しないstdout: {stdout}");
+        // 停止行は tree（loop 行）と VM（本体行）で異なり得るため、行番号を除いて比べる。
+        assert!(
+            stderr.lines().count() == 1
+                && stderr.ends_with("ステップ上限に達しました (上限: 1000000)"),
+            "{context}: 既定上限で停止していないか、想定外の診断が出ています\n--- stderr ---\n{stderr}"
+        );
+    }
+}
+
+/// execution-control §13: legacy `TSUMUGI_MAX_*` は CLI 起動時に 1 回だけ読まれ、file / stdin の
+/// tree・VM 全経路へ同じ上限として効き、deprecation warning が 1 回だけ出る。
+#[test]
+fn legacy_budget_env_applies_to_all_cli_paths_with_one_warning() {
+    use std::io::Write;
+
+    let dir = TestDir::new("legacy-budget-env");
+    let script = dir.path.join("loop.tsg");
+    let source = "let i = 0\nwhile true\n  i = i + 1\nend\n";
+    std::fs::write(&script, source).expect("スクリプトの作成に失敗");
+    let warning = "警告: 環境変数 TSUMUGI_MAX_STEPS, TSUMUGI_MAX_COLLECTION_SIZE による実行予算の上書きは非推奨であり、将来のバージョンで削除されます";
+
+    for use_vm in [false, true] {
+        for from_stdin in [false, true] {
+            let context = format!("legacy budget env [vm={use_vm}, stdin={from_stdin}]");
+            let mut cmd = Command::new(tsumugi_bin());
+            if use_vm {
+                cmd.arg("--vm");
+            }
+            if from_stdin {
+                cmd.arg("-").stdin(std::process::Stdio::piped());
+            } else {
+                cmd.arg(&script);
+            }
+            cmd.env("TSUMUGI_MAX_STEPS", "100")
+                .env("TSUMUGI_MAX_COLLECTION_SIZE", "10")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let mut child = cmd.spawn().expect("tsumugi の起動に失敗");
+            if from_stdin {
+                child
+                    .stdin
+                    .take()
+                    .expect("stdin")
+                    .write_all(source.as_bytes())
+                    .expect("stdin への書き込みに失敗");
+            }
+            let output = child.wait_with_output().expect("tsumugi の終了待ちに失敗");
+            let stderr = normalize(&String::from_utf8_lossy(&output.stderr));
+
+            assert!(!output.status.success(), "{context}: 停止していません");
+            let lines: Vec<&str> = stderr.lines().collect();
+            assert!(
+                lines.len() == 2
+                    && lines[0] == warning
+                    && lines[1].ends_with("ステップ上限に達しました (上限: 100)"),
+                "{context}: env の上限か warning が想定と異なります\n--- stderr ---\n{stderr}"
+            );
+        }
+    }
+}
+
+/// 数値として解釈できない legacy env は従来どおり無視して既定上限を使い、warning も出さない。
+#[test]
+fn unparsable_legacy_budget_env_is_ignored_without_warning() {
+    let dir = TestDir::new("legacy-budget-env-invalid");
+    let script = dir.path.join("loop.tsg");
+    std::fs::write(&script, "let i = 0\nwhile true\n  i = i + 1\nend\n")
+        .expect("スクリプトの作成に失敗");
+
+    for use_vm in [false, true] {
+        let context = format!("invalid legacy budget env [vm={use_vm}]");
+        let output = run_script_process(&script, use_vm, &[("TSUMUGI_MAX_STEPS", "abc")], &context);
+        let stderr = normalize(&String::from_utf8_lossy(&output.stderr));
+        assert!(
+            stderr.lines().count() == 1
+                && stderr.ends_with("ステップ上限に達しました (上限: 1000000)"),
+            "{context}: 不正値が無視されていないか warning が出ています\n--- stderr ---\n{stderr}"
+        );
+    }
 }
 
 /// option B 後も軽量な import なし script は exit 0 のまま（standard budget の範囲内）。
@@ -876,99 +947,95 @@ fn import_outside_sandbox_is_blocked_in_both_engines() {
 /// REV-015 Slice 2: import module は import_count へ課金する。上限 0 では初めての import 解決で
 /// source 上限エラーになり 1 文も実行しない。
 ///
-/// C6-c + option B 以降、**legacy env budget（`TSUMUGI_MAX_IMPORT_COUNT`）が効くのは VM arm だけ**に
-/// なった。tree arm の file/stdin は embedding Engine API（standard budget）経由になり legacy env budget
-/// を参照しない（import なし script が既に option B で tree=standard budget になっていたのと同じ理由を、
-/// C6-c が import あり script へ広げた）。そのため本テストは VM arm のみを対象にする（意図的な
-/// tree/VM 既知差）。tree 経路（standard budget）の source/import 本数境界は CAP-AT-17 で担保する
-/// （`cap_at_17_source_count_boundary_tree` / `cap_at_17_import_count_boundary_tree` が in-process の
-/// `Evaluator::with_budget(standard)` で N-1/N 成功・N+1 を chunk 蓄積前に拒否することを固定する）。
-///
-/// E9 で VM file/stdin も link 層 capability gate（Engine resolver、standard budget）を通すように
-/// なったため、`--allow-import-root default=<dir>` で `module_resolver` を grant して gate を通す。
-/// legacy env budget（`TSUMUGI_MAX_IMPORT_COUNT`）は gate 通過後の run 層 `vm.charge_link` が参照する
-/// ため、import_count 上限 0 の課金エラーは従来どおり観測できる（gate は standard budget で import
-/// を解決するだけで legacy env budget を見ない）。
+/// legacy env budget（`TSUMUGI_MAX_IMPORT_COUNT`）は CLI adapter（execution-control §13）が tree/VM の
+/// 両経路へ同じく適用するため、両 engine で同じ結果になる。link 層 capability gate を通すために
+/// `--allow-import-root default=<dir>` で `module_resolver` を grant する。
 #[test]
-fn import_count_limit_gates_file_execution_vm() {
-    let use_vm = true;
-    let dir = TestDir::new("import-count-vm");
+fn import_count_limit_gates_file_execution() {
+    for use_vm in [false, true] {
+        let dir = TestDir::new(if use_vm {
+            "import-count-vm"
+        } else {
+            "import-count-tree"
+        });
 
-    let lib = dir.path.join("lib.tsg");
-    std::fs::write(&lib, "let helper = 42\n").expect("lib の作成に失敗");
-    let script = dir.path.join("main.tsg");
-    std::fs::write(&script, "import \"lib.tsg\"\nprint(\"AFTER\")\n").expect("main の作成に失敗");
+        let lib = dir.path.join("lib.tsg");
+        std::fs::write(&lib, "let helper = 42\n").expect("lib の作成に失敗");
+        let script = dir.path.join("main.tsg");
+        std::fs::write(&script, "import \"lib.tsg\"\nprint(\"AFTER\")\n")
+            .expect("main の作成に失敗");
 
-    let context = "import count limit [VM]";
-    let import_root = format!("default={}", dir.as_str());
-    let output = run_script_process_with_args(
-        &script,
-        use_vm,
-        &["--allow-import-root", &import_root],
-        &[
-            ("TSUMUGI_SANDBOX", dir.as_str()),
-            ("TSUMUGI_MAX_IMPORT_COUNT", "0"),
-        ],
-        context,
-    );
-    let (stdout, stderr) = output_text(&output);
+        let context = format!("import count limit [vm={use_vm}]");
+        let import_root = format!("default={}", dir.as_str());
+        let output = run_script_process_with_args(
+            &script,
+            use_vm,
+            &["--allow-import-root", &import_root],
+            &[
+                ("TSUMUGI_SANDBOX", dir.as_str()),
+                ("TSUMUGI_MAX_IMPORT_COUNT", "0"),
+            ],
+            &context,
+        );
+        let (stdout, stderr) = output_text(&output);
 
-    assert!(
-        !output.status.success(),
-        "{context}: 終了コード0で終了しました\n--- stderr ---\n{stderr}"
-    );
-    assert!(
-        stderr.contains("import の本数が上限を超えました"),
-        "{context}: import count 上限が適用されていません\n--- stderr ---\n{stderr}"
-    );
-    // 1 文も実行しないため後続の print は出ない。
-    assert_eq!(
-        stdout, "",
-        "{context}: 上限超過後に実行されました\n--- stdout ---\n{stdout}"
-    );
+        assert!(
+            !output.status.success(),
+            "{context}: 終了コード0で終了しました\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stderr.contains("import の本数が上限を超えました"),
+            "{context}: import count 上限が適用されていません\n--- stderr ---\n{stderr}"
+        );
+        // 1 文も実行しないため後続の print は出ない。
+        assert_eq!(
+            stdout, "",
+            "{context}: 上限超過後に実行されました\n--- stdout ---\n{stdout}"
+        );
+    }
 }
 
 /// REV-015 Slice 2: import source は source_bytes と import_bytes の両方へ課金する。上限内なら
-/// root + import が実行される。
-///
-/// `import_count_limit_gates_file_execution_vm` と同じ理由で、legacy env budget が効く VM arm のみを
-/// 対象にする（C6-c + option B で tree arm は standard budget へ移行、legacy env budget 非参照）。
-/// E9 で VM file/stdin も link 層 capability gate を通すため、`--allow-import-root` で
-/// `module_resolver` を grant して gate を通す（run 層の env budget 課金は従来どおり）。
+/// root + import が実行される。legacy env budget は tree/VM の両経路へ同じく適用される（§13）。
 #[test]
-fn import_source_bytes_charged_allows_execution_within_limit_vm() {
-    let use_vm = true;
-    let dir = TestDir::new("import-bytes-ok-vm");
+fn import_source_bytes_charged_allows_execution_within_limit() {
+    for use_vm in [false, true] {
+        let dir = TestDir::new(if use_vm {
+            "import-bytes-ok-vm"
+        } else {
+            "import-bytes-ok-tree"
+        });
 
-    let lib = dir.path.join("lib.tsg");
-    std::fs::write(&lib, "let helper = 7\n").expect("lib の作成に失敗");
-    let script = dir.path.join("main.tsg");
-    std::fs::write(&script, "import \"lib.tsg\"\nprint(helper)\n").expect("main の作成に失敗");
+        let lib = dir.path.join("lib.tsg");
+        std::fs::write(&lib, "let helper = 7\n").expect("lib の作成に失敗");
+        let script = dir.path.join("main.tsg");
+        std::fs::write(&script, "import \"lib.tsg\"\nprint(helper)\n").expect("main の作成に失敗");
 
-    let context = "import bytes within limit [VM]";
-    let import_root = format!("default={}", dir.as_str());
-    let output = run_script_process_with_args(
-        &script,
-        use_vm,
-        &["--allow-import-root", &import_root],
-        &[
-            ("TSUMUGI_SANDBOX", dir.as_str()),
-            // root + import の合計 byte 数を十分に上回る上限。
-            ("TSUMUGI_MAX_SOURCE_BYTES", "1024"),
-            ("TSUMUGI_MAX_IMPORT_BYTES", "1024"),
-        ],
-        context,
-    );
-    let (stdout, stderr) = output_text(&output);
+        let context = format!("import bytes within limit [vm={use_vm}]");
+        let import_root = format!("default={}", dir.as_str());
+        let output = run_script_process_with_args(
+            &script,
+            use_vm,
+            &["--allow-import-root", &import_root],
+            &[
+                ("TSUMUGI_SANDBOX", dir.as_str()),
+                // root + import の合計 byte 数を十分に上回る上限。
+                ("TSUMUGI_MAX_SOURCE_BYTES", "1024"),
+                ("TSUMUGI_MAX_IMPORT_BYTES", "1024"),
+            ],
+            &context,
+        );
+        let (stdout, stderr) = output_text(&output);
 
-    assert!(
-        output.status.success(),
-        "{context}: 上限内なのに失敗しました\n--- stderr ---\n{stderr}"
-    );
-    assert!(
-        stdout.contains("7"),
-        "{context}: import した値が使えていません\n--- stdout ---\n{stdout}"
-    );
+        assert!(
+            output.status.success(),
+            "{context}: 上限内なのに失敗しました\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("7"),
+            "{context}: import した値が使えていません\n--- stdout ---\n{stdout}"
+        );
+    }
 }
 
 // =============================================================================
@@ -980,10 +1047,9 @@ fn import_source_bytes_charged_allows_execution_within_limit_vm() {
 // 優先順位（`SingleSourceBytes < SourceCount < SourceBytes`、`ImportCount < ImportBytes`）に従い、
 // source 本数超過は `SourceCount`、import 本数超過は `ImportCount` が primary resource になる。
 //
-// `import_count_limit_gates_file_execution_vm` が legacy env budget（VM arm）を見るのに対し、
-// 本テストは tree arm の standard budget 経路を in-process で直接駆動する。tree CLI は
-// `BudgetConfig::standard` を使い `TSUMUGI_MAX_*` を参照しないため、subprocess env 注入では tree arm
-// を駆動できない（調査済み）。代わりに `Evaluator::with_budget` + ambient `ModuleLoader`
+// `import_count_limit_gates_file_execution` が CLI の legacy env budget を subprocess で見るのに対し、
+// 本テストは tree arm の standard budget 経路を in-process で直接駆動し、N-1/N/N+1 境界と
+// 「chunk 蓄積前に拒否」を観測する。`Evaluator::with_budget` + ambient `ModuleLoader`
 // （`set_base_dir` + tempdir に staging した `.tsg`）で standard budget をそのまま使う。
 // `TSUMUGI_SANDBOX` は process 全体の `OnceLock` で並列テストに敵対的なので設定しない
 // （未設定時の sandbox は許容的）。
@@ -1933,7 +1999,16 @@ fn tree_repl_resets_step_budget_per_submission() {
     let (stdout, stderr) = output_text(&output);
 
     assert!(output.status.success(), "tree REPLが異常終了: {stderr}");
-    assert!(stderr.is_empty(), "入力間でstep予算が累積: {stderr}");
+    // legacy env を使うので deprecation warning（§13）だけが 1 回出る。
+    assert!(
+        !stderr.contains("ステップ上限"),
+        "入力間でstep予算が累積: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("非推奨").count(),
+        1,
+        "warning は起動時に 1 回: {stderr}"
+    );
     assert_eq!(
         stdout.matches("1\n").count(),
         2,
@@ -2255,7 +2330,7 @@ fn shared_dag_sort_is_bounded_in_both_engines() {
 #[test]
 fn shared_builtin_range_gates_via_ledger_collection_limit_in_both_engines() {
     // REV-015 Slice 1: 共有 builtin（range）の collection 検査も、engine の
-    // BudgetLedger が保持する上限（legacy env 由来）を単一の正本として使う。
+    // BudgetLedger が保持する上限（CLI adapter が legacy env から設定）を単一の正本として使う。
     let source = "print(range(0, 5))\n";
 
     for use_vm in [false, true] {
@@ -3391,13 +3466,12 @@ fn heap_release_recovers_across_reassignment_in_both_engines() {
 }
 
 #[test]
-fn heap_accumulation_trips_limit_on_vm() {
+fn heap_accumulation_trips_limit_in_both_engines() {
     // 対になる負のテスト: 1 つの List へ push し続けて解放しない場合は、live heap が
     // 単調増加して上限を超える。release が「なんでも通す」わけではないことを固定する。
     // iterable range(0, 1000)=32024 + 累積 push。上限 50000 は途中で必ず超える。
-    // REV-015 option B 以降、legacy env `TSUMUGI_MAX_LIVE_HEAP_BYTES` を参照するのは VM 経路の
-    // みなので、この env 駆動の累積テストは VM に限定する（tree 既定の有限性は fuel 側の
-    // `cli_default_budget_is_finite_for_import_less_script_tree` で固定）。
+    // legacy env `TSUMUGI_MAX_LIVE_HEAP_BYTES` は CLI adapter（execution-control §13）が
+    // tree/VM の両経路へ同じく適用する。
     let script = concat!(
         "let x = []\n",
         "for i in range(0, 1000)\n",
@@ -3409,29 +3483,26 @@ fn heap_accumulation_trips_limit_on_vm() {
     let path = std::path::Path::new(dir.as_str()).join("accum.tsg");
     std::fs::write(&path, script).expect("スクリプトの書き込みに失敗");
 
-    // REV-015 最終形移行 Slice 1（option B）以降、tree CLI 経路は legacy env
-    // `TSUMUGI_MAX_LIVE_HEAP_BYTES` を参照せず standard budget（max_live_heap_bytes=64 MiB）で
-    // 走るため、1000 要素の累積ではこの小さな env 上限を踏まない（64 MiB には遠く届かない）。
-    // したがって env で小さな heap 上限を課して「累積が上限を超える」ことを示すのは、legacy env
-    // を参照する VM 経路でのみ成立する。tree CLI 既定の有限性（standard budget が効くこと）は
-    // `cli_default_budget_is_finite_for_import_less_script_tree` が fuel 側で別途固定している。
-    // VM 経路（legacy env を参照する）で累積が env 上限を超えることを固定する。
-    let mut cmd = Command::new(tsumugi_bin());
-    cmd.arg("--vm")
-        .arg(path.to_str().unwrap())
-        .env("TSUMUGI_MAX_LIVE_HEAP_BYTES", "50000");
-    let output = cmd.output().expect("tsumugi バイナリの実行に失敗");
-    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
-    let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
-    // 累積で上限を超えるため "done" は出ず、heap 診断が出る。
-    assert!(
-        !normalize(&stdout).contains("done"),
-        "VM: 累積 push が上限を超えず完走してしまった: {stdout}"
-    );
-    assert!(
-        stderr.contains("ヒープ"),
-        "VM: 累積 push で heap 診断が出ない: {stderr}"
-    );
+    for (mode, use_vm) in [("tree", false), ("VM", true)] {
+        let mut cmd = Command::new(tsumugi_bin());
+        if use_vm {
+            cmd.arg("--vm");
+        }
+        cmd.arg(path.to_str().unwrap())
+            .env("TSUMUGI_MAX_LIVE_HEAP_BYTES", "50000");
+        let output = cmd.output().expect("tsumugi バイナリの実行に失敗");
+        let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+        let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
+        // 累積で上限を超えるため "done" は出ず、heap 診断が出る。
+        assert!(
+            !normalize(&stdout).contains("done"),
+            "{mode}: 累積 push が上限を超えず完走してしまった: {stdout}"
+        );
+        assert!(
+            stderr.contains("ヒープ"),
+            "{mode}: 累積 push で heap 診断が出ない: {stderr}"
+        );
+    }
 }
 
 #[test]

@@ -175,7 +175,7 @@ print(square(5))    # 25
 - 行番号付きエラーメッセージ（パースエラー・ランタイムエラー両方）
 - パースエラーの回復（複数のエラーを一度にまとめて報告）
 - スタックトレース（関数呼び出し経路の表示）
-- 実行予算（ステップ・コレクション要素数・文字列・source/import 本数・deadline など。無限ループ・無限再帰も強制停止する）。CLI は既定の上限（ステップ 1,000,000 など）を使う。旧環境変数 `TSUMUGI_MAX_STEPS` / `TSUMUGI_MAX_COLLECTION_SIZE` は現状 REPL と `--vm` のファイル実行にだけ反映され、ツリーウォークのファイル/標準入力実行には反映されない
+- 実行予算（ステップ・コレクション要素数・文字列・source/import 本数・deadline など。無限ループ・無限再帰も強制停止する）。CLI は既定の上限（ステップ 1,000,000 など）を使う。`TSUMUGI_MAX_STEPS` / `TSUMUGI_MAX_COLLECTION_SIZE` などの `TSUMUGI_MAX_*` 環境変数で上限を変えられるが、非推奨の互換入口であり、設定すると起動時に警告が出る（組み込みAPIはこれらを読まない）
 - capability による外部効果の制御（deny-by-default。CLI では `--allow-*` / `--fs-*` / `--allow-import-root` で付与し、組み込みAPIでは `CapabilitySet` で付与）
 - legacy profile の互換制御（`--profile legacy` 時のみ、環境変数 `TSUMUGI_SANDBOX` / `TSUMUGI_ENV_ALLOW` でファイル操作と環境変数の許可リストを指定）
 - 実行時監査（組み込みAPIで audit sink を設定した場合のみ。tree backend のみ対応）

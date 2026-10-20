@@ -1,6 +1,6 @@
 # Tsumugi — 設計ドキュメント
 
-最終更新: 2026-08-31
+最終更新: 2026-10-20
 
 ## 目的と位置づけ
 
@@ -676,8 +676,8 @@ builtin_core.rs
 
 | 設定 / 定数 | 対象 | 動作 |
 |---|---|---|
-| `TSUMUGI_MAX_STEPS` | ループ反復 + 関数呼び出し | 上限超過でランタイムエラー |
-| `TSUMUGI_MAX_COLLECTION_SIZE` | List/Dictの生成・拡張とList生成builtin | 要素数上限超過でランタイムエラー |
+| `TSUMUGI_MAX_STEPS` | ループ反復 + 関数呼び出し（CLIのみ・非推奨） | 上限超過でランタイムエラー |
+| `TSUMUGI_MAX_COLLECTION_SIZE` | List/Dictの生成・拡張とList生成builtin（CLIのみ・非推奨） | 要素数上限超過でランタイムエラー |
 | `TSUMUGI_SANDBOX` | 全ファイル操作（read/write/import） | 許可パス外へのアクセスをブロック |
 | `TSUMUGI_ENV_ALLOW` | `env()` 関数 | 許可リスト外のキーは null を返す |
 | `MAX_USER_CALL_DEPTH = 128` | ユーザー関数のcall frame（root除く） | 129個目の直前で`StackOverflow` |

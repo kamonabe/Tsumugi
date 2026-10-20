@@ -284,13 +284,12 @@ impl BudgetConfig {
         })
     }
 
-    /// legacy 環境変数（`TSUMUGI_MAX_STEPS` / `TSUMUGI_MAX_COLLECTION_SIZE`）から
-    /// Slice 1 用の config を組み立てる（§13 の移行入口）。
+    /// fuel と collection 要素数の上限を指定し、他の field を §3.1 の既定値にした config を作る。
     ///
-    /// Slice 1 で実際に課金するのは fuel（= step）と collection 要素数だけなので、
-    /// その 2 field を引数で受け取り、他の field は既定値相当を置く。deadline は
-    /// Slice 1 では ledger の charge 経路で確認しないため、内部 clock の遠い未来を置く。
-    /// deadline checkpoint の配線は Slice 4 で行う。
+    /// process env は読まない（legacy env の上書きは [`Self::apply_legacy_overrides`]）。
+    /// clock を持たない既定経路（`Evaluator::new` / `Vm::new` / `Vm::new_repl`）と
+    /// テストが使う。deadline は内部 clock の遠い未来を置く（clock を注入しない経路では
+    /// ledger が deadline を確認しない）。
     pub fn for_legacy(total_fuel: u64, max_collection_elements: u64) -> Self {
         // 内部 clock 由来の遠い未来 deadline。Slice 1 では ledger が参照しない。
         let deadline = MonotonicInstant {
@@ -322,128 +321,98 @@ impl BudgetConfig {
         }
     }
 
-    /// legacy 環境変数から config を組み立てる（§13）。
+    /// legacy 上限の上書きに使う key（§13）。CLI adapter（`main.rs`）だけがこれらを
+    /// 起動時に 1 回 process env から読み、[`Self::apply_legacy_overrides`] へ渡す。
     ///
-    /// `TSUMUGI_MAX_STEPS` を `total_fuel`、`TSUMUGI_MAX_COLLECTION_SIZE` を
-    /// `max_collection_elements` に写す。未設定・不正値は既定（各 1,000,000）。
-    /// process-global な互換入口であり、library 埋め込みは明示 `BudgetConfig` を使う。
-    pub fn from_legacy_env() -> Self {
-        let total_fuel = std::env::var("TSUMUGI_MAX_STEPS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(1_000_000);
-        let max_collection_elements = std::env::var("TSUMUGI_MAX_COLLECTION_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(1_000_000);
-        let mut config = Self::for_legacy(total_fuel, max_collection_elements);
-        // string accounting（REV-015 Slice 2）の legacy 上限入口。未設定は §3.1 の既定値。
-        if let Some(v) = std::env::var("TSUMUGI_MAX_SINGLE_STRING_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            config.max_single_string_bytes = v;
+    /// §13 の表の `TSUMUGI_MAX_STEPS`（→ `total_fuel`）・`TSUMUGI_MAX_COLLECTION_SIZE`
+    /// （→ `max_collection_elements`）に加え、Slice 2 で追加した string / source / import /
+    /// heap / I-O / host call の上限 key も同じ移行規則（deprecation warning 付きの互換入口）で扱う。
+    pub const LEGACY_OVERRIDE_KEYS: &'static [&'static str] = &[
+        "TSUMUGI_MAX_STEPS",
+        "TSUMUGI_MAX_COLLECTION_SIZE",
+        "TSUMUGI_MAX_SINGLE_STRING_BYTES",
+        "TSUMUGI_MAX_STRING_ALLOCATIONS",
+        "TSUMUGI_MAX_STRING_BYTES",
+        "TSUMUGI_MAX_SINGLE_SOURCE_BYTES",
+        "TSUMUGI_MAX_SOURCE_COUNT",
+        "TSUMUGI_MAX_SOURCE_BYTES",
+        "TSUMUGI_MAX_IMPORT_COUNT",
+        "TSUMUGI_MAX_IMPORT_BYTES",
+        "TSUMUGI_MAX_LIVE_HEAP_BYTES",
+        "TSUMUGI_MAX_INPUT_CALLS",
+        "TSUMUGI_MAX_INPUT_BYTES",
+        "TSUMUGI_MAX_OUTPUT_CALLS",
+        "TSUMUGI_MAX_OUTPUT_BYTES",
+        "TSUMUGI_MAX_HOST_CALLS",
+        "TSUMUGI_MAX_HOST_REQUEST_BYTES",
+        "TSUMUGI_MAX_HOST_RESPONSE_BYTES",
+        "TSUMUGI_MAX_HOST_CALL_BYTES",
+    ];
+
+    /// legacy 上限の上書きを config へ適用する（§13）。
+    ///
+    /// library は process env を読まない（§14 Slice 1「CLI だけに旧環境変数 adapter を置く」）。
+    /// 値は `lookup` で受け取り、[`Self::LEGACY_OVERRIDE_KEYS`] の各 key について、値が数値として
+    /// 解釈できたものだけを該当 field へ上書きする（不正値は従来どおり無視して既定を残す）。
+    /// deadline・accounting revision は変えない。適用した key を
+    /// [`Self::LEGACY_OVERRIDE_KEYS`] の順で返す（CLI の deprecation warning に使う）。
+    pub fn apply_legacy_overrides(
+        &mut self,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Vec<&'static str> {
+        let mut applied = Vec::new();
+        for &key in Self::LEGACY_OVERRIDE_KEYS {
+            let Some(raw) = lookup(key) else { continue };
+            if self.apply_legacy_override(key, &raw) {
+                applied.push(key);
+            }
         }
-        if let Some(v) = std::env::var("TSUMUGI_MAX_STRING_ALLOCATIONS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            config.max_string_allocations = v;
+        applied
+    }
+
+    /// 1 key ぶんの上書き。値を解釈できて field へ書いたときだけ `true`。
+    fn apply_legacy_override(&mut self, key: &str, raw: &str) -> bool {
+        // source / import の本数は u32、それ以外は u64。
+        match key {
+            "TSUMUGI_MAX_SOURCE_COUNT" | "TSUMUGI_MAX_IMPORT_COUNT" => {
+                let Ok(v) = raw.parse::<u32>() else {
+                    return false;
+                };
+                if key == "TSUMUGI_MAX_SOURCE_COUNT" {
+                    self.max_source_count = v;
+                } else {
+                    self.max_import_count = v;
+                }
+                true
+            }
+            _ => {
+                let Ok(v) = raw.parse::<u64>() else {
+                    return false;
+                };
+                let field = match key {
+                    "TSUMUGI_MAX_STEPS" => &mut self.total_fuel,
+                    "TSUMUGI_MAX_COLLECTION_SIZE" => &mut self.max_collection_elements,
+                    "TSUMUGI_MAX_SINGLE_STRING_BYTES" => &mut self.max_single_string_bytes,
+                    "TSUMUGI_MAX_STRING_ALLOCATIONS" => &mut self.max_string_allocations,
+                    "TSUMUGI_MAX_STRING_BYTES" => &mut self.max_string_bytes,
+                    "TSUMUGI_MAX_SINGLE_SOURCE_BYTES" => &mut self.max_single_source_bytes,
+                    "TSUMUGI_MAX_SOURCE_BYTES" => &mut self.max_source_bytes,
+                    "TSUMUGI_MAX_IMPORT_BYTES" => &mut self.max_import_bytes,
+                    "TSUMUGI_MAX_LIVE_HEAP_BYTES" => &mut self.max_live_heap_bytes,
+                    "TSUMUGI_MAX_INPUT_CALLS" => &mut self.max_input_calls,
+                    "TSUMUGI_MAX_INPUT_BYTES" => &mut self.max_input_bytes,
+                    "TSUMUGI_MAX_OUTPUT_CALLS" => &mut self.max_output_calls,
+                    "TSUMUGI_MAX_OUTPUT_BYTES" => &mut self.max_output_bytes,
+                    "TSUMUGI_MAX_HOST_CALLS" => &mut self.max_host_calls,
+                    "TSUMUGI_MAX_HOST_REQUEST_BYTES" => &mut self.max_host_request_bytes,
+                    "TSUMUGI_MAX_HOST_RESPONSE_BYTES" => &mut self.max_host_response_bytes,
+                    "TSUMUGI_MAX_HOST_CALL_BYTES" => &mut self.max_host_call_bytes,
+                    _ => return false,
+                };
+                *field = v;
+                true
+            }
         }
-        if let Some(v) = std::env::var("TSUMUGI_MAX_STRING_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            config.max_string_bytes = v;
-        }
-        // source accounting（REV-015 Slice 2）の legacy 上限入口。未設定は §3.1 の既定値。
-        if let Some(v) = std::env::var("TSUMUGI_MAX_SINGLE_SOURCE_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            config.max_single_source_bytes = v;
-        }
-        if let Some(v) = std::env::var("TSUMUGI_MAX_SOURCE_COUNT")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-        {
-            config.max_source_count = v;
-        }
-        if let Some(v) = std::env::var("TSUMUGI_MAX_SOURCE_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            config.max_source_bytes = v;
-        }
-        if let Some(v) = std::env::var("TSUMUGI_MAX_IMPORT_COUNT")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-        {
-            config.max_import_count = v;
-        }
-        if let Some(v) = std::env::var("TSUMUGI_MAX_IMPORT_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            config.max_import_bytes = v;
-        }
-        // heap accounting（REV-015 Slice 2）の legacy 上限入口。未設定は §3.1 の既定値。
-        if let Some(v) = std::env::var("TSUMUGI_MAX_LIVE_HEAP_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            config.max_live_heap_bytes = v;
-        }
-        // I-O accounting（REV-015 Slice 2）の legacy 上限入口。未設定は §3.1 の既定値。
-        if let Some(v) = std::env::var("TSUMUGI_MAX_INPUT_CALLS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            config.max_input_calls = v;
-        }
-        if let Some(v) = std::env::var("TSUMUGI_MAX_INPUT_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            config.max_input_bytes = v;
-        }
-        if let Some(v) = std::env::var("TSUMUGI_MAX_OUTPUT_CALLS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            config.max_output_calls = v;
-        }
-        if let Some(v) = std::env::var("TSUMUGI_MAX_OUTPUT_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            config.max_output_bytes = v;
-        }
-        if let Some(v) = std::env::var("TSUMUGI_MAX_HOST_CALLS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            config.max_host_calls = v;
-        }
-        if let Some(v) = std::env::var("TSUMUGI_MAX_HOST_REQUEST_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            config.max_host_request_bytes = v;
-        }
-        if let Some(v) = std::env::var("TSUMUGI_MAX_HOST_RESPONSE_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            config.max_host_response_bytes = v;
-        }
-        if let Some(v) = std::env::var("TSUMUGI_MAX_HOST_CALL_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            config.max_host_call_bytes = v;
-        }
-        config
     }
 
     /// config の妥当性を検証する（§3）。execution 作成前に呼ぶ。
@@ -4180,5 +4149,60 @@ mod tests {
         assert_eq!(l.usage().committed.string_allocations, alloc_before);
         drop(again);
         assert_eq!(l.usage().live_heap_bytes, 0);
+    }
+
+    /// §13: legacy 上書きは lookup で与えた key だけを該当 field へ写し、process env を読まない。
+    #[test]
+    fn apply_legacy_overrides_maps_each_key_to_its_field() {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+        let applied = config.apply_legacy_overrides(|key| match key {
+            "TSUMUGI_MAX_STEPS" => Some("100".to_string()),
+            "TSUMUGI_MAX_COLLECTION_SIZE" => Some("10".to_string()),
+            "TSUMUGI_MAX_IMPORT_COUNT" => Some("3".to_string()),
+            "TSUMUGI_MAX_HOST_CALL_BYTES" => Some("77".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            applied,
+            vec![
+                "TSUMUGI_MAX_STEPS",
+                "TSUMUGI_MAX_COLLECTION_SIZE",
+                "TSUMUGI_MAX_IMPORT_COUNT",
+                "TSUMUGI_MAX_HOST_CALL_BYTES",
+            ]
+        );
+        assert_eq!(config.total_fuel, 100);
+        assert_eq!(config.max_collection_elements, 10);
+        assert_eq!(config.max_import_count, 3);
+        assert_eq!(config.max_host_call_bytes, 77);
+        // 指定しなかった field は既定のまま。
+        assert_eq!(config.max_source_count, 1_025);
+    }
+
+    /// §13: 数値として解釈できない値は無視して既定を残し、適用 key にも数えない。
+    #[test]
+    fn apply_legacy_overrides_ignores_unparsable_values() {
+        let mut config = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+        let deadline = config.deadline;
+        let applied = config.apply_legacy_overrides(|key| match key {
+            "TSUMUGI_MAX_STEPS" => Some("abc".to_string()),
+            // u32 field に u32 を超える値。
+            "TSUMUGI_MAX_SOURCE_COUNT" => Some("4294967296".to_string()),
+            _ => None,
+        });
+        assert!(applied.is_empty());
+        assert_eq!(config.total_fuel, 1_000_000);
+        assert_eq!(config.max_source_count, 1_025);
+        assert_eq!(config.deadline, deadline, "deadline は上書きしない");
+    }
+
+    /// 全 key が少なくとも 1 つの field へ写る（key 表と match の取りこぼし防止）。
+    #[test]
+    fn every_legacy_override_key_is_applicable() {
+        for &key in BudgetConfig::LEGACY_OVERRIDE_KEYS {
+            let mut config = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+            let applied = config.apply_legacy_overrides(|k| (k == key).then(|| "5".to_string()));
+            assert_eq!(applied, vec![key], "{key} が適用されない");
+        }
     }
 }

@@ -910,7 +910,23 @@ run-turn queueはEngine全体でFIFO round-robinとし、continuation自体で�
 | `TSUMUGI_MAX_STEPS` | `BudgetConfig.total_fuel` | embedding側の明示値が最優先。CLIで明示値がない場合だけ起動時に1回読み、同値へ設定してdeprecation warningを出す |
 | `TSUMUGI_MAX_COLLECTION_SIZE` | `BudgetConfig.max_collection_elements` | 同上。`OnceLock`を使わず、executionごとのconfigへcopyする |
 
-新fuelはstatement・expression等も課金するため、同じ数値でも旧step limitより早く到達し得る。互換mappingは安全側であり、旧実行量の完全再現を保証しない。`ExecutionContext::reset_step_budget()`は削除し、executionごとに新しい`BudgetUsage`を作る。REPLの各入力は1 executionとし、contextだけを引き継ぐ。
+Slice 2で追加した上限のlegacy key（`TSUMUGI_MAX_SINGLE_STRING_BYTES` / `TSUMUGI_MAX_STRING_ALLOCATIONS` / `TSUMUGI_MAX_STRING_BYTES` / `TSUMUGI_MAX_SINGLE_SOURCE_BYTES` / `TSUMUGI_MAX_SOURCE_COUNT` / `TSUMUGI_MAX_SOURCE_BYTES` / `TSUMUGI_MAX_IMPORT_COUNT` / `TSUMUGI_MAX_IMPORT_BYTES` / `TSUMUGI_MAX_LIVE_HEAP_BYTES` / `TSUMUGI_MAX_INPUT_CALLS` / `TSUMUGI_MAX_INPUT_BYTES` / `TSUMUGI_MAX_OUTPUT_CALLS` / `TSUMUGI_MAX_OUTPUT_BYTES` / `TSUMUGI_MAX_HOST_CALLS` / `TSUMUGI_MAX_HOST_REQUEST_BYTES` / `TSUMUGI_MAX_HOST_RESPONSE_BYTES` / `TSUMUGI_MAX_HOST_CALL_BYTES`）も、上表と同じ移行規則で扱う（2026-10-20決定）。各keyは同名の`BudgetConfig`上限fieldへ写し、数値として解釈できない値は無視して既定を残す。
+
+新fuelはstatement・expression等も課金するため、同じ数値でも旧step limitより早く到達し得る。互換mappingは安全側であり、旧実行量の完全再現を保証しない。
+
+> **§13 実装注記（2026-10-20）**
+>
+> legacy envの入口はCLI adapter（`src/main.rs`の`LegacyBudgetEnv`）だけに置いた。起動時に1回だけ
+> process envを読み、tree/VMのfile・stdin・REPLの全経路で同じ上書きを適用する（tree/VMは
+> `BudgetConfig::standard`、clockを持たないVM実行は`for_legacy(1_000_000, 1_000_000)`を土台にする）。
+> 上書きが1つでも効くと、stderrへ1回
+> 「警告: 環境変数 KEY[, KEY...] による実行予算の上書きは非推奨であり、将来のバージョンで削除されます」を出す。
+> libraryは env を読まない: `BudgetConfig::from_legacy_env`を削除し、env非依存の
+> `BudgetConfig::apply_legacy_overrides(lookup)`と`LEGACY_OVERRIDE_KEYS`へ置き換えた。
+> `Evaluator::new` / `Vm::new` / `Vm::new_repl`（alpha facadeの`ExecutionContext::new`を含む）は
+> §3.1既定の上限を使う。VMへ明示configを渡す`Vm::with_budget` / `Vm::new_repl_with_budget`を追加した。
+> これにより、option B（最終形移行Slice 1）以降に残っていた「tree file/stdinだけがenvを無視する」
+> tree/VM差を解消した。削除予定versionは、最初のreleaseを切る時点で決める（未決）。`ExecutionContext::reset_step_budget()`は削除し、executionごとに新しい`BudgetUsage`を作る。REPLの各入力は1 executionとし、contextだけを引き継ぐ。
 
 `MAX_AST_DEPTH`、`MAX_IMPORT_DEPTH`、`MAX_USER_CALL_DEPTH`は環境変数化せず、language revisionに紐づく構造上限として維持する。将来configurableにする場合もbudgetと同じ不変configへ置き、paused中変更は許さない。
 
@@ -936,7 +952,8 @@ run-turn queueはEngine全体でFIFO round-robinとし、continuation自体で�
 > arithmetic と第7.2節の固定優先順位（`BudgetResource::priority`）に従う。overflow は
 > `requested = u64::MAX` の `BudgetExceeded` へ写像し wrap しない。`BudgetConfig::standard`
 > は第3.1節の既定値を、`from_legacy_env` / `for_legacy` は `TSUMUGI_MAX_STEPS` /
-> `TSUMUGI_MAX_COLLECTION_SIZE` を fuel / collection 上限へ写す legacy 入口を提供する。
+> `TSUMUGI_MAX_COLLECTION_SIZE` を fuel / collection 上限へ写す legacy 入口を提供する
+> （2026-10-20: `from_legacy_env` は削除し、env の読み込みは CLI adapter へ移した。§13 実装注記）。
 >
 > tree evaluator（`src/eval.rs`）と VM（`src/vm.rs`）の step 検査を `charge_fuel(1, Run)`
 > へ、collection 検査を `check_collection_elements` / 共有 handler へ渡す

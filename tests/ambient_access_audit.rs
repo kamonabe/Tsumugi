@@ -3,8 +3,9 @@
 //! 静的: `src/` の production コード（`#[cfg(test)]` モジュールより前）で、`std::env::var*` /
 //! `std::fs::*` / `std::io::stdin` / `std::io::stdout` / `std::process::exit` / `SystemTime::now`
 //! の直接呼びが CLI adapter（`main.rs` / `cli_capability.rs`）と capability adapter
-//! （`capability.rs`）以外に無いこと（import 解決の `module.rs` / `sandbox.rs`、budget env の
-//! `budget.rs` は許可リストで除外）。
+//! （`capability.rs`）以外に無いこと（import 解決の `module.rs` / `sandbox.rs` は許可リストで除外）。
+//! legacy budget env（`TSUMUGI_MAX_*`）は CLI adapter（`main.rs`）だけが読み、library の `budget.rs`
+//! は env を読まない（execution-control §13 / §14 Slice 1）。
 //!
 //! 動的: safe 既定で fs/env/clock/stdin/exit を試み、未 grant で Denial（ambient へ漏れない）
 //! ことを tree/VM で確認する。
@@ -25,14 +26,12 @@ fn src_dir() -> PathBuf {
 /// - `main.rs` / `cli_capability.rs`: CLI adapter。profile から frozen set を組む境界で OS を触る。
 /// - `capability.rs`: System* / OsDirectoryHandle adapter（OS 実装そのもの）。
 /// - `module.rs` / `sandbox.rs`: import 解決（C6）。runtime fs ではない（§6.6）。C6/E7 で撤去予定。
-/// - `budget.rs`: `from_legacy_env`（budget env）。C9/C10 対象外（Phase 3/REV-015）。
 const ALLOWLIST: &[&str] = &[
     "main.rs",
     "cli_capability.rs",
     "capability.rs",
     "module.rs",
     "sandbox.rs",
-    "budget.rs",
 ];
 
 /// 検出する ambient パターン。
