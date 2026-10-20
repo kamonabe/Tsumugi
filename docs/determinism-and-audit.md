@@ -924,8 +924,148 @@ Slice 5 の最小縦切り（A-1）を tree engine にのみ実装した時点�
   `AuditYieldReason::AuditBackpressure` の Yielded/Resumed pair で満たされる（`tests/audit_backpressure.rs`）。
 - **未実装（意図的に含めない）**: redaction policy 本体（§9）、strict deterministic CBOR（§9.2、A-1 の
   `encoded_bytes` は naive 推定で後で差し替え可能に隔離）、record/replay（§6）、VM の変更、§10.2 の
-  audit drain queue byte 会計（B-2）。`AdmissionQueued` / `SchedulerPreempted` / `HostPaused`
+  audit drain queue byte 会計（B-2、設計確定・未実装。下記「B-2 実装スライス」）。`AdmissionQueued` / `SchedulerPreempted` / `HostPaused`
   の yield emission（engine-poll 経路に sink が無い、上記）も後続スライスへ延期する。
+
+#### B-2 実装スライス（tree engine、opt-in、audit drain queue byte 会計）
+
+> 状態: **設計確定・未実装**（2026-10-20）。実装完了時にこの注記を実装済みへ更新する。
+
+B-1 は sink の `Pending` 応答に由来する backpressure だけを配線し、§10.2 の
+「audit drain queue の byte 上限」は消費していない（`AuditBudget.max_pending_bytes` は未使用）。
+B-2 はこの byte 会計を tree engine の監査付き poll driver へ入れる。仕様（§10.2・§11）が正本であり、
+以下は B-2 時点の実装範囲と逸脱の記録である。
+
+- **drain queue の定義**: execution の audit drain queue を「生成済みだが sink の ack を
+  まだ得ていない通常 event の encoded byte 合計」と定義する。A-1/B-1 の実装では次の 2 つの和になる。
+  1. 評価器 buffer（host-call triple・`Yielded`/`Resumed`・確定済み `BudgetCharged`）にあり、
+     journal へまだ append していない event。
+  2. journal へ append 済みで、sink の ack をまだ得ていない in-flight batch（現在は 1 envelope/batch
+     の同期 deliver なので高々 1 batch）。
+
+  既定 slice fuel（`u64::MAX`）では script 全体が 1 slice で走り、評価器 buffer は terminal まで
+  flush されない。B-2 の主目的は、この buffer の無制限な成長を §10.2 の上限で抑えることである。
+  `ExecutionStarted` と `Terminal` は queue 会計の対象外とする（Started は最初の work の前に ack 待ち、
+  Terminal は §10.1 の専用 reserve を使うため）。`BudgetCharged` は accumulator 内の未確定集約
+  （256-charge cut 前）を数えず、確定 event として buffer へ移った時点で数える（未確定集約は
+  (resource, reason) ごとに 1 件で有界）。
+
+- **上限判定の位置**: 評価器は event を buffer へ積むたびに queue byte を加算し、既存の slice fuel
+  判定と同じ **トップレベル driver の文/反復境界**（`run_driver` の `can_yield && …` 判定と同じ位置）で
+  `queue_bytes >= max_pending_bytes` を判定する。達していれば slice を終えて crate 内部の
+  `SliceOutcome::YieldedAuditQueue` を返す。式の途中、および関数呼び出し・callback の本体
+  （`drive_call_body`、`can_yield = false`）の中では yield しない（tree は Rust 再帰スタックを
+  保存できないため。§4.2・[実行予算・協調実行仕様](execution-control.md) Slice 3 PR-d と同じ制約）。
+  したがって上限は「トップレベル境界で判定する soft limit」である（下記「逸脱」）。
+
+- **前進保証**: 判定は **その slice で 1 文以上実行した後** にだけ行う。resume 直後（`Resumed` を
+  buffer した直後）の境界では判定しない。これにより `max_pending_bytes` がどんな値（0 や
+  `Resumed` 1 件より小さい値を含む）でも、yield と resume だけを繰り返して 1 文も進まない livelock は
+  起きない。`max_pending_bytes = 0` は「トップレベルの 1 文ごとに flush する」設定として有効であり、
+  config error にはしない。
+
+- **yield と event 順序**: queue 上限による yield は §10.2 どおり
+  `Yielded { reason: AuditBackpressure }` として記録する（新しい `AuditYieldReason` や
+  CBOR tag は追加しない）。sink が即 Ack する場合も必ず `Yielded`/`Resumed` の pair を出す
+  （§8: yield は必ず監査される）。順序は SliceFuel yield と同じ規律に従う。
+  1. §8 規則7: budget accumulator を flush し、その slice ぶんの `BudgetCharged` を `Yielded` より前に置く。
+  2. `Yielded(AuditBackpressure)` を評価器の単一 `poll_index` カウンタで発番する（driver 独自カウンタなし）。
+  3. driver は `flush_events` で buffer を全量 deliver する（sink が `Pending` なら B-1 の round-trip に入る）。
+     flush 完了時に queue は 0 へ戻る。
+  4. 次の `run_slice` 先頭で `Resumed { previous_reason: AuditBackpressure }` を buffer する（§8 規則8）。
+
+  queue 由来か sink `Pending` 由来かは event 上は区別しない（どちらも `AuditBackpressure`）。
+
+- **単一 event が上限を超える場合**: 特別扱いしない。flush 完了で queue は必ず 0 へ戻るため、
+  `max_pending_bytes` を超える event が 1 件あっても、次のトップレベル境界で yield・flush して前進する
+  （進行不能にはならない）。event 単体の size 検査は従来どおり journal 側（`EventTooLarge` /
+  `BudgetExceeded`、§11）に任せ、`EventTooLarge` を queue 上限の意味では使わない。
+
+- **byte の測り方**: queue byte は journal の会計と同じ推定関数で測る（§9.2「予算 byte counter が
+  別実装の size 推定を持つことを禁止」）。評価器 buffer の event はまだ envelope ではない（sequence 未確定）
+  ため、`audit::estimate_encoded_bytes` を「envelope 固定部（`language_revision` に依存、sequence に
+  非依存）＋ `estimate_event_bytes(event)`」の 2 部品へ分解し、journal と queue の双方がこの同じ部品を
+  使う。現行 naive 推定は sequence に依存しないので、push 時の計上値は append 時の journal 計上値と
+  一致する。
+
+- **engine 全体 16 MiB の延期**: B-2 は **per-execution の上限（`max_pending_bytes`）だけ**を
+  実装する。engine 全体の 16 MiB 上限は、複数 execution で共有する queue 会計の持ち主と、上限で
+  yield した execution を起こす wake 経路が scheduler（E10 統合）と不可分なため、後続スライスへ延期する。
+
+- **設定経路**: facade は既定で `AuditBudget::default()`（`max_pending_bytes` = 1 MiB）を使う。
+  公開 builder setter は追加しない。境界テストのため、`EngineBuilder` に `#[doc(hidden)] pub` の
+  shim `audit_budget_for_test(AuditBudget)` を置く（`link_for_repl` / `run_for_repl` と同じ扱いで、
+  公開契約は増やさない）。shim は内部で `AuditBudget::validate()` を呼び、不正値なら panic する
+  （テスト専用のため）。注入された budget は facade の `AuditJournal::open` と queue 判定の双方に使う。
+
+- **opt-in・非破壊**: sink なし経路（`run_guarded`）は queue 会計を一切行わず、観測結果・出力 byte・
+  exit code は不変。sink あり経路では、queue が一度も上限に達しない実行の envelope 列は B-1 と
+  完全一致する。新しい公開型・CBOR tag・`language_revision` の変更はない。
+  **sink あり経路での挙動変化**: 既定 budget（1 MiB）でも、トップレベル境界までに 1 MiB 超の event を
+  溜める script では、envelope 列の途中に `AuditBackpressure` の `Yielded`/`Resumed` pair が入る
+  （queue 上限到達は backpressure の一種）。opt-in 経路内の変化であり alpha として受容する。
+
+- **逸脱（B-2 時点で残るもの）**:
+  - **関数呼び出し・callback の中では上限が効かない**。判定はトップレベル境界だけなので、例えば
+    `main()` の 1 文の中で多数の host call を行うと、`main()` から戻るまで queue は上限を超えて
+    溜まり続ける。超過量は host-call 回数 budget（`BudgetConfig::standard` で `max_host_calls`
+    = 10,000、event 最大約 3 万件）で有界だが、1 MiB を大きく超え得る。根本対策（関数内 yield、
+    または §11 の host call 開始前 reserve）は B-2 の範囲外。
+  - engine 全体 16 MiB の未実装。同一 `Engine`（`Send + Sync`、`run_audited(&self, …)`）を複数 thread
+    から同時に `run_audited` した場合の合計は束縛しない。
+  - byte 数は naive 推定。§9.2 strict CBOR へ差し替えると sequence/timestamp の encode 長が値依存に
+    なり、push 時点（sequence 未確定）では正確な長さが分からない。その時点では §11 の size pass と
+    同じく「sequence を最大長とみなした上限値」で queue へ計上する。差し替えで yield が起きる位置が
+    変わり得るため、回帰テストの期待値を更新する。
+  - 公開 setter（`EngineBuilder::audit_budget`）と `ConfigError` への `AuditConfigError` 接続は、
+    sink 必須化（§1.1）のスライスへ延期する。
+
+- **変更箇所**:
+  - `src/eval.rs`: queue byte カウンタ（buffer への push 時に加算、drain 時に減算）、
+    `max_pending_bytes` の保持、トップレベル文/反復境界での判定（slice 内で 1 文以上実行済みの場合のみ）、
+    `SliceOutcome::YieldedAuditQueue`（crate 内部）、`audit_yield_reason_from` の写像追加
+    （→ `AuditYieldReason::AuditBackpressure`）。
+  - `src/builtin.rs`: `push_host_call_events` 経由で加算されることの確認（呼び出し側の変更は原則不要）。
+  - `src/budget.rs`: 確定済み `BudgetCharged` を buffer へ移す際の加算フック。
+  - `src/audit.rs`: `estimate_encoded_bytes` を envelope 固定部 ＋ event 本体へ分解し、
+    `estimate_event_bytes` を `pub(crate)` にする。`max_pending_bytes` の doc コメント
+    「A-1 では消費しない」を更新する。
+  - `src/embedding.rs`: `run_audited_driver` で `YieldedAuditQueue` を `continue` 扱いにし、
+    `flush_events` 後に queue が 0 に戻ることを assert（debug）。`AuditDelivery` の in-flight
+    batch byte を queue へ含める。`EngineBuilder::audit_budget_for_test` shim と、注入 budget の
+    `AuditJournal::open` への受け渡し。
+
+- **受入基準（B-2）**:
+  - **B2-AT-01**: `max_pending_bytes` を小さく注入し、**トップレベルのループから** host call を多数行う
+    script を監査付きで実行すると、上限到達の境界で `Yielded{AuditBackpressure}` →
+    `Resumed{AuditBackpressure}` の pair が出る。sink が即 Ack する場合も pair が出る。pair は
+    poll_index を共有し、`Resumed.previous_reason` は対の `Yielded.reason` と一致する（§15.3）。
+  - **B2-AT-02**: 上限到達時に queue の event が捨てられたり上書きされたりしない。sequence は 0 から
+    gap・重複がなく、host-call の triple がすべて揃う（§10.2「queueを捨てない」・§15.3）。
+  - **B2-AT-03**: §8 規則7（`BudgetCharged` が `Yielded` より前）・規則8（`Resumed` が次の work より前）・
+    規則9（Terminal が最後）を満たす。
+  - **B2-AT-04**: queue 上限 yield と sink `Pending` が重なる場合（queue 上限で flush 中に sink が
+    `PendingThenAck` を返す場合）も、pair が交互に正しく対応し、最終的に Completed になる。
+  - **B2-AT-05**: queue 上限 yield 中の flush で sink が `PendingForever` を返し deadline に達した場合は、
+    `AuditFailure::BackpressureDeadline` になる（script の Deadline より優先、§10.2）。
+  - **B2-AT-06**: 単一 envelope が `max_pending_bytes` を超える設定（`max_pending_bytes = 0` を含む）でも、
+    進行不能にならず各トップレベル境界で yield・flush して Completed になる。yield/resume だけを
+    繰り返す livelock が起きない（前進保証）。
+  - **B2-AT-07（非破壊）**: 既定 budget（1 MiB）で既存の `tests/audit_core.rs` /
+    `tests/audit_hostcall.rs` / `tests/audit_yield_resume.rs` / `tests/audit_backpressure.rs` が
+    無改変で緑。sink なし経路の出力 byte・exit code が不変。既存テストが上限に到達して期待値が
+    変わる場合は、実装を止めて報告する。
+  - **B2-AT-08（決定性）**: 同じ script・同じ注入 budget・同じ sink 応答列では、yield が起きる位置と
+    envelope 列が 100 回の実行で一致する（§15.1 の部分適用）。
+  - **B2-AT-09（関数内 soft limit）**: 関数本体の中で多数の host call を行う script では、関数の中では
+    yield せず、関数から戻った後のトップレベル境界で yield する。その間 event は欠落せず、
+    sequence・triple の完全性（B2-AT-02 と同条件）を満たす。
+  - **B2-AT-10（byte 計上の一致）**: push 時に queue へ計上した byte の総和が、同じ event を journal へ
+    append したときの `committed_bytes` の増分と一致する（推定関数の共有）。
+  - VM は対象外（監査 sink と `VmExperimental` の同時設定は従来どおり build 時に拒否）。
+
+- **テスト配置案**: `tests/audit_queue_bytes.rs`（B2-AT-01〜06・08〜09）を新設する。B2-AT-10 は
+  `src/audit.rs` / `src/eval.rs` の unit test、B2-AT-07 は既存テストの無改変緑で担保する。
 
 ### Slice 6: VM conformance
 
