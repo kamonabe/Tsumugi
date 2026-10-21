@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-10-20（F-1 fuel parity を実装）
+最終更新: 2026-10-21（Phase 6 audit の redaction 本体を R-1 slice として定義）
 
 > このロードマップは「進捗だけ」を追う。機能の詳細・採用/不採用の理由は各設計正本に置く
 > （ドキュメントの役割分担は [ドキュメント運用ガイド](documentation-guide.md) を参照）。
@@ -10,7 +10,7 @@
 
 - **フェーズ:** Phase 2（deny-by-default capability）・Phase 3/4（包括的な実行予算・協調実行）を並行して進行中。
 - **現在の slice:** 決定性 Slice 1（規範的 primitive）＝Phase 5 の着手部分は実装完了（StableError を含む deterministic primitive が一通り揃った。VM parity・FakeHost gate・audit normalize は後続 slice）。
-- **次のタスク:** 着手順 3（Phase 6 audit の残り）から slice を選定する（受入基準・変更箇所を持つ slice 定義は未作成）。正本は [決定性・実行時監査仕様](determinism-and-audit.md) §14 Slice 5。§4.1 の課金表（F-2）は未定義。
+- **次のタスク:** R-1（redaction 本体、R-1a 粒度）を実装する。受入基準・逸脱・変更箇所を持つ slice 定義は作成済み（正本は [決定性・実行時監査仕様](determinism-and-audit.md) §14「R-1 実装スライス」）。実装は docs の slice 定義（本コミット）とは別 PR。採用・不採用の判断履歴は同 §14「R-1 レビュー反映の記録」。§4.1 の課金表（F-2）は引き続き未定義。
 - **直近完了:** F-1 fuel parity（[実行予算・協調実行仕様](execution-control.md) §14「F-1 実装スライス」）。VM の fuel を tree と同じ課金点に揃え、停止性を fuel から独立した instruction watchdog へ移した（[次期意味論・実装決定](semantic-decisions.md) §17.7 改訂）。同じ script の成功・失敗と上限到達時の line が tree/VM で一致する。
 - **直近完了（その前）:** legacy budget env（`TSUMUGI_MAX_*`）の CLI adapter 一本化（[実行予算・協調実行仕様](execution-control.md) §13）。tree file/stdin だけが env を無視していた tree/VM 差を解消し、library は env を読まなくなった。
 - **直近完了（さらに前）:** audit drain queue byte 会計（§10.2、B-2）を tree backend で完了（per-execution 上限・opt-in。engine 全体 16 MiB は E10 統合後）。あわせて yield と host call が同じ実行で起きるときの §8 規則8 違反（B-1 からの既存不具合）を修正。詳細は [決定性・実行時監査仕様](determinism-and-audit.md) §14「B-2 実装スライス」。
@@ -68,7 +68,7 @@
 | AUD-045 | MSRV 1.97・stable/MSRV CI・install/release・artifact・署名/SBOM/OCI・運用 gate | 🟡 | [検証・リリース・運用設計](verification-release-operations.md) §3〜10・17〜18節 |
 | AUD-048 | 動的評価ごとの per-instance `FunctionId` による関数等価性 | ✅ | [次期意味論・実装決定](semantic-decisions.md) §12・[決定性・実行時監査仕様](determinism-and-audit.md) §4.7 |
 | Phase 5 残 | deterministic shared helpers（NaN canonicalization `0x7ff8_0000_0000_0000`・Float format）・DeterminismRulesRevision/ModuleId 正規化・StableError（`src/stable_error.rs`、tree 射影）は完了。Slice 1 の deterministic primitive は一通り揃った。残りは Slice 2〜6（HostBoundary/FakeHost・VM parity・audit normalize・record/replay 等） | 🟡 | [決定性・実行時監査仕様](determinism-and-audit.md) 第14節 Slice 1〜6 |
-| Phase 6 残 | audit drain queue の engine 全体 16 MiB 上限（§10.2、E10 統合後。per-execution 上限は B-2 で実装済み）・redaction 本体・strict CBOR・record/replay・VM 対応・sink 必須化・`AdmissionQueued`/`SchedulerPreempted`/`HostPaused` の yield emission（engine-poll 経路に sink が無い）（A-1 ＋ `BudgetCharged` ＋ host-call lifecycle 3 event `CapabilityDecision` / `HostCallStarted` / `HostCallFinished` ＋ yield/resume 2 event `Yielded` / `Resumed` emission ＋ `AuditBackpressure`-yield 配線〔B-1、sink-Pending 由来〕＋ audit drain queue byte 会計〔B-2、per-execution〕は tree backend で実装済み） | 🟡 | [決定性・実行時監査仕様](determinism-and-audit.md) §6〜12・14 Slice 5 |
+| Phase 6 残 | audit drain queue の engine 全体 16 MiB 上限（§10.2、E10 統合後。per-execution 上限は B-2 で実装済み）・redaction 本体（R-1 で slice 定義済み・実装未着手）・strict CBOR・record/replay・VM 対応・sink 必須化・`AdmissionQueued`/`SchedulerPreempted`/`HostPaused` の yield emission（engine-poll 経路に sink が無い）（A-1 ＋ `BudgetCharged` ＋ host-call lifecycle 3 event `CapabilityDecision` / `HostCallStarted` / `HostCallFinished` ＋ yield/resume 2 event `Yielded` / `Resumed` emission ＋ `AuditBackpressure`-yield 配線〔B-1、sink-Pending 由来〕＋ audit drain queue byte 会計〔B-2、per-execution〕は tree backend で実装済み） | 🟡 | [決定性・実行時監査仕様](determinism-and-audit.md) §6〜12・14 Slice 5 |
 | 品質改善 | 未着手の処理改善（`dispatch` の match 分割・`exec_stmt` 分割・sandbox `OnceLock` テスタビリティ・fuzzing 導入） | ⬜ | [設計](design.md) |
 
 ## 着手順（次に何をやるか）
@@ -77,7 +77,7 @@
 
 1. **包括 budget の残り（REV-001/REV-015、Phase 3/4）** — 残 I/O/host budget と Phase 6 audit への budget/event 伝播。budget 本体は tree/VM 完了で、Phase 6 伝播のうち `BudgetCharged`・host-call lifecycle の 3 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished`）・yield/resume lifecycle の 2 event（`Yielded` / `Resumed`）・`AuditBackpressure`-yield 配線（§10.2、B-1、sink-Pending 由来）は tree backend で実装済み。これで host-call + yield/resume + backpressure の audit 伝播は完了（tree-only・opt-in・非破壊）。B-2 の audit drain queue byte 会計（§10.2、per-execution）も実装済みで、残るのは VM 対応（別フェーズ）。REV-001 の全順序化（REV-017）は revision 0.21 で実装済み（§17.8）。正本: [実行予算・協調実行仕様](execution-control.md)、全順序化の設計は [次期意味論・実装決定](semantic-decisions.md) §17.8。
 2. **Phase 1/2 の残り** — E8b（capability profile/options の safe/legacy 移行）は完了。profile/options 配線は C9/C10/E7/E11 で統合済み、migration warning は正式に descope 済み（理由は [Capability Model仕様](capability-model.md) §14.4）、EMB-AT-10/11 は profile 経由 subprocess test で固定済み（上記「直近完了」）。これで embedding 側の Phase 1/2（E7・E8b）が揃った。VM/E9 の import・resolver 統合（Phase 5）・tree REPL の Engine API 統合（E7 残）・CAP-AT-17 の budget N 境界（Phase 3/C11）は完了（上記「直近完了」系）。VM/E9 の import・resolver 統合は VM file/stdin の link 層 capability gate のみ done で、E9 の adapter/conformance（charge parity 他）・VM stable 化は別途残る（Phase 5／着手順 3 側）。Phase 2 全体の完了可否は capability model 側の Phase 2 基準（CAP-AT 等）にも依存する（「ステータス一覧」を正とする）。正本: [組み込みAPI仕様](embedding-api.md)・[Capability Model仕様](capability-model.md)。
-3. **Phase 6 audit の残り** — audit drain queue の engine 全体上限（§10.2、E10 統合後）・redaction 本体・strict CBOR・record/replay・VM 対応・sink 必須化ほか（`Yielded` / `Resumed` emission ＋ `AuditBackpressure`-yield 配線〔B-1〕は shipped）。正本: [決定性・実行時監査仕様](determinism-and-audit.md)。
+3. **Phase 6 audit の残り** — 次は **R-1（redaction 本体、R-1a 粒度）** を実装する（slice 定義済み・正本は [決定性・実行時監査仕様](determinism-and-audit.md) §14「R-1 実装スライス」）。以降は audit drain queue の engine 全体上限（§10.2、E10 統合後）・strict CBOR・record/replay・VM 対応・sink 必須化・body allow-list Reveal〔R-1b〕ほか（`Yielded` / `Resumed` emission ＋ `AuditBackpressure`-yield 配線〔B-1〕＋ audit drain queue byte 会計〔B-2〕は shipped）。正本: [決定性・実行時監査仕様](determinism-and-audit.md)。
 4. **Phase 7 運用保証** — MSRV・release/install・artifact・OCI・運用資材。正本: [検証・リリース・運用設計](verification-release-operations.md)。
 
 > 完了（直近）: audit drain queue byte 会計（§10.2、B-2）を tree backend で shipped。詳細・逸脱・受入基準 B2-AT-01〜10 は [決定性・実行時監査仕様](determinism-and-audit.md) §14「B-2 実装スライス」を参照。

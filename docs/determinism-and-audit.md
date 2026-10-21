@@ -1,10 +1,10 @@
 # Tsumugi 決定性・実行時監査仕様
 
-最終更新: 2026-10-20
+最終更新: 2026-10-21
 
 設計ステータス: **実装仕様確定・部分実装（Phase 6 A-1 subset ＋ `BudgetCharged` ＋ host-call lifecycle 3 event ＋ `Yielded` / `Resumed` emission 実装済み）**
 
-> Phase 6 の A-1 subset（schema v1・8 event 型・logical journal・`AuditSink`・fail-closed・opt-in、tree-only）に加え、`BudgetCharged`（§7.2/§7.3）、host-call lifecycle の 3 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished`）、yield/resume lifecycle の 2 event（`Yielded` / `Resumed`、§7.2 tag 5/6）、`AuditBackpressure`-yield 配線（§10/§10.2、B-1、sink-Pending 由来）、および §10.2 の audit drain queue byte 会計（B-2、per-execution 上限のみ）を tree backend で実装済み。これで §7.2 の 8 event 型が tree backend で emission される（backpressure も既存 `Yielded`/`Resumed` に `AuditYieldReason::AuditBackpressure` を載せる）。残りの redaction・strict CBOR・record/replay・VM 対応・sink 必須化、および engine 全体の queue 上限（16 MiB）は未実装。進捗の唯一の正本は [ロードマップ](roadmap.md)。
+> Phase 6 の A-1 subset（schema v1・8 event 型・logical journal・`AuditSink`・fail-closed・opt-in、tree-only）に加え、`BudgetCharged`（§7.2/§7.3）、host-call lifecycle の 3 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished`）、yield/resume lifecycle の 2 event（`Yielded` / `Resumed`、§7.2 tag 5/6）、`AuditBackpressure`-yield 配線（§10/§10.2、B-1、sink-Pending 由来）、および §10.2 の audit drain queue byte 会計（B-2、per-execution 上限のみ）を tree backend で実装済み。これで §7.2 の 8 event 型が tree backend で emission される（backpressure も既存 `Yielded`/`Resumed` に `AuditYieldReason::AuditBackpressure` を載せる）。残りの redaction・strict CBOR・record/replay・VM 対応・sink 必須化、および engine 全体の queue 上限（16 MiB）は未実装（redaction 本体は §14「R-1 実装スライス」で slice 定義済み・実装未着手）。進捗の唯一の正本は [ロードマップ](roadmap.md)。
 
 ## 1. 位置づけ
 
@@ -926,7 +926,8 @@ Slice 5 の最小縦切り（A-1）を tree engine にのみ実装した時点�
   「永続 Pending で script が成功扱いにならず AuditFailure terminal になる」が sink-Pending 経路で
   満たされ、§15.3「Yielded と Resumed が交互に対応し audit backpressure を区別できる」も
   `AuditYieldReason::AuditBackpressure` の Yielded/Resumed pair で満たされる（`tests/audit_backpressure.rs`）。
-- **未実装（意図的に含めない）**: redaction policy 本体（§9）、strict deterministic CBOR（§9.2、A-1 の
+- **未実装（意図的に含めない）**: redaction policy 本体（§9、下記「R-1 実装スライス」で slice 定義済み・実装未着手）、
+  strict deterministic CBOR（§9.2、A-1 の
   `encoded_bytes` は naive 推定で後で差し替え可能に隔離）、record/replay（§6）、VM の変更、§10.2 の
   audit drain queue byte 会計のうち engine 全体の上限（per-execution 上限は B-2 で実装済み。下記「B-2 実装スライス」）。`AdmissionQueued` / `SchedulerPreempted` / `HostPaused`
   の yield emission（engine-poll 経路に sink が無い、上記）も後続スライスへ延期する。
@@ -1094,6 +1095,399 @@ B-2 はこの byte 会計を tree engine の監査付き poll driver へ入れ�
   - **accumulator から直接 drain する `BudgetCharged`**: flush 時に accumulator から drain した分は、
     drain で accumulator 側の合計から外れるため、その時点で queue へ計上し直し、ack 時に外す。queue の
     判定は評価器の境界（flush 中ではない）で行うので、判定時点の queue に in-flight 分は現れない。
+
+#### R-1 実装スライス（tree engine、opt-in、redaction policy 本体）
+
+> 状態: **未実装（計画）**。本小節は A-1 が残した redaction プレースホルダ（payload は leak-free の
+> `Omitted`、`redaction_policy_id` は固定値）を §9.1/§9.2 の redaction policy 本体へ差し替える
+> 最小縦切り（R-1a）の slice 定義である。仕様（本章 §9）が正本であり、以下は R-1 で実装する範囲と
+> 意図的に延期する逸脱の記録である。実装は本定義とは別 PR で行う。
+
+A-1 は host-call lifecycle 3 event（§7.2/§8）を tree backend で emission する。payload
+（`request` / `resource` / `response`）は redaction 本体未実装のため、crate 内簡略型
+`AuditPayloadField::Omitted` を使い、`request`/`response` には `body` field（原本 byte 長
+`request_bytes`/`response_bytes`）、`resource` には `path` field（`original_bytes` は現状 **0 固定**で
+canonical label が評価器の手元に無いため）を `Omitted` で載せている（**payload は空ではない**。構築は
+`src/builtin_core.rs::host_call_triple`）。`ExecutionStarted` の `redaction_policy_id` は安定の既定値
+（`"default"`）のままである。R-1 はこのプレースホルダを §9.1 の `AuditField` ツリーへ置き換え、
+既定 redaction policy を tree engine の監査付き経路へ配線する。
+
+> このスライス定義は semantic review（本小節末尾「R-1 レビュー反映の記録」）を複数周通し、初版から
+> 次の点を改めた: (1) encoded 長の非破壊根拠が成り立たないため **byte 推定（`estimate_event_bytes`）を
+> R-1 では据え置く**ことにした、(2) 現状 payload が「空」という事実誤認と `src/builtin.rs` の誤記を正した、
+> (3) 既定 `hmac_key` のジレンマを設計判断として明記した、(4) 公開型 `AuditPayload`/`AuditPayloadField`
+> 差し替えが破壊的変更であることを明記した。採用・不採用の理由は末尾の記録を参照。
+
+- **粒度は R-1a（既定 policy のみ）**: 既定 policy（`identifier_mode = Reveal` / `path_mode =
+  HmacSha256` / `body_mode = Omit`）だけを実装し、filesystem host-call（tree 唯一の host-call 境界）の
+  実 payload を §9.1 の `AuditField` ツリーへ載せる。body の allow-list Reveal 経路
+  （`reveal_body_fields` と `max_revealed_body_bytes > 0` による `audit_safe` field の明示開示）は
+  型として用意するが R-1 では常に `Omitted` に畳み、R-1b（後続スライス）へ延期する。
+
+- **型の差し替え（§9.1）**: crate 内簡略型 `AuditPayload`（`Vec<(String, AuditPayloadField)>`）と
+  `AuditPayloadField`（`Public` / `Omitted`）を §9.1 の型へ差し替える。`AuditField`（`Revealed` /
+  `HmacSha256` / `Omitted`、tag 0/1/2）・`AuditValue`（`Scalar` / `Sequence` / `Object`）・
+  `AuditScalar`・`AuditFieldClass`（`Public` / `Identifier` / `Path` / `Body` / `Secret`）・
+  `RedactionMode`（`Reveal` / `HmacSha256` / `Omit`）・`RedactionPolicy` を新設する。`AuditPayload.fields`
+  は §9.1 どおり `BTreeMap<String, AuditField>`（UTF-8 key byte 順）とし、`Sequence` は argument/element
+  順を維持する。host call 引数は `fields["arguments"] = Sequence(...)` へ、operation 固有 metadata は
+  別 key へ入れる。nesting は 64 段までとし、それ以上の subtree は `Body`/`Omitted` へ縮退する。
+
+- **field class 判定と既定モード（§9.1）**: filesystem host-call について次を適用する。
+  - **Path**: provider が認可に使った canonical resource label に HMAC-SHA-256 を適用し、
+    `HmacSha256 { digest, original_bytes }` で記録する。**canonical resource label の定義**: routing 後の
+    `FilesystemTarget`（`src/capability.rs`）＝ **mount 名（`MountName`）＋ mount 相対 path
+    （`RelativePath` の component 列）**を、`@<mount>/<component>/...` の正規形へ組んだ文字列とする
+    （host absolute path・CWD・symlink 解決結果は含めない）。同じ mount・同じ mount 相対 path は同じ label
+    ＝同じ digest になり（R-AT-01 の「同じ label」の意味）、別 mount または別相対 path は別 digest になる。
+    host absolute path は label へ含めない。raw path は `Revealed` へ出さない。deny event でも raw
+    requested path を出さない。単純 SHA-256 は使わない。この配線のため、評価器は現状 0 固定の
+    `path.original_bytes` を実長へ改め、canonical resource label を `host_call_triple` へ渡す
+    （下記「変更箇所」）。
+    - **Path を HMAC するかは decision で決める（label の有無ではなく判定で分岐）**: HMAC 対象は「provider が
+      認可に使った canonical resource label」で、これは `fs_route`（`src/builtin_core.rs`）が
+      `FilesystemTarget` を返した**時点**（＝mount routing と operation 認可が通った時点）で確定する。
+      `fs_open` 内の `adapter.open_file` 失敗はこの後に起きるので、その host error でも label は既にある。
+      **R-1 の確定規則は「`host_call_triple` の `CapabilityDecisionKind` が `Allow` なら Path を
+      `HmacSha256`、`Deny` なら label が手元にあっても `Omitted { class: Path }`」**とし、label の有無では
+      なく decision で分岐させる（label 有無を基準にすると「label があるなら HMAC してよい」と読み違える
+      恐れがあるため）。decision 別の内訳:
+      - **Allow / `Success`**（正常完了）→ Path は `HmacSha256`。
+      - **Allow / `HostError`**（route は成功して label 確定済み、その後 `adapter.open_file` /
+        `read_to_end` / `write_all` / `create_dir` / `remove` 等が失敗。`fs_result` は
+        `Err(ErrorKind::Host)`）→ label はあるので Path は `HmacSha256`。`fs_result` が `Err` でも label を
+        落とさないことが要件（下記「変更箇所」の戻り値型）。
+      - **Deny / `Denied`** → Path は `Omitted { class: Path }`。大半は label 確定前の拒否だが、
+        **route 成功後に拒否される経路もある**: Upsert（`write_file`/`append_file`）が Write では通り
+        Create 権限が無いとき、`fs_route`（Write 代表 op）成功で target＝label が決まった後に
+        `filesystem_denied` になる。この経路でも decision は `Deny` なので label を HMAC せず `Omitted`。
+        その他の Deny は label 確定前: (a) filesystem 未 grant（`filesystem()` が `None`）、
+        (b) path lexical/argument エラー（`FilesystemTarget::parse` の `PathError`）、
+        (c) mount 未登録・operation 未 grant・許可外（provider 問い合わせ前の `sandbox` denial）。
+
+      Deny では HMAC せず raw requested path も `Revealed`/HMAC 入力に出さない（raw path を代用 HMAC する
+      のは host absolute path を label へ含めない §9.1 方針に反し、3 OS の path 表現差が digest に漏れる
+      ため採らない）。まとめると **Path は `Allow`（Success/HostError 両方）で `HmacSha256`、`Deny` で
+      `Omitted`（label の有無を問わず）、raw は常に非露出**（R-AT-01/02 で明記）。
+      - **`original_bytes` の取り方**: `Allow` は canonical label の UTF-8 byte 長。`Deny` で label が
+        手元にある場合（Upsert の Create 不足）も、`Deny` は label を payload へ出さないため
+        `original_bytes` は requested path 文字列の UTF-8 byte 長で統一する（label 由来の長さを漏らさない）。
+        `Deny` の (a)/(c) も requested path の UTF-8 byte 長。(b) のうち **引数の型エラー（`require_str`
+        失敗で path 文字列すら取れない）**は requested path が無いため `original_bytes = 0` とする。
+  - **Body**: file 内容・stdin/stdout・host args/result の自由文は `body_mode = Omit` により
+    `Omitted { class: Body, original_bytes }` にする。`original_bytes` は redaction 前の canonical
+    subtree 長。R-1 では allow-list Reveal を行わない。
+  - **Identifier**: host function 名・capability 名・rule ID・module logical name は既定 `Reveal`
+    （`Revealed { class: Identifier, value, original_bytes }`）。
+  - **Public**: event 種別・ID・hash・count・error code は `Revealed { class: Public, .. }`。
+  - **Secret**: credential/token/password/secret env value/redaction key は常に subtree 全体を
+    `Omitted`、mode 変更不可。`Secret<T>` を型で区別し `Debug` / `Display` / generic serializer を
+    実装しない。存在と byte 数だけを Public metadata として記録する。R-1 の filesystem 境界には
+    Secret field は現れないが、型と畳み規則は本スライスで入れる。
+
+- **`original_bytes` の定義（§9.1）と R-1 での代用**: §9.1 では `original_bytes` は redaction 前の
+  canonical subtree payload 長（§9.2 の canonical encoding で測る）と定義される。ただし R-1 は strict CBOR
+  （§9.2）を実装せず byte 推定を据え置くため、**strict CBOR スライスまでは `original_bytes` を値の UTF-8
+  byte 長で代用する**（scalar は UTF-8 文字列の byte 長、Path は canonical label または requested path の
+  UTF-8 byte 長、body は原本文字列の byte 長）。canonical subtree 長との差は strict CBOR 導入時に揃える。
+  この代用値は payload の**値**であって event の encode 推定長（128 固定）とは独立で、B-2 の queue 会計には
+  影響しない（上記「byte 推定は据え置く」）。
+
+- **`redaction_policy_id` の実配線（§7.1/§7.2）**: `ExecutionStarted.redaction_policy_id` に注入された
+  `RedactionPolicy.policy_id` を**そのまま**載せる。`policy_id` は §9.1 の型どおり **host が付ける
+  `String`**（内容ハッシュではない。host が policy を識別するための安定ラベル）。A-1 の固定値 `"default"`
+  から、注入 policy の `policy_id` 値へ変える。既定 policy は `policy_id = "default-r1"` とし、A-1 の
+  `"default"` と区別できる識別子にする（後続スライスで policy が増えたとき既定と区別するため）。
+
+- **byte 推定は R-1 では据え置く（§9.2、非破壊の前提）**: R-1 は `estimate_event_bytes`
+  （`src/audit.rs`）を**変更しない**。現状 host-call lifecycle event（`HostCallStarted` /
+  `CapabilityDecision` / `HostCallFinished`）・`Yielded` / `Resumed` / `BudgetCharged` は naive 推定の
+  **固定 128 byte**（`_ => 128` 分岐）で見積もられ、journal/queue の byte 会計はこの値で動く。R-1 は
+  payload の**中身**を §9.1 の `AuditField` ツリーへ差し替える（leak-free を強化する）が、見積もり長は
+  128 固定のまま据え置く。これにより host-call event の encoded 推定長・sequence・yield 位置・B-2 の
+  queue byte 会計が A-1/B-2 と完全に不変になり、R-AT-05 の非破壊が実際に成立する。
+  - **なぜ据え置くか**: payload を実サイズで見積もるように変えると、host-call event の見積もり長は
+    128 から payload 依存の値へ動き、B-2 の `max_pending_bytes` queue 会計で yield が起きる位置が変わる。
+    これは §9.2 strict CBOR スライス（naive 推定全体を正確な encode 長へ差し替える別スライス、既に延期中）が
+    扱う範囲であり、そちらに寄せる方が B-2 の回帰を 1 回で済ませられる。R-1 で見積もりに手を入れると、
+    初版定義が自己矛盾していた「`original_bytes`（field の値）を保てば encode 長も不変」という成り立たない
+    根拠に逆戻りする（`original_bytes` は payload 中の値であって encode 後の長さそのものではない）。
+  - **60 KiB 縮退規則も strict 推定に依存するため R-1 では範囲外**: §9 の「normal event は最大 60 KiB、
+    超過時 Body → Path → Identifier の順で `Omitted` へ縮退、なお超過で `EventTooLarge`」は、event の
+    実 encode 長に対する判定なので、正確な byte 推定が前提になる。128 固定見積もりのままでは faithful に
+    実装できないため、縮退規則は strict CBOR スライスへ延期する（R-1 の受入基準から R-AT-09 を外す）。
+    Terminal の `Emergency` 置換は A-1 で実装済みの範囲を踏襲し、R-1 では触らない。
+
+- **policy 注入経路**: facade は既定で `RedactionPolicy::default()`（上記既定モード・空
+  `reveal_body_fields`・`max_revealed_body_bytes = 0`・`policy_id = "default-r1"`・固定 `hmac_key`）を
+  使う。公開 builder setter は追加しない（sink 必須化 §1.1 のスライスへ延期）。境界テスト用に
+  `EngineBuilder` へ `#[doc(hidden)] pub` の shim（`audit_redaction_policy_for_test` 等、
+  `audit_budget_for_test` と同じ扱い）を置き、注入 policy を journal と payload 構築の双方へ渡す。
+  `hmac_key` は `SecretBytes` で保持し、`Debug` / `Display` を実装せず生 key を出さない。
+
+- **既定 `hmac_key` の性質（設計判断・逸脱として明記）**: R-1 では公開 setter を作らないため、既定
+  policy の利用者は既定 `hmac_key` しか使えない。この key の扱いには相反する制約がある。
+  - 実行ごとに乱数で生成すると §7.1「engine は ambient な乱数源に触らない」に反し、R-AT-06（決定性・
+    HMAC が key 固定で決定的）も壊れる。したがって **R-1 は key を乱数生成しない**。
+  - 一方、コードに固定 key を埋め込むと key が公開されているのと同義で、§9.1 が「単純 SHA-256 は辞書攻撃に
+    弱いので使わない」と定めた path hashing の秘匿性はほぼ得られない。
+  - **採る方針**: R-1 の既定 `hmac_key` は **crate 内の固定値（alpha 用・秘匿性なし）**とし、「audit に
+    **raw path をそのまま載せない**」ことだけを目的とする。固定 key では同一 label が同一 digest になるため
+    label の相関は残り（これは R-AT-01 の決定性に必要）、かつ **key が公開されている以上、digest から
+    候補 path を総当たりで推測・復元できる**（辞書攻撃耐性は得られない）。したがって R-1 が守るのは
+    「平文 path の直接露出を防ぐ」ところまでで、推測復元に耐える秘匿性は守れないと明記する。推測復元にも
+    耐える秘匿性のある key を host から渡させる公開経路（`EngineBuilder` の key 必須 setter、または sink が
+    あるとき key 必須）は **sink 必須化（§1.1）スライス**へ延期する。R-1 の固定 key は §7.1（乱数源に
+    触らない）と R-AT-06（決定性）を満たし、秘匿性だけを後続へ送る割り切りである。
+
+- **opt-in・非破壊**: sink なし経路（`run_guarded`）は redaction を一切行わず、観測結果・出力 byte・
+  exit code は不変。sink あり経路では、上記「byte 推定は据え置く」により host-call event の encoded
+  推定長は 128 固定のまま変わらないため、sequence・yield 位置・B-2 の queue byte 会計が A-1/B-2 と一致する。
+  新しい CBOR tag・`language_revision` の変更はない（`AuditField` の tag は §9.2 で既に予約済み）。
+  変わるのは **payload の中身**だけである: `request`/`resource`/`response` の `fields` が A-1 の簡略型
+  `AuditPayloadField::Omitted`（`body`/`path`）から §9.1 の `AuditField` ツリー（path は Allow 時
+  `HmacSha256`・Deny 時 `Omitted{class:Path}`、body は `Omitted{class:Body}`、function 名等は
+  `Revealed{class:Identifier}`）へ変わり、`redaction_policy_id` が `"default"` から `"default-r1"` へ
+  変わり、`resource` の `path.original_bytes` が 0 固定から実長（Allow は canonical label の UTF-8 byte 長、
+  Deny は requested path の UTF-8 byte 長〔Upsert の Create 不足で label があっても requested path 長で
+  統一〕、引数型エラーは 0）へ変わる。したがって
+  payload 構造・`redaction_policy_id`・`original_bytes` を検査する既存テストの期待値更新が要る
+  （下記 R-AT-05）。
+
+- **公開 API の破壊的変更（alpha・受容、`language_revision` bump なし）**: `AuditPayload` と
+  `AuditPayloadField` は crate root（`src/lib.rs`）で `pub use` 公開されている。R-1 は簡略
+  `AuditPayloadField` を撤去し `AuditPayload.fields` を §9.1 の `BTreeMap<String, AuditField>` へ
+  差し替えるため、これらの型に依存する外部コードは壊れる。B-1（`YieldReason::AuditBackpressure` 追加）と
+  同じく、alpha（後方互換無保証）につき roadmap 明記を条件に**破壊的変更を受容**する。CBOR tag 表・
+  charge table・script 観測値は不変なので `language_revision` bump は無い（既存 tag 1/2/3 の payload 中身が
+  簡略型から §9.1 ツリーへ変わるだけ。`AuditField` の tag 0/1/2 は §9.2 で予約済み）。
+
+- **逸脱（R-1 時点で残るもの、後続スライスへ延期）**:
+  - body の allow-list Reveal（`reveal_body_fields` / `max_revealed_body_bytes > 0` による
+    `audit_safe` 開示）は型のみで常に Omit（R-1b）。
+  - **byte 推定の正確化**（`estimate_event_bytes` を payload 依存の実 encode 長へ差し替え）は R-1 の
+    範囲外。host-call event は 128 固定見積もりのまま据え置く（上記「byte 推定は据え置く」）。strict
+    deterministic CBOR（§9.2）スライスで naive 推定全体をまとめて差し替える。
+    - **128 固定は概算であり上限保証ではない**: 現状のコメントは 128 を保守的な上限扱いにしているが、
+      R-1 で payload が HMAC digest（32 byte）や Identifier の実データを含むと、実 encode 長が 128 を
+      超えうる。R-1 は見積もりを据え置くため、§11 の `max_encoded_bytes` / 60 KiB 判定は実長ではなく
+      128 概算に対して行われ、**strict CBOR スライスまで不正確**（過小評価がありうる）。R-1 の host-call
+      payload は path=digest・body=Omit・識別子のみで数百 byte 規模に収まり 60 KiB 判定に実害は無いが、
+      判定が概算依存である事実を逸脱として残す。
+  - **compile-fail に `trybuild` を使わない**: R-AT-07 の compile-fail は、dev-dependency を増やさず
+    `compile_fail` doctest で固定する。現状 dev-deps は `criterion` のみで、`trybuild` の stderr
+    snapshot は 3 OS（ubuntu/macos/windows）CI で壊れやすい。doctest は error 文言に依存せず「compile
+    しない」ことだけを固定できるため、OS 差に強く依存も増えない。`trybuild` 導入は必要になった時点で
+    別途判断する。
+  - **60 KiB 縮退規則**（§9 の Body → Path → Identifier 縮退・`EventTooLarge`）は正確な byte 推定が
+    前提のため strict CBOR スライスへ延期する。
+  - 秘匿性のある `hmac_key` の host 注入経路（公開 key 必須 setter、sink 時 key 必須）は sink 必須化
+    （§1.1）スライスへ延期する。R-1 の既定 key は固定値（alpha 用・秘匿性なし。raw path を直接載せない
+    ことだけを担保し、key 公開ゆえ digest からの推測復元には耐えない）。
+  - VM 対応（Slice 6）。監査 sink と `VmExperimental` の同時設定は従来どおり build 時に拒否する。
+  - record/replay の redaction 再適用（§12「record 済み redacted payload を盲目コピーせず現行 policy を
+    適用」）は record/replay スライス（§6）へ延期する。
+  - 公開 setter（`EngineBuilder::audit_redaction_policy`）と `ConfigError` 接続は sink 必須化（§1.1）
+    のスライスへ延期する。
+
+- **変更箇所（見込み）**:
+  - `src/audit.rs`: §9.1 の型（`AuditField` / `AuditValue` / `AuditScalar` / `AuditFieldClass` /
+    `RedactionMode` / `RedactionPolicy` / `Secret` / `SecretBytes`）新設、簡略 `AuditPayloadField` 撤去、
+    `AuditPayload.fields` を `BTreeMap<String, AuditField>` 化。**`estimate_event_bytes` は変更しない**
+    （128 固定見積もりを据え置く。上記「byte 推定は据え置く」）。60 KiB 縮退規則は実装しない（延期）。
+  - `src/builtin_core.rs`（**初版の `src/builtin.rs` は誤記**）: `host_call_triple` の payload 構築を、
+    現状の `AuditPayloadField::Omitted`（`body`/`path`）から既定 policy 適用の `AuditField` ツリーへ
+    置き換える。path は allow 時に canonical resource label を HMAC・deny 時は `Omitted{class:Path}`、
+    body は `Omitted{class:Body}`、function 名は `Revealed{class:Identifier}`。現状 0 固定の
+    `path.original_bytes` を実長（allow は label 長、deny は requested path 長）へ改める。
+    - **canonical label を triple まで運ぶ配線が必要（host error でも label を落とさない）**: label は現在
+      `dispatch_fs` → `dispatch_filesystem_capability` の**内側**、具体的には `fs_route` が
+      `FilesystemTarget` を返した時点（`fs_open` 内の `adapter.open_file` 成否より前）で確定し、外へ返って
+      いない。実装では label を `fs_route` の直後に受け取り、open/adapter 失敗（HostError）でも保持する。一方 triple は `src/builtin.rs` 側で `dispatch_fs` が返った **後**に
+      `fs_result: Result<Value, TsumugiError>` から組み立てている（label は手元に無い）。label の有無は
+      `host_call_triple` の分類どおり **decision で決まり outcome の成否と独立**なので、戻り値型は
+      **`Ok` でも `Err` でも label を運べる形**にする。具体的には `dispatch_fs` の戻り値を
+      `Result<Value, TsumugiError>` から「`{ outcome: Result<Value, TsumugiError>, label: Option<ResourceLabel> }`」
+      相当（label は Allow＝`Success`/`HostError` 両方で `Some`、Deny で `None`）へ拡張する。
+      **特に host error（route 成功後に `read_to_end`/`write_all` 等が失敗）では `outcome` が `Err` でも
+      `label` は `Some`** にする（ここが「allow なら Some」だけでは取りこぼす経路）。`src/builtin.rs` の
+      呼び出し側はこの `label` を `host_call_triple` へ渡す。`dispatch_fs` は非監査経路（sink なし）でも
+      通るため、label 返却は監査の有無に関わらず常に行い、triple 構築側だけが使う（非監査経路は label を
+      無視し観測挙動不変）。
+  - `src/builtin.rs`: filesystem builtin dispatch で `dispatch_fs` が返した canonical label（または
+    その不在）を `host_call_triple` へ渡す（上記配線の呼び出し側）。
+  - `src/embedding.rs`: `EngineBuilder`/`Engine` に `RedactionPolicy` を保持（field 非公開）、
+    journal と payload 構築へ受け渡し、`audit_redaction_policy_for_test` shim、`ExecutionStarted` の
+    `redaction_policy_id` 実配線（既定 `"default-r1"`）。
+    - **`#[derive(Debug)]` との整合**: `EngineBuilder` と `Engine` は現在 `#[derive(Debug)]`。
+      `RedactionPolicy`（`hmac_key: SecretBytes` を含む）を field に持たせると、`SecretBytes` が `Debug` を
+      実装しない方針（§9.1・R-AT-07）のため derive が壊れる。対応は `SecretBytes` 以外を自動 derive しつつ、
+      `RedactionPolicy` に **key を伏せた手書き `Debug`**（`hmac_key` を `"<redacted>"` 等で出す）を実装し、
+      `Engine`/`EngineBuilder` の derive はそのまま使えるようにする。`SecretBytes` 自体は `Debug`/`Display`/
+      generic serialize を実装しない（R-AT-07 の compile-fail で固定）。
+  - `src/eval.rs`: payload 構築 helper が policy と canonical label を参照できるよう受け渡し（host-call
+    buffer へ積む前に redaction 適用、temporal 順 1 本 buffer の不変は B-2 のまま）。
+
+- **受入基準（R-1）**:
+  - **R-AT-01（Allow 時の Path、Success と HostError 両方）**: 認可が通った filesystem host-call の path が
+    raw ではなく `HmacSha256`（32 byte digest）として記録され、同じ canonical label は同じ digest、異なる
+    label は異なる digest になる（§9.1）。**正常完了（`Success`）だけでなく、route/open 成功後に adapter が
+    失敗した host error（Allow/`HostError`、`fs_result` は `Err`）でも Path は `HmacSha256`**（label は失敗
+    前に確定しているため）。host error ケースを明示的にテスト対象へ含める。
+  - **R-AT-02（Deny 時の Path と raw 非露出）**: decision が `Deny` の host-call は **label が手元にある
+    場合でも** Path field が `Omitted { class: Path }` になる。対象経路——(a) filesystem 未 grant、
+    (b) path lexical/argument エラー、(c) mount 未登録・operation 未 grant・許可外、(d) **Upsert の
+    Create 権限不足**（`fs_route` 成功で label 確定済みだが `Deny`）——いずれでも Path は `Omitted`。
+    そのうえで **全経路で raw requested path も canonical label も payload（`resource`/`request`/error）に
+    1 byte も現れない**（`Revealed` にも HMAC 入力にも出ない。§9.1）。(d) を「label があるのに Omitted」の
+    テストケースとして明示的に含める。R-1 の不変条件は「Path は `Allow`（Success/HostError）で
+    `HmacSha256`・`Deny` で `Omitted`（label の有無を問わず）、raw/label は Deny で常に非露出」。
+  - **R-AT-03**: body（file 内容・args の自由文）が `Omitted { class: Body }` で、`original_bytes` に
+    redaction 前の canonical byte 長が入る（prefix も残さない。§9.1）。
+  - **R-AT-04**: `ExecutionStarted.redaction_policy_id` が注入 policy の `policy_id`（§9.1 の host 指定
+    `String`）を**そのまま**反映する。既定 policy では `"default-r1"`、別 `policy_id` を注入すると
+    その値になる（§7.1。内容ハッシュではなく host ラベルの反映）。
+  - **R-AT-05（非破壊）**: sink なし経路の出力 byte・exit code が不変。既定 policy で既存
+    `tests/audit_core.rs` / `tests/audit_hostcall.rs` / `tests/audit_yield_resume.rs` /
+    `tests/audit_backpressure.rs` / `tests/audit_queue_bytes.rs` の **sequence・yield 位置・encoded
+    推定長（128 固定）**が不変。これは R-1 が `estimate_event_bytes` を据え置くことから機械的に従う
+    （payload 中身の型だけが変わり、見積もり長は payload 非依存の 128 固定のまま）。payload 構造・
+    `redaction_policy_id`・`path.original_bytes` を検査する assertion は §9.1 ツリーへ期待値を更新する。
+    万一 yield 位置が動く差分が出たら、見積もり据え置きが崩れている兆候なので実装を止めて報告する。
+  - **R-AT-06（決定性）**: 同じ script・同じ `hmac_key`・同じ注入 policy では、redaction 結果と envelope
+    列が 100 回の実行で一致する（§15.1）。既定 key は固定値で乱数生成しない（§7.1）ため HMAC は決定的。
+  - **R-AT-07（Secret・§15.4 の compile-fail を含む）**: Secret class の field は存在と byte 数だけが
+    記録され、値が payload・`Debug`/`Display` 出力・error message のいずれにも漏れない。加えて §15.4 の
+    要求どおり `Secret` / `SecretBytes` が `Debug` / `Display` / generic serialize を**実装しない**ことを
+    compile-fail で固定する。**枠組みは `trybuild` を使わず `compile_fail` doctest にする**（下記「逸脱」）。
+  - **R-AT-08（byte 計上の不変）**: R-1 は見積もりを据え置くため、host-call event の push 時計上 byte
+    （128 固定 + envelope 固定部）が A-1/B-2 と変わらず、journal の `committed_bytes` 増分とも一致し続ける
+    （B2-AT-10 の不変条件を維持）。redaction 後 field を実サイズで測る正確化は strict CBOR スライスへ延期。
+  - **R-AT-09（error message）**: Terminal/error の payload に安定 `ErrorCode` / `message_id` / source
+    位置 / redacted parameter summary だけが入り、script-visible message がそのまま入らない（§9.1）。
+  - VM は対象外（監査 sink と `VmExperimental` の同時設定は build 時に拒否）。
+  - **範囲外（初版 R-AT-09「60 KiB 縮退」を削除）**: 60 KiB 縮退・`EventTooLarge` は正確な byte 推定が
+    前提のため strict CBOR スライスへ延期し、R-1 の受入基準から外した（上記「逸脱」）。
+
+- **テスト配置**: `tests/audit_redaction.rs`（R-AT-01〜04・06・09）。R-AT-05 は既存
+  `tests/audit_*.rs` の sequence/yield 位置/encoded 推定長の不変 ＋ payload 期待値更新で担保。R-AT-07 の
+  compile-fail は `src/audit.rs`（または `src/lib.rs`）の `compile_fail` doctest。R-AT-08 は
+  `src/audit.rs` の unit test（見積もり据え置きの確認）。
+  - **compile-fail doctest の偽陽性対策**: `compile_fail` doctest は「どんな理由で compile が落ちても成功」
+    になるため、型が参照できない（非公開・パス誤記）だけで通ってしまう。これを防ぐため doctest は次の 2 本を
+    1 ペアにする: (1) `compile_fail` 版——**公開経路から `SecretBytes` を参照**し（例えば
+    `tsumugi::RedactionPolicy` 経由、または `SecretBytes` を公開 export して参照）、その値に
+    `format!("{:?}", ..)` 等 `Debug` を要求して**落ちる**ことを固定する。(2) 通常 doctest 版——**同じ参照
+    経路で、通るべき操作**（`Clone` や byte 長取得など `Debug` 以外）を実際に compile・実行し、「型には
+    手が届くが `Debug`/`Display`/serialize だけが無い」ことを担保する。(2) が通ることで (1) の失敗が
+    「型が見えない」ではなく「`Debug` が無い」由来であることを保証する。
+
+- **R-1 レビュー反映の記録（採用・不採用とその理由）**: 初版の R-1 定義に対する semantic review を
+  1 周通し、現行コード（`src/audit.rs` / `src/builtin_core.rs` / `src/embedding.rs` / `src/eval.rs`）と
+  仕様 §7・§9〜§11・§15 を突き合わせた指摘を次のとおり処理した。将来この slice を実装・改訂する際の
+  判断履歴として残す。
+
+  **採用した指摘（定義を改めた）**
+  - **byte 推定の非破壊根拠が成り立たない（最重要）**: 初版は「`original_bytes` を保てば encoded 長も
+    yield 位置も不変」としたが、`estimate_event_bytes` は host-call 系を payload 非依存の 128 固定で
+    見積もっており（`src/audit.rs` の `_ => 128`）、`original_bytes` は payload 中の値であって encode 後の
+    長さではない。見積もりを payload 依存に変えると B-2 の queue 会計で yield 位置が動く。**対応**: R-1 では
+    見積もりを**据え置く**（payload の中身だけ §9.1 ツリーへ差し替え、見積もり長は 128 固定のまま）。
+    **据え置きを選んだ理由**: レビューは「書き直す／範囲から外す」の 2 択を許したが、naive 推定全体の
+    正確化は既に延期済みの strict CBOR スライスが扱う領域で、そこへ寄せれば B-2 の回帰更新を 1 回で済ませ、
+    R-AT-05 の非破壊が本当に成立する。見積もりを R-1 で変えると初版の自己矛盾に逆戻りする。
+  - **「現状 payload は空」という事実誤認**: 実際は `host_call_triple`（`src/builtin_core.rs`）が `body`/
+    `path` を `Omitted` にした field を既に積んでおり、空 `fields` は `eval.rs` のユニットテストだけ。
+    **対応**: 冒頭記述を実態（`Omitted` プレースホルダ・`path.original_bytes` は 0 固定）へ修正。
+  - **変更箇所 `src/builtin.rs` は `src/builtin_core.rs` の誤記**: **対応**: 修正。あわせて canonical
+    resource label を `host_call_triple` へ渡す新規配線と、`path.original_bytes` を実 label 長へ改める
+    作業を変更箇所へ明記（初版は欠落）。
+  - **既定 `hmac_key` のジレンマ（セキュリティ判断）**: 固定埋め込みは公開鍵同然で §9.1 の辞書攻撃耐性が
+    消え、乱数生成は §7.1（ambient 乱数源に触らない）と R-AT-06（決定性）を壊す。**対応**: R-1 の既定 key は
+    固定値（alpha 用・秘匿性なし。raw path を直接載せないことだけを担保し、key 公開ゆえ推測復元には
+    耐えない）と割り切り、秘匿性のある host 注入経路を sink 必須化スライスへ延期、と逸脱に明記。
+    **この割り切りを選んだ理由**: R-1 の主目的は raw path をそのまま載せないことであり、固定 key でもそれは
+    達成できる。推測復元に耐える秘匿性は公開 API（key 注入経路）の設計を伴うため sink 必須化と同じスライスに
+    まとめる方が設計が一貫する（「相関除去」という当初表現は 3 周目で不正確と認め、下記のとおり言い直した）。
+  - **公開 API の破壊的変更に触れていない**: `AuditPayload`/`AuditPayloadField` は `src/lib.rs` で公開
+    export 済み。**対応**: 差し替えが破壊的変更であること、B-1 と同じく alpha として roadmap 明記の上
+    受容し `language_revision` bump は無いことを明記。
+  - **invalid-path 時の HMAC 対象が未定義**: **対応**: canonical label が無い場合は Path field を
+    `Omitted{class:Path}` にし HMAC しない、を確定規則として追加（raw path は leak させない）。
+  - **`policy_id` の決め方が曖昧**: **対応**: §9.1 の型どおり host 指定 `String`（内容ハッシュでない）と
+    明記し、既定を `"default-r1"` に。R-AT-04 を「注入値をそのまま反映」に統一。
+  - **R-AT-07 が §15.4 より弱い**: 初版は「値が漏れない」だけだった。**対応**: §15.4 の compile-fail
+    （`Secret`/`SecretBytes` が `Debug`/`Display`/serialize 不可）を R-AT-07 に含め強度を揃えた。
+  - **ロードマップの一貫性**: 初版は「直近完了」に未マージの slice 定義を入れ、「次のタスク」に既定モードの
+    詳細を書いていた。**対応**: F-1 の docs PR に倣い「次のタスク」中心の更新へ寄せ、詳細は spec 参照に留める
+    （本コミットで roadmap を再修正）。
+
+  **不採用・範囲外にした指摘（理由つき）**
+  - **60 KiB 縮退規則（初版 R-AT-09）を R-1 で実装する**: 縮退判定は event の実 encode 長に対する判定で、
+    正確な byte 推定が前提。R-1 は見積もりを据え置くため faithful に実装できない。**不採用の理由**: 見積もり
+    据え置きと両立しないため strict CBOR スライスへ延期し、受入基準から外した（レビューの指摘 1 対応の
+    論理的帰結）。
+  - **見積もり関数を「変わる前提に書き直す」案（指摘 1 の第一選択肢）**: レビューが許した 2 択のうち
+    採らなかった方。**不採用の理由**: 上記「据え置きを選んだ理由」のとおり、strict CBOR スライスへ寄せる方が
+    B-2 回帰を 1 回で済ませられ非破壊が成立するため。
+
+  **2 周目レビューで採用した指摘（上記定義へ反映済み）**
+  - **R-AT-02 と invalid-path ルールの矛盾**: 初版改訂で invalid-path を `Omitted` にしたのに R-AT-02 は
+    「deny でも Path は HmacSha256」のままだった。コード（`dispatch_fs`/`dispatch_filesystem_capability`）を
+    確認すると label が無い deny は invalid-path だけでなく「未 grant」「mount 未登録・未 grant・許可外」も
+    該当。**対応**: canonical label が得られるのは allow 時だけと一般化し、R-AT-01（allow=HmacSha256）と
+    R-AT-02（deny 3 経路=Omitted・raw 非露出）に書き分けた。
+  - **label の渡し方がコード構造と不整合**: triple は `dispatch_fs` が返った後に `fs_result` から組み立てて
+    おり、label は `dispatch_fs` 内に閉じている。**対応**: `dispatch_fs` の戻り値を label 同伴型へ拡張し
+    呼び出し側が triple へ渡す配線を変更箇所に明記（非監査経路は label を無視し観測挙動不変）。
+  - **trybuild ハーネスが存在しない**: dev-deps は criterion のみ。3 OS CI で trybuild の stderr snapshot は
+    壊れやすい。**対応**: R-AT-07 の compile-fail を `trybuild` ではなく `compile_fail` doctest で固定する
+    方針に変更（依存を増やさず OS 差に強い）。
+  - **`SecretBytes` の Debug 未実装で `Engine`/`EngineBuilder` の `#[derive(Debug)]` が壊れる**: **対応**:
+    `RedactionPolicy` に key を伏せた手書き `Debug` を実装し derive を保つ、と変更箇所に明記。`SecretBytes`
+    自体は `Debug`/`Display`/serialize 非実装（R-AT-07 の compile-fail で固定）。
+  - **128 固定見積もりは上限保証でない**: payload が HMAC digest/Identifier の実データを含むと 128 を
+    超えうる。**対応**: `max_encoded_bytes`/60 KiB 判定が strict CBOR まで概算依存（過小評価あり）である旨を
+    逸脱に明記（R-1 の payload 規模では実害なし）。
+  - **「相関除去」は不正確**: 固定 key では同一 label→同一 digest で相関は残り、key 公開なので path は推測
+    復元されうる。**対応**: 既定 key の目的を「raw path をそのまま載せない」に正し、推測復元に耐える秘匿性は
+    得られないと明記。
+  - **記録場所の表現ミス**: 導入文の「§14 末尾」を「本小節末尾」に修正。
+
+  **3 周目レビューで採用した指摘（上記定義へ反映済み）**
+  - **host error 経路で label を取りこぼす**: 「allow なら `Some`、deny なら `None`」では
+    `HostCallOutcome::HostError`（route/open 成功後に adapter が失敗。`host_call_triple` の分類で
+    Allow/`HostError`、`fs_result` は `Err`）が抜ける。コード（`builtin_core.rs` の fs operation は
+    `fs_open`/`fs_route` 成功後に `read_to_end`/`write_all` 等が失敗し `fs_host_error`）で確認。
+    **対応**: label の有無は decision で決まり outcome の成否と独立と整理し、`dispatch_fs` 戻り値を
+    `Err` でも label を運ぶ型へ拡張、Path は Allow（Success/HostError 両方）で `HmacSha256`。R-AT-01 に
+    host error ケースを明示的にテスト対象として追加。
+  - **compile_fail doctest の偽陽性**: 型が参照できない（非公開・パス誤記）だけで compile が落ちても
+    `compile_fail` は成功になる。**対応**: (1) 公開経路から `SecretBytes` を参照して `Debug` 要求で落ちる
+    `compile_fail` 版と、(2) 同じ経路で `Debug` 以外（`Clone` 等）が通る通常 doctest 版を 1 ペアにし、
+    失敗が「型が見えない」でなく「`Debug` が無い」由来であることを担保する、とテスト配置に明記。
+  - **直し漏れ・不整合**: (a)「逸脱」節の `hmac_key` に「相関除去のみ」が残っていた → 「raw path を直接
+    載せない／推測復元には耐えない」に統一。(b)「opt-in・非破壊」節の Path 記述が旧ルール（常に
+    `HmacSha256`）のまま → Allow=`HmacSha256`/Deny=`Omitted` に、`path.original_bytes` も Allow/Deny/
+    引数型エラー別の実長に修正。(c) `original_bytes` の定義ぶれ（§9.1 の canonical subtree 長 vs Path の
+    label/path byte 長）→ strict CBOR までは UTF-8 byte 長で代用すると一文で固定。(d) 引数型エラー
+    （`require_str` 失敗で path 文字列が無い）の `original_bytes` 未定義 → `0` と定義。
+  - **canonical resource label の中身（好みの範囲・採用）**: R-AT-01 の「同じ label」を明確にするため、
+    label を routing 後の `FilesystemTarget`（mount 名＋mount 相対 path を `@<mount>/...` 正規形へ）と
+    一文で固定した。host absolute path・CWD・symlink 解決結果は含めない。
+
+  **4 周目レビューで採用した指摘（上記定義へ反映済み、いずれも書き方の精密化）**
+  - **label 確定は「route 成功時点」であって「open の後」ではない**: `fs_route` が `FilesystemTarget` を
+    返した時点で label が決まり、`fs_open` 内の `adapter.open_file` 失敗はその後に起きる（`builtin_core.rs`）。
+    **対応**: field class 判定と変更箇所を「route 成功時点で label 確定、open 失敗を含む host error でも
+    label あり」に直し、実装は label を `fs_route` 直後に受け取ると明記。
+  - **「Deny は label 確定前に拒否」は全経路には当てはまらない**: Upsert（`write_file`/`append_file`）の
+    Create 権限不足は、`fs_route`（Write 代表 op）成功で label が決まった**後**に `filesystem_denied` に
+    なる（`builtin_core.rs` の `fs_open`）。**対応**: Path のルールを「label の有無」ではなく
+    「**decision が `Deny` なら label が手元にあっても `Omitted`**」という判定基準に書き直し（「label が
+    あれば HMAC してよい」と読み違えるのを防ぐ）。R-AT-02 に Upsert 経路 (d) を「label があるのに Omitted」の
+    テストケースとして追加し、`original_bytes` は Deny では requested path 長で統一（label 長を漏らさない）と
+    定義。
 
 ### Slice 6: VM conformance
 
