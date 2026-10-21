@@ -114,7 +114,7 @@ spec_slice = "exec-control Slice 6"
 spec       = { doc = "docs/execution-control.md", section = "F-2 実装スライス（§4.1 課金表への移行：既定 total_fuel 見直し・language_revision 戦略）" }
 acceptance = ["F2-AT-01..08"]
 depends_on = ["F-1"]
-design_pr  = 0  # 設計 PR 作成後に採番して追記する
+design_pr  = 241
 order      = 20
 
 [[slice]]
