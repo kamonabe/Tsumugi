@@ -397,6 +397,13 @@ const HMAC_BLOCK_SIZE: usize = 64;
 /// `hmac_key` は [`SecretBytes`] で保持し `Debug`/`Display` で生 key を出さない。この型自身の
 /// `Debug` は手書きで key を `"<redacted>"` に伏せる（`Engine`/`EngineBuilder` の `#[derive(Debug)]`
 /// を壊さないため）。
+///
+/// # Path class の fail-safe（§9.1 / R-1）
+///
+/// Path class の field は `path_mode == HmacSha256` のときだけ canonical label の HMAC digest を
+/// 記録する。`path_mode` が HMAC 以外（`Reveal` / `Omit`）のときは raw path を記録せず
+/// `Omitted { class: Path }` へ畳む。これにより policy を誤設定しても raw path が leak しない
+/// （[`fold_audit_field`] が畳み規則を 1 か所へ集約する）。
 #[derive(Clone)]
 pub struct RedactionPolicy {
     /// host が付ける安定ラベル（内容ハッシュではない、§9.1）。既定 `"default-r1"`。
@@ -451,8 +458,92 @@ impl RedactionPolicy {
     ///
     /// `crate::embedding::hash::sha256`（block size 64）の上に ipad 0x36 / opad 0x5c で
     /// HMAC-SHA-256 を組む。同じ key・同じ label なら同じ digest、別 label なら別 digest。
-    pub fn hmac_path(&self, label: &str) -> [u8; 32] {
+    ///
+    /// spec（§9）に無い HMAC 計算の口を公開面へ出さないため `pub(crate)`（R-1 スライス・公開面整理）。
+    /// 外部は [`fold_audit_field`] 経由でだけ Path digest を得る。
+    pub(crate) fn hmac_path(&self, label: &str) -> [u8; 32] {
         hmac_sha256(self.hmac_key.expose(), label.as_bytes())
+    }
+}
+
+/// class と policy mode から 1 つの [`AuditField`] を組む（§9.1 の畳み規則を 1 か所へ集約）。
+///
+/// 畳み規則（R-1 の確定規則、`docs/determinism-and-audit.md` §9.1 / §14 R-1 スライス）:
+///
+/// - **`Secret`**: mode に関係なく **常に** `Omitted`（値を走査・記録しない、§9.1 / R-AT-07）。
+/// - **`Path`**: `path_mode == HmacSha256` かつ `label` が `Some` のときだけ canonical label の
+///   `HmacSha256` digest。それ以外（mode が HMAC でない・label 不在）は raw を出さず `Omitted`
+///   へ fail-safe で畳む（label 不在時は raw path を漏らさないため `original_bytes` のみ）。
+/// - **`Body`**: R-1 では allow-list Reveal を実装しないため `body_mode` に関わらず常に `Omitted`。
+///   （R-1b で `reveal_body_fields` を参照する Reveal 経路を有効化する。）
+/// - **`Public` / `Identifier`**: `Reveal`（既定）のとき呼び出し側が渡す `value` を `Revealed`。
+///   `Omit`/`HmacSha256` 設定時は `Omitted`（Identifier を HMAC する経路は R-1 範囲外）。
+///
+/// `value` は `Revealed` を組むときにだけ使う（`Public`/`Identifier` の Reveal）。`Path` の HMAC
+/// 入力は `label` であり `value` は使わない。`original_bytes` は redaction 前の byte 長（呼び出し側が
+/// 用途ごとに確定する。R-1 は値の UTF-8 byte 長で代用）。
+pub(crate) fn fold_audit_field(
+    policy: &RedactionPolicy,
+    class: AuditFieldClass,
+    original_bytes: u64,
+    label: Option<&str>,
+    value: Option<AuditValue>,
+) -> AuditField {
+    match class {
+        // Secret は mode を問わず常に Omitted（§9.1 / R-AT-07）。
+        AuditFieldClass::Secret => AuditField::Omitted {
+            class,
+            original_bytes,
+        },
+        // Path は HmacSha256 mode かつ label がある場合だけ HMAC、それ以外は raw を出さず Omitted。
+        AuditFieldClass::Path => match (policy.path_mode, label) {
+            (RedactionMode::HmacSha256, Some(label)) => AuditField::HmacSha256 {
+                class,
+                digest: policy.hmac_path(label),
+                original_bytes,
+            },
+            _ => AuditField::Omitted {
+                class,
+                original_bytes,
+            },
+        },
+        // Body は R-1 では allow-list を無視して常に Omit（R-1b で Reveal 経路を有効化）。
+        AuditFieldClass::Body => AuditField::Omitted {
+            class,
+            original_bytes,
+        },
+        // Public / Identifier は Reveal 既定。Omit/HMAC 設定時は Omitted（Identifier HMAC は範囲外）。
+        AuditFieldClass::Public | AuditFieldClass::Identifier => match class_mode(policy, class) {
+            RedactionMode::Reveal => match value {
+                Some(value) => AuditField::Revealed {
+                    class,
+                    value,
+                    original_bytes,
+                },
+                // Reveal だが値が無い異常時は raw を出さず Omitted へ fail-safe。
+                None => AuditField::Omitted {
+                    class,
+                    original_bytes,
+                },
+            },
+            _ => AuditField::Omitted {
+                class,
+                original_bytes,
+            },
+        },
+    }
+}
+
+/// class に対応する policy mode を引く（`Public` は常に Reveal、他 class は対応 field）。
+fn class_mode(policy: &RedactionPolicy, class: AuditFieldClass) -> RedactionMode {
+    match class {
+        // Public は既定 raw 固定（policy field を持たない）。
+        AuditFieldClass::Public => RedactionMode::Reveal,
+        AuditFieldClass::Identifier => policy.identifier_mode,
+        AuditFieldClass::Path => policy.path_mode,
+        AuditFieldClass::Body => policy.body_mode,
+        // Secret は mode を持たない（常に Omit）。呼び出し側は fold_audit_field で先に分岐する。
+        AuditFieldClass::Secret => RedactionMode::Omit,
     }
 }
 
@@ -2877,6 +2968,138 @@ mod tests {
         let p2 = RedactionPolicy::default();
         assert_eq!(p1.hmac_path("@default/x"), p2.hmac_path("@default/x"));
         assert_eq!(p1.policy_id, "default-r1");
+    }
+
+    // --- R-1（§9.1）: fold_audit_field の畳み規則 ---
+
+    /// Secret class は mode に関係なく常に `Omitted`（Reveal mode でも値を記録しない、R-AT-07）。
+    #[test]
+    fn fold_secret_is_always_omitted_even_in_reveal_mode() {
+        let policy = RedactionPolicy {
+            body_mode: RedactionMode::Reveal,
+            path_mode: RedactionMode::Reveal,
+            identifier_mode: RedactionMode::Reveal,
+            ..RedactionPolicy::default()
+        };
+        let field = fold_audit_field(
+            &policy,
+            AuditFieldClass::Secret,
+            7,
+            Some("@data/secret.txt"),
+            Some(AuditValue::Scalar(AuditScalar::Utf8("token".to_string()))),
+        );
+        assert!(matches!(
+            field,
+            AuditField::Omitted {
+                class: AuditFieldClass::Secret,
+                original_bytes: 7
+            }
+        ));
+    }
+
+    /// Path は `path_mode == HmacSha256` のとき canonical label を HMAC、それ以外は `Omitted` へ
+    /// fail-safe。label 不在でも raw を出さず `Omitted`。
+    #[test]
+    fn fold_path_hmac_in_hmac_mode_omitted_otherwise() {
+        let policy = RedactionPolicy::default(); // path_mode = HmacSha256
+        let label = "@data/a.txt";
+        match fold_audit_field(&policy, AuditFieldClass::Path, 11, Some(label), None) {
+            AuditField::HmacSha256 {
+                class: AuditFieldClass::Path,
+                digest,
+                original_bytes,
+            } => {
+                assert_eq!(digest, policy.hmac_path(label));
+                assert_eq!(original_bytes, 11);
+            }
+            other => panic!("HMAC mode は HmacSha256 のはず: {other:?}"),
+        }
+
+        // path_mode が HMAC 以外なら Omitted へ畳む（raw を出さない fail-safe）。
+        let reveal_policy = RedactionPolicy {
+            path_mode: RedactionMode::Reveal,
+            ..RedactionPolicy::default()
+        };
+        assert!(matches!(
+            fold_audit_field(&reveal_policy, AuditFieldClass::Path, 11, Some(label), None),
+            AuditField::Omitted {
+                class: AuditFieldClass::Path,
+                original_bytes: 11
+            }
+        ));
+
+        // HMAC mode でも label 不在なら Omitted（raw path を漏らさない）。
+        assert!(matches!(
+            fold_audit_field(&policy, AuditFieldClass::Path, 5, None, None),
+            AuditField::Omitted {
+                class: AuditFieldClass::Path,
+                original_bytes: 5
+            }
+        ));
+    }
+
+    /// Body は R-1 では allow-list を無視して `body_mode` に関わらず常に `Omitted`。
+    #[test]
+    fn fold_body_is_always_omitted_in_r1() {
+        let reveal_policy = RedactionPolicy {
+            body_mode: RedactionMode::Reveal,
+            ..RedactionPolicy::default()
+        };
+        assert!(matches!(
+            fold_audit_field(
+                &reveal_policy,
+                AuditFieldClass::Body,
+                16,
+                None,
+                Some(AuditValue::Scalar(AuditScalar::Utf8("CANARY".to_string()))),
+            ),
+            AuditField::Omitted {
+                class: AuditFieldClass::Body,
+                original_bytes: 16
+            }
+        ));
+    }
+
+    /// Identifier は既定（Reveal）で渡した value を `Revealed`、Omit 設定時は `Omitted`。
+    #[test]
+    fn fold_identifier_reveals_in_reveal_mode() {
+        let policy = RedactionPolicy::default(); // identifier_mode = Reveal
+        let value = AuditValue::Scalar(AuditScalar::Utf8("filesystem".to_string()));
+        match fold_audit_field(
+            &policy,
+            AuditFieldClass::Identifier,
+            "filesystem".len() as u64,
+            None,
+            Some(value.clone()),
+        ) {
+            AuditField::Revealed {
+                class: AuditFieldClass::Identifier,
+                value: got,
+                original_bytes,
+            } => {
+                assert_eq!(got, value);
+                assert_eq!(original_bytes, "filesystem".len() as u64);
+            }
+            other => panic!("Reveal mode は Revealed のはず: {other:?}"),
+        }
+
+        let omit_policy = RedactionPolicy {
+            identifier_mode: RedactionMode::Omit,
+            ..RedactionPolicy::default()
+        };
+        assert!(matches!(
+            fold_audit_field(
+                &omit_policy,
+                AuditFieldClass::Identifier,
+                3,
+                None,
+                Some(AuditValue::Scalar(AuditScalar::Utf8("abc".to_string()))),
+            ),
+            AuditField::Omitted {
+                class: AuditFieldClass::Identifier,
+                original_bytes: 3
+            }
+        ));
     }
 
     /// R-AT-08: §9.1 の payload ツリーを載せても host-call lifecycle event の `estimate_event_bytes`

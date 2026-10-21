@@ -2,9 +2,9 @@
 
 最終更新: 2026-10-21
 
-設計ステータス: **実装仕様確定・部分実装（Phase 6 A-1 subset ＋ `BudgetCharged` ＋ host-call lifecycle 3 event ＋ `Yielded` / `Resumed` emission 実装済み）**
+設計ステータス: **実装仕様確定・部分実装（Phase 6 A-1 subset ＋ `BudgetCharged` ＋ host-call lifecycle 3 event ＋ `Yielded` / `Resumed` emission ＋ R-1 redaction R-1a 実装済み）**
 
-> Phase 6 の A-1 subset（schema v1・8 event 型・logical journal・`AuditSink`・fail-closed・opt-in、tree-only）に加え、`BudgetCharged`（§7.2/§7.3）、host-call lifecycle の 3 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished`）、yield/resume lifecycle の 2 event（`Yielded` / `Resumed`、§7.2 tag 5/6）、`AuditBackpressure`-yield 配線（§10/§10.2、B-1、sink-Pending 由来）、および §10.2 の audit drain queue byte 会計（B-2、per-execution 上限のみ）を tree backend で実装済み。これで §7.2 の 8 event 型が tree backend で emission される（backpressure も既存 `Yielded`/`Resumed` に `AuditYieldReason::AuditBackpressure` を載せる）。残りの redaction・strict CBOR・record/replay・VM 対応・sink 必須化、および engine 全体の queue 上限（16 MiB）は未実装（redaction 本体は §14「R-1 実装スライス」で slice 定義済み・実装未着手）。進捗の唯一の正本は [ロードマップ](roadmap.md)。
+> Phase 6 の A-1 subset（schema v1・8 event 型・logical journal・`AuditSink`・fail-closed・opt-in、tree-only）に加え、`BudgetCharged`（§7.2/§7.3）、host-call lifecycle の 3 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished`）、yield/resume lifecycle の 2 event（`Yielded` / `Resumed`、§7.2 tag 5/6）、`AuditBackpressure`-yield 配線（§10/§10.2、B-1、sink-Pending 由来）、§10.2 の audit drain queue byte 会計（B-2、per-execution 上限のみ）、および redaction 本体 R-1a（§9/§9.1、既定 policy を tree backend の監査付き host-call 経路へ配線・opt-in・破壊的変更〔`AuditPayload`/`AuditField` 差し替え〕を alpha として受容・`language_revision` bump なし）を tree backend で実装済み。これで §7.2 の 8 event 型が tree backend で emission され、host-call payload は §9.1 の redaction tree を載せる（backpressure も既存 `Yielded`/`Resumed` に `AuditYieldReason::AuditBackpressure` を載せる）。残る strict deterministic CBOR（§9.2）・record/replay・VM audit triple 対応・sink 必須化・body allow-list Reveal（R-1b）、および engine 全体の queue 上限（16 MiB）は未実装。進捗の唯一の正本は [ロードマップ](roadmap.md)。
 
 ## 1. 位置づけ
 
@@ -926,7 +926,8 @@ Slice 5 の最小縦切り（A-1）を tree engine にのみ実装した時点�
   「永続 Pending で script が成功扱いにならず AuditFailure terminal になる」が sink-Pending 経路で
   満たされ、§15.3「Yielded と Resumed が交互に対応し audit backpressure を区別できる」も
   `AuditYieldReason::AuditBackpressure` の Yielded/Resumed pair で満たされる（`tests/audit_backpressure.rs`）。
-- **未実装（意図的に含めない）**: redaction policy 本体（§9、下記「R-1 実装スライス」で slice 定義済み・実装未着手）、
+- **未実装（意図的に含めない）**: redaction policy 本体のうち body allow-list Reveal（§9、R-1b。既定 policy の
+  redaction tree R-1a は下記「R-1 実装スライス」で実装済み）、
   strict deterministic CBOR（§9.2、A-1 の
   `encoded_bytes` は naive 推定で後で差し替え可能に隔離）、record/replay（§6）、VM の変更、§10.2 の
   audit drain queue byte 会計のうち engine 全体の上限（per-execution 上限は B-2 で実装済み。下記「B-2 実装スライス」）。`AdmissionQueued` / `SchedulerPreempted` / `HostPaused`
@@ -1098,19 +1099,22 @@ B-2 はこの byte 会計を tree engine の監査付き poll driver へ入れ�
 
 #### R-1 実装スライス（tree engine、opt-in、redaction policy 本体）
 
-> 状態: **未実装（計画）**。本小節は A-1 が残した redaction プレースホルダ（payload は leak-free の
-> `Omitted`、`redaction_policy_id` は固定値）を §9.1/§9.2 の redaction policy 本体へ差し替える
-> 最小縦切り（R-1a）の slice 定義である。仕様（本章 §9）が正本であり、以下は R-1 で実装する範囲と
-> 意図的に延期する逸脱の記録である。実装は本定義とは別 PR で行う。
+> 状態: **実装済み（R-1a、tree backend・opt-in）**。本小節は A-1 が残した redaction プレースホルダ
+> （payload は leak-free の `Omitted`、`redaction_policy_id` は固定値）を §9.1/§9.2 の redaction policy
+> 本体へ差し替える最小縦切り（R-1a）の slice 定義である。仕様（本章 §9）が正本であり、以下は R-1 で
+> 実装した範囲と意図的に延期する逸脱の記録である。実装は本定義とは別 PR（実装 PR #238）で行った。
+> 公開型 `AuditPayload`/`AuditField` 差し替えは破壊的変更だが alpha として受容し、`language_revision`
+> の bump は行わない（根拠は [ロードマップ](roadmap.md) 明記）。残る strict CBOR・record/replay・VM
+> audit triple 対応・sink 必須化・body allow-list Reveal（R-1b）は未実装。
 
-A-1 は host-call lifecycle 3 event（§7.2/§8）を tree backend で emission する。payload
-（`request` / `resource` / `response`）は redaction 本体未実装のため、crate 内簡略型
-`AuditPayloadField::Omitted` を使い、`request`/`response` には `body` field（原本 byte 長
-`request_bytes`/`response_bytes`）、`resource` には `path` field（`original_bytes` は現状 **0 固定**で
-canonical label が評価器の手元に無いため）を `Omitted` で載せている（**payload は空ではない**。構築は
-`src/builtin_core.rs::host_call_triple`）。`ExecutionStarted` の `redaction_policy_id` は安定の既定値
-（`"default"`）のままである。R-1 はこのプレースホルダを §9.1 の `AuditField` ツリーへ置き換え、
-既定 redaction policy を tree engine の監査付き経路へ配線する。
+A-1 が残していた redaction プレースホルダ（host-call lifecycle 3 event〔§7.2/§8〕の payload を
+crate 内簡略型 `AuditPayloadField::Omitted` で leak-free に載せ、`redaction_policy_id` を固定値
+`"default"` にしていた）は R-1a で §9.1 の `AuditField` ツリーへ差し替え済みである（構築は
+`src/builtin_core.rs::host_call_triple`）。R-1a は既定 redaction policy を tree engine の監査付き
+経路へ配線し、`request`/`response` の `body` は `Omitted{class:Body}`、`resource` の path は Allow で
+canonical label の `HmacSha256`・Deny で `Omitted{class:Path}`（raw path/label は非露出）とし、
+`arguments` は `Revealed{class:Public, Sequence}` で各要素を Path/Body へ畳む。`ExecutionStarted` の
+`redaction_policy_id` は注入 policy の `policy_id`（既定 `"default-r1"`）を反映する。
 
 > このスライス定義は semantic review（本小節末尾「R-1 レビュー反映の記録」）を複数周通し、初版から
 > 次の点を改めた: (1) encoded 長の非破壊根拠が成り立たないため **byte 推定（`estimate_event_bytes`）を
@@ -1333,7 +1337,9 @@ canonical label が評価器の手元に無いため）を `Omitted` で載せ�
     raw ではなく `HmacSha256`（32 byte digest）として記録され、同じ canonical label は同じ digest、異なる
     label は異なる digest になる（§9.1）。**正常完了（`Success`）だけでなく、route/open 成功後に adapter が
     失敗した host error（Allow/`HostError`、`fs_result` は `Err`）でも Path は `HmacSha256`**（label は失敗
-    前に確定しているため）。host error ケースを明示的にテスト対象へ含める。
+    前に確定しているため）。host error ケースを明示的にテスト対象へ含める。**`rename`（2 path）は
+    `resource` を `source_path` / `destination_path` の 2 field に分け、Allow 時は 2 つとも `HmacSha256`**
+    （5 周目レビュー反映。単一 label では destination が source を上書きするため）。
   - **R-AT-02（Deny 時の Path と raw 非露出）**: decision が `Deny` の host-call は **label が手元にある
     場合でも** Path field が `Omitted { class: Path }` になる。対象経路——(a) filesystem 未 grant、
     (b) path lexical/argument エラー、(c) mount 未登録・operation 未 grant・許可外、(d) **Upsert の
@@ -1342,6 +1348,9 @@ canonical label が評価器の手元に無いため）を `Omitted` で載せ�
     1 byte も現れない**（`Revealed` にも HMAC 入力にも出ない。§9.1）。(d) を「label があるのに Omitted」の
     テストケースとして明示的に含める。R-1 の不変条件は「Path は `Allow`（Success/HostError）で
     `HmacSha256`・`Deny` で `Omitted`（label の有無を問わず）、raw/label は Deny で常に非露出」。
+    **`rename` の Deny は、移動元の route だけ通った場合も含め `source_path` / `destination_path` の 2 つとも
+    `Omitted { class: Path }`**（`original_bytes` はそれぞれの requested path の UTF-8 byte 長。
+    5 周目レビュー反映）。移動元だけ route が通るケースをテスト対象へ含める。
   - **R-AT-03**: body（file 内容・args の自由文）が `Omitted { class: Body }` で、`original_bytes` に
     redaction 前の canonical byte 長が入る（prefix も残さない。§9.1）。
   - **R-AT-04**: `ExecutionStarted.redaction_policy_id` が注入 policy の `policy_id`（§9.1 の host 指定
@@ -1488,6 +1497,40 @@ canonical label が評価器の手元に無いため）を `Omitted` で載せ�
     あれば HMAC してよい」と読み違えるのを防ぐ）。R-AT-02 に Upsert 経路 (d) を「label があるのに Omitted」の
     テストケースとして追加し、`original_bytes` は Deny では requested path 長で統一（label 長を漏らさない）と
     定義。
+
+  **5 周目レビューで採用した指摘（実装 PR #238 のレビュー反映、上記定義へ反映済み）**
+  - **`arguments` field の形**: 初版実装は `arguments` を `Revealed { class: Body, value: Sequence([]) }`
+    にしていたが、§9.1 で Body が `Revealed` になるのは allow-list に載り上限内のときだけであり、形の上で
+    「Body を開示した」と読めてしまう（値は空なので leak はない）。**対応（R-1 の確定規則）**: host-call
+    引数の `fields["arguments"]` は外側を `Revealed { class: Public, value: Sequence([...]) }`（開示するのは
+    引数の個数と並びだけ）とし、各要素は引数の種類に応じて `Omitted { class: Path }`（path 引数）または
+    `Omitted { class: Body }`（書き込み内容などの自由文）に畳む。path の HMAC は `resource` 側だけで持ち、
+    `arguments` 側では HMAC しない。各要素の `original_bytes` はその引数の UTF-8 byte 長（R-1 の代用規則）。
+    これにより R-1b の allow-list Reveal を要素単位で差し込める。
+  - **`rename` の resource は 2 field に分ける**: `rename` は `fs_route` を source/destination で 2 回
+    呼ぶため、単一 `label` では destination の digest で source が上書きされ、Allow 時に `resource.path` へ
+    destination しか残らない（Deny 側は `Omitted` なので漏洩はない）。**対応（R-1 の確定規則）**: 単一 path
+    を扱う操作は従来どおり `resource.fields["path"]` のまま残し、`rename` だけ `resource` を
+    `source_path` / `destination_path` の 2 field にする。Allow（Success/HostError）では 2 つとも canonical
+    label の `HmacSha256`、Deny では（移動元の route だけ通った場合も含め）2 つとも `Omitted { class: Path }`
+    とし、`original_bytes` はそれぞれの requested path の UTF-8 byte 長。label を運ぶ仕組みは 2 つの label を
+    保持できる形へ広げる（`Option<String>` 1 つでは足りない）。R-AT-01/02 に `rename` の Allow/Deny
+    （移動元だけ route が通るケースを含む）をテストケースとして追加する。
+  - **Secret class の畳み規則を本スライスで入れる**: 初版実装は `AuditFieldClass::Secret` を扱う構築経路が
+    無く、`AuditField::Revealed { class: Secret, .. }` を作れてしまった。R-AT-07 は「Secret class の field は
+    存在と byte 数だけが記録される」を要求する。**対応**: class と mode から `AuditField` を組む小さな helper
+    を `audit.rs` に置き、Secret は mode に関係なく常に `Omitted` にする。`host_call_triple` の body/path も
+    この helper を経由させ、畳み規則を 1 か所へ集約する。unit test を添える。
+  - **`identifier_mode` を payload へ反映する（ユーザー判断 A＝(イ)）**: slice 定義の「function 名・capability
+    名・rule ID は既定 `Reveal`（`Revealed { class: Identifier, .. }`）」を実装にも反映する。初版は
+    function/capability を event の素の String のままにしていた（payload の Identifier 二重化なし）。**対応**:
+    host-call payload 側にも既定 policy の `identifier_mode` を適用した `Revealed { class: Identifier, value,
+    original_bytes }` を載せ、slice 文面と実装を一致させる。
+  - **test shim の `debug_assert!(reveal_body_fields.is_empty())` を撤去**: allow-list 非空 policy を注入
+    すると debug build で panic し、ホスト安定性原則に反する。**対応**: assert を外し、「R-1 は allow-list を
+    無視して常に Omit する」ことをコメントで明記する（R-1b で Reveal 経路を有効化する）。
+  - **公開面の整理**: `RedactionPolicy::hmac_path` は spec に無い HMAC 計算の口なので `pub(crate)` にする。
+    `path_mode` が HMAC 以外のとき `Omitted` へ畳む fail-safe 挙動を `RedactionPolicy` の doc に明記する。
 
 ### Slice 6: VM conformance
 

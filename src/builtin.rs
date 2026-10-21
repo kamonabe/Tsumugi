@@ -184,6 +184,10 @@ impl Evaluator {
                         line,
                     )?)
                 } else if crate::builtin_core::is_filesystem_builtin(name) {
+                    // 監査 triple は I-O byte 課金対象（`is_host_call`）に加えて `rename` でも
+                    // emission する（§9.1 / R-1・5 周目レビュー反映）。triple push は budget・意味論・
+                    // 外部効果に影響しない（監査付き facade が drain するときだけ emission）。
+                    let is_audited = crate::builtin_core::is_audited_host_call(name);
                     // C10: filesystem builtin は grant 有無に関わらず常に capability 経路を通す。
                     // 未 grant（filesystem() が None）なら dispatch_fs が adapter/OS call 0 で
                     // 単一の sandbox denial を返す。ambient std::fs fallback へは落ちない。
@@ -195,8 +199,9 @@ impl Evaluator {
                         language_revision,
                         line,
                     );
-                    // Phase 6 R-1: dispatch_fs が返す canonical label（Deny は None）を triple へ渡す。
-                    let fs_label = dispatched_fs.label;
+                    // Phase 6 R-1: dispatch_fs が返す canonical label（Deny は None、rename は
+                    // source/destination の 2 label）を triple へ渡す。
+                    let fs_labels = dispatched_fs.labels;
                     let fs_result = dispatched_fs.outcome;
                     // Phase 6（§7.2/§8）: filesystem は唯一の tree host-call 境界なので、ここで
                     // host-call lifecycle triple（HostCallStarted → CapabilityDecision →
@@ -204,20 +209,27 @@ impl Evaluator {
                     // するときだけ emission され、sink 無し経路は drain しない（opt-in、byte 不変）。
                     // 既存の制御フロー（成功時 response byte 課金・error 伝播）は triple を積んだ後
                     // も厳密に保つため、`fs_result` を `?` で畳む前に triple を構築・push する。
-                    if is_host_call {
+                    if is_audited {
                         let response_bytes = match &fs_result {
                             Ok(value) => crate::builtin_core::host_call_response_bytes(name, value),
                             Err(_) => 0,
                         };
-                        // Deny の original_bytes 用: 先頭の Str 引数（requested path）の UTF-8 byte
-                        // 長。path 文字列が無い（引数型エラー等）なら 0（§9.1 / R-1 スライス）。
-                        let requested_path_bytes = evaluated
-                            .first()
-                            .and_then(|v| match v {
-                                crate::value::Value::Str(s) => Some(s.as_str().len() as u64),
-                                _ => None,
-                            })
-                            .unwrap_or(0);
+                        // Deny / label 不在時の original_bytes 用: 各 Str 引数（requested path）の
+                        // UTF-8 byte 長。path 文字列が無い（引数型エラー等）なら 0（§9.1 / R-1）。
+                        // rename は arg[0]=source・arg[1]=destination、他操作は arg[0]=path。
+                        let str_arg_bytes = |idx: usize| -> u64 {
+                            evaluated
+                                .get(idx)
+                                .and_then(|v| match v {
+                                    crate::value::Value::Str(s) => Some(s.as_str().len() as u64),
+                                    _ => None,
+                                })
+                                .unwrap_or(0)
+                        };
+                        let requested_path_bytes = crate::builtin_core::RequestedPathBytes {
+                            primary: str_arg_bytes(0),
+                            destination: str_arg_bytes(1),
+                        };
                         let op_id = self.alloc_host_call_operation_id(line)?;
                         let triple = crate::builtin_core::host_call_triple(
                             op_id,
@@ -226,8 +238,8 @@ impl Evaluator {
                             &fs_result,
                             response_bytes,
                             self.redaction_policy(),
-                            fs_label.as_deref(),
-                            requested_path_bytes,
+                            &fs_labels,
+                            &requested_path_bytes,
                         );
                         self.push_host_call_events(triple);
                     }
