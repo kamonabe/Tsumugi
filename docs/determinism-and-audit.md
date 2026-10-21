@@ -1560,6 +1560,191 @@ canonical label の `HmacSha256`・Deny で `Omitted{class:Path}`（raw path/lab
     `host_call_triple_tests` に read 系（要素 1 つ）と write 系（Path + Body の 2 要素）のケースを
     追加し、raw path や書き込み内容が要素に出ないことも確認する。
 
+#### R-1b 実装スライス（tree engine、opt-in、body allow-list Reveal）
+
+> 状態: **未実装**（設計のみ）。本小節は R-1a が型だけ用意して常に `Omitted` に畳んでいる body
+> allow-list Reveal 経路（`reveal_body_fields` と `max_revealed_body_bytes > 0` による `audit_safe`
+> field の明示開示）を有効化する最小縦切り（R-1b）の slice 定義である。仕様（本章 §9/§9.1）が正本で
+> あり、以下は R-1b で実装する範囲と意図的に延期する逸脱の記録である。R-1a 小節冒頭の状態注記
+> （body allow-list Reveal〔R-1b〕は未実装）は実装 PR で直すものなので本スライスでは触らない。
+
+R-1a は §9.1 の `AuditField` ツリーと `RedactionPolicy`（`reveal_body_fields` /
+`max_revealed_body_bytes` を含む）を型として用意したが、body を扱う畳み規則
+（`src/audit.rs::fold_audit_field` の `AuditFieldClass::Body` 分岐）は `body_mode` に関わらず
+**常に `Omitted`** にしており、allow-list を無視している（R-1a の確定規則・コメントで明記済み）。
+R-1b はこの 1 か所の畳み規則を §9.1 の Body Reveal 条件へ差し替え、allow-list に載った body field を
+上限内でだけ `Revealed` にする。R-1a と同じ opt-in（sink あり経路）・tree backend だけを対象とし、
+新しい公開型・CBOR tag・`language_revision` の変更は行わない。
+
+- **粒度は R-1b（body Reveal 経路の有効化のみ）**: R-1a が常に `Omitted` に畳んでいた Body class を、
+  §9.1 の条件——`body_mode == Reveal` **かつ** field の `AuditFieldKey` が `reveal_body_fields` に
+  ある **かつ** `original_bytes <= max_revealed_body_bytes`（`max_revealed_body_bytes > 0`）——を
+  すべて満たすときだけ `Revealed { class: Body, value, original_bytes }` にする。1 つでも満たさなければ
+  R-1a と同じく `Omitted { class: Body, original_bytes }` のままとする。filesystem host-call
+  （tree 唯一の監査対象境界、R-1a と同じ 4 builtin〔`read_file` / `read_lines` / `write_file` /
+  `append_file`〕）の `request` body・`response` body・`arguments` 各要素（自由文の書き込み内容）を対象に
+  する。path 引数（`AuditFieldClass::Path`）・Secret・Identifier・Public の畳み規則は R-1a のまま一切
+  変えない。
+
+- **allow-list のキー（§9.1 どおり、新設しない）**: Reveal 可否は §9.1 の `AuditFieldKey`
+  （`{ operation: String, direction: AuditDirection, field: String }`）で引く。R-1b はこの型を
+  そのまま使い、新しいキー型を作らない。各単位の割り当ては次のとおり固定する。
+  - `operation` = host function 名（R-1a が `request.function` / `resource.action` に載せている
+    Identifier と同じ文字列。`read_file` / `read_lines` / `write_file` / `append_file`）。
+  - `direction` = その body がどちらの payload に現れるかで決める。`request` body と `request` の
+    `arguments` 要素は `AuditDirection::Request`、`response` body は `AuditDirection::Response`。
+  - `field` = payload の key。`request`/`response` の自由文 body は `"body"`、`arguments` の各要素は
+    §9.1 の「name または 0 始まり argument index」どおり **0 始まりの index の 10 進文字列**
+    （`"0"`、`"1"`、…）とする。R-1a の `arguments` は arg[0]=path・arg[1]=書き込み内容なので、Body の
+    Reveal 対象になり得るのは write/append の `"1"` だけである（arg[0] は Path class で対象外）。
+  - **根拠**: §9.1 は `AuditFieldKey` を allow-list の要素型として既に定め、`field` を「name または
+    0 始まり argument index」と規定している。R-1b はこの規定を host-call payload の実際の key 名
+    （`"body"`）と `arguments` の index 文字列へ機械的に対応づけるだけで、新たな識別子体系を導入しない。
+    operation に host function 名を使うのは、R-1a が同じ名前を payload の Identifier として既に露出して
+    いるため、host が allow-list を書くときに参照できる安定ラベルになるからである。
+
+- **`max_revealed_body_bytes` の比較対象と上限超過時の表現（§9.1）**: 比較対象は当該 field の
+  `original_bytes`、すなわち **redaction 前の canonical subtree 長**（R-1a の代用規則どおり、strict CBOR
+  スライスまでは値の UTF-8 byte 長で代用する。body は原本文字列の byte 長）とする。`original_bytes >
+  max_revealed_body_bytes` の body は §9.1 どおり **truncation せず subtree 全体を `Omitted { class:
+  Body, original_bytes }`** にする。prefix も 1 byte も残さない（prefix を残すと secret が漏れうるため）。
+  §9.1 の「`truncated = true` ではなく `omitted = true` と byte 数を記録する」は、R-1a の `AuditField`
+  表現では「variant が `Omitted` であること（truncation variant を持たない）」と「`original_bytes` に
+  原本 byte 長が入ること」で満たす。`max_revealed_body_bytes` の既定は 0 なので、既定 policy では
+  `original_bytes <= 0` を満たす body が無く（空 body の `original_bytes` も 0 だが、空 body は
+  allow-list に載っても Reveal する値が無い）、実質すべて `Omitted` のままになる。
+  - **根拠**: §9.1 が「上限を超えた body は truncation せず全体を omit」「prefix だけを残して secret を
+    漏らさない」と明記している。比較対象を `original_bytes`（redaction 前の subtree 長）にするのは、
+    §9.1 が Body Reveal の条件を「上限内」と定め、`original_bytes` を「redaction 前の canonical subtree
+    payload 長」と定義しているため、両者の突合が仕様の意図どおりになる。
+
+- **class 間の優先順位（§9.1、allow-list より class 規則が優先）**: Reveal 条件を満たしても、次の
+  class 規則が allow-list より優先し、body Reveal には **到達しない**。
+  - **Secret は常に `Omitted`**（mode 変更不可・走査しない、§9.1）。allow-list に載っていても Secret
+    class の field は `fold_audit_field` の Secret 分岐で先に `Omitted` になる（R-1a の畳み順を変えない）。
+  - **Path は decision 由来の規則が優先**（Allow=`HmacSha256` / Deny=`Omitted`、R-1a の R-AT-01/02）。
+    `arguments` の path 引数（arg[0]）は Path class なので、allow-list に `"0"` を載せても body Reveal の
+    対象にならない（Path 分岐で処理され Body 分岐へ来ない）。
+  - **64 段を超える nesting は `Body`/`Omitted` へ縮退**（§9.1）。縮退した subtree は Body class の
+    `Omitted` になり、allow-list に載っていても Reveal しない（縮退先が `Omitted` 固定であることは §9.1 の
+    既定であり、R-1b はこれを Reveal へ昇格させない）。R-1a の filesystem payload は `arguments` が 1 段
+    （`Sequence` の要素はスカラ）なので 64 段には達しないが、縮退規則と allow-list の優先関係を本スライスで
+    確定しておく。
+  - 優先順位をまとめると **Secret > Path（decision 規則）> 64 段縮退 > body allow-list Reveal** であり、
+    body Reveal は「Body class として `fold_audit_field` の Body 分岐に到達し、かつ §9.1 の 3 条件を満たす」
+    ときだけ起きる。
+  - **根拠**: §9.1 は「Secret の親は必ず subtree 全体を `Omitted`」「Body は `body_mode == Reveal` かつ
+    key が allow-list にあり上限内の場合だけ `Revealed`」「64 段を超える subtree は Body/Omitted へ縮退」
+    と、class 規則を Body Reveal 条件の前段として規定している。R-1b はこの順序をそのまま実装し、allow-list
+    を class 規則の後ろに置く。
+
+- **`redaction_policy_id` の扱い（R-1a の実配線を踏襲）**: `ExecutionStarted.redaction_policy_id` は
+  R-1a どおり注入 policy の `policy_id`（§9.1 の host 指定 `String`）を**そのまま**反映する。allow-list が
+  非空の policy でも R-1b は `policy_id` の決め方・既定値・format に手を入れない（既定 policy は allow-list
+  が空のままなので `"default-r1"` を維持する）。allow-list 非空 policy に特定の `policy_id` を要求するか、
+  allow-list の内容を `policy_id` へ反映するか（例: 内容ハッシュを含める）は §9.1 の「`policy_id` は host が
+  付ける安定ラベル・内容ハッシュではない」に反し得る API/format の約束になるため、本スライスでは決めず
+  PR 本文の「判断待ち」へ回す。
+  - **根拠**: §9.1 が `policy_id` を「host が付ける安定ラベル（内容ハッシュではない）」と定義し、R-1a の
+    R-AT-04 が「注入値をそのまま反映」を確定している。R-1b は Body の畳み規則だけを変え、この契約は維持する。
+
+- **policy 注入経路は R-1a のまま（公開 setter を新設しない）**: R-1b は facade の既定 policy
+  （`RedactionPolicy::default()`、allow-list 空・`max_revealed_body_bytes = 0`）を変えない。allow-list を
+  非空にした policy を注入する経路は、R-1a が置いた `#[doc(hidden)] pub` の test shim
+  （`EngineBuilder::audit_redaction_policy_for_test`）をそのまま使い、受入基準のテストもこの shim 経由で
+  allow-list 入り policy を注入する。host が production で allow-list 付き policy を設定する**公開 API**
+  （`EngineBuilder::audit_redaction_policy` などの安定 setter）は、選択肢があり公開契約を増やすため、
+  R-1a と同じく sink 必須化（§1.1）スライスへ延期し、R-1b では決めない（詳細は PR 本文「判断待ち」）。
+  - **根拠**: R-1a の slice 定義が「公開 setter は追加しない・sink 必須化スライスへ延期」「test shim で
+    注入」を確定している。R-1b は Body Reveal の意味論を有効化する縦切りであり、公開 API の設計を伴わない。
+
+- **opt-in・非破壊（既定 policy で R-1a と 1 byte も変わらない）**: sink なし経路（`run_guarded`）は
+  redaction を一切行わず、観測結果・出力 byte・exit code は不変（R-1a のまま）。sink あり経路でも、既定
+  policy（allow-list 空・`max_revealed_body_bytes = 0`）では §9.1 の Reveal 条件を満たす body が存在せず、
+  `fold_audit_field` の Body 分岐は R-1a と同じ `Omitted` を返す。したがって既定 policy での payload・
+  `redaction_policy_id`・`original_bytes`・envelope 列は R-1a と **byte 単位で完全一致**する（R1b-AT-06 で
+  固定）。挙動が変わるのは allow-list を非空にした policy を test shim 経由で注入したときだけで、その場合も
+  R-1a の byte 推定据え置き（host-call event は 128 固定見積もり）を維持するため、sequence・yield 位置・
+  B-2 の queue byte 会計は不変である（payload の**中身**だけが `Omitted` から `Revealed` へ変わる）。
+
+- **byte 推定は R-1b でも据え置く（§9.2、非破壊の前提）**: R-1b は `estimate_event_bytes`
+  （`src/audit.rs`）を**変更しない**（R-1a と同じ理由。host-call lifecycle event は payload 非依存の
+  128 固定見積もりのまま）。Body を Reveal しても見積もり長は 128 固定で動かないため、B-2 の queue byte
+  会計・yield 位置は allow-list の有無に関わらず不変になる。payload を実サイズで見積もる正確化は strict
+  deterministic CBOR（§9.2）スライスへ延期する（R-1a と同じ割り切り）。
+
+- **逸脱（R-1b 時点で残るもの、後続スライスへ延期）**:
+  - **公開 setter**（`EngineBuilder::audit_redaction_policy`）と `ConfigError` への接続は sink 必須化
+    （§1.1）スライスへ延期する（R-1a と同じ）。R-1b の allow-list 注入は test shim 経由だけ。
+  - **allow-list 非空 policy の `policy_id` 契約**（特定値の要求・内容反映の有無）は決めず、PR 本文の
+    「判断待ち」へ回す。R-1b は R-1a の「注入値をそのまま反映」を維持する。
+  - **byte 推定の正確化**（`estimate_event_bytes` を payload 依存の実 encode 長へ）は strict CBOR
+    （§9.2）スライスへ延期する。Reveal された body が 128 を超える encode 長になっても、R-1b は見積もりを
+    据え置くため §11 の `max_encoded_bytes` / 60 KiB 判定は 128 概算に対して行われ、strict CBOR まで
+    不正確なまま（R-1a と同じ逸脱）。
+  - **60 KiB 縮退規則**（§9 の Body → Path → Identifier 縮退・`EventTooLarge`）は正確な byte 推定が
+    前提のため strict CBOR スライスへ延期する（R-1a と同じ）。Reveal した body が大きい場合でも R-1b は
+    `max_revealed_body_bytes` 上限（超過時は全体 `Omitted`）で有界化し、縮退規則には依存しない。
+  - **fs builtin 全体の監査範囲**（`rename` ほか非課金 fs builtin への監査 triple 拡張）は別 slice
+    （R-1a の逸脱と同じ「fs builtin 監査範囲」slice）。R-1b は R-1a と同じ 4 builtin だけを対象とする。
+  - **VM 対応**（Slice 6）。監査 sink と `VmExperimental` の同時設定は従来どおり build 時に拒否する。
+  - **record/replay の redaction 再適用**（§12）は record/replay スライス（§6）へ延期する。
+
+- **変更箇所（見込み）**:
+  - `src/audit.rs`: `fold_audit_field` の `AuditFieldClass::Body` 分岐を、§9.1 の 3 条件
+    （`body_mode == Reveal` ∧ key ∈ `reveal_body_fields` ∧ `original_bytes <= max_revealed_body_bytes`
+    かつ `max_revealed_body_bytes > 0`）を満たすとき `Revealed { class: Body, value, original_bytes }`、
+    満たさなければ `Omitted { class: Body, original_bytes }` にする。allow-list 判定に必要な
+    `AuditFieldKey`（`operation` / `direction` / `field`）と Reveal する `value` を呼び出し側から
+    受け取れるよう、Body 用の畳み口（`fold_audit_field` の引数追加または Body 専用 helper）を整える。
+    Secret / Path / 縮退の畳み規則は変えない。`RedactionPolicy` の Body Reveal 条件を doc に明記する。
+  - `src/builtin_core.rs`: `host_call_triple` の `body_field` helper が、`request`/`response`/`arguments`
+    の各 body について `AuditFieldKey`（host function 名・direction・key 名または index 文字列）と
+    原本の `AuditValue`（Reveal される場合に載せる自由文の `AuditScalar::Utf8` 等）を組んで Body の
+    畳み口へ渡すようにする。allow-list に無い・上限超過・既定 policy のときは従来どおり `Omitted`。
+    path 引数（Path class）・Identifier・Public の経路は変えない。
+  - `src/embedding.rs` / `src/eval.rs`: 変更なし（policy は R-1a の受け渡し経路をそのまま使う。
+    test shim・`redaction_policy_id` 配線は R-1a のまま）。
+
+- **受入基準（R-1b）**:
+  - **R1b-AT-01（allow-list + 上限内で Reveal）**: `body_mode = Reveal`・当該 body の `AuditFieldKey` を
+    `reveal_body_fields` に含め・`max_revealed_body_bytes` を body 長以上にした policy を注入すると、その
+    body field が `Revealed { class: Body, value, original_bytes }` になり、`value` に原本の自由文が、
+    `original_bytes` に redaction 前の byte 長（R-1b の代用規則＝UTF-8 byte 長）が入る（§9.1）。
+  - **R1b-AT-02（上限超過は全体 Omit・truncation しない）**: `original_bytes > max_revealed_body_bytes`
+    の body は、allow-list に載り `body_mode = Reveal` でも `Omitted { class: Body, original_bytes }` に
+    なる。prefix を含め原本の byte が payload に 1 byte も現れず、`original_bytes` に原本長が入る（§9.1
+    「truncation せず全体 omit・prefix を残さない」）。
+  - **R1b-AT-03（allow-list 外は Omit）**: `AuditFieldKey` が `reveal_body_fields` に無い body は、
+    `body_mode = Reveal`・上限内でも `Omitted { class: Body }` のままになる。`direction` 違い・`field`
+    違い・`operation`（host function 名）違いのいずれでもキーが一致しなければ Reveal しない（§9.1）。
+  - **R1b-AT-04（class 優先順位）**: allow-list に載っていても (a) Secret class は常に `Omitted`、
+    (b) `arguments` の path 引数（arg[0]＝Path class）は decision 規則（Allow=`HmacSha256`/Deny=`Omitted`）に
+    従い body Reveal に到達しない、(c) 64 段を超える nesting で Body/Omitted へ縮退した subtree は Reveal
+    しない。優先順位 Secret > Path > 64 段縮退 > body allow-list Reveal を満たす（§9.1）。
+  - **R1b-AT-05（`body_mode != Reveal` では Reveal しない）**: allow-list に載り上限内でも、
+    `body_mode = Omit`（既定）または `body_mode = HmacSha256` の policy では body が `Revealed` にならない
+    （§9.1 の 3 条件は `body_mode == Reveal` を含む）。既定 policy（`body_mode = Omit`）がこのケースを兼ねる。
+  - **R1b-AT-06（既定 policy で R-1a と byte 一致・非破壊）**: 既定 policy（allow-list 空・
+    `max_revealed_body_bytes = 0`・`body_mode = Omit`）では、payload・`redaction_policy_id`・
+    `original_bytes`・envelope 列・sequence・yield 位置が R-1a と **1 byte も変わらない**。既存
+    `tests/audit_redaction.rs` / `tests/audit_core.rs` / `tests/audit_hostcall.rs` /
+    `tests/audit_yield_resume.rs` / `tests/audit_backpressure.rs` / `tests/audit_queue_bytes.rs` が
+    無改変で緑。sink なし経路の出力 byte・exit code が不変。既存テストの期待値が変わる場合は実装を止めて
+    報告する。
+  - **R1b-AT-07（決定性）**: 同じ script・同じ `hmac_key`・同じ allow-list 入り policy では、Reveal 結果と
+    envelope 列が 100 回の実行で一致する（§15.1）。Reveal は原本値をそのまま載せるだけで乱数源に触れない。
+  - **R1b-AT-08（byte 計上の不変）**: R-1b は `estimate_event_bytes` を据え置くため、allow-list の有無・
+    Reveal の有無に関わらず host-call event の push 時計上 byte（128 固定 + envelope 固定部）が R-1a/B-2 と
+    変わらず、journal の `committed_bytes` 増分とも一致し続ける（B2-AT-10 の不変条件を維持）。
+  - VM は対象外（監査 sink と `VmExperimental` の同時設定は build 時に拒否）。
+
+- **テスト配置**: `tests/audit_redaction.rs`（R1b-AT-01〜05・07 を allow-list 入り policy の test shim
+  注入で追加）。R1b-AT-06 は既存 `tests/audit_*.rs` の無改変緑 ＋ 既定 policy payload の期待値不変で担保。
+  R1b-AT-08 は `src/audit.rs` の unit test（見積もり据え置きと Body 畳み規則）で担保。allow-list 判定・
+  class 優先順位の畳み規則は `src/audit.rs::fold_audit_field` と `src/builtin_core.rs::host_call_triple_tests`
+  の unit test に Reveal/Omit の分岐ケースを追加する。
+
 ### Slice 6: VM conformance
 
 - Charge opcode、StableError、FunctionId、host boundary、transaction、audit semantic eventをtreeと一致させる
