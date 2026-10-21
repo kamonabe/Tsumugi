@@ -2102,14 +2102,19 @@ impl Vm {
         // adapter/OS call 0 で単一の sandbox denial を返す。ambient std::fs fallback へは落ちない。
         let language_revision = self.language_revision();
         let fs_capability_result = if crate::builtin_core::is_filesystem_builtin(name) {
-            Some(crate::builtin_core::dispatch_fs(
-                name,
-                &args,
-                self.capabilities.filesystem(),
-                max_collection,
-                language_revision,
-                line,
-            )?)
+            // Phase 6 R-1: dispatch_fs は canonical label を同伴して返すが、VM は監査 triple を
+            // 組まないため label は無視し、従来どおり outcome だけを取り出す（観測挙動不変）。
+            Some(
+                crate::builtin_core::dispatch_fs(
+                    name,
+                    &args,
+                    self.capabilities.filesystem(),
+                    max_collection,
+                    language_revision,
+                    line,
+                )
+                .outcome?,
+            )
         } else {
             None
         };

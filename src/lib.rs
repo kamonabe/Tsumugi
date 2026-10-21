@@ -179,9 +179,11 @@ pub use stable_error::{ErrorCode, ErrorMessageId, StableError, StableFrame};
 // alpha facade と名前衝突しないため、そのままの名前で re-export する。opt-in: sink を
 // `EngineBuilder::audit_sink` で設定しない限り emission は起きない（§1.1 の sink 必須は後続）。
 pub use audit::{
-    AuditAck, AuditBudget, AuditConfigError, AuditEnvelope, AuditError, AuditErrorPayload,
-    AuditEvent, AuditFailure, AuditFrame, AuditJournal, AuditPayload, AuditPayloadField, AuditSink,
-    AuditSinkError, AuditSubmit, AuditTicket, AuditWaker, AuditYieldReason, BudgetChargeReason,
+    AuditAck, AuditBudget, AuditConfigError, AuditDirection, AuditEnvelope, AuditError,
+    AuditErrorPayload, AuditEvent, AuditFailure, AuditField, AuditFieldClass, AuditFieldKey,
+    AuditFrame, AuditJournal, AuditPayload, AuditScalar, AuditSink, AuditSinkError, AuditSubmit,
+    AuditTicket, AuditValue, AuditWaker, AuditYieldReason, BudgetChargeReason,
     CapabilityDecisionKind, EffectStatus, ExecutionMode, HostCallOutcome, HostTimestamp,
-    InMemoryAuditSink, ScriptedAuditSink, ScriptedResponse, SyncAuditSink, TerminalOutcome,
+    InMemoryAuditSink, RedactionMode, RedactionPolicy, ScriptedAuditSink, ScriptedResponse, Secret,
+    SecretBytes, SyncAuditSink, TerminalOutcome,
 };

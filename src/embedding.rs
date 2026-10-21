@@ -318,6 +318,11 @@ pub struct EngineBuilder {
     /// 公開 setter は無く、test 専用 shim [`Self::audit_budget_for_test`] だけが差し替える
     /// （Phase 6 B-2）。公開構造体 [`EngineConfig`] へは置かない（field 追加で literal 構築を壊さない）。
     audit_budget: crate::audit::AuditBudget,
+    /// 監査付き run 経路が使う host-call redaction policy（Phase 6 R-1、§9.1）。既定は
+    /// `RedactionPolicy::default()`（`policy_id = "default-r1"`）。公開 setter は無く、test 専用
+    /// shim [`Self::audit_redaction_policy_for_test`] だけが差し替える（公開 setter と
+    /// `ConfigError` 接続は sink 必須化スライスへ延期）。
+    redaction_policy: crate::audit::RedactionPolicy,
 }
 
 impl Default for EngineBuilder {
@@ -337,6 +342,7 @@ impl EngineBuilder {
             // 既定は空 registry（host function なし）。run-path 挙動は従来と同一。
             host_registry: std::sync::Arc::new(crate::host_function::HostFunctionRegistry::empty()),
             audit_budget: crate::audit::AuditBudget::default(),
+            redaction_policy: crate::audit::RedactionPolicy::default(),
         }
     }
 
@@ -400,6 +406,22 @@ impl EngineBuilder {
         self
     }
 
+    /// **test 専用 shim**: 監査付き run 経路の host-call redaction policy（§9.1）を差し替える
+    /// （Phase 6 R-1、`docs/determinism-and-audit.md` §14「R-1 実装スライス」）。
+    ///
+    /// redaction の境界テストで別 `policy_id` や policy を注入するためだけに置く。外部 embedder
+    /// 向けの安定した公開契約ではない（`audit_budget_for_test` と同じ扱いで `#[doc(hidden)]`）。
+    /// 公開 setter（`audit_redaction_policy`）と `ConfigError` 接続は sink 必須化（§1.1）スライスへ
+    /// 延期している。
+    #[doc(hidden)]
+    pub fn audit_redaction_policy_for_test(
+        mut self,
+        policy: crate::audit::RedactionPolicy,
+    ) -> Self {
+        self.redaction_policy = policy;
+        self
+    }
+
     /// build 済みの host function registry を engine へ登録する（Phase 2、E7、第11.1節）。
     ///
     /// registry は engine 単位の build-time 設定（link 時に name→ID を固定する）であり、実行ごとに
@@ -433,6 +455,7 @@ impl EngineBuilder {
             config: self.config,
             host_registry: self.host_registry,
             audit_budget: self.audit_budget,
+            redaction_policy: self.redaction_policy,
         })
     }
 }
@@ -453,6 +476,9 @@ pub struct Engine {
     /// 監査付き run 経路の control-plane budget（§11）。既定は `AuditBudget::default()`
     /// （[`EngineBuilder::audit_budget_for_test`] でだけ差し替わる、Phase 6 B-2）。
     audit_budget: crate::audit::AuditBudget,
+    /// 監査付き run 経路の host-call redaction policy（§9.1）。既定は `RedactionPolicy::default()`
+    /// （[`EngineBuilder::audit_redaction_policy_for_test`] でだけ差し替わる、Phase 6 R-1）。
+    redaction_policy: crate::audit::RedactionPolicy,
 }
 
 impl Engine {
@@ -2233,9 +2259,10 @@ impl Engine {
             heap_accounting_revision: crate::budget::HEAP_ACCOUNTING_REVISION,
             budget,
             // capability policy hash は実行を認可した frozen set の相関 ID（上で算出）。
-            // redaction policy は A-1 では未配線のため安定の既定値を載せる。
+            // Phase 6 R-1: 注入 redaction policy の policy_id をそのまま載せる（既定 "default-r1"、
+            // §7.1/§9.1 / R-AT-04。内容ハッシュではなく host ラベルの反映）。
             capability_policy_hash,
-            redaction_policy_id: "default".to_string(),
+            redaction_policy_id: self.redaction_policy.policy_id.clone(),
             mode: ExecutionMode::Live,
         };
         let started_seq = match journal.append_normal(&make_envelope(0, started_event.clone())) {
@@ -2442,6 +2469,11 @@ impl Engine {
             self.audit_budget.max_pending_bytes,
             crate::audit::estimate_envelope_overhead_bytes(&delivery.language_revision),
         );
+        // Phase 6 R-1: host-call payload 構築へ注入 redaction policy を渡す（§9.1 / R-AT-04）。
+        // set_audit_queue と同じく install（reset_budget）後に設定する。
+        context
+            .evaluator
+            .set_redaction_policy(self.redaction_policy.clone());
 
         // begin_execution（E4: transactional=true）。Link 失敗は専用 terminal へ写す。
         if let Err((phase, error)) =
