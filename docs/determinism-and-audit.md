@@ -1267,6 +1267,16 @@ canonical label の `HmacSha256`・Deny で `Omitted{class:Path}`（raw path/lab
   簡略型から §9.1 ツリーへ変わるだけ。`AuditField` の tag 0/1/2 は §9.2 で予約済み）。
 
 - **逸脱（R-1 時点で残るもの、後続スライスへ延期）**:
+  - **fs builtin 全体の監査範囲**は別 slice で決める（6 周目レビュー反映）。R-1 で host-call triple を
+    emission するのは I/O byte 課金対象の 4 builtin（`read_file` / `read_lines` / `write_file` /
+    `append_file`）のみで、`rename` / `mkdir` / `remove` 系 / `list_dir` / `file_size` / `is_file` /
+    `is_dir` / `path_exists` など capability 判定を通る他の fs builtin は監査対象外のまま据え置く。これらを
+    監査対象へ広げると emission 範囲（event 件数・sequence・queue byte 会計）が変わり §7.2/§8 の扱いを要する
+    ため、「fs builtin 監査範囲」slice で一括して決める。その slice で `rename`（2 path 操作）を対象化する
+    ときは、resource を `source_path` / `destination_path` の 2 field に分け、Allow は 2 つとも canonical
+    label の `HmacSha256`、Deny は（移動元の route だけ通った場合も含め）2 つとも `Omitted { class: Path }`、
+    `original_bytes` はそれぞれの requested path の UTF-8 byte 長とする（PR #238 でユーザー合意済みの設計を
+    引き継ぐ）。
   - body の allow-list Reveal（`reveal_body_fields` / `max_revealed_body_bytes > 0` による
     `audit_safe` 開示）は型のみで常に Omit（R-1b）。
   - **byte 推定の正確化**（`estimate_event_bytes` を payload 依存の実 encode 長へ差し替え）は R-1 の
@@ -1337,9 +1347,10 @@ canonical label の `HmacSha256`・Deny で `Omitted{class:Path}`（raw path/lab
     raw ではなく `HmacSha256`（32 byte digest）として記録され、同じ canonical label は同じ digest、異なる
     label は異なる digest になる（§9.1）。**正常完了（`Success`）だけでなく、route/open 成功後に adapter が
     失敗した host error（Allow/`HostError`、`fs_result` は `Err`）でも Path は `HmacSha256`**（label は失敗
-    前に確定しているため）。host error ケースを明示的にテスト対象へ含める。**`rename`（2 path）は
-    `resource` を `source_path` / `destination_path` の 2 field に分け、Allow 時は 2 つとも `HmacSha256`**
-    （5 周目レビュー反映。単一 label では destination が source を上書きするため）。
+    前に確定しているため）。host error ケースを明示的にテスト対象へ含める。（`rename` は R-1 の監査対象外
+    ＝triple を emission するのは I/O byte 課金対象の 4 builtin〔`read_file`/`read_lines`/`write_file`/
+    `append_file`〕のみ。2 path 操作の resource 分割は後続「fs builtin 監査範囲」slice へ延期。下記「逸脱」
+    参照。）
   - **R-AT-02（Deny 時の Path と raw 非露出）**: decision が `Deny` の host-call は **label が手元にある
     場合でも** Path field が `Omitted { class: Path }` になる。対象経路——(a) filesystem 未 grant、
     (b) path lexical/argument エラー、(c) mount 未登録・operation 未 grant・許可外、(d) **Upsert の
@@ -1348,9 +1359,7 @@ canonical label の `HmacSha256`・Deny で `Omitted{class:Path}`（raw path/lab
     1 byte も現れない**（`Revealed` にも HMAC 入力にも出ない。§9.1）。(d) を「label があるのに Omitted」の
     テストケースとして明示的に含める。R-1 の不変条件は「Path は `Allow`（Success/HostError）で
     `HmacSha256`・`Deny` で `Omitted`（label の有無を問わず）、raw/label は Deny で常に非露出」。
-    **`rename` の Deny は、移動元の route だけ通った場合も含め `source_path` / `destination_path` の 2 つとも
-    `Omitted { class: Path }`**（`original_bytes` はそれぞれの requested path の UTF-8 byte 長。
-    5 周目レビュー反映）。移動元だけ route が通るケースをテスト対象へ含める。
+    （`rename` は R-1 の監査対象外のため R-AT-02 の対象にも含めない。下記「逸脱」参照。）
   - **R-AT-03**: body（file 内容・args の自由文）が `Omitted { class: Body }` で、`original_bytes` に
     redaction 前の canonical byte 長が入る（prefix も残さない。§9.1）。
   - **R-AT-04**: `ExecutionStarted.redaction_policy_id` が注入 policy の `policy_id`（§9.1 の host 指定
@@ -1507,15 +1516,16 @@ canonical label の `HmacSha256`・Deny で `Omitted{class:Path}`（raw path/lab
     `Omitted { class: Body }`（書き込み内容などの自由文）に畳む。path の HMAC は `resource` 側だけで持ち、
     `arguments` 側では HMAC しない。各要素の `original_bytes` はその引数の UTF-8 byte 長（R-1 の代用規則）。
     これにより R-1b の allow-list Reveal を要素単位で差し込める。
-  - **`rename` の resource は 2 field に分ける**: `rename` は `fs_route` を source/destination で 2 回
-    呼ぶため、単一 `label` では destination の digest で source が上書きされ、Allow 時に `resource.path` へ
-    destination しか残らない（Deny 側は `Omitted` なので漏洩はない）。**対応（R-1 の確定規則）**: 単一 path
-    を扱う操作は従来どおり `resource.fields["path"]` のまま残し、`rename` だけ `resource` を
-    `source_path` / `destination_path` の 2 field にする。Allow（Success/HostError）では 2 つとも canonical
-    label の `HmacSha256`、Deny では（移動元の route だけ通った場合も含め）2 つとも `Omitted { class: Path }`
-    とし、`original_bytes` はそれぞれの requested path の UTF-8 byte 長。label を運ぶ仕組みは 2 つの label を
-    保持できる形へ広げる（`Option<String>` 1 つでは足りない）。R-AT-01/02 に `rename` の Allow/Deny
-    （移動元だけ route が通るケースを含む）をテストケースとして追加する。
+  - **`rename` の resource 2 field は R-1 から外し後続 slice へ延期**（6 周目で撤回・下記参照）: 5 周目で
+    `rename` の resource を `source_path` / `destination_path` の 2 field にすると定義したが、これは
+    「`rename` も監査 triple を出している」という誤前提に基づいていた。実際は triple を emission するのは
+    I/O byte 課金対象の 4 builtin（`read_file` / `read_lines` / `write_file` / `append_file`）だけで、
+    `rename` は初版（R-1 着手前）から監査対象外である。`rename` を監査対象へ追加すると emission 範囲
+    （event 件数・sequence・queue byte 会計）が変わり、その変更が §7.2/§8/§14 に未記載になるうえ、
+    capability で判定される他の fs builtin（`mkdir` / `remove` 系 / `list_dir` / `file_size` / `is_file` /
+    `is_dir` / `path_exists`）が監査対象外のまま `rename` だけ対象になる非対称を生む。**対応**: `rename` の
+    2 field 規則は R-1 の受入基準から外し、下記「逸脱」の「fs builtin 全体の監査範囲」slice へ延期する
+    （その slice で `rename` を対象化するときの 2 field 設計は合意済みとして引き継ぐ）。
   - **Secret class の畳み規則を本スライスで入れる**: 初版実装は `AuditFieldClass::Secret` を扱う構築経路が
     無く、`AuditField::Revealed { class: Secret, .. }` を作れてしまった。R-AT-07 は「Secret class の field は
     存在と byte 数だけが記録される」を要求する。**対応**: class と mode から `AuditField` を組む小さな helper
@@ -1531,6 +1541,24 @@ canonical label の `HmacSha256`・Deny で `Omitted{class:Path}`（raw path/lab
     無視して常に Omit する」ことをコメントで明記する（R-1b で Reveal 経路を有効化する）。
   - **公開面の整理**: `RedactionPolicy::hmac_path` は spec に無い HMAC 計算の口なので `pub(crate)` にする。
     `path_mode` が HMAC 以外のとき `Omitted` へ畳む fail-safe 挙動を `RedactionPolicy` の doc に明記する。
+
+  **6 周目レビューで採用した指摘（実装 PR #238 の 2 周目レビュー反映、上記定義へ反映済み）**
+  - **`rename` の監査対象化を R-1 から外す（1 周目指摘 4 の誤前提の訂正）**: 1 周目レビューの指摘 4
+    （`rename` の resource を 2 field に）は「`rename` も監査 triple を出している」という前提だったが、これは
+    誤りだった。初版（R-1 着手前）から triple を emission するのは I/O byte 課金対象の 4 builtin
+    （`read_file` / `read_lines` / `write_file` / `append_file`）のみで、`rename` は監査対象外である。
+    2 周目修正で `is_audited_host_call` を新設して `rename` を監査対象へ追加したが、これは R-1 の範囲
+    （既存 payload の中身を §9.1 ツリーへ差し替える最小縦切り）を超える emission 範囲の変更で、§7.2/§8/§14
+    に未記載であり、他の capability 判定 fs builtin が対象外のまま `rename` だけ対象になる非対称も生む。
+    **対応（ユーザー決定）**: `is_audited_host_call` を撤去し `is_host_call` の元判定へ戻す。`rename` 専用に
+    入れた label 運搬（`AuditResourceLabels::Rename` など）と `rename` テストも R-1 から外す（未使用コードを
+    残さない。単一 path 操作の label 運搬は R-1 に必要な形へ整理する）。5 周目で R-AT-01/02・本記録に書いた
+    `rename` 2 field 規則は受入基準から外し、下記「逸脱」の「fs builtin 全体の監査範囲」slice へ移す。
+  - **`arguments` と Identifier field のテスト追加**: `arguments` の構造（外側 `Revealed { class: Public }`・
+    各要素の class・`original_bytes`）と payload に載った Identifier field（request の `function`、resource の
+    `capability` / `rule_id` / `action`）を検査するテストが無かった。**対応**: `tests/audit_redaction.rs`
+    （または `host_call_triple_tests`）に read 系（要素 1 つ）と write 系（Path + Body の 2 要素）のケースを
+    追加し、raw path や書き込み内容が要素に出ないことも `assert_no_substring` で確認する。
 
 ### Slice 6: VM conformance
 

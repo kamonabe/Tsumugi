@@ -992,18 +992,6 @@ pub fn is_host_call_builtin(name: &str) -> bool {
     )
 }
 
-/// 監査 host-call lifecycle triple（§7.2/§8）を emission する filesystem builtin か（Phase 6 R-1）。
-///
-/// [`is_host_call_builtin`]（I-O byte 課金対象）に `rename` を加えた集合。`rename` は書き込み/
-/// 読み込み payload byte を持たず I-O byte 課金対象ではない（[`is_host_call_builtin`] に含めない）が、
-/// capability decision を伴う filesystem 境界なので監査 triple は emission する（§9.1 / R-1 スライス・
-/// 5 周目レビュー反映。`rename` は resource を source_path / destination_path の 2 field に分ける）。
-/// triple の push は budget・意味論・外部効果に影響しない（監査付き facade が drain するときだけ
-/// emission される）ため、`rename` を監査対象へ加えても byte 会計・I-O call count は不変。
-pub fn is_audited_host_call(name: &str) -> bool {
-    is_host_call_builtin(name) || name == "rename"
-}
-
 /// host call の request payload byte 長（host へ渡す内容）。§6.1、REV-015 Slice 2。
 ///
 /// write/append は書き込む内容の byte 長、read 系は request payload を持たないため 0。
@@ -1041,17 +1029,6 @@ pub fn host_call_response_bytes(name: &str, result: &Value) -> u64 {
         },
         _ => 0,
     }
-}
-
-/// host call の redaction で Deny/label 不在時に使う requested path の UTF-8 byte 長（§9.1 / R-1）。
-///
-/// 単一 path 操作は `primary` だけを使う。`rename` は `primary` を source、`destination` を
-/// destination の requested path 長に使う（2 field 化、5 周目レビュー反映）。
-pub struct RequestedPathBytes {
-    /// 第 1 path（単一操作の path、rename の source）の requested path 長。
-    pub primary: u64,
-    /// rename の destination の requested path 長（単一操作では未使用）。
-    pub destination: u64,
 }
 
 /// Identifier class（capability 名・host function 名・rule ID 等）を既定 policy で畳んだ
@@ -1104,10 +1081,9 @@ fn identifier_field(
 /// Body class で常に `Omitted`（R-1 は allow-list Reveal 未実装）。`arguments` は外側
 /// `Revealed{class:Public, Sequence}`（個数と並びだけ開示）で各要素を Path/Body へ畳む。
 /// `function` / `capability` / `action` / `rule_id` は Identifier class（既定 Reveal）で載せる
-/// （ユーザー判断 A＝(イ)）。`rename` だけ resource を `source_path` / `destination_path` の 2
-/// field に分ける。`error_code` は安定 `ErrorCode` 文字列（`ErrorKind::as_str`）で script 可視
-/// message は載せない（§9 意図）。
-// R-1 で redaction 用の 3 引数（policy / labels / requested_path_bytes）が加わり 8 引数になる。
+/// （ユーザー判断 A＝(イ)）。`error_code` は安定 `ErrorCode` 文字列（`ErrorKind::as_str`）で
+/// script 可視 message は載せない（§9 意図）。
+// R-1 で redaction 用の 3 引数（policy / label / requested_path_bytes）が加わり 8 引数になる。
 // これらは §9.1 の payload 構築に不可欠で、まとめる自然な struct も無い（id/name/bytes/result は
 // 呼び出し側の別経路で確定する）ため許容する。
 #[allow(clippy::too_many_arguments)]
@@ -1118,8 +1094,8 @@ pub fn host_call_triple(
     result: &Result<Value, TsumugiError>,
     response_bytes: u64,
     policy: &crate::audit::RedactionPolicy,
-    labels: &AuditResourceLabels,
-    requested_path_bytes: &RequestedPathBytes,
+    label: Option<&str>,
+    requested_path_bytes: u64,
 ) -> [crate::audit::AuditEvent; 3] {
     use crate::audit::{
         AuditEvent, AuditField, AuditFieldClass, AuditPayload, AuditValue, CapabilityDecisionKind,
@@ -1229,7 +1205,7 @@ pub fn host_call_triple(
     argument_elements.push(fold_audit_field(
         policy,
         AuditFieldClass::Path,
-        requested_path_bytes.primary,
+        requested_path_bytes,
         None,
         None,
     ));
@@ -1239,9 +1215,7 @@ pub fn host_call_triple(
         argument_elements.push(body_field(request_bytes));
     }
     let arguments_original_bytes =
-        requested_path_bytes
-            .primary
-            .saturating_add(if is_write { request_bytes } else { 0 });
+        requested_path_bytes.saturating_add(if is_write { request_bytes } else { 0 });
     request_fields.insert(
         "arguments".to_string(),
         AuditField::Revealed {
@@ -1255,30 +1229,10 @@ pub fn host_call_triple(
         fields: request_fields,
     };
 
-    // resource payload: path field。単一 path 操作は `path`、rename は `source_path` /
-    // `destination_path` の 2 field（§9.1 / R-1 スライス・5 周目レビュー反映）。
+    // resource payload: path field。decision が Allow なら canonical label を HMAC、Deny なら
+    // label が手元にあっても Omitted{class:Path}（§9.1 / R-AT-01・R-AT-02）。
     let mut resource_fields: BTreeMap<String, AuditField> = BTreeMap::new();
-    match labels {
-        AuditResourceLabels::Single(label) => {
-            resource_fields.insert(
-                "path".to_string(),
-                path_field(label.as_deref(), requested_path_bytes.primary),
-            );
-        }
-        AuditResourceLabels::Rename {
-            source,
-            destination,
-        } => {
-            resource_fields.insert(
-                "source_path".to_string(),
-                path_field(source.as_deref(), requested_path_bytes.primary),
-            );
-            resource_fields.insert(
-                "destination_path".to_string(),
-                path_field(destination.as_deref(), requested_path_bytes.destination),
-            );
-        }
-    }
+    resource_fields.insert("path".to_string(), path_field(label, requested_path_bytes));
     // capability 名・rule ID は Identifier class（既定 Reveal）で payload にも載せる（§9.1 /
     // ユーザー判断 A＝(イ)）。これにより slice 文面の「既定 Reveal」と実装が一致する。
     resource_fields.insert(
@@ -1509,7 +1463,7 @@ pub fn dispatch_fs(
     revision: crate::embedding::LanguageRevision,
     line: usize,
 ) -> FsDispatch {
-    let mut labels = AuditResourceLabels::for_operation(name);
+    let mut label: Option<String> = None;
     let outcome = match filesystem {
         Some(fs) => dispatch_filesystem_capability(
             name,
@@ -1518,60 +1472,26 @@ pub fn dispatch_fs(
             max_collection,
             revision,
             line,
-            &mut labels,
+            &mut label,
         ),
-        // 未 grant（Deny、label 確定前）。labels は初期値（全 None）のまま。
+        // 未 grant（Deny、label 確定前）。label は None のまま。
         None => Err(TsumugiError::filesystem_denied(line)),
     };
-    FsDispatch { outcome, labels }
+    FsDispatch { outcome, label }
 }
 
 /// [`dispatch_fs`] の戻り値（Phase 6 R-1、§9.1）。outcome に加えて canonical resource label を運ぶ。
 ///
-/// `labels` は capability decision が `Allow`（成功・host error の両方）のとき確定した canonical
-/// label を保持し、`Deny`（未 grant・path/argument エラー・mount/op denial・Upsert の Create 不足）
-/// では該当 label が `None` になる。label の有無は routing が通ったか（＝ decision）で決まり、その後の
-/// adapter 成否とは独立する（host error でも label は保持する、R-1 スライス）。非監査経路（sink なし）も
-/// 常にこの型を受け取るが labels を無視し、triple 構築側だけが使う（観測挙動は不変）。
+/// `label` は capability decision が `Allow`（成功・host error の両方）のとき `Some`、`Deny`
+/// （未 grant・path/argument エラー・mount/op denial・Upsert の Create 不足）では `None` になる。
+/// label の有無は routing が通ったか（＝ decision）で決まり、その後の adapter 成否とは独立する
+/// （host error でも label は保持する、R-1 スライス）。非監査経路（sink なし）も常にこの型を受け取るが
+/// label を無視し、triple 構築側だけが使う（観測挙動は不変）。
 pub struct FsDispatch {
     /// filesystem 操作の結果。
     pub outcome: Result<Value, TsumugiError>,
-    /// 認可に使った canonical resource label。単一 path 操作は 1 つ、`rename` は 2 つ（§9.1 / R-1）。
-    pub labels: AuditResourceLabels,
-}
-
-/// host-call が認可に使った canonical resource label（§9.1 / R-1 スライス）。
-///
-/// 単一 path を扱う操作（read/write/mkdir/remove/list 等）は 1 つの label（[`Self::Single`]）、
-/// `rename` は source / destination の 2 つ（[`Self::Rename`]）を運ぶ。単一 `Option<String>` では
-/// `rename` の destination が source を上書きしてしまうため、2 label を保持できるこの形に広げた
-/// （5 周目レビュー反映。単一操作は従来どおり 1 label のまま）。
-///
-/// label は decision が `Allow` のとき `Some`、`Deny` のとき `None`。
-pub enum AuditResourceLabels {
-    /// 単一 path 操作の canonical label。
-    Single(Option<String>),
-    /// `rename` の source / destination の canonical label。
-    Rename {
-        /// 移動元の canonical label（source の route が通ったとき `Some`）。
-        source: Option<String>,
-        /// 移動先の canonical label（destination の route が通ったとき `Some`）。
-        destination: Option<String>,
-    },
-}
-
-impl AuditResourceLabels {
-    /// operation 名から初期値（全 `None`）を作る。`rename` だけ 2 label 形、他は単一形。
-    fn for_operation(name: &str) -> Self {
-        if name == "rename" {
-            AuditResourceLabels::Rename {
-                source: None,
-                destination: None,
-            }
-        } else {
-            AuditResourceLabels::Single(None)
-        }
-    }
+    /// 認可に使った canonical resource label（`@<mount>/<component>/...`）。Allow のとき `Some`。
+    pub label: Option<String>,
 }
 
 /// routing 後の [`FilesystemTarget`] を canonical resource label 文字列へ組む（§9.1 / R-1 スライス）。
@@ -1611,19 +1531,11 @@ pub fn dispatch_filesystem_capability(
     max_collection: u64,
     revision: crate::embedding::LanguageRevision,
     line: usize,
-    labels: &mut AuditResourceLabels,
+    label: &mut Option<String>,
 ) -> Result<Value, TsumugiError> {
     use crate::capability::{FsOperation, OpenFileRequest, RemoveKind, WriteMode};
 
-    // 単一 path 操作用の label slot。`rename` 以外はこの 1 つを helper へ渡す。`rename` は
-    // 自分の 2 label を直接 `labels` へ書くため、この slot は使わない。
-    //
-    // arm 内の `?` が関数全体を抜けて `*labels` 書き込みを飛ばさないよう、単一 path の dispatch は
-    // 内側クロージャに包み、`?` をクロージャ内で閉じる（label は host error でも確定済みを保持する）。
-    let mut label: Option<String> = None;
-    let label = &mut label;
-
-    let result = (|| match name {
+    match name {
         "read_file" => {
             check_arity(name, args, 1, line)?;
             let path = require_str(&args[0], name, 1, line)?;
@@ -1756,46 +1668,21 @@ pub fn dispatch_filesystem_capability(
             check_arity(name, args, 2, line)?;
             let from = require_str(&args[0], name, 1, line)?;
             let to = require_str(&args[1], name, 2, line)?;
-            // rename は source `Delete` と destination `Create` を要求する（第8.4節）。source/dest
-            // で 2 回 route するため、label も source/destination で別々に確定する（§9.1 / R-1）。
-            // source だけ route が通った後に destination で Deny しても、source の label は保持する
-            // （decision が Deny でも payload 側で Omitted に畳む）。
-            let mut source_label: Option<String> = None;
-            let mut destination_label: Option<String> = None;
-            let route_result = (|| {
-                let (from_root, from_target) = fs_route(
-                    name,
-                    filesystem,
-                    from,
-                    FsOperation::Delete,
-                    line,
-                    &mut source_label,
-                )?;
-                let (to_root, to_target) = fs_route(
-                    name,
-                    filesystem,
-                    to,
-                    FsOperation::Create,
-                    line,
-                    &mut destination_label,
-                )?;
-                from_root
-                    .adapter
-                    .rename(
-                        &from_target.path,
-                        to_root.adapter.as_ref(),
-                        &to_target.path,
-                        true,
-                    )
-                    .map_err(|_| fs_host_error(name, line))?;
-                Ok(Value::Bool(true))
-            })();
-            // route で確定した 2 label を結果に反映する（host error でも保持、Deny では None のまま）。
-            *labels = AuditResourceLabels::Rename {
-                source: source_label,
-                destination: destination_label,
-            };
-            route_result
+            // rename は source `Delete` と destination `Create` を要求する（第8.4節）。
+            let (from_root, from_target) =
+                fs_route(name, filesystem, from, FsOperation::Delete, line, label)?;
+            let (to_root, to_target) =
+                fs_route(name, filesystem, to, FsOperation::Create, line, label)?;
+            from_root
+                .adapter
+                .rename(
+                    &from_target.path,
+                    to_root.adapter.as_ref(),
+                    &to_target.path,
+                    true,
+                )
+                .map_err(|_| fs_host_error(name, line))?;
+            Ok(Value::Bool(true))
         }
         "list_dir" => {
             check_arity(name, args, 1, line)?;
@@ -1861,13 +1748,7 @@ pub fn dispatch_filesystem_capability(
         }
         // is_filesystem_builtin と本 match は同じ名前集合を持つ。ここへ来ない。
         _ => Err(TsumugiError::filesystem_denied(line)),
-    })();
-    // 単一 path 操作で確定した label を結果へ反映する。`rename` はクロージャ内で `*labels` を
-    // 2 label 形（`Rename`）へ書き済みなので、ここで `Single` へ上書きしない。
-    if name != "rename" {
-        *labels = AuditResourceLabels::Single(std::mem::take(label));
     }
-    result
 }
 
 /// write/append の content 引数を文字列化する（`Str` はそのまま、他は `to_string`）。
@@ -2168,17 +2049,16 @@ fn is_leap_year(year: i64) -> bool {
 mod host_call_triple_tests {
     //! `host_call_triple` の分類ユニットテスト（§7.2/§8）。full run を回さずに、deny/allow/
     //! host-error × read/write の分類と triple の ID 再利用・emission 順序を固定する。
-    use super::{AuditResourceLabels, RequestedPathBytes, host_call_triple};
+    use super::host_call_triple;
     use crate::audit::{
-        AuditEvent, AuditField, AuditFieldClass, CapabilityDecisionKind, EffectStatus,
-        HostCallOutcome, RedactionPolicy,
+        AuditEvent, AuditField, AuditFieldClass, AuditPayload, AuditValue, CapabilityDecisionKind,
+        EffectStatus, HostCallOutcome, RedactionPolicy,
     };
     use crate::error::{ErrorKind, TsumugiError};
     use crate::value::Value;
 
     /// 既定 policy・sample label でのテスト用 triple 構築（Allow は label あり、Deny は None を
-    /// 呼び出し側で与える）。単一 path 操作用に `Single` label を組む。requested_path_bytes は
-    /// テストでは 0 既定（primary のみ使用）。
+    /// 呼び出し側で与える）。
     fn triple(
         id: u64,
         name: &str,
@@ -2195,11 +2075,8 @@ mod host_call_triple_tests {
             result,
             response_bytes,
             &RedactionPolicy::default(),
-            &AuditResourceLabels::Single(label.map(|l| l.to_string())),
-            &RequestedPathBytes {
-                primary: requested_path_bytes,
-                destination: 0,
-            },
+            label,
+            requested_path_bytes,
         )
     }
 
@@ -2378,6 +2255,167 @@ mod host_call_triple_tests {
                 ..
             }
         ));
+    }
+
+    // -------------------------------------------------------------------------
+    // arguments（Public Sequence）と Identifier field の payload 構造検査（§9.1）。
+    // 1 周目レビューで入れた arguments の Public Sequence 化・identifier_mode の payload 反映を
+    // 固定する（指摘 B）。
+    // -------------------------------------------------------------------------
+
+    /// triple[0]（HostCallStarted）の request payload を取り出す。
+    fn request_payload(triple: &[AuditEvent; 3]) -> &AuditPayload {
+        match &triple[0] {
+            AuditEvent::HostCallStarted { request, .. } => request,
+            other => panic!("triple[0] は HostCallStarted のはず: {other:?}"),
+        }
+    }
+
+    /// triple[1]（CapabilityDecision）の resource payload を取り出す。
+    fn resource_payload(triple: &[AuditEvent; 3]) -> &AuditPayload {
+        match &triple[1] {
+            AuditEvent::CapabilityDecision { resource, .. } => resource,
+            other => panic!("triple[1] は CapabilityDecision のはず: {other:?}"),
+        }
+    }
+
+    /// payload field が `Revealed{class:Identifier}` で値が `Utf8(expected)` か検査する。
+    fn assert_identifier_field(payload: &AuditPayload, key: &str, expected: &str) {
+        match payload.fields.get(key) {
+            Some(AuditField::Revealed {
+                class: AuditFieldClass::Identifier,
+                value: AuditValue::Scalar(crate::audit::AuditScalar::Utf8(text)),
+                original_bytes,
+            }) => {
+                assert_eq!(text, expected, "{key} は Identifier として値を開示する");
+                assert_eq!(
+                    *original_bytes,
+                    expected.len() as u64,
+                    "{key} の original_bytes は値の UTF-8 byte 長"
+                );
+            }
+            other => panic!("{key} は Revealed{{class:Identifier}} のはず: {other:?}"),
+        }
+    }
+
+    /// payload ツリー全体（Debug 表現）に `needle` が 1 文字も現れないことを確認する。
+    /// Omitted/HmacSha256 は値を持たないので raw path・書き込み内容は payload に出ない（leak-free）。
+    fn assert_payload_has_no_substring(payload: &AuditPayload, needle: &str) {
+        let rendered = format!("{payload:?}");
+        assert!(
+            !rendered.contains(needle),
+            "payload に raw 文字列 {needle:?} が現れてはいけない: {rendered}"
+        );
+    }
+
+    #[test]
+    fn read_arguments_is_public_sequence_with_single_omitted_path() {
+        // read 系は path 引数 1 つ＝要素 1 つ（Omitted{class:Path}）。raw path は arguments にも
+        // payload 全体にも現れない。
+        let raw_path = "@default/secret-read.txt";
+        let result = Ok(Value::str_constant("hello".to_string()));
+        let triple = triple(
+            7,
+            "read_file",
+            0,
+            &result,
+            5,
+            Some(raw_path),
+            raw_path.len() as u64,
+        );
+        let request = request_payload(&triple);
+
+        // arguments 外側は Revealed{class:Public, Sequence}（開示は個数と並びだけ）。
+        let (elements, outer_bytes) = match request.fields.get("arguments") {
+            Some(AuditField::Revealed {
+                class: AuditFieldClass::Public,
+                value: AuditValue::Sequence(elements),
+                original_bytes,
+            }) => (elements, *original_bytes),
+            other => panic!("arguments は Revealed{{Public, Sequence}} のはず: {other:?}"),
+        };
+        assert_eq!(elements.len(), 1, "read 系は path 引数 1 つ＝要素 1 つ");
+        // 第 1 要素は path 引数＝Omitted{class:Path}、original_bytes は引数の UTF-8 byte 長。
+        match &elements[0] {
+            AuditField::Omitted {
+                class: AuditFieldClass::Path,
+                original_bytes,
+            } => assert_eq!(*original_bytes, raw_path.len() as u64),
+            other => panic!("read の arg[0] は Omitted{{class:Path}} のはず: {other:?}"),
+        }
+        // read 系の arguments 外側 original_bytes は path 引数長のみ。
+        assert_eq!(outer_bytes, raw_path.len() as u64);
+
+        // Identifier field: request.function は Revealed{class:Identifier}。
+        assert_identifier_field(request, "function", "read_file");
+        // resource の capability / rule_id / action も Identifier（既定 Reveal）。
+        let resource = resource_payload(&triple);
+        assert_identifier_field(resource, "capability", "filesystem");
+        assert_identifier_field(resource, "rule_id", "mount-granted");
+        assert_identifier_field(resource, "action", "read_file");
+
+        // leak-free: raw path は request/resource payload のどこにも現れない。
+        assert_payload_has_no_substring(request, raw_path);
+        assert_payload_has_no_substring(resource, raw_path);
+    }
+
+    #[test]
+    fn write_arguments_is_public_sequence_with_path_and_body_omitted() {
+        // write 系は path + 書き込み内容の 2 要素（Omitted{class:Path} + Omitted{class:Body}）。
+        let raw_path = "@default/secret-write.txt";
+        let raw_body = "TOPSECRETWRITECONTENT";
+        let request_bytes = raw_body.len() as u64;
+        let result = Ok(Value::Bool(true));
+        let triple = triple(
+            8,
+            "write_file",
+            request_bytes,
+            &result,
+            0,
+            Some(raw_path),
+            raw_path.len() as u64,
+        );
+        let request = request_payload(&triple);
+
+        let (elements, outer_bytes) = match request.fields.get("arguments") {
+            Some(AuditField::Revealed {
+                class: AuditFieldClass::Public,
+                value: AuditValue::Sequence(elements),
+                original_bytes,
+            }) => (elements, *original_bytes),
+            other => panic!("arguments は Revealed{{Public, Sequence}} のはず: {other:?}"),
+        };
+        assert_eq!(elements.len(), 2, "write 系は path + body の 2 要素");
+        // 第 1 要素: path 引数＝Omitted{class:Path}。
+        match &elements[0] {
+            AuditField::Omitted {
+                class: AuditFieldClass::Path,
+                original_bytes,
+            } => assert_eq!(*original_bytes, raw_path.len() as u64),
+            other => panic!("write の arg[0] は Omitted{{class:Path}} のはず: {other:?}"),
+        }
+        // 第 2 要素: 書き込み内容＝Omitted{class:Body}、original_bytes は内容 byte 長。
+        match &elements[1] {
+            AuditField::Omitted {
+                class: AuditFieldClass::Body,
+                original_bytes,
+            } => assert_eq!(*original_bytes, request_bytes),
+            other => panic!("write の arg[1] は Omitted{{class:Body}} のはず: {other:?}"),
+        }
+        // write 系の arguments 外側 original_bytes は path 長 + body 長。
+        assert_eq!(outer_bytes, raw_path.len() as u64 + request_bytes);
+
+        // Identifier field も載る（action は builtin 名）。
+        assert_identifier_field(request, "function", "write_file");
+        let resource = resource_payload(&triple);
+        assert_identifier_field(resource, "capability", "filesystem");
+        assert_identifier_field(resource, "action", "write_file");
+
+        // leak-free: raw path も書き込み内容も payload のどこにも現れない（Omitted は値を持たない）。
+        assert_payload_has_no_substring(request, raw_path);
+        assert_payload_has_no_substring(request, raw_body);
+        assert_payload_has_no_substring(resource, raw_path);
+        assert_payload_has_no_substring(resource, raw_body);
     }
 }
 
