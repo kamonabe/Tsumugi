@@ -1,6 +1,6 @@
 # Tsumugi — ロードマップ
 
-最終更新: 2026-10-21（Phase 6 audit の R-1 redaction R-1a を実装）
+最終更新: 2026-10-22（F-2〔§4.1 課金表への移行〕を設計し ready に）
 
 > このロードマップは「進捗だけ」を追う。機能の詳細・採用/不採用の理由は各設計正本に置く
 > （ドキュメントの役割分担は [ドキュメント運用ガイド](documentation-guide.md) を参照）。
@@ -10,7 +10,7 @@
 
 - **フェーズ:** Phase 2（deny-by-default capability）・Phase 3/4（包括的な実行予算・協調実行）を並行して進行中。
 - **現在の slice:** 決定性 Slice 1（規範的 primitive）＝Phase 5 の着手部分は実装完了（StableError を含む deterministic primitive が一通り揃った。VM parity・FakeHost gate・audit normalize は後続 slice）。
-- **次のタスク:** R-1 の直接の後続は R-1b（body allow-list Reveal）。その先の Phase 6 残は別 slice 群（strict deterministic CBOR〔§9.2〕・record/replay 再適用・VM audit triple 対応・sink 必須化〔§1.1〕・engine 全体の audit queue 上限〔16 MiB〕・fs builtin 全体の監査範囲）と、§4.1 の課金表（F-2、引き続き未定義）。正本は [決定性・実行時監査仕様](determinism-and-audit.md) §14 と「ステータス一覧」。
+- **次のタスク:** ready なスライスは R-1b（body allow-list Reveal）と F-2（§4.1 課金表への移行）。着手順（[`slices.toml`](slices.toml) の `order`）は R-1b〔10〕→ F-2〔20〕。F-2 は §4.1 の課金表（既に規範として定義済み）へ tree/VM の fuel 課金を揃える移行で、既定 `total_fuel` の見直しと `language_revision` bump（`V0_22`、破壊的変更を alpha として受容・旧課金経路は温存しない）を含む（設計正本は [実行予算・協調実行仕様](execution-control.md) §14「F-2 実装スライス」）。その先の Phase 6 残は別 slice 群（strict deterministic CBOR〔§9.2〕・record/replay 再適用・VM audit triple 対応・sink 必須化〔§1.1〕・engine 全体の audit queue 上限〔16 MiB〕・fs builtin 全体の監査範囲）。正本は各 spec §14 と「ステータス一覧」。
 - **直近完了:** R-1 redaction R-1a（[決定性・実行時監査仕様](determinism-and-audit.md) §14「R-1 実装スライス」）。既定 policy（path=HMAC・body=omit・identifier=reveal）を tree engine の監査付き host-call 経路へ配線し、filesystem host-call の実 payload を §9.1 の `AuditField` ツリーへ redaction した（Path は Allow で HMAC・Deny で Omitted、body は Omitted、raw path/label は非露出。監査対象は I/O byte 課金対象の 4 builtin〔read_file/read_lines/write_file/append_file〕のみで `rename` は R-1 の監査対象外）。opt-in（sink 設定時のみ emission）で byte 会計（`estimate_event_bytes` の 128 固定・yield/sequence）は不変。**破壊的変更（`AuditPayload`/`AuditField` 差し替え）を alpha として受容**（`language_revision` bump なし）。逸脱: body allow-list Reveal〔R-1b〕・byte 推定の正確化・60 KiB 縮退・公開 setter・VM audit triple・record/replay は延期。採用・不採用の判断履歴は同 §14「R-1 レビュー反映の記録」。
 - **直近完了（その前）:** F-1 fuel parity（[実行予算・協調実行仕様](execution-control.md) §14「F-1 実装スライス」）。VM の fuel を tree と同じ課金点に揃え、停止性を fuel から独立した instruction watchdog へ移した（[次期意味論・実装決定](semantic-decisions.md) §17.7 改訂）。同じ script の成功・失敗と上限到達時の line が tree/VM で一致する。
 - **直近完了（その前）:** legacy budget env（`TSUMUGI_MAX_*`）の CLI adapter 一本化（[実行予算・協調実行仕様](execution-control.md) §13）。tree file/stdin だけが env を無視していた tree/VM 差を解消し、library は env を読まなくなった。
@@ -48,7 +48,7 @@
 | ID | 一行概要 | 状態 | owning spec |
 |---|---|---|---|
 | REV-001 | 共有 DAG の比較・表示・join・sort を有限化（指数化対策は完結、全順序化は REV-017 で実装済み・revision 0.21。残りは包括 budget 側の Phase 6 伝播で、うち `BudgetCharged`・host-call lifecycle 3 event・yield/resume 2 event emission は実装済み） | 🟡 | [実行予算・協調実行仕様](execution-control.md) |
-| REV-015 | source/string/heap/I-O/bulk work の包括 budget・deadline・cancel（budget 本体は tree/VM 完了。fuel の課金点は F-1 で tree/VM を揃えた。§4.1 の課金表は未実装（F-2）、CAP-AT-17 の source/import 本数 N 境界受入試験も tree 経路で完了。残りは Phase 6 への伝播。うち `BudgetCharged`・host-call lifecycle 3 event・yield/resume 2 event（`Yielded` / `Resumed`）emission は tree backend で実装済み） | 🟡 | [実行予算・協調実行仕様](execution-control.md) |
+| REV-015 | source/string/heap/I-O/bulk work の包括 budget・deadline・cancel（budget 本体は tree/VM 完了。fuel の課金点は F-1 で tree/VM を揃えた。§4.1 の課金表への移行〔F-2〕は設計承認済み・実装待ち〔ready、[実行予算・協調実行仕様](execution-control.md) §14「F-2 実装スライス」〕、CAP-AT-17 の source/import 本数 N 境界受入試験も tree 経路で完了。残りは Phase 6 への伝播。うち `BudgetCharged`・host-call lifecycle 3 event・yield/resume 2 event（`Yielded` / `Resumed`）emission は tree backend で実装済み） | 🟡 | [実行予算・協調実行仕様](execution-control.md) |
 | REV-007 | `ExecutionContext` の session state と run meter を request ごとに分離 | ⬜ | [実行予算・協調実行仕様](execution-control.md) |
 | REV-008 | 全 stable execution へ transaction を適用（REPL は AUD-024 で完了） | 🟡 | [組み込みAPI仕様](embedding-api.md)・[実行予算・協調実行仕様](execution-control.md) |
 | REV-010 | 32-bit target の `i64 as usize` wrap を `try_from`/checked へ | ⬜ | [実行予算・協調実行仕様](execution-control.md) |
