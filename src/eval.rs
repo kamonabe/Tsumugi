@@ -470,6 +470,11 @@ pub struct Evaluator {
     /// 注入し（`set_language_revision`）、CLI/テストは既定 `CURRENT`（=0.21）で動く。
     /// backend 固有分岐を作らないため VM 側（`Vm`）と同一シグネチャで持つ。
     language_revision: crate::embedding::LanguageRevision,
+    /// host-call payload の redaction policy（Phase 6 R-1、§9.1）。既定は
+    /// `RedactionPolicy::default()`（path=HMAC・body=omit・identifier=reveal、`policy_id =
+    /// "default-r1"`）。監査付き facade が実行単位で [`Self::set_redaction_policy`] で注入する。
+    /// 非監査経路は triple を drain しないため無視され、観測挙動は不変（§1.1）。
+    redaction_policy: crate::audit::RedactionPolicy,
 }
 
 /// audit drain queue の byte 計器（Phase 6 B-2、`docs/determinism-and-audit.md` §10.2）。
@@ -563,6 +568,9 @@ impl Evaluator {
             yield_for_audit_queue: false,
             // 既定は現行 revision（=0.21）。埋め込み host が set_language_revision で上書きする。
             language_revision: crate::embedding::LanguageRevision::CURRENT,
+            // host-call redaction policy（Phase 6 R-1）。既定は default-r1。監査付き facade が
+            // 実行単位で set_redaction_policy で注入する（非監査経路は無視）。
+            redaction_policy: crate::audit::RedactionPolicy::default(),
         }
     }
 
@@ -714,6 +722,19 @@ impl Evaluator {
     /// この実行の言語 revision を参照する（builtin dispatch から consult する）。
     pub(crate) fn language_revision(&self) -> crate::embedding::LanguageRevision {
         self.language_revision
+    }
+
+    /// この実行の host-call redaction policy を設定する（Phase 6 R-1、§9.1）。監査付き facade が
+    /// 実行単位で注入する。`set_audit_queue`/`set_language_revision` と対称。per-execution の
+    /// reset（`reset_budget`）では戻さず、facade が各監査付き run で明示的に注入する（非監査経路は
+    /// 既定のまま無視される）。
+    pub(crate) fn set_redaction_policy(&mut self, policy: crate::audit::RedactionPolicy) {
+        self.redaction_policy = policy;
+    }
+
+    /// この実行の host-call redaction policy を参照する（builtin dispatch から triple 構築時に使う）。
+    pub(crate) fn redaction_policy(&self) -> &crate::audit::RedactionPolicy {
+        &self.redaction_policy
     }
 
     /// この実行の host function registry を設定する（Phase 2 C8）。埋め込み host が実行単位で
@@ -4499,13 +4520,16 @@ mod tests {
         use crate::audit::{
             AuditEvent, AuditPayload, estimate_envelope_overhead_bytes, estimate_event_bytes,
         };
+        use std::collections::BTreeMap;
 
         fn started(operation_id: u64) -> AuditEvent {
             AuditEvent::HostCallStarted {
                 operation_id,
                 call_id: operation_id,
                 function: "write_file".to_string(),
-                request: AuditPayload { fields: Vec::new() },
+                request: AuditPayload {
+                    fields: BTreeMap::new(),
+                },
                 request_bytes: 5,
             }
         }

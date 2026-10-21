@@ -23,6 +23,8 @@
 //!   [`estimate_encoded_bytes`] の naive 推定で、後で §9.2 encoder へ差し替え可能に隔離する。
 //! - record/replay（§6）、VM 変更、§1.1 の sink 必須ポリシー（opt-in のまま）。
 
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -166,29 +168,325 @@ pub enum ExecutionMode {
     Replay,
 }
 
-/// redaction 適用後の host-call payload（§9.1）。A-1 では型のみ（本体は未配線）。
+// =============================================================================
+// §9.1 redaction field tree（R-1 実装スライス）
+// =============================================================================
+
+/// field class（§9.1）。redaction の既定モードをこの class から決める。
 ///
-/// A-1 は host-call lifecycle event を emission しないため、payload の実体は作らない。後続
-/// スライスで §9.1 の `AuditField` ツリーへ差し替える。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AuditPayload {
-    /// redaction 済み field 群（A-1 は空のまま）。将来 §9.1 の map へ拡張する。
-    pub fields: Vec<(String, AuditPayloadField)>,
+/// canonical CBOR では宣言順を 0 始まり u8 で encode する（§9.2）。
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum AuditFieldClass {
+    /// event 種別・ID・hash・count・error code 等。既定 raw。
+    Public,
+    /// capability 名・host function 名・rule ID・module logical name 等。既定 raw。
+    Identifier,
+    /// filesystem path・module source location・URL resource identity 等。既定 HMAC-SHA-256。
+    Path,
+    /// source・stdin/stdout・file/network body・host args/result・error の自由文。既定 omit。
+    Body,
+    /// credential・token・password・secret env value・redaction key。常に omit（mode 変更不可）。
+    Secret,
 }
 
-/// `AuditPayload` の field（§9.1 の `AuditField` の A-1 プレースホルダ、型のみ）。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AuditPayloadField {
-    /// 公開可能なスカラ（A-1 ではこの variant だけ型として用意）。
-    Public {
-        /// redaction 前の canonical byte 長。
+/// redaction mode（§9.1）。policy の class 別既定を表す。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RedactionMode {
+    /// 値をそのまま記録する。
+    Reveal,
+    /// canonical label に HMAC-SHA-256 を適用して digest だけ記録する。
+    HmacSha256,
+    /// 値を捨て class と byte 数だけ記録する。
+    Omit,
+}
+
+/// audit field の方向（§9.1）。request / response を区別する。
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum AuditDirection {
+    /// host-call request 側。
+    Request,
+    /// host-call response 側。
+    Response,
+}
+
+/// body allow-list のキー（§9.1）。operation + 方向 + field 名/argument index で特定する。
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct AuditFieldKey {
+    /// operation（host function 名など）。
+    pub operation: String,
+    /// request / response。
+    pub direction: AuditDirection,
+    /// field 名または 0 始まり argument index の文字列。
+    pub field: String,
+}
+
+/// redaction 前の scalar 値（§9.1）。canonical CBOR では宣言順を 0 始まり tag で encode する。
+#[derive(Clone, Debug, PartialEq)]
+pub enum AuditScalar {
+    /// null。
+    Null,
+    /// bool。
+    Bool(bool),
+    /// 符号付き整数。
+    Int(i64),
+    /// canonicalized binary64 bits（§9.2）。
+    Float(u64),
+    /// 正規化しない UTF-8 text。
+    Utf8(String),
+    /// byte 列。
+    Bytes(Vec<u8>),
+}
+
+/// redaction 前の field 値ツリー（§9.1）。scalar / sequence / object を持つ。
+///
+/// `Sequence` は argument/element 順を維持し、`Object` は UTF-8 key byte 順（`BTreeMap`）を保つ。
+/// nesting は 64 段までとし、それ以上の subtree は呼び出し側が `Body`/`Omitted` へ縮退させる。
+#[derive(Clone, Debug, PartialEq)]
+pub enum AuditValue {
+    /// scalar。
+    Scalar(AuditScalar),
+    /// 順序を保つ列（argument/element 順）。各要素は独立した `AuditField`。
+    Sequence(Vec<AuditField>),
+    /// UTF-8 key byte 順の map。各 value は独立した `AuditField`。
+    Object(BTreeMap<String, AuditField>),
+}
+
+/// redaction 適用後の host-call payload（§9.1）。
+///
+/// `fields` は UTF-8 key byte 順（`BTreeMap`）。host call 引数は `fields["arguments"]`
+/// （`AuditValue::Sequence`）へ、operation 固有 metadata は別 key へ入れる。
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuditPayload {
+    /// redaction 済み field 群（UTF-8 key byte 順）。
+    pub fields: BTreeMap<String, AuditField>,
+}
+
+/// redaction 適用後の 1 field（§9.1）。canonical CBOR tag は 0=Revealed / 1=HmacSha256 /
+/// 2=Omitted（§9.2 で予約済み）。`original_bytes` は redaction 前の subtree payload 長で、
+/// omit/hash 後も保持する（R-1 では値の UTF-8 byte 長で代用、§9.1 / R-1 スライス）。
+#[derive(Clone, Debug, PartialEq)]
+pub enum AuditField {
+    /// 値をそのまま記録する（tag 0）。
+    Revealed {
+        /// field class。
+        class: AuditFieldClass,
+        /// 記録する値ツリー。
+        value: AuditValue,
+        /// redaction 前の byte 長。
         original_bytes: u64,
     },
-    /// omit 済み（class 情報を残し値は捨てる）。
+    /// canonical label の HMAC-SHA-256 digest を記録する（tag 1）。raw は記録しない。
+    HmacSha256 {
+        /// field class（Path 等）。
+        class: AuditFieldClass,
+        /// HMAC-SHA-256 digest（32 bytes）。
+        digest: [u8; 32],
+        /// redaction 前の byte 長。
+        original_bytes: u64,
+    },
+    /// 値を捨て class と byte 数だけ記録する（tag 2）。
     Omitted {
-        /// redaction 前の canonical byte 長。
+        /// field class。
+        class: AuditFieldClass,
+        /// redaction 前の byte 長。
         original_bytes: u64,
     },
+}
+
+/// secret 値の型マーカー（§9.1）。`Debug` / `Display` / generic serializer を **実装しない**。
+///
+/// 存在と byte 数だけを Public metadata として記録できる。R-1 の filesystem 境界には Secret
+/// field は現れないが、型と畳み規則をこのスライスで入れる（§9.1 / R-1 スライス）。
+///
+/// `Debug`/`Display`/serialize を導出・実装しないことは R-AT-07 の compile-fail doctest で固定する。
+///
+/// # R-AT-07: `Secret<T>` が `Debug` を実装しないことの compile-fail 固定（§15.4）
+///
+/// ```compile_fail
+/// // (1) compile_fail 版: Secret を Debug で表示しようとすると compile しない。
+/// let secret = tsumugi::Secret::new(42u32);
+/// let _ = format!("{:?}", secret); // Secret<T> は Debug を実装しない
+/// ```
+///
+/// ```
+/// // (2) 通常版: 同じ型で Debug 以外（Clone）は compile・実行できる。
+/// let secret = tsumugi::Secret::new(42u32);
+/// let _cloned = secret.clone();
+/// ```
+#[derive(Clone)]
+pub struct Secret<T> {
+    inner: T,
+}
+
+impl<T> Secret<T> {
+    /// secret を包む。
+    pub fn new(inner: T) -> Self {
+        Self { inner }
+    }
+
+    /// 包んだ値への参照（crate 内部でだけ使う。audit payload へは漏らさない）。
+    pub(crate) fn expose(&self) -> &T {
+        &self.inner
+    }
+}
+
+/// secret な byte 列（§9.1）。HMAC key 等を保持する。`Debug` / `Display` / serialize を実装しない。
+///
+/// 存在と byte 数（[`Self::len`]）だけを Public metadata として公開する。
+///
+/// # R-AT-07: `Debug` を実装しないことの compile-fail 固定（§15.4）
+///
+/// `SecretBytes` は `Debug` を実装しないため、公開経路（`tsumugi::RedactionPolicy`）経由で
+/// `hmac_key` を `{:?}` で表示しようとすると compile しない。これを compile_fail doctest で固定する。
+/// 偽陽性（型が見えないだけで落ちる）を防ぐため、下の通常 doctest と 1 ペアにする。
+///
+/// ```compile_fail
+/// // (1) compile_fail 版: 公開経路から SecretBytes を参照し Debug を要求 → compile しない。
+/// let policy = tsumugi::RedactionPolicy::default();
+/// let key: &tsumugi::SecretBytes = &policy.hmac_key;
+/// let _ = format!("{:?}", key); // SecretBytes は Debug を実装しない
+/// ```
+///
+/// ```
+/// // (2) 通常版: 同じ公開経路で Debug 以外（byte 長・Clone）を使う → compile・実行できる。
+/// // これにより (1) の失敗が「型が見えない」ではなく「Debug が無い」由来だと保証する。
+/// let policy = tsumugi::RedactionPolicy::default();
+/// let key: &tsumugi::SecretBytes = &policy.hmac_key;
+/// assert!(key.len() > 0);
+/// let _cloned = key.clone();
+/// ```
+#[derive(Clone)]
+pub struct SecretBytes {
+    bytes: Secret<Vec<u8>>,
+}
+
+impl SecretBytes {
+    /// byte 列を包む。
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: Secret::new(bytes),
+        }
+    }
+
+    /// 保持している byte 数（Public metadata）。値そのものは公開しない。
+    pub fn len(&self) -> usize {
+        self.bytes.expose().len()
+    }
+
+    /// 空かどうか（clippy の `len_without_is_empty` 対応・Public metadata）。
+    pub fn is_empty(&self) -> bool {
+        self.bytes.expose().is_empty()
+    }
+
+    /// crate 内部でだけ raw bytes を参照する（HMAC 計算用。audit payload へは漏らさない）。
+    pub(crate) fn expose(&self) -> &[u8] {
+        self.bytes.expose()
+    }
+}
+
+/// R-1 既定の固定 HMAC key（alpha 用・秘匿性なし、§7.1 の ambient 乱数禁止と R-AT-06 決定性のため
+/// 乱数生成しない）。raw path を audit へそのまま載せないことだけを目的とする。key は公開されている
+/// ため digest からの推測復元には耐えない（秘匿性のある host 注入経路は sink 必須化スライスへ延期）。
+const DEFAULT_HMAC_KEY: &[u8] = b"tsumugi-r1-default-hmac-key-v1";
+
+/// SHA-256 の block size（HMAC の ipad/opad padding に使う）。
+const HMAC_BLOCK_SIZE: usize = 64;
+
+/// redaction policy（§9.1）。R-1 の既定は path=HMAC・body=omit・identifier=reveal。
+///
+/// `hmac_key` は [`SecretBytes`] で保持し `Debug`/`Display` で生 key を出さない。この型自身の
+/// `Debug` は手書きで key を `"<redacted>"` に伏せる（`Engine`/`EngineBuilder` の `#[derive(Debug)]`
+/// を壊さないため）。
+#[derive(Clone)]
+pub struct RedactionPolicy {
+    /// host が付ける安定ラベル（内容ハッシュではない、§9.1）。既定 `"default-r1"`。
+    pub policy_id: String,
+    /// identifier class の mode（既定 Reveal）。
+    pub identifier_mode: RedactionMode,
+    /// path class の mode（既定 HmacSha256）。
+    pub path_mode: RedactionMode,
+    /// body class の mode（既定 Omit）。
+    pub body_mode: RedactionMode,
+    /// body allow-list（R-1 では空・常に Omit）。
+    pub reveal_body_fields: BTreeSet<AuditFieldKey>,
+    /// path HMAC に使う秘密鍵。
+    pub hmac_key: SecretBytes,
+    /// Reveal できる body の上限 byte 数（R-1 既定 0）。
+    pub max_revealed_body_bytes: u64,
+}
+
+impl Default for RedactionPolicy {
+    /// R-1 の既定 policy（`policy_id = "default-r1"`、path=HMAC・body=omit・identifier=reveal、
+    /// 空 allow-list、固定 `hmac_key`）。
+    fn default() -> Self {
+        Self {
+            policy_id: "default-r1".to_string(),
+            identifier_mode: RedactionMode::Reveal,
+            path_mode: RedactionMode::HmacSha256,
+            body_mode: RedactionMode::Omit,
+            reveal_body_fields: BTreeSet::new(),
+            hmac_key: SecretBytes::new(DEFAULT_HMAC_KEY.to_vec()),
+            max_revealed_body_bytes: 0,
+        }
+    }
+}
+
+impl std::fmt::Debug for RedactionPolicy {
+    /// `hmac_key` を `"<redacted>"` に伏せた手書き `Debug`（§9.1 / R-1 スライス）。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedactionPolicy")
+            .field("policy_id", &self.policy_id)
+            .field("identifier_mode", &self.identifier_mode)
+            .field("path_mode", &self.path_mode)
+            .field("body_mode", &self.body_mode)
+            .field("reveal_body_fields", &self.reveal_body_fields)
+            .field("hmac_key", &"<redacted>")
+            .field("max_revealed_body_bytes", &self.max_revealed_body_bytes)
+            .finish()
+    }
+}
+
+impl RedactionPolicy {
+    /// canonical resource label へ HMAC-SHA-256 を適用して digest を返す（§9.1）。
+    ///
+    /// `crate::embedding::hash::sha256`（block size 64）の上に ipad 0x36 / opad 0x5c で
+    /// HMAC-SHA-256 を組む。同じ key・同じ label なら同じ digest、別 label なら別 digest。
+    pub fn hmac_path(&self, label: &str) -> [u8; 32] {
+        hmac_sha256(self.hmac_key.expose(), label.as_bytes())
+    }
+}
+
+/// HMAC-SHA-256（RFC 2104）。`crate::embedding::hash::sha256` を内部 hash に使う。
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    use crate::embedding::hash::sha256;
+
+    // key を block size へ正規化する: 長い key は hash、短い key は 0 padding。
+    let mut block = [0u8; HMAC_BLOCK_SIZE];
+    if key.len() > HMAC_BLOCK_SIZE {
+        let digest = sha256(key);
+        block[..digest.len()].copy_from_slice(&digest);
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; HMAC_BLOCK_SIZE];
+    let mut opad = [0x5cu8; HMAC_BLOCK_SIZE];
+    for i in 0..HMAC_BLOCK_SIZE {
+        ipad[i] ^= block[i];
+        opad[i] ^= block[i];
+    }
+
+    // inner = SHA-256(ipad || message)
+    let mut inner_input = Vec::with_capacity(HMAC_BLOCK_SIZE + message.len());
+    inner_input.extend_from_slice(&ipad);
+    inner_input.extend_from_slice(message);
+    let inner = sha256(&inner_input);
+
+    // outer = SHA-256(opad || inner)
+    let mut outer_input = Vec::with_capacity(HMAC_BLOCK_SIZE + inner.len());
+    outer_input.extend_from_slice(&opad);
+    outer_input.extend_from_slice(&inner);
+    sha256(&outer_input)
 }
 
 /// 監査 trace の 1 フレーム（§7.2 `AuditFrame`）。型のみ。
@@ -1711,7 +2009,9 @@ mod tests {
                 operation_id: 0,
                 call_id: 0,
                 function: "write_file".to_string(),
-                request: AuditPayload { fields: Vec::new() },
+                request: AuditPayload {
+                    fields: BTreeMap::new(),
+                },
                 request_bytes: 5,
             },
             AuditEvent::Yielded {
@@ -2515,5 +2815,125 @@ mod tests {
             ));
         }
         assert!(sink.is_empty(), "永続 Pending は決して記録しない");
+    }
+
+    // --- R-1（§9.1）: HMAC-SHA-256 の既知応答・決定性と byte 推定据え置き ---
+
+    /// RFC 4231 Test Case 2（key="Jefe", data="what do ya want for nothing?"）で HMAC-SHA-256 の
+    /// 実装正しさを固定する。
+    #[test]
+    fn hmac_sha256_rfc4231_test_case_2() {
+        let key = b"Jefe";
+        let data = b"what do ya want for nothing?";
+        let expected = [
+            0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e, 0x6a, 0x04, 0x24, 0x26, 0x08, 0x95,
+            0x75, 0xc7, 0x5a, 0x00, 0x3f, 0x08, 0x9d, 0x27, 0x39, 0x83, 0x9d, 0xec, 0x58, 0xb9,
+            0x64, 0xec, 0x38, 0x43,
+        ];
+        assert_eq!(hmac_sha256(key, data), expected);
+    }
+
+    /// RFC 4231 Test Case 1（20-byte 0x0b key, data="Hi There")。短い key の 0 padding 経路。
+    #[test]
+    fn hmac_sha256_rfc4231_test_case_1() {
+        let key = [0x0bu8; 20];
+        let data = b"Hi There";
+        let expected = [
+            0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53, 0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b,
+            0xf1, 0x2b, 0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7, 0x26, 0xe9, 0x37, 0x6c,
+            0x2e, 0x32, 0xcf, 0xf7,
+        ];
+        assert_eq!(hmac_sha256(&key, data), expected);
+    }
+
+    /// RFC 4231 Test Case 6（131-byte key、block size 超で key を hash する経路）。
+    #[test]
+    fn hmac_sha256_rfc4231_test_case_6_long_key() {
+        let key = [0xaau8; 131];
+        let data = b"Test Using Larger Than Block-Size Key - Hash Key First";
+        let expected = [
+            0x60, 0xe4, 0x31, 0x59, 0x1e, 0xe0, 0xb6, 0x7f, 0x0d, 0x8a, 0x26, 0xaa, 0xcb, 0xf5,
+            0xb7, 0x7f, 0x8e, 0x0b, 0xc6, 0x21, 0x37, 0x28, 0xc5, 0x14, 0x05, 0x46, 0x04, 0x0f,
+            0x0e, 0xe3, 0x7f, 0x54,
+        ];
+        assert_eq!(hmac_sha256(&key, data), expected);
+    }
+
+    /// R-AT-06 の下敷き: 同 key・同 label は同 digest、別 label は別 digest（決定性）。
+    #[test]
+    fn hmac_path_same_label_same_digest_different_label_differs() {
+        let policy = RedactionPolicy::default();
+        let a1 = policy.hmac_path("@default/a.txt");
+        let a2 = policy.hmac_path("@default/a.txt");
+        let b = policy.hmac_path("@default/b.txt");
+        assert_eq!(a1, a2, "同じ label は同じ digest");
+        assert_ne!(a1, b, "別 label は別 digest");
+    }
+
+    /// 既定 key が固定であることを確認（§7.1 乱数禁止・R-AT-06 の前提）。別インスタンス間で一致する。
+    #[test]
+    fn default_policy_hmac_key_is_fixed() {
+        let p1 = RedactionPolicy::default();
+        let p2 = RedactionPolicy::default();
+        assert_eq!(p1.hmac_path("@default/x"), p2.hmac_path("@default/x"));
+        assert_eq!(p1.policy_id, "default-r1");
+    }
+
+    /// R-AT-08: §9.1 の payload ツリーを載せても host-call lifecycle event の `estimate_event_bytes`
+    /// が payload 非依存の 128 固定のまま据え置かれる（B-2 queue 会計の不変条件）。
+    #[test]
+    fn r_at_08_estimate_event_bytes_frozen_for_host_call_events() {
+        let mut big_fields = BTreeMap::new();
+        big_fields.insert(
+            "path".to_string(),
+            AuditField::HmacSha256 {
+                class: AuditFieldClass::Path,
+                digest: [0xabu8; 32],
+                original_bytes: 4096,
+            },
+        );
+        big_fields.insert(
+            "arguments".to_string(),
+            AuditField::Revealed {
+                class: AuditFieldClass::Identifier,
+                value: AuditValue::Sequence(vec![AuditField::Omitted {
+                    class: AuditFieldClass::Body,
+                    original_bytes: 9999,
+                }]),
+                original_bytes: 9999,
+            },
+        );
+        let big_payload = AuditPayload { fields: big_fields };
+
+        let started = AuditEvent::HostCallStarted {
+            operation_id: 0,
+            call_id: 0,
+            function: "write_file".to_string(),
+            request: big_payload.clone(),
+            request_bytes: 4096,
+        };
+        let decision = AuditEvent::CapabilityDecision {
+            operation_id: 0,
+            call_id: Some(0),
+            capability: "filesystem".to_string(),
+            action: "write_file".to_string(),
+            resource: big_payload.clone(),
+            decision: CapabilityDecisionKind::Allow,
+            rule_id: "mount-granted".to_string(),
+        };
+        let finished = AuditEvent::HostCallFinished {
+            operation_id: 0,
+            call_id: 0,
+            outcome: HostCallOutcome::Success,
+            response: big_payload,
+            response_bytes: 0,
+            error_code: None,
+            effect_status: EffectStatus::Committed,
+        };
+
+        // host-call lifecycle 3 event は `_ => 128` 分岐で payload に依存せず 128 固定。
+        assert_eq!(estimate_event_bytes(&started), 128);
+        assert_eq!(estimate_event_bytes(&decision), 128);
+        assert_eq!(estimate_event_bytes(&finished), 128);
     }
 }

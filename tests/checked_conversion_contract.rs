@@ -263,6 +263,7 @@ fn file_size_of_real_file_is_positive_int() {
         1024,
         tsumugi::LanguageRevision::CURRENT,
         1,
+        &mut None,
     ) {
         Ok(Value::Int(n)) => assert_eq!(n, 5, "file_size はバイト数を返す"),
         other => panic!("Int が返るはず: {other:?}"),
@@ -284,6 +285,7 @@ fn missing_file_is_host_error() {
         1024,
         tsumugi::LanguageRevision::CURRENT,
         1,
+        &mut None,
     );
     let error = result.expect_err("存在しない file の file_size は host error");
     assert_eq!(error.kind(), Some(ErrorKind::Host));

@@ -1063,18 +1063,26 @@ pub fn host_call_response_bytes(name: &str, result: &Value) -> u64 {
 /// leak しない規則）、request/response body も既定 omit で `Omitted`。`error_code` は安定
 /// `ErrorCode` 文字列（`ErrorKind::as_str`）であり、script 可視 message は載せない（§9 意図）。
 /// `capability` / `action` / `rule_id` は path/secret を含まない Identifier 文字列にする。
+// R-1 で redaction 用の 3 引数（policy / label / requested_path_bytes）が加わり 8 引数になる。
+// これらは §9.1 の payload 構築に不可欠で、まとめる自然な struct も無い（id/name/bytes/result は
+// 呼び出し側の別経路で確定する）ため許容する。
+#[allow(clippy::too_many_arguments)]
 pub fn host_call_triple(
     id: u64,
     name: &str,
     request_bytes: u64,
     result: &Result<Value, TsumugiError>,
     response_bytes: u64,
+    policy: &crate::audit::RedactionPolicy,
+    label: Option<&str>,
+    requested_path_bytes: u64,
 ) -> [crate::audit::AuditEvent; 3] {
     use crate::audit::{
-        AuditEvent, AuditPayload, AuditPayloadField, CapabilityDecisionKind, EffectStatus,
-        HostCallOutcome,
+        AuditEvent, AuditField, AuditFieldClass, AuditPayload, AuditValue, CapabilityDecisionKind,
+        EffectStatus, HostCallOutcome,
     };
     use crate::error::ErrorKind;
+    use std::collections::BTreeMap;
 
     let is_write = matches!(name, "write_file" | "append_file");
 
@@ -1131,31 +1139,78 @@ pub fn host_call_triple(
         },
     };
 
-    // A-1 の leak-free payload: path は Omitted（Path class）、body は原本 byte 長だけ。
+    // §9.1 redaction tree（既定 policy）を適用して payload を組む。
+    //
+    // body（§9.1 Body、既定 Omit）: 値は捨て class と byte 数だけ残す。R-1 は allow-list Reveal を
+    // 行わない（allow-list が空なので body_mode に関わらず常に Omit へ畳む、R-1 スライス）。
+    debug_assert!(
+        policy.reveal_body_fields.is_empty(),
+        "R-1 は body allow-list を実装しない（常に Omit）"
+    );
+    let body_field = |original_bytes: u64| -> AuditField {
+        AuditField::Omitted {
+            class: AuditFieldClass::Body,
+            original_bytes,
+        }
+    };
+
+    // request payload: body（原本 byte 長）＋ arguments（R-1 は class 畳みで Omitted、raw 非露出）。
+    let mut request_fields: BTreeMap<String, AuditField> = BTreeMap::new();
+    request_fields.insert("body".to_string(), body_field(request_bytes));
+    // host-call 引数は §9.1 どおり Sequence(...) で載せる。R-1 既定では各要素を Body/Omitted へ
+    // 畳むため raw path も自由文も露出しない（path は resource.path 側で Path class として扱う）。
+    request_fields.insert(
+        "arguments".to_string(),
+        AuditField::Revealed {
+            class: AuditFieldClass::Body,
+            value: AuditValue::Sequence(Vec::new()),
+            original_bytes: request_bytes,
+        },
+    );
     let request_payload = AuditPayload {
-        fields: vec![(
-            "body".to_string(),
-            AuditPayloadField::Omitted {
-                original_bytes: request_bytes,
-            },
-        )],
+        fields: request_fields,
     };
+
+    // resource payload: path field。decision が Allow なら canonical label を HMAC、Deny なら
+    // label が手元にあっても Omitted{class:Path}（§9.1 / R-AT-01・R-AT-02）。raw path も label も
+    // Revealed/HMAC 入力に出さない。
+    let path_field = match decision {
+        CapabilityDecisionKind::Allow => {
+            // Allow は label 確定済み（Success/HostError 両方）。label 文字列の UTF-8 byte 長を
+            // original_bytes にする。万一 label が無い異常時は Omitted へ fail-safe で畳む。
+            match (policy.path_mode, label) {
+                (crate::audit::RedactionMode::HmacSha256, Some(label)) => AuditField::HmacSha256 {
+                    class: AuditFieldClass::Path,
+                    digest: policy.hmac_path(label),
+                    original_bytes: label.len() as u64,
+                },
+                // path_mode が HMAC 以外、または label 不在（異常）は raw を出さず Omitted。
+                (_, label) => AuditField::Omitted {
+                    class: AuditFieldClass::Path,
+                    original_bytes: label
+                        .map(|l| l.len() as u64)
+                        .unwrap_or(requested_path_bytes),
+                },
+            }
+        }
+        // Deny は label の有無を問わず Omitted。original_bytes は requested path 長（label 長を
+        // 漏らさない）。引数型エラーで path が無いときは呼び出し側が 0 を渡す。
+        CapabilityDecisionKind::Deny => AuditField::Omitted {
+            class: AuditFieldClass::Path,
+            original_bytes: requested_path_bytes,
+        },
+    };
+    let mut resource_fields: BTreeMap<String, AuditField> = BTreeMap::new();
+    resource_fields.insert("path".to_string(), path_field);
     let resource_payload = AuditPayload {
-        fields: vec![(
-            "path".to_string(),
-            AuditPayloadField::Omitted {
-                // path 原本 byte 長は A-1 では手元に無いので 0（class 情報のみ）。
-                original_bytes: 0,
-            },
-        )],
+        fields: resource_fields,
     };
+
+    // response payload: body（原本 byte 長）。
+    let mut response_fields: BTreeMap<String, AuditField> = BTreeMap::new();
+    response_fields.insert("body".to_string(), body_field(response_bytes));
     let response_payload = AuditPayload {
-        fields: vec![(
-            "body".to_string(),
-            AuditPayloadField::Omitted {
-                original_bytes: response_bytes,
-            },
-        )],
+        fields: response_fields,
     };
 
     [
@@ -1368,11 +1423,50 @@ pub fn dispatch_fs(
     max_collection: u64,
     revision: crate::embedding::LanguageRevision,
     line: usize,
-) -> Result<Value, TsumugiError> {
-    match filesystem {
-        Some(fs) => dispatch_filesystem_capability(name, args, fs, max_collection, revision, line),
+) -> FsDispatch {
+    let mut label: Option<String> = None;
+    let outcome = match filesystem {
+        Some(fs) => dispatch_filesystem_capability(
+            name,
+            args,
+            fs,
+            max_collection,
+            revision,
+            line,
+            &mut label,
+        ),
+        // 未 grant（Deny、label 確定前）。label は None のまま。
         None => Err(TsumugiError::filesystem_denied(line)),
+    };
+    FsDispatch { outcome, label }
+}
+
+/// [`dispatch_fs`] の戻り値（Phase 6 R-1、§9.1）。outcome に加えて canonical resource label を運ぶ。
+///
+/// `label` は capability decision が `Allow`（成功・host error の両方）のとき `Some`、`Deny`
+/// （未 grant・path/argument エラー・mount/op denial・Upsert の Create 不足）のとき `None` にする。
+/// label の有無は routing が通ったか（＝ decision）で決まり、その後の adapter 成否とは独立する
+/// （host error でも label は保持する、R-1 スライス）。非監査経路（sink なし）も常にこの型を受け取るが
+/// label を無視し、triple 構築側だけが使う（観測挙動は不変）。
+pub struct FsDispatch {
+    /// filesystem 操作の結果。
+    pub outcome: Result<Value, TsumugiError>,
+    /// 認可に使った canonical resource label（`@<mount>/<component>/...`）。Allow のとき `Some`。
+    pub label: Option<String>,
+}
+
+/// routing 後の [`FilesystemTarget`] を canonical resource label 文字列へ組む（§9.1 / R-1 スライス）。
+///
+/// 形式は `@<mount>/<component>/...`。host absolute path・CWD・symlink 解決結果は含めない。
+/// 同じ mount・同じ mount 相対 path は同じ label（＝同じ digest）になる。
+fn canonical_resource_label(target: &crate::capability::FilesystemTarget) -> String {
+    let mut label = String::from("@");
+    label.push_str(target.mount.as_str());
+    for component in target.path.components() {
+        label.push('/');
+        label.push_str(component);
     }
+    label
 }
 
 /// filesystem builtin を frozen [`FilesystemCapability`] 経由で実行する（C5-c、案 B の grant 経路）。
@@ -1398,6 +1492,7 @@ pub fn dispatch_filesystem_capability(
     max_collection: u64,
     revision: crate::embedding::LanguageRevision,
     line: usize,
+    label: &mut Option<String>,
 ) -> Result<Value, TsumugiError> {
     use crate::capability::{FsOperation, OpenFileRequest, RemoveKind, WriteMode};
 
@@ -1405,7 +1500,14 @@ pub fn dispatch_filesystem_capability(
         "read_file" => {
             check_arity(name, args, 1, line)?;
             let path = require_str(&args[0], name, 1, line)?;
-            let mut file = fs_open(name, filesystem, path, OpenFileRequest::ReadExisting, line)?;
+            let mut file = fs_open(
+                name,
+                filesystem,
+                path,
+                OpenFileRequest::ReadExisting,
+                line,
+                label,
+            )?;
             let bytes = file
                 .read_to_end(None)
                 .map_err(|_| fs_host_error(name, line))?;
@@ -1415,7 +1517,14 @@ pub fn dispatch_filesystem_capability(
         "read_lines" => {
             check_arity(name, args, 1, line)?;
             let path = require_str(&args[0], name, 1, line)?;
-            let mut file = fs_open(name, filesystem, path, OpenFileRequest::ReadExisting, line)?;
+            let mut file = fs_open(
+                name,
+                filesystem,
+                path,
+                OpenFileRequest::ReadExisting,
+                line,
+                label,
+            )?;
             let bytes = file
                 .read_to_end(None)
                 .map_err(|_| fs_host_error(name, line))?;
@@ -1439,6 +1548,7 @@ pub fn dispatch_filesystem_capability(
                     mode: WriteMode::Truncate,
                 },
                 line,
+                label,
             )?;
             file.write_all(content.as_bytes())
                 .map_err(|_| fs_host_error(name, line))?;
@@ -1456,6 +1566,7 @@ pub fn dispatch_filesystem_capability(
                     mode: WriteMode::Append,
                 },
                 line,
+                label,
             )?;
             file.write_all(content.as_bytes())
                 .map_err(|_| fs_host_error(name, line))?;
@@ -1464,7 +1575,8 @@ pub fn dispatch_filesystem_capability(
         "mkdir" => {
             check_arity(name, args, 1, line)?;
             let path = require_str(&args[0], name, 1, line)?;
-            let (root, target) = fs_route(name, filesystem, path, FsOperation::Create, line)?;
+            let (root, target) =
+                fs_route(name, filesystem, path, FsOperation::Create, line, label)?;
             root.adapter
                 .create_dir(&target.path)
                 .map_err(|_| fs_host_error(name, line))?;
@@ -1473,7 +1585,8 @@ pub fn dispatch_filesystem_capability(
         "remove" => {
             check_arity(name, args, 1, line)?;
             let path = require_str(&args[0], name, 1, line)?;
-            let (root, target) = fs_route(name, filesystem, path, FsOperation::Delete, line)?;
+            let (root, target) =
+                fs_route(name, filesystem, path, FsOperation::Delete, line, label)?;
             root.adapter
                 .remove(&target.path, RemoveKind::FileOrSymlink)
                 .map_err(|_| fs_host_error(name, line))?;
@@ -1485,7 +1598,8 @@ pub fn dispatch_filesystem_capability(
             // remove_dir は空 directory のみ（`EmptyDirectory`）。非空は最も一般的な失敗要因の
             // ため、capability 経路の失敗を `directory_not_empty` category の host error へ写す
             // （REV-021 §17.6.5）。再帰削除は remove_tree（`RecursiveDelete`）を使う。
-            let (root, target) = fs_route(name, filesystem, path, FsOperation::Delete, line)?;
+            let (root, target) =
+                fs_route(name, filesystem, path, FsOperation::Delete, line, label)?;
             root.adapter
                 .remove(&target.path, RemoveKind::EmptyDirectory)
                 .map_err(|_| {
@@ -1498,8 +1612,14 @@ pub fn dispatch_filesystem_capability(
             let path = require_str(&args[0], name, 1, line)?;
             // 再帰削除は専用 capability `RecursiveDelete` を要求する（`EmptyDirectory` から
             // 暗黙昇格させない、REV-021 §17.6）。symlink は adapter がリンク自体を削除する。
-            let (root, target) =
-                fs_route(name, filesystem, path, FsOperation::RecursiveDelete, line)?;
+            let (root, target) = fs_route(
+                name,
+                filesystem,
+                path,
+                FsOperation::RecursiveDelete,
+                line,
+                label,
+            )?;
             root.adapter
                 .remove(&target.path, RemoveKind::Tree)
                 .map_err(|_| fs_host_error(name, line))?;
@@ -1511,8 +1631,9 @@ pub fn dispatch_filesystem_capability(
             let to = require_str(&args[1], name, 2, line)?;
             // rename は source `Delete` と destination `Create` を要求する（第8.4節）。
             let (from_root, from_target) =
-                fs_route(name, filesystem, from, FsOperation::Delete, line)?;
-            let (to_root, to_target) = fs_route(name, filesystem, to, FsOperation::Create, line)?;
+                fs_route(name, filesystem, from, FsOperation::Delete, line, label)?;
+            let (to_root, to_target) =
+                fs_route(name, filesystem, to, FsOperation::Create, line, label)?;
             from_root
                 .adapter
                 .rename(
@@ -1527,7 +1648,7 @@ pub fn dispatch_filesystem_capability(
         "list_dir" => {
             check_arity(name, args, 1, line)?;
             let path = require_str(&args[0], name, 1, line)?;
-            let (root, target) = fs_route(name, filesystem, path, FsOperation::List, line)?;
+            let (root, target) = fs_route(name, filesystem, path, FsOperation::List, line, label)?;
             // REV-009 §17.4（safe profile）: 個別 entry 取得失敗・非 UTF-8 名を黙殺せず、
             // それぞれ `directory_read` / `invalid_encoding` category の catch 可能な `host`
             // error へ写す（部分結果を成功 List として返さない）。
@@ -1554,7 +1675,8 @@ pub fn dispatch_filesystem_capability(
         "file_size" => {
             check_arity(name, args, 1, line)?;
             let path = require_str(&args[0], name, 1, line)?;
-            let (root, target) = fs_route(name, filesystem, path, FsOperation::Metadata, line)?;
+            let (root, target) =
+                fs_route(name, filesystem, path, FsOperation::Metadata, line, label)?;
             let meta = root
                 .adapter
                 .metadata(&target.path, true)
@@ -1564,7 +1686,7 @@ pub fn dispatch_filesystem_capability(
         "is_file" => {
             check_arity(name, args, 1, line)?;
             let path = require_str(&args[0], name, 1, line)?;
-            let kind = fs_metadata_kind(name, filesystem, path, line)?;
+            let kind = fs_metadata_kind(name, filesystem, path, line, label)?;
             Ok(Value::Bool(matches!(
                 kind,
                 Some(crate::capability::EntryKind::File)
@@ -1573,7 +1695,7 @@ pub fn dispatch_filesystem_capability(
         "is_dir" => {
             check_arity(name, args, 1, line)?;
             let path = require_str(&args[0], name, 1, line)?;
-            let kind = fs_metadata_kind(name, filesystem, path, line)?;
+            let kind = fs_metadata_kind(name, filesystem, path, line, label)?;
             Ok(Value::Bool(matches!(
                 kind,
                 Some(crate::capability::EntryKind::Directory)
@@ -1582,7 +1704,7 @@ pub fn dispatch_filesystem_capability(
         "path_exists" => {
             check_arity(name, args, 1, line)?;
             let path = require_str(&args[0], name, 1, line)?;
-            let kind = fs_metadata_kind(name, filesystem, path, line)?;
+            let kind = fs_metadata_kind(name, filesystem, path, line, label)?;
             Ok(Value::Bool(kind.is_some()))
         }
         // is_filesystem_builtin と本 match は同じ名前集合を持つ。ここへ来ない。
@@ -1625,6 +1747,7 @@ fn fs_route<'a>(
     path: &str,
     operation: crate::capability::FsOperation,
     line: usize,
+    label: &mut Option<String>,
 ) -> Result<
     (
         &'a crate::capability::FilesystemRoot,
@@ -1669,6 +1792,9 @@ fn fs_route<'a>(
     if !root.operations.contains(&operation) {
         return Err(TsumugiError::filesystem_denied(line));
     }
+    // routing と operation 認可が通った時点で canonical resource label を確定する（§9.1 / R-1）。
+    // この後 adapter が失敗（host error）しても label は保持する。
+    *label = Some(canonical_resource_label(&target));
     Ok((root, target))
 }
 
@@ -1679,6 +1805,7 @@ fn fs_open(
     path: &str,
     request: crate::capability::OpenFileRequest,
     line: usize,
+    label: &mut Option<String>,
 ) -> Result<Box<dyn crate::capability::FileHandle>, TsumugiError> {
     use crate::capability::{FsOperation, OpenFileRequest};
     // open request に対応する FsOperation を確定する（第8.4節 operation matrix）。
@@ -1690,12 +1817,15 @@ fn fs_open(
         // route し、Create の可否は下で追加検査する。
         OpenFileRequest::Upsert { .. } => FsOperation::Write,
     };
-    let (root, target) = fs_route(name, filesystem, path, operation, line)?;
+    let (root, target) = fs_route(name, filesystem, path, operation, line, label)?;
     // Upsert は Write+Create を事前要求する（第8.4節）。route では Write を検査済みなので、
     // 追加で Create の grant を確認する（不足なら adapter call 0 の sandbox denial）。
     if matches!(request, OpenFileRequest::Upsert { .. })
         && !root.operations.contains(&FsOperation::Create)
     {
+        // Upsert の Create 不足は route 成功後の Deny（§9.1 / R-AT-02d）。label は fs_route で
+        // 立っているが decision が Deny なので None へ戻し、Path を Omitted にする。
+        *label = None;
         return Err(TsumugiError::filesystem_denied(line));
     }
     root.adapter
@@ -1712,9 +1842,10 @@ fn fs_metadata_kind(
     filesystem: &crate::capability::FilesystemCapability,
     path: &str,
     line: usize,
+    label: &mut Option<String>,
 ) -> Result<Option<crate::capability::EntryKind>, TsumugiError> {
     use crate::capability::FsOperation;
-    let (root, target) = fs_route(name, filesystem, path, FsOperation::Metadata, line)?;
+    let (root, target) = fs_route(name, filesystem, path, FsOperation::Metadata, line, label)?;
     match root.adapter.metadata(&target.path, true) {
         Ok(meta) => Ok(Some(meta.kind)),
         // 許可 root 内の not-found は benign（false へ写す）。それ以外の adapter 失敗も
@@ -1880,9 +2011,46 @@ mod host_call_triple_tests {
     //! `host_call_triple` の分類ユニットテスト（§7.2/§8）。full run を回さずに、deny/allow/
     //! host-error × read/write の分類と triple の ID 再利用・emission 順序を固定する。
     use super::host_call_triple;
-    use crate::audit::{AuditEvent, CapabilityDecisionKind, EffectStatus, HostCallOutcome};
+    use crate::audit::{
+        AuditEvent, AuditField, AuditFieldClass, CapabilityDecisionKind, EffectStatus,
+        HostCallOutcome, RedactionPolicy,
+    };
     use crate::error::{ErrorKind, TsumugiError};
     use crate::value::Value;
+
+    /// 既定 policy・sample label でのテスト用 triple 構築（Allow は label あり、Deny は None を
+    /// 呼び出し側で与える）。requested_path_bytes はテストでは 0 既定。
+    fn triple(
+        id: u64,
+        name: &str,
+        request_bytes: u64,
+        result: &Result<Value, TsumugiError>,
+        response_bytes: u64,
+        label: Option<&str>,
+        requested_path_bytes: u64,
+    ) -> [AuditEvent; 3] {
+        host_call_triple(
+            id,
+            name,
+            request_bytes,
+            result,
+            response_bytes,
+            &RedactionPolicy::default(),
+            label,
+            requested_path_bytes,
+        )
+    }
+
+    /// triple[1]（CapabilityDecision）の resource.path field を取り出す。
+    fn resource_path(triple: &[AuditEvent; 3]) -> &AuditField {
+        match &triple[1] {
+            AuditEvent::CapabilityDecision { resource, .. } => resource
+                .fields
+                .get("path")
+                .expect("resource に path field がある"),
+            other => panic!("triple[1] は CapabilityDecision のはず: {other:?}"),
+        }
+    }
 
     /// triple を (operation_id, call_id, decision, outcome, effect_status, error_code) へ畳む。
     #[allow(clippy::type_complexity)]
@@ -1951,18 +2119,26 @@ mod host_call_triple_tests {
     #[test]
     fn read_success_is_allow_success_none() {
         let result = Ok(Value::str_constant("hello".to_string()));
-        let triple = host_call_triple(0, "read_file", 0, &result, 5);
+        let triple = triple(0, "read_file", 0, &result, 5, Some("@default/a.txt"), 0);
         let (_, _, _, decision, outcome, effect, code) = parts(&triple);
         assert_eq!(decision, CapabilityDecisionKind::Allow);
         assert_eq!(outcome, HostCallOutcome::Success);
         assert_eq!(effect, EffectStatus::None);
         assert_eq!(code, None);
+        // Allow の Path は HmacSha256（§9.1 / R-AT-01）。
+        assert!(matches!(
+            resource_path(&triple),
+            AuditField::HmacSha256 {
+                class: AuditFieldClass::Path,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn write_success_is_allow_success_committed() {
         let result = Ok(Value::Bool(true));
-        let triple = host_call_triple(3, "write_file", 11, &result, 0);
+        let triple = triple(3, "write_file", 11, &result, 0, Some("@default/out.txt"), 0);
         let (op, call, _, decision, outcome, effect, code) = parts(&triple);
         assert_eq!(op, 3);
         assert_eq!(call, Some(3));
@@ -1976,7 +2152,7 @@ mod host_call_triple_tests {
     fn denied_is_deny_denied_none_with_pair_and_triple() {
         // filesystem_denied（ErrorKind::Sandbox）。Deny/Denied/None の 3 event が揃う（§8 規則4）。
         let result: Result<Value, TsumugiError> = Err(TsumugiError::filesystem_denied(1));
-        let triple = host_call_triple(0, "read_file", 0, &result, 0);
+        let triple = triple(0, "read_file", 0, &result, 0, None, 10);
         // 順序は Started → Decision → Finished。
         assert!(matches!(triple[0], AuditEvent::HostCallStarted { .. }));
         assert!(matches!(triple[1], AuditEvent::CapabilityDecision { .. }));
@@ -1986,6 +2162,14 @@ mod host_call_triple_tests {
         assert_eq!(outcome, HostCallOutcome::Denied);
         assert_eq!(effect, EffectStatus::None);
         assert_eq!(code, Some(ErrorKind::Sandbox.as_str().to_string()));
+        // Deny の Path は Omitted{class:Path}、original_bytes は requested path 長（§9.1 / R-AT-02）。
+        assert!(matches!(
+            resource_path(&triple),
+            AuditField::Omitted {
+                class: AuditFieldClass::Path,
+                original_bytes: 10,
+            }
+        ));
     }
 
     #[test]
@@ -1995,12 +2179,21 @@ mod host_call_triple_tests {
             "write_file",
             "filesystem",
         ));
-        let triple = host_call_triple(1, "write_file", 4, &result, 0);
+        // Allow/HostError: route 成功後に adapter 失敗。label は確定済み。
+        let triple = triple(1, "write_file", 4, &result, 0, Some("@default/out.txt"), 0);
         let (_, _, _, decision, outcome, effect, code) = parts(&triple);
         assert_eq!(decision, CapabilityDecisionKind::Allow);
         assert_eq!(outcome, HostCallOutcome::HostError);
         assert_eq!(effect, EffectStatus::Unknown);
         assert_eq!(code, Some(ErrorKind::Host.as_str().to_string()));
+        // Allow/HostError でも Path は HmacSha256（§9.1 / R-AT-01）。
+        assert!(matches!(
+            resource_path(&triple),
+            AuditField::HmacSha256 {
+                class: AuditFieldClass::Path,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2010,11 +2203,19 @@ mod host_call_triple_tests {
             "read_file",
             "filesystem",
         ));
-        let triple = host_call_triple(2, "read_file", 0, &result, 0);
+        let triple = triple(2, "read_file", 0, &result, 0, Some("@default/a.txt"), 0);
         let (_, _, _, decision, outcome, effect, _) = parts(&triple);
         assert_eq!(decision, CapabilityDecisionKind::Allow);
         assert_eq!(outcome, HostCallOutcome::HostError);
         assert_eq!(effect, EffectStatus::None);
+        // Allow/HostError（read）でも Path は HmacSha256。
+        assert!(matches!(
+            resource_path(&triple),
+            AuditField::HmacSha256 {
+                class: AuditFieldClass::Path,
+                ..
+            }
+        ));
     }
 }
 

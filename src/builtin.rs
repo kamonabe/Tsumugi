@@ -187,7 +187,7 @@ impl Evaluator {
                     // C10: filesystem builtin は grant 有無に関わらず常に capability 経路を通す。
                     // 未 grant（filesystem() が None）なら dispatch_fs が adapter/OS call 0 で
                     // 単一の sandbox denial を返す。ambient std::fs fallback へは落ちない。
-                    let fs_result = crate::builtin_core::dispatch_fs(
+                    let dispatched_fs = crate::builtin_core::dispatch_fs(
                         name,
                         &evaluated,
                         self.capabilities().filesystem(),
@@ -195,6 +195,9 @@ impl Evaluator {
                         language_revision,
                         line,
                     );
+                    // Phase 6 R-1: dispatch_fs が返す canonical label（Deny は None）を triple へ渡す。
+                    let fs_label = dispatched_fs.label;
+                    let fs_result = dispatched_fs.outcome;
                     // Phase 6（§7.2/§8）: filesystem は唯一の tree host-call 境界なので、ここで
                     // host-call lifecycle triple（HostCallStarted → CapabilityDecision →
                     // HostCallFinished）を監査バッファへ積む。buffer は監査付き facade が drain
@@ -206,6 +209,15 @@ impl Evaluator {
                             Ok(value) => crate::builtin_core::host_call_response_bytes(name, value),
                             Err(_) => 0,
                         };
+                        // Deny の original_bytes 用: 先頭の Str 引数（requested path）の UTF-8 byte
+                        // 長。path 文字列が無い（引数型エラー等）なら 0（§9.1 / R-1 スライス）。
+                        let requested_path_bytes = evaluated
+                            .first()
+                            .and_then(|v| match v {
+                                crate::value::Value::Str(s) => Some(s.as_str().len() as u64),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
                         let op_id = self.alloc_host_call_operation_id(line)?;
                         let triple = crate::builtin_core::host_call_triple(
                             op_id,
@@ -213,6 +225,9 @@ impl Evaluator {
                             request_bytes_for_audit,
                             &fs_result,
                             response_bytes,
+                            self.redaction_policy(),
+                            fs_label.as_deref(),
+                            requested_path_bytes,
                         );
                         self.push_host_call_events(triple);
                     }
