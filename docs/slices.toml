@@ -1,0 +1,172 @@
+# Tsumugi — 実装スライス一覧（状態の正本）
+#
+# このファイルは「実装スライス」（1 スライス = 1 実装 PR）の一覧と状態の唯一の正本である。
+# 書き手・承認・状態遷移・ready の条件などの運用規則は docs/documentation-guide.md
+# 「実装スライスの運用」だけに書く。ここにはフィールドの定義だけを置く。
+#
+# ── status ─────────────────────────────────────────────────────
+#   todo     未設計。spec に実装範囲・受入基準がまだない
+#   ready    設計承認済み。実装ループが着手してよい
+#   done     実装済み（実装 PR がマージされた）
+#   blocked  外部要因で着手不可。blocked_reason 必須
+#
+# ── フィールド ─────────────────────────────────────────────────
+#   id              必須。リポジトリ全体で一意。spec に既存の名前（R-1b、F-2 など）があればそれを使う。
+#                   名前がなければ kebab-case の仮 ID とし、status = todo の間だけ改名してよい。
+#   title           必須。一行概要。詳細は spec に書く
+#   status          必須。上記 4 値のいずれか
+#   parent          必須。roadmap.md「ステータス一覧」の ID（REV-015、Phase 6 残 など）
+#   spec_slice      任意。spec 側の粗い slice（例: "determinism Slice 5"、"E9"、"C12"）
+#   spec            ready / done で必須。{ doc = "docs/…md", section = "見出しテキスト（完全一致）" }
+#   acceptance      ready で必須（空配列不可）。受入基準 ID のみ。範囲は "B2-AT-01..10" と書く
+#   depends_on      任意。先に done になっている必要があるスライスの id
+#   order           todo / ready で必須。着手順。小さいほど先。ループは ready のうち最小を選ぶ
+#   blocked_reason  blocked で必須
+#   design_pr       todo → ready にした設計 PR の番号（PR 作成後、同じ PR に追記する）
+#   impl_pr         ready → done にした実装 PR の番号（同上）
+#   issues          任意。このスライスで立った needs-design issue の番号（履歴として残す）
+#
+# ready の条件（Definition of Ready）は documentation-guide.md を参照。
+# 将来 tests/slices_contract.rs で CI 検証する（未実装）。
+
+# ════════════════════════════════════════════════════════════════
+# 実装済み（依存関係の起点として載せる）
+# ════════════════════════════════════════════════════════════════
+
+[[slice]]
+id         = "A-1"
+title      = "audit core の最小縦切り（schema v1・8 event 型・logical journal・AuditSink・fail-closed）"
+status     = "done"
+parent     = "Phase 6 残"
+spec_slice = "determinism Slice 5"
+spec       = { doc = "docs/determinism-and-audit.md", section = "A-1 実装スライス（tree engine、opt-in）" }
+acceptance = []  # 受入基準 ID が spec 上で未採番（ガイド導入前の完了スライスとして許容）
+impl_pr    = 205
+
+[[slice]]
+id         = "B-1"
+title      = "AuditBackpressure-yield 配線（sink-Pending 由来）"
+status     = "done"
+parent     = "Phase 6 残"
+spec_slice = "determinism Slice 5"
+spec       = { doc = "docs/determinism-and-audit.md", section = "A-1 実装スライス（tree engine、opt-in）" }
+acceptance = []
+depends_on = ["A-1"]
+impl_pr    = 228
+
+[[slice]]
+id         = "B-2"
+title      = "audit drain queue byte 会計（per-execution）"
+status     = "done"
+parent     = "Phase 6 残"
+spec_slice = "determinism Slice 5"
+spec       = { doc = "docs/determinism-and-audit.md", section = "B-2 実装スライス（tree engine、opt-in、audit drain queue byte 会計）" }
+acceptance = ["B2-AT-01..10"]
+depends_on = ["B-1"]
+design_pr  = 231
+impl_pr    = 232
+
+[[slice]]
+id         = "R-1a"
+title      = "redaction policy 本体（既定 policy を tree の監査付き host-call 経路へ配線）"
+status     = "done"
+parent     = "Phase 6 残"
+spec_slice = "determinism Slice 5"
+spec       = { doc = "docs/determinism-and-audit.md", section = "R-1 実装スライス（tree engine、opt-in、redaction policy 本体）" }
+acceptance = []
+depends_on = ["A-1"]
+design_pr  = 237
+impl_pr    = 238
+
+[[slice]]
+id         = "F-1"
+title      = "fuel parity（VM を tree の現行課金点へ、2 メーター化）"
+status     = "done"
+parent     = "REV-015"
+spec_slice = "exec-control Slice 6"
+spec       = { doc = "docs/execution-control.md", section = "F-1 実装スライス（fuel parity：VM を tree の現行課金点へ、2 メーター化）" }
+acceptance = ["F1-AT-01..09"]
+design_pr  = 235
+impl_pr    = 236
+
+# ════════════════════════════════════════════════════════════════
+# 未着手（roadmap.md「現在地」「Phase 6 残」から分解。order は暫定）
+# ════════════════════════════════════════════════════════════════
+
+[[slice]]
+id         = "R-1b"
+title      = "body allow-list Reveal"
+status     = "todo"
+parent     = "Phase 6 残"
+spec_slice = "determinism Slice 5"
+depends_on = ["R-1a"]
+order      = 10
+
+[[slice]]
+id         = "F-2"
+title      = "§4.1 の課金表（既定 total_fuel の見直しと language_revision の扱いを含む）"
+status     = "todo"
+parent     = "REV-015"
+depends_on = ["F-1"]
+order      = 20
+
+[[slice]]
+id         = "audit-strict-cbor"
+title      = "strict deterministic CBOR（§9.2）"
+status     = "todo"
+parent     = "Phase 6 残"
+spec_slice = "determinism Slice 5"
+depends_on = ["A-1"]
+order      = 30
+
+[[slice]]
+id         = "audit-sink-required"
+title      = "sink 必須化（§1.1）"
+status     = "todo"
+parent     = "Phase 6 残"
+spec_slice = "determinism Slice 5"
+depends_on = ["A-1"]
+order      = 40
+
+[[slice]]
+id         = "audit-fs-builtin-scope"
+title      = "fs builtin 全体の監査範囲（rename ほか非課金 fs builtin への監査 triple 拡張）"
+status     = "todo"
+parent     = "Phase 6 残"
+spec_slice = "determinism Slice 5"
+depends_on = ["R-1a"]
+order      = 50
+
+[[slice]]
+id         = "audit-yield-emission-engine-poll"
+title      = "AdmissionQueued / SchedulerPreempted / HostPaused の yield emission（engine-poll 経路）"
+status     = "todo"
+parent     = "Phase 6 残"
+spec_slice = "determinism Slice 5"
+depends_on = ["B-1"]
+order      = 60
+
+[[slice]]
+id         = "audit-vm-triple"
+title      = "VM の audit triple 対応"
+status     = "todo"
+parent     = "Phase 6 残"
+spec_slice = "determinism Slice 6"
+order      = 70
+
+[[slice]]
+id         = "audit-record-replay"
+title      = "record/replay（大きいため設計時に複数スライスへ分割する想定）"
+status     = "todo"
+parent     = "Phase 6 残"
+spec_slice = "determinism Slice 4"
+order      = 80
+
+[[slice]]
+id             = "audit-queue-engine-limit"
+title          = "audit drain queue の engine 全体上限（16 MiB、§10.2）"
+status         = "blocked"
+parent         = "Phase 6 残"
+spec_slice     = "determinism Slice 5"
+depends_on     = ["B-2"]
+blocked_reason = "E10 統合後（roadmap.md「Phase 6 残」の記載どおり）"
