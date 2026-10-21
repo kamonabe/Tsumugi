@@ -1556,9 +1556,9 @@ canonical label の `HmacSha256`・Deny で `Omitted{class:Path}`（raw path/lab
     `rename` 2 field 規則は受入基準から外し、下記「逸脱」の「fs builtin 全体の監査範囲」slice へ移す。
   - **`arguments` と Identifier field のテスト追加**: `arguments` の構造（外側 `Revealed { class: Public }`・
     各要素の class・`original_bytes`）と payload に載った Identifier field（request の `function`、resource の
-    `capability` / `rule_id` / `action`）を検査するテストが無かった。**対応**: `tests/audit_redaction.rs`
-    （または `host_call_triple_tests`）に read 系（要素 1 つ）と write 系（Path + Body の 2 要素）のケースを
-    追加し、raw path や書き込み内容が要素に出ないことも `assert_no_substring` で確認する。
+    `capability` / `rule_id` / `action`）を検査するテストが無かった。**対応**: `src/builtin_core.rs` の
+    `host_call_triple_tests` に read 系（要素 1 つ）と write 系（Path + Body の 2 要素）のケースを
+    追加し、raw path や書き込み内容が要素に出ないことも確認する。
 
 ### Slice 6: VM conformance
 
