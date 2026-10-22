@@ -114,7 +114,7 @@ spec_slice = "exec-control Slice 3"
 spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation 実装スライス（Slice 3 PR-e：式の途中での slice yield）" }
 acceptance = ["TEC-AT-01..05"]
 depends_on = ["F-1"]
-design_pr  = 0  # 設計 PR 作成後に採番して追記する
+design_pr  = 242
 order      = 15
 
 # 設計は PR #241 で確定済みだが、前段 tree-expr-continuation が done になるまで着手不可。
