@@ -1308,6 +1308,125 @@ Slice 3 には含めない。
     terminal 後 poll 拒否、slice 分割を跨いだ runtime error terminal を固定した。観測挙動は
     既定 slice（同期経路）では不変（597 tests green）。
 
+#### tree-expr-continuation 実装スライス（Slice 3 PR-e：式の途中での slice yield）
+
+> 状態: **未実装**（設計のみ）。本小節は Slice 3 PR-a〜d が文・反復・関数呼び出し・try を明示
+> frame 化し slice fuel/yield を入れた後に残る最後のピース——**式評価（`eval_expr`）を Rust 再帰から
+> 明示 continuation へ移し、式の途中でも slice yield/resume できるようにする**——の slice 定義で
+> ある。§9.3「continuation へ保存するもの」と §4.2 の slice yield が正本であり、以下は本スライスで
+> 実装する範囲・観測挙動・意図的に延期する逸脱の記録である。進捗の唯一の正本は
+> [`slices.toml`](slices.toml) と [ロードマップ](roadmap.md)。
+>
+> **後続スライスとの関係**: 本スライスは F-2（§4.1 課金表の主要 charge point への移行）の前段依存
+> である。F-2 で charge point が statement / expression / operation 単位になると式評価中に slice
+> fuel を使い切りうるが、現状 tree は文/反復境界でしか yield できない（PR-d「yield は文/反復境界
+> だけ（式評価は当面 Rust 再帰のままで、途中では resume 不能）」）。本スライスはこの制約を外す。
+> **本スライスは課金値を変えない**（課金点・課金値の移行は F-2）。現状の fuel 課金のまま「式の途中で
+> yield できる」ようにするだけである。
+
+PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再帰である以上、呼び出しごとの Rust フレーム
+除去には明示式評価スタックが必要で、それは範囲外」として式を Rust 再帰（`eval_expr`）のまま残した。
+本スライスはその明示式評価スタックを導入する。ただし **blast radius を抑えるため、Rust 再帰を式から
+完全排除はしない（ハイブリッド）**。目的は「式の途中で yield/resume できる」ことなので、yield 可能点を
+入れるのに必要な範囲でだけ式の評価状態を明示 continuation に持たせ、それ以外は Rust 再帰を残す。
+
+- **方針＝ハイブリッド（1b）**: `eval_expr` の全式種を一括で明示スタック化する（Rust 再帰を式から
+  完全に排除する）案は、`eval_expr` が全式種を扱う大きな関数であり blast radius が過大なため採らない。
+  本スライスは **yield 可能点を置ける粒度まで**式の評価を明示 frame 上の段階評価へ分解し、各段階の
+  境界で slice 境界を確認して yield/resume する。深い部分式の評価自体は Rust 再帰のまま残してよい。
+  - **維持する防御**: 深度上限 `MAX_USER_CALL_DEPTH = 128`（`src/limits.rs`）と `main.rs` の 8 MiB
+    実行スレッドは**変えない**。式から Rust 再帰を完全排除しないため、呼び出しごとの Rust フレームは
+    残る。これらは停止性・stack overflow 防御として引き続き機能する。
+  - **過大なら分割してよい**: Slice 3 が PR-a〜d に割れたのと同様、実装着手時に 1 PR が過大と判断
+    したら sub-PR へ割ってよい（例: 二項演算の operand 境界だけ先行 → call 引数の部分評価境界を
+    後続）。分割する場合は `slices.toml` を更新し本小節を割る。
+
+- **continuation へ保存する式の評価状態（§9.3 の具体化）**: §9.3 は「AST cursor・value stack・
+  保留中 operand」を heap 上の明示状態として保存することを要求する。本スライスが式について保存する
+  のは次である（PR-b/c が導入した `Frame` / `FrameKind` と同じ continuation heap に載せる）。
+  - **operand stack**: 評価済みだがまだ親式に消費されていない中間値（例: 二項演算 `a + b` で `a` を
+    評価し終え `b` を評価する間の `a` の値）。
+  - **評価中の式 cursor**: 親式のどの operand まで評価したか（二項/単項の左右、index の `obj[idx]` の
+    どちら、call の callee と各引数のどこまで）。
+  - **callee 引数の部分評価結果**: call 式 `f(e0, e1, …)` で、評価済みの引数値と次に評価する引数の
+    index。関数へ入る前（引数評価の途中）で yield できるようにする。
+  - **保留中の二項/単項/index 演算**: operand を揃えた後に適用する演算の種別（左右の値が揃うまで
+    frame に保持し、揃ったら適用）。
+  - これらは §5.1 の `continuation_frame`（96 + local slot 32 × count）heap 課金に載せ、frame の
+    push で課金し pop / unwind / catch 切替で release する（PR-b/c の既存規律をそのまま使う）。
+
+- **yield 可能点（どの式境界で slice 境界を確認するか）**: §4.2「次の論理 charge が slice 残量を
+  超える場合は charge せず `Yielded(SliceFuelExhausted)` を返す」を式にも適用する。本スライスが
+  slice 境界を確認する式境界は次とする。
+  - 二項 / 比較演算の左 operand 評価後・右 operand 評価前。
+  - 単項演算の operand 評価後・演算適用前。
+  - index 式 `obj[idx]` の各 operand 評価境界。
+  - call 式の各引数評価の境界（引数 i を評価後・引数 i+1 を評価前、および全引数評価後・関数本体へ
+    入る前）。関数本体内は既存の文/反復境界 yield（PR-d）が担う。
+  - **これらの境界は現状課金では 0 fuel 境界になりうる**（課金値の付与は F-2）。本スライスでは
+    「境界で slice 残量を確認し、超過なら yield する機構」を置き、F-2 がそこへ課金値を載せる。
+    課金が 0 の間は yield がほぼ起きないが、機構としては resume 可能であることを受入基準で固定する。
+
+- **式中の関数呼び出しと PR-c の Call frame の接続**: 現状 `eval_call`（`src/eval.rs`）は式評価の
+  Rust 再帰の中から PR-c の `drive_call_body`（`FrameKind::Call`）を呼ぶ。本スライスは、call 式の
+  引数評価を明示 operand stack 上で行い、全引数が揃った時点で Call frame を push して本体 driver へ
+  制御を渡す形へ接続する。これにより「引数評価の途中」と「関数本体の文/反復境界」の両方で yield でき、
+  resume 時は operand stack と Call frame の両方が永続 frame stack 上にあるので続きから再開できる。
+  callback（`src/builtin.rs` の `call_fn_value`）も同じ接続にする。
+
+- **変更箇所**（Slice 3 PR-b/c と同じ粒度で列挙）:
+  - `src/eval.rs`: `eval_expr` を、yield 可能点を持つ段階評価（operand stack と式 cursor を `Frame`
+    に載せる）へ分解する。`FrameKind` に式評価用の variant（仮称 `Expr { … }`：評価中の式・operand
+    stack・cursor・保留演算）を追加し、`run_driver` のループで文/反復境界と同じく式境界の slice 確認を
+    行う。`eval_call` / 引数評価を operand stack 経由へ接続する。深い部分式は Rust 再帰を残す。
+  - `src/env.rs`: 式 frame が持つ一時値のスコープ管理が要る場合は PR-b で入れた `scope_depth()` /
+    `truncate_scopes(len)` の規律に合わせる（新 API は増やさない想定）。
+  - continuation heap 課金: 式 frame の push/pop を §5.1 `continuation_frame` 課金へ配線する。
+  - docs: 本小節、roadmap。VM は対象外（下記逸脱）。
+
+- **観測挙動（原則不変・やむを得ない差は明記）**: 既定 slice（同期経路）では観測挙動を不変に保つ
+  （fuel 値・成否・エラー行・trace・stdout・exit code が現状と一致）。原則として式の明示化は
+  evaluation 順・課金順・エラー発生点を変えない。ただし Slice 3 PR-b が「ループ外 break/continue の
+  エラー行」を tree/VM parity のため意図的に変えた前例があるとおり、式の明示化で trace やエラー行に
+  避けられない差が出る場合は、F-1/PR-b と同じく**意図的な差として本小節と実装 PR 本文に明記し、
+  tree/VM parity を壊さない方向でのみ許容する**。既定 slice で緑を保つべき既存テスト群（597 tests
+  green を含む）は無改変で緑を回帰条件とする。期待値が説明できない形で変わる場合は実装を止めて報告する。
+
+- **逸脱（本スライス時点で残るもの、後続スライスへ延期）**:
+  - **式の charge point と課金値**（statement/expression/operation への移行）は **F-2**。本スライスは
+    yield 機構だけを置き、課金は現状のまま。
+  - **VM の式レベル continuation**は Slice 6（VM が experimental の間）。本スライスは tree evaluator
+    だけを対象とする。VM の continuation/charge parity は Slice 6 で扱う。
+  - **Rust 再帰の完全排除・深度上限や 8 MiB スレッドの見直し**（1a）は本スライスの範囲外。深い式の
+    評価は Rust 再帰を残し、既存の防御（128 / 8 MiB）を維持する。必要になれば別スライスで判断する。
+
+- **受入基準（tree-expr-continuation）**:
+  - **TEC-AT-01（式途中 yield/resume が一括実行と一致）**: slice fuel を最小値 **16** にして、
+    上記の全 yield 可能点（二項/単項の operand 境界・index 境界・call 引数境界・関数本体の文/反復境界）
+    を跨ぐ script を実行したとき、複数 slice に分かれて yield/resume した結果が、大きな slice 1 回の
+    一括実行と一致する。一致を検査するのは **stdout・`committed.fuel`・terminal 種別・audit の
+    `Yielded`/`Resumed` 列**。本スライスは課金値を変えないので、yield 回数は現状課金に依存する
+    （課金 0 の境界では yield しないが、resume 機構が壊れていないことを下記 TEC-AT-02 で固定する）。
+  - **TEC-AT-02（resume の忠実性）**: operand stack・式 cursor・callee 引数の部分評価結果が yield を
+    跨いで保存され、resume 後に続きから評価される。深い式・入れ子 call・引数途中での yield を、
+    テスト用に式境界で強制 yield させる注入（`audit_slice_fuel` 相当の最小 slice fuel）で起こし、
+    resume 後の最終値と副作用列が一括実行と一致することを固定する。
+  - **TEC-AT-03（観測不変・既定 slice）**: 既定 slice（同期経路）で、既存の全テスト（`tests/`・
+    unit test、PR-d の 597 tests green を含む）が無改変で緑。fuel 値・エラー行・trace・stdout・
+    exit code が現状と一致する。意図的に変えた差があれば本基準の例外として明記し、tree/VM parity を
+    壊さないことを別途固定する。
+  - **TEC-AT-04（深度・停止性の維持）**: `MAX_USER_CALL_DEPTH = 128` と stack overflow 防御（8 MiB
+    スレッド）が従来どおり機能する。深い再帰・深い式が従来と同じ `call_depth_limit` / 有限停止で
+    止まる（Rust 再帰を式から完全排除しないため、呼び出しごとの Rust フレームは残る前提）。
+  - **TEC-AT-05（transaction / 境界の不変）**: yield は transaction 境界ではない（§10 規則7）。
+    式途中 yield を跨いでも submission journal が保持され、terminal でだけ commit/rollback される
+    （PR-d の transaction 不変条件を式境界 yield でも維持）。
+
+- **テスト配置**: 式途中 yield/resume の一致（TEC-AT-01/02）と transaction 不変（TEC-AT-05）は
+  `tests/engine_api.rs`（PR-d の slice 分割テストと同じ場所。強制 yield は最小 slice fuel 注入）、
+  観測不変（TEC-AT-03）は既存 `tests/` の無改変緑、深度・停止性（TEC-AT-04）は `tests/defensive*.rs`、
+  式 frame の push/pop・operand stack 不変条件は `src/eval.rs` の unit test。
+
 ### Slice 4: cancellation・pause・transaction
 
 - `CancellationToken`、pause/resume、checkpointを実装
