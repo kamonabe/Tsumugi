@@ -106,12 +106,40 @@ depends_on = ["R-1a"]
 order      = 10
 
 [[slice]]
-id         = "F-2"
-title      = "§4.1 の課金表（既定 total_fuel の見直しと language_revision の扱いを含む）"
+id         = "tree-expr-continuation"
+title      = "tree evaluator の式レベル continuation（式の途中で slice yield 可能に、§4.2/§9.3）"
 status     = "todo"
 parent     = "REV-015"
+spec_slice = "exec-control Slice 6"
 depends_on = ["F-1"]
+order      = 15
+
+# 設計は PR #241 で確定済みだが、前段 tree-expr-continuation が done になるまで着手不可。
+# DoR 3（depends_on がすべて done）を満たさないため status は todo のまま置き、
+# 前段が done になった時点で状態整理 PR で todo → ready にする（documentation-guide の運用どおり）。
+[[slice]]
+id         = "F-2"
+title      = "§4.1 課金表の主要 charge point への移行（既定 total_fuel 見直し・fuel 会計 revision bump）"
+status     = "todo"
+parent     = "REV-015"
+spec_slice = "exec-control Slice 6"
+spec       = { doc = "docs/execution-control.md", section = "F-2 実装スライス（§4.1 課金表への移行：主要 charge point・既定 total_fuel 見直し・fuel 会計 revision）" }
+acceptance = ["F2-AT-01..08", "F2-AT-01b"]
+depends_on = ["F-1", "tree-expr-continuation"]
+design_pr  = 241
 order      = 20
+
+# F-2 が入れる FuelSchedule / Charge opcode の基盤の上に bulk 課金点を足すため F-2 依存。
+# map/filter/serialize の per-element 課金もここで扱う（現状 fuel per-element は比較/表示/sort のみ）。
+# 新課金点を足すため fuel_accounting_revision の再 bump と既定 total_fuel の再測定を伴う。
+[[slice]]
+id         = "fuel-bulk-charge"
+title      = "UTF-8 payload（ceil(bytes/64)）・AST node（1/node）・map/filter/serialize の per-element fuel 課金（§4.1、revision 再 bump・既定 total_fuel 再測定を伴う）"
+status     = "todo"
+parent     = "REV-015"
+spec_slice = "exec-control Slice 6"
+depends_on = ["F-2"]
+order      = 25
 
 [[slice]]
 id         = "audit-strict-cbor"

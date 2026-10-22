@@ -213,6 +213,7 @@ per-item超過時の`BudgetExceeded`は`used = 0`、`reserved = 0`、`requested 
 | field | 既定値 |
 |---|---:|
 | `heap_accounting_revision` | 1 |
+| `fuel_accounting_revision` | 1 |
 | `total_fuel` | 1,000,000 fuel |
 | `max_live_heap_bytes` | 64 MiB |
 | `max_string_allocations` | 1,000,000 |
@@ -234,6 +235,8 @@ per-item超過時の`BudgetExceeded`は`used = 0`、`reserved = 0`、`requested 
 | `max_host_call_bytes` | 24 MiB |
 
 `MiB`は1,048,576 byteである。`heap_accounting_revision != 1`は`ConfigError::UnsupportedAccountingRevision`でexecution作成前に拒否する。すべての上限は0を許し、該当操作を最初から禁止できる。deadlineだけは作成時点より後でなければならない。
+
+`fuel_accounting_revision`は§4.1の課金表（charge pointと課金値）の版である。`heap_accounting_revision`が§5.1の論理サイズ表の版であるのと対称で、`BudgetConfig`が`u32`で保持し、`BudgetConfig::standard`は既定を現行版にする。課金表を変える変更（charge pointの追加・課金値の変更）はこの値を1つ上げ、同時に受理する版を新版だけへ更新する（`heap_accounting_revision`と同じく、受理しない版はexecution作成前に`ConfigError`で拒否する）。会計版の不正は、どのfield（heapかfuelか）が不正かを呼び出し側が区別できる形のconfig errorで返す（現行の単一variant `UnsupportedAccountingRevision(u32)`をheap/fuelで区別できる形へ改める。詳細は§14「F-2 実装スライス」の変更箇所）。旧版の課金を再現する互換経路は持たない（alphaにつき後方互換無保証、旧版指定は拒否されるのであって旧課金で動くのではない）。fuelの会計版をこの専用fieldに分離するのは、`language_revision`（§17.8の全順序化などscriptから観測できる言語挙動の版）と会計の版を混ぜないためである。したがってfuel課金の変更で`language_revision`はbumpしない。初期版は`1`（F-1までの課金。F-2が§4.1の表へ移行するとき`2`へ上げる）。
 
 ## 4. Fuel課金
 
@@ -1487,6 +1490,217 @@ F-2 で行う（F-2 は既定 `total_fuel` の見直しと `language_revision` �
   - **テスト配置**: F1-AT-01/02/03/07 は `tests/differential.rs`、F1-AT-04/05/08/09 は
     `tests/integration.rs`（F1-AT-05 は `call_budget_is_checked_before_callee_in_both_engines` を
     「呼び出し 1 回＝ちょうど 1 fuel」へ復元）、F1-AT-06/09（watchdog 側）は `tests/defensive_vm.rs`。
+
+#### F-2 実装スライス（§4.1 課金表への移行：主要 charge point・既定 total_fuel 見直し・fuel 会計 revision）
+
+> 状態: **未実装**（設計のみ）。本小節は §4.1 の課金表（既に規範として定義済み）の主要 charge point
+> へ fuel 課金を揃える縦切り（F-2）の slice 定義である。§4.1〜4.2 の課金表・fuel 意味論が正本で
+> あり、以下は F-2 で実装する範囲・観測挙動の変化・意図的に延期する逸脱の記録である。進捗の唯一の
+> 正本は [`slices.toml`](slices.toml) と [ロードマップ](roadmap.md)。
+>
+> **依存（前段スライス）**: F-2 は、slice の yield を式の途中でも行える tree evaluator の continuation
+> 拡張（実装スライス `tree-expr-continuation`）が **done** であることを前提にする。理由は本小節
+> 「式の途中での slice yield は前段スライスで解決済みとする」を参照。`tree-expr-continuation` は
+> F-2 とは独立に先行できるため、別スライスへ切り出して `depends_on` にした。
+
+F-1 は VM の fuel を tree の**現行の**課金点（ループ back-edge 1・user function 呼び出し 1・builtin
+callback 1）へ揃えて fuel parity を回復し、停止性を instruction watchdog（§17.7）へ分離した。ただし
+F-1 の課金点と課金値は §4.1 の課金表そのものとは一致していない（F-1 小節「F-1 の範囲外」に明記）。
+F-2 は、両 engine の fuel が一致した F-1 の状態を起点に、§4.1 の表のうち**主要 charge point**
+（statement / expression / operation / function / loop / host）の課金点と課金値を §4.1 どおりへ移行する。
+
+§4.1 の主要 charge point は F-1 の課金粒度より細かく、同じ script の消費 fuel が増える。したがって
+F-2 は既定 `total_fuel` の見直しと、課金表の版である `fuel_accounting_revision`（§3.1）の bump を
+含む（観測挙動が変わる）。これらは設計判断を要するため F-1 とは別 slice とする（F-1 小節で予告済み）。
+
+- **課金点を §4.1 の主要 charge point どおりへ張り直す（tree/VM 両方）**: 下記の charge point を
+  両 engine で同一の順序・同一の line で課金する。VM は §4.1 の要求どおり compiler が statement /
+  expression / operation / function / loop の境界へ `Charge` opcode を挿入し、tree evaluator は
+  同じ共有 `FuelSchedule` API を呼ぶ。対応は次のとおり。
+  - **statement へ入る = 1**: 到達した statement の実行開始時。到達しない statement は課金しない。
+  - **expression へ入る = 1**: literal・変数参照・call 式を含む各 expression の評価開始時。
+  - **unary / binary / compare / index / assignment の論理 operation = 1**: operand の expression
+    charge とは別に、その operation 1 個につき 1。
+  - **language-level function invocation = 5**: user function・lambda・core builtin・callback で
+    共通。F-1 の「呼び出し 1 課金」を 5 へ置き換える。line は呼び出し位置（F-1 と同じ）。
+  - **loop iteration 開始 = 2**: condition・iterable・body の charge とは別に、1 反復につき 2。
+    F-1 の back-edge 1 課金を、§4.1 の「iteration 開始 2」へ置き換える（課金のタイミングと値の
+    両方が変わる。line はループ文の line で F-1 と同じ）。
+  - **host call attempt = 10**: 許可・拒否・host error のいずれでも課金。tree の host-call 境界
+    （filesystem builtin）にだけ現れる。VM は host function に対応しないため該当なし（F-1 と同じ）。
+  - **VM `Charge` dispatch = 0 / その他 VM 内部 opcode = 0**: lowering 差を script の fuel 差に
+    しないため、§4.1 どおり課金しない。compiler optimization で charge point を削除・併合しない。
+
+- **既に §4.1 どおりで F-2 が変えない per-element 課金（再掲のみ）**: collection element の
+  per-element fuel 課金（1 / element）が現状あるのは **比較・表示・`sort`** の経路だけである
+  （`src/builtin_core.rs` の sort 走査課金＝`render_display` の per-node fuel 代替、`src/value.rs`
+  の比較走査、`src/budget.rs` の表示課金）。これらは F-1 以前から fuel メーターへ課金しており §4.1
+  と一致するため、F-2 は値も課金点も変えない。**`map` / `filter` / serialize の per-element 課金は
+  §4.1 の規範だが未実装**（現状は callback 呼び出しごとの課金しかない）であり、UTF-8 payload・AST
+  node と同じく後続スライス `fuel-bulk-charge` へ延期する（下記「逸脱」）。bulk work の 256 element
+  / 16 KiB chunk 分割（§4.1）は既存経路でそのまま維持する。
+
+- **変更箇所**（F-1 小節と同じ粒度で列挙）:
+  - `src/budget.rs`: `BudgetConfig` に `fuel_accounting_revision: u32` を追加（既定 `1` → F-2 で
+    `2`）。受理版の検査を `heap_accounting_revision` と同じ入口（`BudgetConfig::validate` ／
+    execution 作成前）へ足す。現行の `ConfigError::UnsupportedAccountingRevision(u32)` は
+    `heap_accounting_revision` 専用で、fuel と共用すると**どちらの版が不正か区別できない**。F-2 は
+    **どの会計 field が不正かを区別できる形**にする（`UnsupportedHeapAccountingRevision(u32)` /
+    `UnsupportedFuelAccountingRevision(u32)` へ分ける、または種別 enum を持たせる）。既存の
+    `UnsupportedAccountingRevision` を参照する箇所（`src/embedding.rs` の doc・`src/budget.rs`
+    `validate`・両者の unit test）を新形へ更新する。課金表の charge point / 課金値を一元提供する
+    共有 API（仮称 `FuelSchedule`：statement=1 / expression=1 / operation=1 / invocation=5 /
+    loop iteration=2 / host call=10 の定数と課金ヘルパ）を新設する。
+  - `src/audit.rs` と [決定性・監査仕様](determinism-and-audit.md): `AuditEvent::ExecutionStarted`
+    は `heap_accounting_revision: u32` と `budget: BudgetConfig` を持つ。`BudgetConfig` に
+    `fuel_accounting_revision` を足すと監査 event の内容が変わるため、`ExecutionStarted` の field
+    定義を更新する。**`heap_accounting_revision` と対称に、`ExecutionStarted` へ独立 field
+    `fuel_accounting_revision: u32` を追加する**（`budget` の中だけで持たせる案は採らない。会計版は
+    監査の第一級の属性で、heap と対称に top-level で引ける方が replay/検証時に扱いやすいため）。
+    R-1a/B-2 と同じく opt-in・tree-only の監査経路のみに影響し、CBOR tag 表・charge table は変えない。
+    determinism-and-audit.md の §7.2 `ExecutionStarted` の記述も `heap_accounting_revision` の隣へ
+    `fuel_accounting_revision` を並べて更新する。
+  - `src/compiler.rs`: statement / expression / operation / function / loop の各境界へ fuel 課金を
+    encode する `Charge` opcode を挿入する。既存の最適化で charge point を削除・併合しない。
+  - `src/opcode.rs` / `src/chunk.rs`: `Charge` opcode（§4.1 の「`Charge` opcode dispatch = 0、payload に
+    論理 charge を encode」）を追加する。
+  - `src/verifier.rs`: `Charge` payload（非負・既知の charge 種別）の検証を追加する。
+  - `src/vm.rs`: F-1 で `OpCode::Loop`（back-edge）・`PrepareCall`・`call_fn_value` に置いた現行の
+    `count_step` を外し、`Charge` opcode の dispatch で `FuelSchedule` を呼ぶ。instruction watchdog
+    （§17.7、停止性）は fuel とは独立なので tick 機構はそのまま残す。
+  - `src/eval.rs`（tree）: 各境界で `FuelSchedule` の課金ヘルパを呼ぶ。F-1 の `count_step` 呼び出し
+    （5 か所）を新 API へ置き換える。式途中の yield は前段スライス `tree-expr-continuation` で
+    入った continuation 機構に乗せる（F-2 は課金点を足すだけで continuation 自体は作らない）。
+  - `unstable-bytecode` feature の公開面: `Charge` opcode を公開列挙へ追加するなど、既存の封印
+    方針（REV-006）に沿って更新する。
+  - docs: 本小節、§3.1（`fuel_accounting_revision` 追記済み）、roadmap。
+
+- **既定 `total_fuel` の見直し（測定して決める）**: 課金が細かくなり、同じ script の消費 fuel が
+  F-1 比で数倍〜十数倍に増える。現在の既定 1,000,000 fuel（§3.1）のままでは、F-1 まで通っていた
+  代表 script の多くが上限に達する。F-2 は既定値を、代表 script 群が F-1 までと同程度に通る水準へ
+  引き上げる。**具体値は実装時にベンチ（`benches/interpreter.rs` の workload と下記「代表 script
+  集合」）で新課金の消費量を測って確定する**。設計では「旧挙動の代表 script が通る最小の切りの良い
+  値を測定で決める」ことと測定対象（下記の固定集合）だけを固定し、本小節に数値を書かない（数値を
+  先に決め打ちすると、実測とずれたとき spec/実装が drift する）。
+  - **代表 script 集合（設計時点で固定・測定対象）**: `examples/*.tsg`（`hello` / `math` /
+    `import_demo`）・`benches/interpreter.rs` の各 workload・F1-AT-04 相当の「2 文ループを既定上限
+    近くまで回す script」と `fib(27)`。この集合が新課金・新既定 `total_fuel` で両 engine とも成功
+    することを確認し、既定値決定の根拠（各 script の新消費 fuel）を実装 PR 本文へ記録する。
+  - **根拠**: §4.2 は `total_fuel` を「terminal までの上限」と定め、具体値は config 事項として
+    §3.1 の既定表に置く設計になっている。F-2 は課金粒度の変更に合わせて既定表の 1 値を更新する
+    変更であり、新しい意味論を導入しない。
+
+- **`fuel_accounting_revision` を 1 → 2 へ bump する（`language_revision` は触らない）**: F-2 は
+  §4.1 の課金値へ移行する会計の変更であり、§3.1 で新設した `fuel_accounting_revision` を `1` から
+  `2` へ上げ、受理版を `2` だけへ更新する。**旧版（`1`）の旧課金を再現する互換経路は持たない**
+  （`fuel_accounting_revision = 1` は `ConfigError::UnsupportedAccountingRevision` で拒否されるので
+  あって、旧課金で動くのではない）。`heap_accounting_revision` が §5.1 の論理サイズ表の版である
+  のと完全に対称で、課金表を変えるたびにこの値だけを上げる。
+  - **`language_revision` を使わない理由**: `language_revision`（REV-017 §17.8）は sort / `list_dir`
+    の全順序化のように **script から観測できる言語挙動**の版であり、その doc は「0.20 以下は従来
+    整列順を温存」と revision ごとの挙動温存を約束している。fuel 課金は言語挙動ではなく**資源会計**
+    であり、§3.1 で既に `heap_accounting_revision` が会計版を言語 revision と分離する前例を確立して
+    いる。fuel 課金の変更を `language_revision` bump に乗せると、(a) revision ごとに挙動を温存する
+    約束と「旧 fuel 課金は温存しない」方針が食い違い、(b) 言語挙動と会計という別種の変更が 1 つの
+    版番号に混ざる。そこで F-2 は `language_revision` を **bump しない**。この方針（fuel は会計
+    revision で管理し言語 revision で分岐しない）は §3.1 の `fuel_accounting_revision` 定義にも
+    明記した。
+  - **根拠**: §3.1 の `heap_accounting_revision` が「会計表の版を専用 field で持ち、受理しない版を
+    execution 作成前に拒否する」型を確立済み。F-2 はその型に fuel 用の版 field を 1 つ対称に足す
+    だけで、新しい revision 機構を導入しない。旧版を温存しない判断は alpha の後方互換無保証
+    （[ロードマップ](roadmap.md)・README の alpha 注記）に基づく。
+
+- **式の途中での slice yield は前段スライスで解決済みとする**: 課金点が expression / operation 単位
+  になると、式の評価の途中で slice fuel を使い切りうる。§4.2 は「次の論理 charge が slice 残量を
+  超える場合は charge せず `Yielded(SliceFuelExhausted)` を返す」と定めるため、式の途中でも yield /
+  resume できる必要がある。現行 tree evaluator は文・反復の粒度でしか continuation を持たず（式は
+  `eval_expr` の Rust 再帰）、§9.3 が求める「保留中 operand を保存し Rust call stack を continuation
+  にしない」を式へ適用できていない。この拡張は F-2 の課金点張り直しとは独立に先行でき、かつ重いので、
+  **前段スライス `tree-expr-continuation` として切り出し、F-2 の `depends_on` に置く**（本小節冒頭の
+  依存注記）。F-2 は `tree-expr-continuation` が done である前提で、新しい charge point を既存の
+  continuation 機構に乗せるだけとし、continuation 自体は設計・実装しない。
+
+- **観測される変化**: 同じ script の `committed.fuel` が §4.1 の主要 charge point どおりに増える。
+  F-1 まで既定上限で通っていた script の一部が、既定 `total_fuel` を引き上げてもなお新課金で上限に
+  達しうる（上限到達 script の集合と、上限到達時の line が変わる）。tree・VM の両方で同じ値・同じ
+  成否・同じ line になる（F-1 の exact parity を維持する）。watchdog（停止性の安全網、§17.7）は
+  fuel とは独立なので F-2 で意味論を変えない。ただし watchdog の上限 `total_fuel × 2 + 16` は既定
+  `total_fuel` に追従するため、既定値を大きく上げると VM が暴走を止めるまでに許す instruction 数も
+  同じ倍率で増える（停止はするが到達までが延びる）。これは資源会計の精度を上げるための許容範囲と
+  する（停止性自体は保たれる）。
+
+- **逸脱（F-2 時点で残るもの、後続スライスへ延期）**:
+  - **UTF-8 payload（`ceil(bytes/64)`）と AST node（1 / node、compile・import link 中）の fuel
+    課金**は F-2 の範囲外とし、後続スライス（`fuel-bulk-charge` 仮称）へ延期する。現状これらは
+    fuel メーターへ課金されておらず（`src/budget.rs` 冒頭の注記「fuel の全 charge point 展開…は
+    Slice 2 の残りサブスライス」）、新規に課金点を足す作業になるため、主要 charge point の移行とは
+    別スライスに分ける。延期中も §4.1 の表はこれらを規範として残す（実装が表に追いつく形）。
+  - **VM の deadline clock 注入・VM audit・VM cooperative 実行**は F-1 と同じく範囲外（既存の後続
+    項目）。
+  - **heap / string / count の課金**（§5）は F-2 の対象外。F-2 は fuel メーターだけを扱う。
+  - **`PollSlice::max_fuel`（slice fuel）の既定値**（§4.2 の公平性の量子）は F-2 で変えない。
+    F-2 が見直すのは `total_fuel`（terminal までの上限）だけ。
+
+- **受入基準（F-2）**:
+  - **F2-AT-01（主要 charge point が §4.1 どおり・tree/VM 一致）**: statement・expression・各論理
+    operation・function invocation（5）・loop iteration（2）を含む代表 script 群で、両 engine の
+    必要 fuel が §4.1 の表から手計算した期待値と一致する。tree は成功時に `committed.fuel` を 0 で
+    snapshot する（入力ごとに reset）ため、usage の直接比較ではなく **F-1 と同じく「成功する最小の
+    fuel 上限 N を二分探索で求めて exact 突合」**する（`tests/differential.rs` の `assert_fuel_parity`
+    を新課金値へ更新）。**host call（10）は VM が host function に対応しないため tree/VM 一致検査に
+    含めない**（下記 F2-AT-01b で tree 単独で検査する）。
+  - **F2-AT-01b（host call = 10・tree 単独）**: filesystem builtin（`read_file` / `read_lines` /
+    `write_file` / `append_file`）の host call 1 回につき 10 fuel 課金される。**builtin を呼ぶ文を
+    1 つだけ増やした** 2 script（例: 同じ `read_file(path)` 文が 1 行 vs 2 行。path 引数は同一リテラル）
+    の必要 fuel N の差を取る。増やした 1 文の内訳は host call 10 + builtin invocation 5 + その文の
+    statement 1 + call 式の expression 1 + 引数リテラルの expression 1 = **18**（path 引数が変数参照
+    1 つの単純形の場合。実際の期待値は選んだ script の式構造から §4.1 の表で手計算し、テストに定数で
+    埋める）。この差のうち host call 由来が 10 であることを、invocation のみの差分（F2-AT-02）と
+    突き合わせて確認する（差 − invocation 5 − statement/expression 分 = 10）。許可（Allow）・
+    拒否（Denied）・host error の **3 経路それぞれ**で host call 10 が課金されることを別々に検査する
+    （§4.1「許可・拒否・host error のいずれでも課金」。Denied は capability 未付与、host error は
+    存在しないパス等で起こす）。tree 単独で、VM は対象外。
+  - **F2-AT-02（function invocation = 5 の差分検査）**: 本体が同一で**呼び出し回数だけが 1 回と 2 回で
+    異なる 2 本の script**について、成功する最小の fuel 上限 N の差がちょうど 5 になる（§4.1 の
+    invocation = 5）。両 engine で一致する。1 回呼ぶ script の絶対 N を上限に使う検査（旧 F2-AT-02 の
+    「上限 5 で成功」）は、statement / 変数参照 / 本体の課金が別途乗り成立しないため採らない。
+  - **F2-AT-03（loop iteration = 2 の差分検査）**: body が同一で**反復回数だけが異なる**2 本の script
+    について、成功する最小の fuel 上限 N の差が「反復回数差 × (2 + 1 反復分の condition / iterable
+    評価の charge + body 1 反復分の charge)」になり、うち iteration 開始分が反復ごとに 2 である
+    （`while` は condition の expression / operation charge、`for` は iterable 要素取り出しの charge が
+    反復ごとに別途乗る）。`while` / `for` / 入れ子 / `continue` / `break` で両 engine の必要 fuel が
+    一致する（F-1 の `continue` 二重課金回避を維持）。
+  - **F2-AT-04（境界）**: F2-AT-01〜03 の各 script で、上限 N = 必要 fuel では両 engine とも成功、
+    N − 1 では両 engine とも上限で失敗し、stdout・stderr（line・trace を含む）・exit code が一致する。
+  - **F2-AT-05（新既定 total_fuel）**: 更新後の既定 `total_fuel` で、上記「代表 script 集合」が
+    両 engine で成功する。既定値の決定根拠（各 script の新消費 fuel）が実装 PR 本文に記録される。
+  - **F2-AT-06（fuel 会計 revision = 2）**: `BudgetConfig::standard` の `fuel_accounting_revision`
+    が `2`。`2` を指定した実行と既定の実行が同じ fuel・同じ成否になる。`fuel_accounting_revision = 1`
+    （旧版）を指定すると execution 作成前に `ConfigError::UnsupportedAccountingRevision` で拒否される
+    （旧課金で動くのではない）。`language_revision` は F-2 前後で変わらない。
+  - **F2-AT-07（watchdog 非干渉）**: 課金粒度を細かくしても、`tests/defensive_vm.rs` の停止性ケース
+    （`Jump(0)` 自己ループ・後方 `Loop` 迂回・raw `Call` 再帰）が従来どおり `limit` で有限停止する。
+    新課金でも watchdog 上限に達する前に fuel 上限へ達する（F1-AT-07 の不変条件を新課金で再確認）。
+  - **F2-AT-08（既存テストの更新）**: VM/tree の fuel 期待値を持つ既存テスト（**F1-AT-04/05 を含む**
+    F1-AT-* の N 値・differential の fuel 比較・integration の境界）を §4.1 の新課金値へ F-2 で
+    再定義し、両 engine で緑。特に F1-AT-04（既定上限での 2 文ループ境界・fib(27)）と F1-AT-05
+    （呼び出し = ちょうど 1 fuel）は新既定 `total_fuel`・invocation = 5 に合わせて数値を更新する。
+    期待値が説明できない形で変わる場合は実装を止めて報告する。
+
+- **テスト配置**: exact fuel 比較（F2-AT-01/02/03）は `tests/differential.rs`、host call tree 単独
+  （F2-AT-01b）と境界・既定上限・revision（F2-AT-04/05/06）は `tests/integration.rs`、watchdog 非干渉
+  （F2-AT-07）は `tests/defensive_vm.rs`、課金点挿入・`Charge` payload・`FuelSchedule` 定数・
+  `ConfigError` の会計 field 区別の単体不変条件は `src/vm.rs` / `src/compiler.rs` / `src/budget.rs`
+  の unit test。（F2-AT-01b は F2-AT-01 の host call 部分を tree 単独へ切り出した補助基準で、
+  `slices.toml` の `acceptance` に明示する。）
+
+- **スライス分割の指針**: F-2 は「主要 charge point の張り直し（実装が重い）」と「既定 `total_fuel`
+  見直し ＋ `fuel_accounting_revision` bump」を 1 PR に載せる前提で設計した。`tree-expr-continuation`
+  （式途中 yield）と `fuel-bulk-charge`（UTF-8・AST node 課金）は既に別スライスへ切り出してあるため、
+  F-2 本体は主要 charge point の移行に絞られている。それでも実装着手時に 1 PR が過大と判断した場合は
+  更に分割してよいが、`fuel_accounting_revision` の bump と既定 `total_fuel` の更新は**同一 PR で
+  行う**（会計版と既定値を別 PR に割ると、中間状態で「新課金なのに旧既定上限」で代表 script が落ちる
+  不整合が main に出るため）。分割する場合は `slices.toml` を更新し、本小節を割る。
 
 ## 15. 境界受入テスト
 
