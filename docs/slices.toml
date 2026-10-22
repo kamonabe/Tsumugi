@@ -117,6 +117,19 @@ depends_on = ["F-1"]
 design_pr  = 242
 order      = 15
 
+# tree-expr-continuation が呼び出し・反復を必ず yield 可能点にした後、callback なし bulk builtin
+# （sort/join/文字列繰り返し/大 collection コピー等）を chunk（256 element/16 KiB）単位で中断・再開
+# できるようにする。tree-expr-continuation 時点では bulk 1 回分を §4.2 の超過例外で有界な超過として
+# 扱うだけ（chunk 前確認は deadline/cancel のみ）。本スライスで chunk 境界 slice yield を入れる。
+[[slice]]
+id         = "fuel-bulk-chunk-yield"
+title      = "callback なし bulk builtin の chunk 境界 slice yield（§4.1 chunk・§4.2）"
+status     = "todo"
+parent     = "REV-015"
+spec_slice = "exec-control Slice 3"
+depends_on = ["tree-expr-continuation"]
+order      = 17
+
 # 設計は PR #241 で確定済みだが、前段 tree-expr-continuation が done になるまで着手不可。
 # DoR 3（depends_on がすべて done）を満たさないため status は todo のまま置き、
 # 前段が done になった時点で状態整理 PR で todo → ready にする（documentation-guide の運用どおり）。

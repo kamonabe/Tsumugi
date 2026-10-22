@@ -278,14 +278,24 @@ slice 残量を使い切った場合は、区間の途中では yield せず、*
 `Yielded(SliceFuelExhausted)` を返す**（それまでは slice を超過して実行してよい）。これは
 「charge せずに yield する」原則の、呼び出しも反復も含まない有界区間に限った例外である。
 
-- **超過量の上限**: この区間 1 つで超過しうる fuel は、その区間が含む AST node 数（式の大きさ。
-  §5.3 の `MAX_AST_DEPTH` と source/collection 上限で有界）と、区間内の bulk work の chunk
-  （256 element / 16 KiB ごとに chunk 前で slice/deadline/cancel を確認、前述）で上限が決まる。
+- **超過量の上限**: この区間 1 つで超過しうる fuel は、次の 2 つの和で上限が決まる。
+  1. **区間が含む AST node 数**（呼び出しも反復も含まない部分式の大きさ。`MAX_AST_DEPTH` と
+     source/collection 上限で有界）。
+  2. **区間内の callback を持たない bulk builtin 1 回分**（`sort` / `join` / 文字列の繰り返し /
+     大きな collection のコピー等）。これは 1 回の呼び出しで最大
+     `max_collection_elements`（既定 1,000,000）要素・`max_single_string_bytes` 等の **collection /
+     string の上限で有界**である。既定 slice（例 10,000）の数十〜数百倍になりうるが、config の
+     collection / string 上限が最悪値を抑える。
   呼び出し・反復はこの区間に入らないため、再帰やループで超過量が無制限に積み上がることはない。
+- **bulk builtin の chunk 境界での yield は本スライスの範囲外**: §4.1 は bulk work を 256 element /
+  16 KiB の chunk に分けると定めるが、**本スライス（Slice 3 PR-e）の時点では chunk 前で確認するのは
+  deadline / cancel だけ**であり、chunk 境界で slice yield はしない。bulk builtin を chunk 単位で
+  中断・再開する slice yield は後続スライス（`fuel-bulk-chunk-yield`、[`slices.toml`](slices.toml) に
+  `todo` で登録）へ延期する。それまでは bulk builtin 1 回分を上記 2 の有界な超過として扱う。
 - **根拠（manifesto 原則 1・4）**: slice yield の目的は「ホストへ制御が戻るまでの最悪時間を有界に
-  保つ」ことである。呼び出し・反復を必ず yield 可能点にすれば、最悪時間は「1 区間の有界な超過 +
-  slice」で抑えられる。区間の内部まで細かく中断できることは要件ではないため、Rust 再帰を一部残す
-  ハイブリッド実装（§14 Slice 3 PR-e の 1b）を許す。
+  保つ」ことである。呼び出し・反復を必ず yield 可能点にすれば、最悪時間は「1 区間の有界な超過
+  （AST 分 + bulk builtin 1 回分）+ slice」で抑えられる。区間の内部まで細かく中断できることは要件
+  ではないため、Rust 再帰を一部残すハイブリッド実装（§14 Slice 3 PR-e の 1b）を許す。
 
 ## 5. Heap accounting
 
@@ -1355,9 +1365,9 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
   - **関数本体・callback 本体の文/反復境界を必ず yield 可能にする**。現状 `drive_call_body` /
     `call_fn_value` は `can_yield = false` なので、本スライスで yield 可能化する（下記「can_yield の
     伝播」）。再帰やループが何段あっても、各段の文/反復境界で yield できる。
-  - **callback を呼ぶ builtin（`map` / `filter` / `sort` / `each` 等）も、callback 本体の途中で
-    中断・再開できる**ようにする。特に `sort` は現状 Rust の `sort_by` の comparator の中で callback を
-    呼ぶため comparator 内では中断できない（下記「callback builtin の段階実行化」）。
+  - **callback を呼ぶ builtin（`map` / `filter` / `each` の 3 つ）も、callback 本体の途中で
+    中断・再開できる**ようにする（これらは要素ごとにユーザー関数を呼ぶ。`sort` は callback を取らない
+    bulk work なので対象外＝下記「逸脱」と §4.2）。
   - **yield できなくてよいのは「呼び出しも反復も含まない区間」だけ**。その区間は §4.2 の例外（slice を
     超過して実行し、区間を抜けた最初の yield 可能点で yield。超過量は AST サイズ + bulk chunk で有界）に
     従う。この区間に限り Rust 再帰を残すハイブリッド（下記 1b）を許す。
@@ -1373,9 +1383,10 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
   - **維持する防御**: 深度上限 `MAX_USER_CALL_DEPTH = 128`（`src/limits.rs`）と `main.rs` の 8 MiB
     実行スレッドは**変えない**。呼び出しごとの Rust フレームは残り、停止性・stack overflow 防御として
     引き続き機能する。
-  - **過大なら分割してよい**: Slice 3 が PR-a〜d に割れたのと同様、sub-PR へ割ってよい。特に **`sort`
-    等の callback builtin の段階実行化は sub-PR に分けてよいが、本スライスの完了条件に含める**（yield 要件
-    の一部であり、別スライスへ外さない）。分割する場合は `slices.toml` を更新し本小節を割る。
+  - **過大なら分割してよい**: Slice 3 が PR-a〜d に割れたのと同様、sub-PR へ割ってよい。特に
+    **`map` / `filter` / `each` の callback 段階実行化は sub-PR に分けてよいが、本スライスの完了条件に
+    含める**（yield 要件の一部であり、別スライスへ外さない）。分割する場合は `slices.toml` を更新し
+    本小節を割る。
 
 - **continuation へ保存する式の評価状態（§9.3 の具体化）**: §9.3 は「AST cursor・value stack・
   保留中 operand」を heap 上の明示状態として保存することを要求する。本スライスが式について保存する
@@ -1386,8 +1397,8 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
     どちら、call の callee と各引数のどこまで）。
   - **callee 引数の部分評価結果**: call 式 `f(e0, e1, …)` で、評価済みの引数値と次に評価する引数の
     index。関数へ入る前（引数評価の途中）で yield できるようにする。
-  - **callback builtin の反復状態**: `map` / `filter` / `sort` 等で、処理済み要素・次の要素 index・
-    部分結果（`sort` は比較の進行状態）。段階実行化（下記）でこれを frame に載せる。
+  - **callback builtin の反復状態**: `map` / `filter` / `each`（callback を取る 3 builtin）で、
+    処理済み要素・次の要素 index・部分結果。段階実行化（下記）でこれを frame に載せる。
   - **保留中の二項/単項/index 演算**: operand を揃えた後に適用する演算の種別（左右の値が揃うまで
     frame に保持し、揃ったら適用）。
 
@@ -1424,12 +1435,17 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
   再入した活性の途中状態を Call frame 経由で復元する）。cooperative host-call の `may_yield`
   （`can_yield_ctx`）はこの新しい可否に追従する。
 
-- **callback builtin の段階実行化（sort を含む）**: `map` / `filter` / `each` は要素ループを明示
-  frame の反復に載せ、1 要素ごとに yield 可能点を置く。`sort` は Rust の `sort_by`（comparator 内で
-  中断不可）をやめ、**中断可能な明示マージソート等の段階実行**へ書き換える（比較の進行状態・部分
-  マージ済み列を frame に保持し、各比較ステップで yield 可能）。既存の `sort` の決定性（§17.8 の
-  `TotalOrder`・安定性）と課金（per-element 1 / element、§4.1）は保つ。この段階実行化は sub-PR に
-  割ってよいが本スライスの完了条件に含む（上記）。
+- **callback builtin の段階実行化（`map` / `filter` / `each`）**: callback を取る 3 builtin は
+  要素ループを明示 frame の反復に載せ、1 要素ごと（callback 呼び出しの前後）に yield 可能点を置く。
+  callback 本体は呼び出しなので、本体の文/反復境界でも yield できる（上記 can_yield 伝播）。
+  per-element 課金・エラー伝播・結果の順序は現状維持。この段階実行化は sub-PR に割ってよいが本スライスの
+  完了条件に含む（上記）。
+  - **`sort` は対象外**: `sort` は callback（ユーザー関数）を取らない bulk work で、`sort_by` の
+    comparator は値比較と per-element 課金（`compare_budgeted`）だけを行う。これを中断可能ソートへ
+    書き換えると比較回数・比較順・同期経路の fuel（比較ごとの per-element 課金）が変わり TEC-AT-03
+    （fuel 値不変）を破るため、**書き換えない**。`sort` を含む callback なし bulk builtin は §4.2 の
+    超過例外（1 回分を collection / string 上限で有界な超過として扱う）に従い、chunk 境界 yield は
+    後続スライス `fuel-bulk-chunk-yield` へ延期する。
 
 - **変更箇所**（Slice 3 PR-b/c と同じ粒度で列挙）:
   - `src/eval.rs`: `eval_expr` のうち呼び出し・反復を含む部分を、yield 可能点を持つ段階評価
@@ -1438,8 +1454,9 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
     callback 本体を `can_yield = true` で回せるようにし（Call frame に yield 可否を持たせ、resume を
     トップレベル driver から駆動）、`run_driver` のループで新境界の slice 確認を行う。呼び出しも反復も
     含まない部分式は Rust 再帰を残す。
-  - `src/builtin.rs` / `src/builtin_core.rs`: `map` / `filter` / `each` / `sort` の callback 呼び出しを
-    段階実行へ書き換える（`sort` は中断可能ソートへ）。per-element 課金・決定性・エラー伝播は現状維持。
+  - `src/builtin.rs` / `src/builtin_core.rs`: `map` / `filter` / `each` の callback 呼び出しを
+    段階実行へ書き換える（要素ループを明示反復に載せ要素境界で yield 可能に）。per-element 課金・
+    エラー伝播・結果順序は現状維持。`sort` は書き換えない（上記）。
   - `src/env.rs`: 式 frame の一時値スコープ管理が要る場合は PR-b の `scope_depth()` /
     `truncate_scopes(len)` 規律に合わせる（新 API は増やさない想定）。
   - continuation heap 課金: 式 frame の push/pop を §5.1 `continuation_frame`（96 byte 固定、上記）へ
@@ -1462,6 +1479,11 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
     だけを対象とする。VM の continuation/charge parity は Slice 6 で扱う。
   - **Rust 再帰の完全排除・深度上限や 8 MiB スレッドの見直し**（1a）は本スライスの範囲外。呼び出しも
     反復も含まない部分式は Rust 再帰を残し、既存の防御（128 / 8 MiB）を維持する。
+  - **callback なし bulk builtin（`sort` / `join` / 文字列繰り返し / 大 collection コピー等）の
+    chunk 境界 slice yield** は本スライスの範囲外。§4.2 の超過例外で 1 回分を有界な超過として扱い、
+    chunk（256 element / 16 KiB）単位での中断・再開は後続スライス `fuel-bulk-chunk-yield`
+    （[`slices.toml`](slices.toml) に `todo` 登録）へ延期する。本スライス時点では bulk の chunk 前
+    確認は deadline / cancel のみ（slice yield はしない）。
   - **cancel / deadline / pause の新境界 checkpoint**: Slice 4 の cancel/deadline checkpoint は現状
     文/反復境界にある。本スライスで増えた callback 本体の文/反復境界には同じ checkpoint が自然に乗る
     （同じ driver ループ境界のため）。式の operand 境界にまで cancel/deadline checkpoint を広げるかは
@@ -1469,12 +1491,14 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
     満たされるため、最悪時間の有界性には影響しない）。
 
 - **受入基準（tree-expr-continuation）**:
-  - **TEC-AT-01（yield 可能点を跨ぐ実行が一括実行と一致）**: 下記の強制 yield フックを有効にして、
-    全 yield 可能点（関数本体・callback 本体の文/反復境界・call 引数境界・呼び出し/反復を含む operand
-    境界）を跨ぐ script を実行したとき、複数 slice に分かれて yield/resume した結果が、yield なしの
-    一括実行と一致する。一致を検査するのは **stdout・`committed.fuel`・terminal 種別、および非
-    `Yielded`/`Resumed` の audit event 列**（`Yielded`/`Resumed` は一括実行には現れないため列全体の
-    一致は求めない。下記 TEC-AT-06 で別途検査する）。
+  - **TEC-AT-01（yield 可能点を跨ぐ実行が同期経路 `run` と一致）**: 下記の強制 yield フックを有効に
+    して、全 yield 可能点（関数本体・callback 本体の文/反復境界・call 引数境界・呼び出し/反復を含む
+    operand 境界）を跨ぐ script を実行したとき、複数 slice に分かれて yield/resume した結果が、
+    **同期経路 `Engine::run`（式 frame を積まない Rust 再帰経路）の結果と一致する**。一致を検査するのは
+    **stdout・`committed.fuel`・terminal 種別、および非 `Yielded`/`Resumed` の audit event 列**
+    （`Yielded`/`Resumed` は同期経路には現れないため列全体の一致は求めない。対・順序は TEC-AT-06 で
+    別途検査する）。`map` / `filter` / `each` の段階実行版についても、同期経路 `run` と同じ結果・同じ
+    副作用順序・同じ `committed.fuel` になることを含める（manifesto 原則 5：2 経路が同じ結果を出す）。
   - **TEC-AT-02（resume の忠実性）**: operand stack・式 cursor・callee 引数の部分評価結果・callback
     反復状態が yield を跨いで保存され、resume 後に続きから評価される。深い式・入れ子 call・引数途中・
     callback 途中での yield を強制 yield フックで起こし、resume 後の最終値と副作用列が一括実行と一致
@@ -1490,14 +1514,20 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
     commit/rollback される（PR-d の transaction 不変条件を新境界 yield でも維持）。
   - **TEC-AT-06（超過量の上限）**: 関数本体のループや callback 本体のループを持つ script を最小 slice
     （`PollSlice::max_fuel = 16`）で実行したとき、1 回の poll で実際に実行される fuel が
-    **slice + 規定の超過上限（§4.2：呼び出しも反復も含まない 1 区間の AST サイズ + bulk chunk 分）
-    以内**に収まる。再帰・ループが何段あっても 1 poll の実行量がこの上限を超えない（呼び出し・反復が
-    必ず yield 可能点だから）。audit の `Yielded`/`Resumed` が対になり順序が単調であることも併せて
-    検査する。
-  - **TEC-AT-07（callback 中断の resume 一致）**: `map` / `filter` / `sort` の callback の途中で
-    yield/resume しても、一括実行と結果・副作用順序が一致する。特に `sort` は中断可能ソートへの
-    書き換え後も §17.8 の `TotalOrder`・安定性・per-element 課金を保ち、yield を挟んでも同じ整列結果に
-    なることを固定する。
+    **slice + 規定の超過上限以内**に収まる。超過上限はテストで計算できる形で次と定める（§4.2）。
+    - **現行課金（`fuel_accounting_revision = 1`、F-1）下では式に fuel がかからない**ため、呼び出しも
+      反復も含まない区間の AST 分の超過は **0**。したがって本スライス時点のテストは実質「超過 ≒
+      bulk builtin 1 回分」を見る（式起因の超過が乗るのは F-2 で式を課金してから＝そのとき上限に
+      「1 区間の node 数」が加わる）。
+    - **callback なし bulk builtin 1 回分**の超過は `max_collection_elements`（既定 1,000,000）・
+      `max_single_string_bytes` 等の collection / string 上限で有界。テストでは小さい collection 上限を
+      注入し、bulk builtin（例 `sort`）1 回の超過がその上限以内であることを exact に確認する。
+    - 再帰・ループが何段あっても 1 poll の実行量がこの上限を超えない（呼び出し・反復が必ず yield
+      可能点だから）。audit の `Yielded`/`Resumed` が対になり順序が単調であることも併せて検査する。
+  - **TEC-AT-07（callback 中断の resume 一致）**: `map` / `filter` / `each`（callback を取る 3
+    builtin）の callback の途中で yield/resume しても、同期経路 `run` と結果・副作用順序・
+    `committed.fuel` が一致する。要素途中・callback 本体途中の両方で強制 yield を起こして固定する。
+    （`sort` は callback を取らないため本基準の対象外。§4.2 の超過例外で扱う。）
 
 - **テスト専用の強制 yield フック**: 現状課金では新 yield 可能点の多くが 0 fuel になり、最小 slice
   fuel でも yield しない。そこで **`unstable-bytecode`（または `cfg(test)`）限定で「全 yield 可能点で
