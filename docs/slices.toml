@@ -124,7 +124,7 @@ status     = "todo"
 parent     = "REV-015"
 spec_slice = "exec-control Slice 6"
 spec       = { doc = "docs/execution-control.md", section = "F-2 実装スライス（§4.1 課金表への移行：主要 charge point・既定 total_fuel 見直し・fuel 会計 revision）" }
-acceptance = ["F2-AT-01..08"]
+acceptance = ["F2-AT-01..08", "F2-AT-01b"]
 depends_on = ["F-1", "tree-expr-continuation"]
 design_pr  = 241
 order      = 20

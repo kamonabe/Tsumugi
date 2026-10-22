@@ -1554,10 +1554,12 @@ F-2 は既定 `total_fuel` の見直しと、課金表の版である `fuel_acco
   - `src/audit.rs` と [決定性・監査仕様](determinism-and-audit.md): `AuditEvent::ExecutionStarted`
     は `heap_accounting_revision: u32` と `budget: BudgetConfig` を持つ。`BudgetConfig` に
     `fuel_accounting_revision` を足すと監査 event の内容が変わるため、`ExecutionStarted` の field
-    定義を更新する。`heap_accounting_revision` と並べて独立 field（`fuel_accounting_revision`）に
-    するか、`budget` の中だけで持つかを決める（R-1a/B-2 と同じく opt-in・tree-only の監査経路のみに
-    影響。CBOR tag 表・charge table は変えない）。determinism-and-audit.md の §7.2 `ExecutionStarted`
-    の記述も合わせて更新する。
+    定義を更新する。**`heap_accounting_revision` と対称に、`ExecutionStarted` へ独立 field
+    `fuel_accounting_revision: u32` を追加する**（`budget` の中だけで持たせる案は採らない。会計版は
+    監査の第一級の属性で、heap と対称に top-level で引ける方が replay/検証時に扱いやすいため）。
+    R-1a/B-2 と同じく opt-in・tree-only の監査経路のみに影響し、CBOR tag 表・charge table は変えない。
+    determinism-and-audit.md の §7.2 `ExecutionStarted` の記述も `heap_accounting_revision` の隣へ
+    `fuel_accounting_revision` を並べて更新する。
   - `src/compiler.rs`: statement / expression / operation / function / loop の各境界へ fuel 課金を
     encode する `Charge` opcode を挿入する。既存の最適化で charge point を削除・併合しない。
   - `src/opcode.rs` / `src/chunk.rs`: `Charge` opcode（§4.1 の「`Charge` opcode dispatch = 0、payload に
@@ -1648,9 +1650,16 @@ F-2 は既定 `total_fuel` の見直しと、課金表の版である `fuel_acco
     を新課金値へ更新）。**host call（10）は VM が host function に対応しないため tree/VM 一致検査に
     含めない**（下記 F2-AT-01b で tree 単独で検査する）。
   - **F2-AT-01b（host call = 10・tree 単独）**: filesystem builtin（`read_file` / `read_lines` /
-    `write_file` / `append_file`）の host call 1 回につき 10 fuel 課金される。許可・拒否・host error
-    のいずれでも課金することを、呼び出し回数を変えた 2 script の必要 fuel N の差（= 回数差 × 10 +
-    builtin 呼び出し自体の invocation 5 ほか）で tree 単独で検査する。VM は対象外。
+    `write_file` / `append_file`）の host call 1 回につき 10 fuel 課金される。**builtin を呼ぶ文を
+    1 つだけ増やした** 2 script（例: 同じ `read_file(path)` 文が 1 行 vs 2 行。path 引数は同一リテラル）
+    の必要 fuel N の差を取る。増やした 1 文の内訳は host call 10 + builtin invocation 5 + その文の
+    statement 1 + call 式の expression 1 + 引数リテラルの expression 1 = **18**（path 引数が変数参照
+    1 つの単純形の場合。実際の期待値は選んだ script の式構造から §4.1 の表で手計算し、テストに定数で
+    埋める）。この差のうち host call 由来が 10 であることを、invocation のみの差分（F2-AT-02）と
+    突き合わせて確認する（差 − invocation 5 − statement/expression 分 = 10）。許可（Allow）・
+    拒否（Denied）・host error の **3 経路それぞれ**で host call 10 が課金されることを別々に検査する
+    （§4.1「許可・拒否・host error のいずれでも課金」。Denied は capability 未付与、host error は
+    存在しないパス等で起こす）。tree 単独で、VM は対象外。
   - **F2-AT-02（function invocation = 5 の差分検査）**: 本体が同一で**呼び出し回数だけが 1 回と 2 回で
     異なる 2 本の script**について、成功する最小の fuel 上限 N の差がちょうど 5 になる（§4.1 の
     invocation = 5）。両 engine で一致する。1 回呼ぶ script の絶対 N を上限に使う検査（旧 F2-AT-02 の
@@ -1683,7 +1692,7 @@ F-2 は既定 `total_fuel` の見直しと、課金表の版である `fuel_acco
   （F2-AT-07）は `tests/defensive_vm.rs`、課金点挿入・`Charge` payload・`FuelSchedule` 定数・
   `ConfigError` の会計 field 区別の単体不変条件は `src/vm.rs` / `src/compiler.rs` / `src/budget.rs`
   の unit test。（F2-AT-01b は F2-AT-01 の host call 部分を tree 単独へ切り出した補助基準で、
-  `acceptance` の `F2-AT-01..08` 範囲に含む。）
+  `slices.toml` の `acceptance` に明示する。）
 
 - **スライス分割の指針**: F-2 は「主要 charge point の張り直し（実装が重い）」と「既定 `total_fuel`
   見直し ＋ `fuel_accounting_revision` bump」を 1 PR に載せる前提で設計した。`tree-expr-continuation`
