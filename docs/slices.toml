@@ -106,16 +106,34 @@ depends_on = ["R-1a"]
 order      = 10
 
 [[slice]]
-id         = "F-2"
-title      = "§4.1 の課金表（既定 total_fuel の見直しと language_revision の扱いを含む）"
-status     = "ready"
+id         = "tree-expr-continuation"
+title      = "tree evaluator の式レベル continuation（式の途中で slice yield 可能に、§4.2/§9.3）"
+status     = "todo"
 parent     = "REV-015"
 spec_slice = "exec-control Slice 6"
-spec       = { doc = "docs/execution-control.md", section = "F-2 実装スライス（§4.1 課金表への移行：既定 total_fuel 見直し・language_revision 戦略）" }
-acceptance = ["F2-AT-01..08"]
 depends_on = ["F-1"]
-design_pr  = 241
-order      = 20
+order      = 15
+
+[[slice]]
+id             = "F-2"
+title          = "§4.1 課金表の主要 charge point への移行（既定 total_fuel 見直し・fuel 会計 revision bump）"
+status         = "blocked"
+parent         = "REV-015"
+spec_slice     = "exec-control Slice 6"
+spec           = { doc = "docs/execution-control.md", section = "F-2 実装スライス（§4.1 課金表への移行：主要 charge point・既定 total_fuel 見直し・fuel 会計 revision）" }
+acceptance     = ["F2-AT-01..08"]
+depends_on     = ["F-1", "tree-expr-continuation"]
+design_pr      = 241
+blocked_reason = "前段スライス tree-expr-continuation（式レベル continuation）が未設計・未実装。これが done になるまで F-2 は着手不可。設計（spec・受入基準）は PR #241 で確定済み"
+
+[[slice]]
+id         = "fuel-bulk-charge"
+title      = "UTF-8 payload（ceil(bytes/64)）と AST node（1/node）の fuel 課金（§4.1）"
+status     = "todo"
+parent     = "REV-015"
+spec_slice = "exec-control Slice 6"
+depends_on = ["F-2"]
+order      = 25
 
 [[slice]]
 id         = "audit-strict-cbor"
