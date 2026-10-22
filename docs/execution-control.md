@@ -282,10 +282,12 @@ slice 残量を使い切った場合は、区間の途中では yield せず、*
   1. **区間が含む AST node 数**（呼び出しも反復も含まない部分式の大きさ。`MAX_AST_DEPTH` と
      source/collection 上限で有界）。
   2. **区間内の callback を持たない bulk builtin 1 回分**（`sort` / `join` / 文字列の繰り返し /
-     大きな collection のコピー等）。これは 1 回の呼び出しで最大
-     `max_collection_elements`（既定 1,000,000）要素・`max_single_string_bytes` 等の **collection /
-     string の上限で有界**である。既定 slice（例 10,000）の数十〜数百倍になりうるが、config の
-     collection / string 上限が最悪値を抑える。
+     大きな collection のコピー等）の fuel。入力サイズが `max_collection_elements`（既定 1,000,000）・
+     `max_single_string_bytes` 等の **collection / string 上限で有界**なので、1 回分の fuel も有限値に
+     なる。ただし **fuel 量そのものは入力要素数 n を超えうる**（`sort` は要素数ぶんの走査課金 n に
+     加えて比較ごとの per-element 課金で O(n log n)、`join` 等の表示系も per-node 課金）。既定 slice
+     （例 10,000）の数十〜数百倍になりうるが、config の collection / string 上限が入力サイズを抑える
+     ことで最悪の fuel 量が有限に決まる。
   呼び出し・反復はこの区間に入らないため、再帰やループで超過量が無制限に積み上がることはない。
 - **bulk builtin の chunk 境界での yield は本スライスの範囲外**: §4.1 は bulk work を 256 element /
   16 KiB の chunk に分けると定めるが、**本スライス（Slice 3 PR-e）の時点では chunk 前で確認するのは
@@ -1369,8 +1371,8 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
     中断・再開できる**ようにする（これらは要素ごとにユーザー関数を呼ぶ。`sort` は callback を取らない
     bulk work なので対象外＝下記「逸脱」と §4.2）。
   - **yield できなくてよいのは「呼び出しも反復も含まない区間」だけ**。その区間は §4.2 の例外（slice を
-    超過して実行し、区間を抜けた最初の yield 可能点で yield。超過量は AST サイズ + bulk chunk で有界）に
-    従う。この区間に限り Rust 再帰を残すハイブリッド（下記 1b）を許す。
+    超過して実行し、区間を抜けた最初の yield 可能点で yield。超過量は区間の AST 分 + callback なし
+    bulk builtin 1 回分で有界）に従う。この区間に限り Rust 再帰を残すハイブリッド（下記 1b）を許す。
 
 - **方針＝ハイブリッド（1b）＋明示側に置く境界規則**: `eval_expr` の全式種を一括で明示スタック化する
   （Rust 再帰を式から完全排除する）案（1a）は blast radius が過大なため採らない。代わりに **yield 要件を
@@ -1501,8 +1503,8 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
     副作用順序・同じ `committed.fuel` になることを含める（manifesto 原則 5：2 経路が同じ結果を出す）。
   - **TEC-AT-02（resume の忠実性）**: operand stack・式 cursor・callee 引数の部分評価結果・callback
     反復状態が yield を跨いで保存され、resume 後に続きから評価される。深い式・入れ子 call・引数途中・
-    callback 途中での yield を強制 yield フックで起こし、resume 後の最終値と副作用列が一括実行と一致
-    することを固定する。
+    callback 途中での yield を強制 yield フックで起こし、resume 後の最終値と副作用列が **同期経路
+    `Engine::run` と一致**することを固定する。
   - **TEC-AT-03（観測不変・既定 slice）**: 既定 slice（同期経路）で、既存の全テスト（`tests/`・
     unit test、PR-d の 597 tests green を含む）が無改変で緑。fuel 値・エラー行・trace・stdout・
     exit code・`live_heap`/`peak_heap` が現状と一致する（同期経路は式 frame を積まないため heap 不変）。
@@ -1519,9 +1521,14 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
       反復も含まない区間の AST 分の超過は **0**。したがって本スライス時点のテストは実質「超過 ≒
       bulk builtin 1 回分」を見る（式起因の超過が乗るのは F-2 で式を課金してから＝そのとき上限に
       「1 区間の node 数」が加わる）。
-    - **callback なし bulk builtin 1 回分**の超過は `max_collection_elements`（既定 1,000,000）・
-      `max_single_string_bytes` 等の collection / string 上限で有界。テストでは小さい collection 上限を
-      注入し、bulk builtin（例 `sort`）1 回の超過がその上限以内であることを exact に確認する。
+    - **callback なし bulk builtin 1 回分**の超過は、その builtin を**同じ入力で単独実行したときの
+      fuel**（テストで事前に測る実測値）を上限とする。`sort` は要素数ぶんの走査課金（n）に加えて
+      比較ごとの `compare_budgeted` per-element 課金（比較回数 O(n log n)）が乗るため、1 回分の fuel は
+      n を超えうる（「collection 上限以内」ではない）。`join` など表示系も per-node 課金で同様。入力
+      サイズ自体は `max_collection_elements`・`max_single_string_bytes` 等の config 上限で有界なので、
+      1 回分の fuel はそれらから決まる有限値になる。テストは「bulk builtin を単独実行した fuel」を測り、
+      その bulk を含む区間を最小 slice で回したときの 1 poll 実行量が「slice + 測った単独 fuel + 区間の
+      AST 分」以内であることを exact に確認する。
     - 再帰・ループが何段あっても 1 poll の実行量がこの上限を超えない（呼び出し・反復が必ず yield
       可能点だから）。audit の `Yielded`/`Resumed` が対になり順序が単調であることも併せて検査する。
   - **TEC-AT-07（callback 中断の resume 一致）**: `map` / `filter` / `each`（callback を取る 3
