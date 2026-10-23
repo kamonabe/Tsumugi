@@ -122,6 +122,7 @@ spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuat
 acceptance = ["TEC-AT-01", "TEC-AT-03..06"]
 depends_on = ["F-1"]
 design_pr  = 250
+impl_pr    = 254
 issues     = [248]
 order      = 11
 
