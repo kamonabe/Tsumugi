@@ -1257,8 +1257,8 @@ pub(crate) fn host_call_triple_with_bodies(
 
     // §9.1 redaction tree（既定 policy）を適用して payload を組む。畳み規則はすべて
     // `fold_audit_field` へ集約する（Secret は常に Omit、Path は HMAC mode だけ digest ほか、
-    // R-1 スライス）。Body は `fold_body_field` が allow-list Reveal を判定する（R-1b）。
-    // Body は §9.1 の allow-list Reveal 条件を `fold_body_field` が判定する（R-1b）。key は
+    // R-1 スライス）。Body は §9.1 の allow-list Reveal 条件を `fold_body_field` が判定する
+    // （R-1b）。key は
     // operation=host function 名・direction・field（payload の key 名、arguments は index 文字列）。
     let body_field = |direction: AuditDirection,
                       field: &str,

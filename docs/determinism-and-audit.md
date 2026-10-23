@@ -27,7 +27,7 @@
 | audit drain queue byte 上限の判定がトップレベル境界だけの soft limit。関数・callback 本体の中では効かず、queue は上限を超えて溜まり得る（超過量は host-call 回数 budget で有界） | §10.2 | B-2 |
 | host-call triple を emission するのは fs builtin のうち I/O byte 課金対象の 4 つ（`read_file` / `read_lines` / `write_file` / `append_file`、`src/builtin_core.rs::is_host_call_builtin`）だけ。`rename` / `mkdir` / `remove` 系 / `list_dir` / `file_size` / `is_file` / `is_dir` / `path_exists` など capability 判定を通る他の fs builtin は監査対象外（「fs builtin 監査範囲」スライスへ延期） | §7.2/§8 | R-1a |
 | **（セキュリティ）** 既定 `hmac_key` が crate 内の固定値（`src/audit.rs` の `DEFAULT_HMAC_KEY`）で秘匿性がない。raw path を直接載せないことだけを担保し、key が公開されているため digest から候補 path を総当たりで推測・復元できる（§9.1 の辞書攻撃耐性は得られない）。秘匿性のある key を host から渡す経路は sink 必須化スライスへ延期 | §9.1 | R-1a |
-| host-call lifecycle event（および `Yielded` / `Resumed` / `BudgetCharged`）の byte 見積もりが payload 非依存の 128 固定（`estimate_event_bytes` の `_ => 128`）。上限保証ではなく、HMAC digest や Identifier を含む実 encode 長を過小評価し得るため、journal の byte 予算・B-2 の queue 会計・§11 の判定は概算依存（strict CBOR スライスへ延期） | §9.2/§11 | R-1a |
+| host-call lifecycle event（および `Yielded` / `Resumed` / `BudgetCharged`）の byte 見積もりが payload 非依存の 128 固定（`estimate_event_bytes` の `_ => 128`）。上限保証ではなく、HMAC digest や Identifier、Reveal された body（最大 `max_revealed_body_bytes`）を含む実 encode 長を過小評価し得るため、journal の byte 予算・B-2 の queue 会計・§11 の判定は概算依存（strict CBOR スライスへ延期） | §9.2/§11 | R-1a |
 | `AuditField` の `original_bytes` を §9.1 の canonical subtree 長（§9.2 の encoding で測る）ではなく値の UTF-8 byte 長で代用（Path は canonical label または requested path の長さ、引数型エラーは 0）。strict CBOR スライスで揃える | §9.1 | R-1a |
 
 ## 未実装範囲（目標仕様 §1〜§13 のうち未着手・延期中）
