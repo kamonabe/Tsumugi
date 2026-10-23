@@ -105,7 +105,7 @@ depends_on = ["R-1a"]
 # 未着手（roadmap.md「現在地」「Phase 6 残」から分解。order は暫定）
 # ════════════════════════════════════════════════════════════════
 
-# tree-expr-continuation（Slice 3 PR-e、元の設計 PR #242）は 1 晩・1 PR に収まらないため、issue #248 で
+# tree-expr-continuation（Slice 3 PR-e、元の設計 PR #242、分割は PR #250）は 1 晩・1 PR に収まらないため、issue #248 で
 # e1〜e4 の 4 スライスへ分割した（spec「tree-expr-continuation の sub-slice 分割」）。元の id は置き換えて
 # 残さない。「tree-expr-continuation が done」は e1〜e4 がすべて done を意味する。
 # acceptance は各スライスが担当する受入基準の ID。複数スライスにまたがる基準（TEC-AT-01 等）の
@@ -121,7 +121,7 @@ spec_slice = "exec-control Slice 3"
 spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation-e1 実装スライス（文レベルの関数呼び出しを driver 上で実行・関数本体の yield・強制 yield フック）" }
 acceptance = ["TEC-AT-01", "TEC-AT-03..06"]
 depends_on = ["F-1"]
-design_pr  = 0
+design_pr  = 250
 issues     = [248]
 order      = 11
 
@@ -134,7 +134,7 @@ spec_slice = "exec-control Slice 3"
 spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation-e2 実装スライス（式 frame：ユーザー関数呼び出しを含む部分式・call 引数境界）" }
 acceptance = ["TEC-AT-01..06"]
 depends_on = ["tree-expr-continuation-e1"]
-design_pr  = 0
+design_pr  = 250
 order      = 12
 
 [[slice]]
@@ -146,7 +146,7 @@ spec_slice = "exec-control Slice 3"
 spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation-e3 実装スライス（builtin・host function の呼び出し引数境界）" }
 acceptance = ["TEC-AT-01..03"]
 depends_on = ["tree-expr-continuation-e2"]
-design_pr  = 0
+design_pr  = 250
 order      = 13
 
 [[slice]]
@@ -158,7 +158,7 @@ spec_slice = "exec-control Slice 3"
 spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation-e4 実装スライス（`map` / `filter` / `each` の段階実行）" }
 acceptance = ["TEC-AT-01..03", "TEC-AT-05..07"]
 depends_on = ["tree-expr-continuation-e3"]
-design_pr  = 0
+design_pr  = 250
 order      = 14
 
 # tree-expr-continuation が呼び出し・反復を必ず yield 可能点にした後、callback なし bulk builtin
