@@ -1347,6 +1347,13 @@ Slice 3 には含めない。
 > 実装する範囲・観測挙動・意図的に延期する逸脱の記録である。進捗の唯一の正本は
 > [`slices.toml`](slices.toml) と [ロードマップ](roadmap.md)。
 >
+> **sub-slice への分割（issue #248）**: 本スライスは 1 晩・1 PR に収まらないため、下記
+> 「tree-expr-continuation の sub-slice 分割」で **e1〜e4 の 4 つの実装スライス**
+> （`tree-expr-continuation-e1` 〜 `-e4`）へ割った。本小節の本文（yield 要件・境界規則・保存する状態・
+> heap 課金・観測挙動・逸脱・受入基準 TEC-AT-01〜07）は 4 つに共通の設計であり、各 sub-slice の範囲・
+> 担当する受入基準の部分・完了条件はそれぞれの小節に書く。他の小節・スライスが
+> 「`tree-expr-continuation` が done」と書くときは **e1〜e4 がすべて done** を意味する。
+>
 > **後続スライスとの関係**: 本スライスは F-2（§4.1 課金表の主要 charge point への移行）の前段依存
 > である。F-2 で charge point が statement / expression / operation 単位になると式評価中に slice
 > fuel を使い切りうるが、現状 tree は文/反復境界でしか yield できない（PR-d「yield は文/反復境界
@@ -1388,7 +1395,7 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
   - **過大なら分割してよい**: Slice 3 が PR-a〜d に割れたのと同様、sub-PR へ割ってよい。特に
     **`map` / `filter` / `each` の callback 段階実行化は sub-PR に分けてよいが、本スライスの完了条件に
     含める**（yield 要件の一部であり、別スライスへ外さない）。分割する場合は `slices.toml` を更新し
-    本小節を割る。
+    本小節を割る。→ 4 つの sub-slice へ分割した（下記「tree-expr-continuation の sub-slice 分割」）。
 
 - **continuation へ保存する式の評価状態（§9.3 の具体化）**: §9.3 は「AST cursor・value stack・
   保留中 operand」を heap 上の明示状態として保存することを要求する。本スライスが式について保存する
@@ -1424,7 +1431,8 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
   - call 式の各引数評価の境界（引数 i を評価後・引数 i+1 を評価前、全引数評価後・本体へ入る前）。
   - 呼び出し・反復を含む部分式の operand 境界（二項/単項/index で、その operand が呼び出し・反復を
     含む場合）。
-  - callback builtin の各要素処理の境界（`map`/`filter`/`sort` の 1 要素・1 比較ステップごと）。
+  - callback builtin の各要素処理の境界（`map`/`filter`/`each` の 1 要素ごと。`sort` は callback を
+    取らないため対象外＝下記「`sort` は対象外」）。
   - **呼び出しも反復も含まない区間は yield 可能点を置かない**（§4.2 の超過例外で有界）。
   - **現状課金では一部境界が 0 fuel になりうる**（課金値の付与は F-2）。本スライスは「境界で slice
     残量を確認し超過なら yield する機構」を置き、F-2 がそこへ課金値を載せる。課金 0 の間でも機構が
@@ -1434,8 +1442,20 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
   `call_fn_value` は `run_driver(base, false)` で回す。本スライスはトップレベル driver から再入した
   活性にも `can_yield = true` を伝える。Call frame（`FrameKind::Call`）に「この活性が yield 可能か」を
   持たせ、resume 時にトップレベル driver が永続 frame stack を根から回し直す形にする（Rust 再帰で
-  再入した活性の途中状態を Call frame 経由で復元する）。cooperative host-call の `may_yield`
-  （`can_yield_ctx`）はこの新しい可否に追従する。
+  再入した活性の途中状態を Call frame 経由で復元する）。
+  - **新しい can_yield が効くのは slice fuel の yield（と下記の強制 yield フック）だけ**とする
+    （issue #248 の分割設計で確定。設計 PR で kamonabe の判断を仰いだ点）。次の 2 つは本スライスでは
+    従来どおり **トップレベル driver の文/反復境界だけ**で判定し、関数本体・callback 本体の中では
+    判定しない。
+    - cooperative host-call の `may_yield`（`can_yield_ctx`）。関数本体内で Pending を返す adapter は
+      従来どおり `may_yield = false` の規約違反（catch 不能 `InternalControl`）になる
+      （`tests/scheduler_api.rs` の `may_yield_false_requires_ready_else_internal_terminal` を無改変で
+      緑に保つ。関数本体内の host-call Pending yield は resume 時の「同じ文の再評価」規約〔§4.7〕を
+      関数本体の文へ広げる別設計が要るため、本スライスの範囲外＝下記「逸脱」）。
+    - audit drain queue 上限の yield（[決定性・実行時監査仕様](determinism-and-audit.md) §10.2・B-2 の
+      「トップレベル境界で判定する soft limit」。B2-AT-09 を無改変で緑に保つ）。
+    - 実装上は「slice fuel を確認してよいか」と「トップレベル（関数本体・callback 本体の外）か」を
+      別の可否として持つ。前者は本スライスで関数本体・callback 本体へ伝え、後者は伝えない。
 
 - **callback builtin の段階実行化（`map` / `filter` / `each`）**: callback を取る 3 builtin は
   要素ループを明示 frame の反復に載せ、1 要素ごと（callback 呼び出しの前後）に yield 可能点を置く。
@@ -1491,6 +1511,8 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
     （同じ driver ループ境界のため）。式の operand 境界にまで cancel/deadline checkpoint を広げるかは
     本スライスでは行わず、必要になれば Slice 4 側の課題として扱う（yield 要件は呼び出し・反復境界で
     満たされるため、最悪時間の有界性には影響しない）。
+  - **関数本体・callback 本体の中での cooperative host-call Pending yield と audit drain queue 上限
+    yield** は本スライスの範囲外（上記「can_yield の伝播」）。どちらも従来どおりトップレベル境界だけ。
 
 - **受入基準（tree-expr-continuation）**:
   - **TEC-AT-01（yield 可能点を跨ぐ実行が同期経路 `run` と一致）**: 下記の強制 yield フックを有効に
@@ -1546,6 +1568,213 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
   強制 yield フック使用）、観測不変（TEC-AT-03）は既存 `tests/` の無改変緑、深度・停止性（TEC-AT-04）は
   `tests/defensive*.rs`、式 frame の push/pop・operand stack・callback 反復状態の不変条件は
   `src/eval.rs` / `src/builtin*.rs` の unit test。
+
+#### tree-expr-continuation の sub-slice 分割
+
+> 状態: **未実装**（設計のみ。issue #248 で分割を決定）。各 sub-slice の進捗は [`slices.toml`](slices.toml)
+> の `tree-expr-continuation-e1` 〜 `-e4` を正とする。共通の設計（yield 要件・境界規則・保存する状態・
+> heap 課金・観測挙動・逸脱・受入基準 TEC-AT-01〜07 の本文）は上の「tree-expr-continuation 実装スライス」
+> 小節にあり、ここでは割り方と各 sub-slice の範囲・完了条件だけを書く。
+
+**割り方の考え方**: yield を Rust 再帰の内側から外へ出すには、yield する活性とトップレベル driver の間に
+Rust 再帰（`eval_expr` / `eval_call` / builtin の要素ループ）が 1 段も挟まっていてはならない。そこで
+「どの呼び出し位置を driver の frame 上で実行するか」を段階的に広げる。
+
+- **e1** は、式の途中を保存しなくてよい唯一の位置＝**文の値そのものがユーザー関数呼び出し**である場合だけを
+  driver 上で実行し、関数本体の文/反復境界を yield 可能にする（式 frame は作らない）。
+- **e2** は式 frame（`FrameKind::Expr`）を入れ、**ユーザー関数呼び出しを含む任意の部分式**へ広げる。
+- **e3** は **builtin / host function / cooperative host function の呼び出しで、引数が呼び出しを含む場合**の
+  引数境界へ広げる。
+- **e4** は **`map` / `filter` / `each` の要素ループ**を明示反復にし、callback 本体の文/反復境界と要素境界を
+  yield 可能にする。
+
+各 sub-slice の完了時点で、まだ driver 上へ移していない呼び出し位置は**従来どおりの Rust 再帰（その内側は
+`can_yield = false` で完了まで実行）**のまま残す。これは sub-slice 間の過渡状態で、その位置の yield は
+§4.2 の超過として後続 sub-slice が done になるまで残る（各 sub-slice の「範囲外」に列挙する）。
+過渡状態でも観測挙動は壊れない。同期経路は全 sub-slice を通じて一切変えず、poll 経路は「yield できる位置が
+増える」以外の観測（結果・副作用順序・`committed.fuel`・エラー行・trace・catch 先）を同期経路と一致させる。
+
+**依存順**: e1 → e2 → e3 → e4 の直列とする。e2・e3・e4 はいずれも e1 の「呼び出しを driver 上の Call frame で
+実行し、終了時に値を受け渡し先へ届ける」機構の上に載る。e3 は e2 の式 frame（引数の operand stack）を使う。
+e4 の要素ループ自体は e1 だけに依存するが、`map` が式の中や他の呼び出しの引数に現れる組み合わせ
+（例: `len(map(xs, f))`、`map(xs, f) + ys`）は e2・e3 の上でしか yield 可能にならず、TEC-AT-01 の全境界を
+跨ぐ組み合わせテストを置く場所を 1 つに決めるため、e4 を最後に置く。ループは実装 PR を同時に 1 本しか
+開かないため、直列化による待ちは生じない。
+
+**呼び出しを含む式（全 sub-slice 共通の定義）**: 部分式のどこかに `Expr::Call` を含む式をいう（静的に判定する）。
+`Expr::Lambda` の本体は定義時に評価されないので数えない。式の中で反復を起こすのは呼び出し（`map` / `filter` /
+`each` を含む）だけなので、「呼び出し・反復を含む部分式」はこの定義と一致する。callee が実行時にユーザー関数・
+builtin・host のどれに解決されるかは静的には決まらない（user binding が builtin より優先する）ため、判定は
+「`Expr::Call` を含むか」で保守的に行い、実行時に callee を解決してから各 sub-slice の経路へ振り分ける。
+
+**全 sub-slice 共通の完了条件**:
+
+- `cargo fmt --check` / `cargo clippy --all-targets --all-features -- -D warnings` / `cargo test --all-features`
+  が緑。既存テストは無改変（TEC-AT-03 のその sub-slice 分）。
+- 同期経路（`Engine::run` / `execute` / REPL、`can_yield = false`）のコードパスを変えない。式 frame を積まず、
+  fuel・heap（`live_heap` / `peak_heap`）・エラー行・trace・stdout・exit code が現状と一致する。
+- その sub-slice で driver 上へ移した呼び出し位置について、強制 yield フックで全境界を yield させた poll 経路の
+  結果が同期経路と一致することを `tests/engine_api.rs` で固定する（TEC-AT-01 のその sub-slice 分）。
+- documentation-guide の Definition of Done に従い、done にする実装 PR で本 spec の逸脱一覧を更新する
+  （`execution-control.md` は逸脱一覧をまだ持たないため、最初に done を出す sub-slice（e1）の実装 PR で
+  逸脱一覧を新設する＝documentation-guide「逸脱一覧の持ち方」の移行注記）。各 sub-slice の「範囲外」に
+  書いた過渡的な未実装範囲は、その sub-slice が done になった時点の逸脱一覧に行として載せ、後続 sub-slice
+  が解消したときに削除する。
+
+##### tree-expr-continuation-e1 実装スライス（文レベルの関数呼び出しを driver 上で実行・関数本体の yield・強制 yield フック）
+
+- **範囲**:
+  - **文レベルのユーザー関数呼び出しを driver 上で実行する（poll 経路だけ）**。対象は、`can_yield = true` の
+    driver が実行する文のうち、次の 4 つの値の位置にある式が **それ自体 `Expr::Call` で、callee と全引数が
+    呼び出しを含まない**ものに限る。
+    - 式文（`Stmt::ExprStmt`）、`let`（`Stmt::Let`）の右辺、再代入（`Stmt::Assign`）の右辺、`return` の値
+  - その呼び出しの callee が実行時にユーザー関数（`Value::Fn`）へ解決されたときだけ、`eval_call` と
+    **同じ順序**（builtin / cooperative / host の fallback 判定 → `count_step` → 深度検査 → callee 評価 →
+    callable 検査 → arity 検査 → 引数評価 → `push_call_frame` → captured / self-binding / 引数の束縛 →
+    call trace の push）で前処理を行い、`drive_call_body` の Rust 再帰に入る代わりに Call frame を
+    `StmtStep::Enter` で driver へ渡す。builtin / cooperative / host に解決された場合や、callee・引数が
+    呼び出しを含む場合は従来の `eval_expr` 経路（その内側は `can_yield = false`）のまま。
+  - Call frame（`FrameKind::Call`）に **「この活性が driver 上で実行されている（yield 可能）か」** と
+    **戻り値の受け渡し先**（捨てる / `let` で束縛する名前 / 再代入する名前 / 呼び出し元の `return`）を持たせる。
+    Call frame が pop するとき（本体完了・`return`）に値を受け渡し先へ届け、`let` / 再代入は同期経路と同じ
+    `env_set` / `env.update` とエラー写像を使う。`return` の受け渡し先は呼び出し元の活性で
+    `FlowSignal::Return` として unwind する。
+  - 終了経路を同期経路（`eval_call` → `drive_call_body` の再入）と一致させる。callee 内で未捕捉のエラーは
+    呼び出し元側の最も近い `try` が捕捉し、`break` / `continue` が Call 境界に達したら同期経路と同じ行・同じ
+    trace で「ループ外」エラーになる。エラー時の call trace も同期経路と同じ内容にする（Call frame を畳む
+    前後のどちらで snapshot するかを含めて揃える）。
+  - **関数本体の文/反復境界での slice yield**: driver 上で実行される関数本体（入れ子の文レベル呼び出しを
+    含む）の文/反復境界で、トップレベルと同じ slice fuel 判定を行う。resume は `run_slice` がトップレベル
+    driver から永続 frame stack を回し直すだけで、関数本体の途中から続く。
+  - cooperative host-call の `may_yield` と audit drain queue 上限の判定は、トップレベル（Call frame の外）
+    だけのまま（上の「can_yield の伝播」）。`can_yield_ctx` を「slice fuel を確認してよいか」と
+    「トップレベルか」に分けて持つ。
+  - **テスト専用の強制 yield フック**（上の小節の定義どおり、`unstable-bytecode` または `cfg(test)` 限定）を
+    追加し、e1 時点の全 yield 可能点（トップレベルと driver 上の関数本体の文/反復境界）で必ず yield させる。
+    e2〜e4 は同じフックを自分の新境界へ広げる。
+  - 深度上限 `MAX_USER_CALL_DEPTH = 128` の検査は driver 上の呼び出しでも同期経路と同じ位置・同じエラーにする。
+- **範囲外（後続 sub-slice）**: 式の途中にある呼び出し・callee や引数が呼び出しを含む呼び出し・`if` / `while`
+  の条件・`for` の反復元・index 代入の index と値に現れる呼び出し（e2）。builtin / host / cooperative の
+  引数に現れる呼び出し（e3）。`map` / `filter` / `each` の callback 本体と要素境界（e4）。これらの内側は
+  e1 時点では従来どおり `can_yield = false` で完了まで実行し、§4.2 の超過として扱う。
+- **heap**: Call frame の `heap_charge` は従来どおり 0。e1 は式 frame を作らないため、poll 経路の
+  continuation heap も増えない。
+- **受入基準（e1 が満たす部分）**:
+  - **TEC-AT-01（e1 分）**: 強制 yield フックで全境界を yield させ、関数本体の文/反復境界を跨ぐ script
+    （4 つの値の位置それぞれ・入れ子の文レベル呼び出し・関数本体のループ・再帰）が、同期経路
+    `Engine::run` と stdout・`committed.fuel`・terminal 種別・非 `Yielded`/`Resumed` の audit event 列で
+    一致する。終了経路（callee 内エラーを呼び出し元の `try` が捕捉する・callee 内エラーが未捕捉で terminal に
+    なる・関数内の `break`/`continue` がループ外エラーになる）についても、エラー種別・行・trace が一致する。
+  - **TEC-AT-03（e1 分）**: 既存テスト無改変で緑（`may_yield_false_requires_ready_else_internal_terminal` と
+    B2-AT-09 を含む）。同期経路の観測値不変。
+  - **TEC-AT-04（e1 分）**: poll 経路で `return f(n - 1)` 形の深い再帰が、同期経路と同じ
+    `call_depth_limit`（同じ行）で止まる。既存 `tests/defensive*.rs` は無改変で緑。
+  - **TEC-AT-05（e1 分）**: 関数本体の途中での yield を跨いでも submission journal が保持され、terminal で
+    だけ commit / rollback される（REPL transaction の成功・失敗の両方）。
+  - **TEC-AT-06（e1 分）**: 文レベルで呼んだ関数の本体にループを持つ script を `PollSlice::max_fuel = 16`
+    で実行したとき、1 回の poll で実行される fuel が「slice + 区間内の callback なし bulk builtin 1 回分の
+    単独実測 fuel」以内（式起因の超過は現行課金で 0）。`Yielded`/`Resumed` が対で順序が単調。
+- **検証**: 全 sub-slice 共通の完了条件。テストは `tests/engine_api.rs`（TEC-AT-01/05/06）、
+  `tests/defensive*.rs` への追加または既存の無改変緑（TEC-AT-04）、Call frame の受け渡し先と終了経路の
+  unit test は `src/eval.rs`。
+
+##### tree-expr-continuation-e2 実装スライス（式 frame：ユーザー関数呼び出しを含む部分式・call 引数境界）
+
+- **範囲**:
+  - `FrameKind::Expr` を追加する。保存するのは上の小節「continuation へ保存する式の評価状態」のうち
+    operand stack・式 cursor・callee 引数の部分評価結果・保留中の演算（callback 反復状態は e4）。
+  - poll 経路で、呼び出しを含む式を式 frame で段階評価する。対象の式種は二項演算（`and` / `or` の短絡を含む）・
+    単項演算・index・list / dict リテラル・f-string・call（callee と引数）。呼び出しを含まない operand は
+    従来どおり `eval_expr` の Rust 再帰で 1 つの値として評価してよい（境界規則）。
+  - 式 frame の operand として現れた call の callee がユーザー関数に解決されたら、e1 と同じ前処理順序で
+    Call frame を driver 上に積み、戻り値の受け渡し先を「親の式 frame の operand stack」とする。builtin /
+    host / cooperative に解決され、かつ引数が呼び出しを含む場合は、e2 時点ではその call 全体を従来の
+    `eval_expr` 経路で評価する（e3 の範囲）。
+  - 文の式スロットを式 frame の対象に広げる: e1 の 4 位置（値が呼び出しを含む任意の式になる）に加え、
+    `if` / `while` の条件（`while` は反復ごとの再評価を含む）、`for` の反復元、index 代入の index と値。
+    評価順序（index 代入は binding 解決 → index → value の規範順序）とエラー行は同期経路と一致させる。
+  - yield 可能点: call の各引数評価の境界（引数 i の評価後・引数 i+1 の評価前、全引数評価後・本体へ入る前）と、
+    呼び出しを含む operand の境界。強制 yield フックをこれらへ広げる。
+  - heap: 式 frame の push で `continuation_frame` 96 byte 固定を課金し、pop / unwind で release する
+    （poll 経路だけ。operand は二重課金しない）。
+  - 式 frame の途中で起きたエラーの捕捉（最も近い `try`）、`break` / `continue` / `return` による unwind で
+    式 frame を正しく畳み、heap を release する。
+- **範囲外（後続 sub-slice）**: builtin / host / cooperative の呼び出しで引数が呼び出しを含む場合（e3）。
+  `map` / `filter` / `each` の callback 本体と要素境界（e4）。
+- **受入基準（e2 が満たす部分）**:
+  - **TEC-AT-01（e2 分）**: 強制 yield フックで、call 引数境界・呼び出しを含む operand 境界・文の式スロット
+    （条件・反復元・index 代入）を跨ぐ script が同期経路と一致する（検査項目は TEC-AT-01 本文どおり）。
+  - **TEC-AT-02（e2 分）**: 深い式・入れ子 call・引数評価の途中・短絡評価の途中で yield させ、resume 後の
+    最終値と副作用列が同期経路と一致する。operand stack・式 cursor・部分評価済み引数が保存されることを
+    unit test で固定する。
+  - **TEC-AT-03（e2 分）**: 既存テスト無改変で緑。同期経路の `live_heap` / `peak_heap` が不変
+    （同期経路は式 frame を積まない）。
+  - **TEC-AT-04（e2 分）**: poll 経路で `f(n - 1) + 1` 形（式の途中の再帰）が同期経路と同じ
+    `call_depth_limit` で止まり、深い呼び出しを含まない式は従来どおり有限停止する。
+  - **TEC-AT-05（e2 分）**: 式の途中の yield を跨いでも submission journal が保持され、terminal でだけ
+    commit / rollback される。
+  - **TEC-AT-06（e2 分）**: 式の中で呼んだ関数の本体にループを持つ script を最小 slice で実行し、1 poll の
+    実行量が e1 と同じ上限以内。
+  - 式 frame の heap: poll 経路で式 frame 1 個につき 96 byte が push で課金され、pop・unwind・エラー捕捉で
+    release されて、terminal 時点の `live_heap` が同期経路と一致する（unit test）。
+- **検証**: 全 sub-slice 共通の完了条件。テストは `tests/engine_api.rs`（TEC-AT-01/02/05/06）、
+  `tests/defensive*.rs`（TEC-AT-04）、式 frame の不変条件と heap は `src/eval.rs` の unit test。
+
+##### tree-expr-continuation-e3 実装スライス（builtin・host function の呼び出し引数境界）
+
+- **範囲**:
+  - poll 経路で、callee が builtin（`map` / `filter` / `each` を除く）・登録 host function・cooperative host
+    function に解決され、引数が呼び出しを含む call を、e2 の式 frame で引数を段階評価してから dispatch する。
+    引数は従来どおり左から右へ評価し、`count_step`・host call 課金（`charge_host_call_request`）・capability /
+    arity 検査・audit の host-call triple の順序と位置を同期経路と一致させる。
+  - 引数の AST を直接読む builtin（`push` / `pop` の対象識別子、`len(識別子)` の最適化、
+    `validate_context_builtin_call` の「第 1 引数が識別子か」判定）は、AST を読む部分の意味を変えない。
+    呼び出しを含む引数だけを式 frame で評価し、それ以外の引数の扱いは同期経路と同じにする。
+  - cooperative host function は、引数評価後の `start` 呼び出しと Pending 時の扱い（`may_yield` は
+    トップレベルだけ＝e1）を同期経路の規約どおりに保つ。
+  - yield 可能点: これらの call の引数境界（e2 の call 引数境界と同じ）。強制 yield フックをここへ広げる。
+  - builtin 本体の実行（bulk work を含む）は yield しない（§4.2 の超過、chunk 境界 yield は
+    `fuel-bulk-chunk-yield`）。
+- **範囲外（後続 sub-slice）**: `map` / `filter` / `each`（e4）。
+- **受入基準（e3 が満たす部分）**:
+  - **TEC-AT-01（e3 分）**: 強制 yield フックで、builtin・host function・cooperative host function の引数に
+    ユーザー関数呼び出しを含む script（`print(f(x))`、`push(xs, f(x))`、登録 host function の引数に呼び出し）
+    を跨いで yield/resume した結果が同期経路と一致する。host-call triple を含む audit event 列（非
+    `Yielded`/`Resumed`）も一致する。
+  - **TEC-AT-02（e3 分）**: builtin の引数評価の途中で yield させ、部分評価済みの引数が保存されて resume 後に
+    同期経路と同じ値・副作用列になる。
+  - **TEC-AT-03（e3 分）**: 既存テスト無改変で緑（host function・cooperative・audit 系のテストを含む）。
+- **検証**: 全 sub-slice 共通の完了条件。テストは `tests/engine_api.rs`（TEC-AT-01/02）と、host function・
+  cooperative の組み合わせが要る場合は既存の配置（`tests/scheduler_api.rs` 等）に新規テストとして追加する。
+
+##### tree-expr-continuation-e4 実装スライス（`map` / `filter` / `each` の段階実行）
+
+- **範囲**:
+  - poll 経路で、`map` / `filter` / `each` の要素ループを明示 frame の反復に載せる（上の小節
+    「callback builtin の段階実行化」）。frame には callback 反復状態（処理済み要素・次の要素 index・部分結果）を
+    保存する。callback 本体は Call frame として driver 上で実行し（e1 の機構）、戻り値の受け渡し先を
+    「この反復 frame」とする。
+  - これらの呼び出しが文レベル（e1 の 4 位置）・式の operand（e2）・他の builtin / host の引数（e3）の
+    どこに現れても、driver 上の段階実行にする。
+  - per-element 課金・callback の arity / 非 callable エラー・エラー伝播・結果の順序は同期経路
+    （`call_fn_value` の現行実装）と一致させる。`sort` は書き換えない。
+  - yield 可能点: 各要素の処理の境界（callback 呼び出しの前後）と callback 本体の文/反復境界。強制 yield
+    フックをここへ広げる。
+  - heap: 反復 frame は式 frame と同じく `continuation_frame` 96 byte 固定（poll 経路だけ）。部分結果の
+    collection は同期経路と同じ課金規律で作る（同期経路と terminal 時点の `live_heap` が一致する）。
+- **受入基準（e4 が満たす部分。e4 の done で TEC-AT-01〜07 がすべて満たされる）**:
+  - **TEC-AT-07**: 本文どおり。要素の途中・callback 本体の途中の両方で強制 yield を起こし、`map` / `filter` /
+    `each` の結果・副作用順序・`committed.fuel` が同期経路と一致する。
+  - **TEC-AT-01（全体）**: 強制 yield フックで、e1〜e4 の全 yield 可能点を 1 つの script の中で跨ぐ組み合わせ
+    （例: 式の operand や builtin の引数に置いた `map`、`map` の callback の中の入れ子呼び出しとループ）を
+    含めて、同期経路と一致する。
+  - **TEC-AT-02（e4 分）**: callback 反復状態が yield を跨いで保存されることを unit test と resume 一致で固定する。
+  - **TEC-AT-05（e4 分）**: callback 途中の yield を跨いでも submission journal が保持される。
+  - **TEC-AT-06（全体）**: callback 本体にループを持つ script を最小 slice で実行し、1 poll の実行量が上限
+    以内（e1 と同じ上限式）。再帰・ループ・callback が何段入れ子でも上限を超えない。
+  - **TEC-AT-03（e4 分）**: 既存テスト無改変で緑。
+- **検証**: 全 sub-slice 共通の完了条件。テストは `tests/engine_api.rs`（TEC-AT-01/02/05/06/07）、callback
+  反復状態の不変条件は `src/builtin*.rs` の unit test。
 
 ### Slice 4: cancellation・pause・transaction
 
