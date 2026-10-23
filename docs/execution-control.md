@@ -1,8 +1,36 @@
 # Tsumugi 実行予算・協調実行仕様
 
-最終更新: 2026-10-20
+最終更新: 2026-10-23
 
-設計ステータス: **実装仕様確定・実装進行中**（第14節 Slice 1 実装済み。Slice 2 は完了（string / source / import accounting、heap accounting 基盤（`AllocationLedger`・§5.1 論理サイズ）、collection（`List`/`Dict`）の per-drop release（`Rc<Tracked<T>>` で生成時に課金し最後の参照 drop で release、tree/VM 両対応）、および String body の per-drop release（PR-b、`Value::Str` を `Rc<Tracked<RefCell<Value>>>` 化し `Value::Fn`/`VmFn` に header token を持たせる）、および AST / bytecode chunk / imported module record / rollback journal の per-drop 追跡（PR-d、`HeapToken = Tracked<()>` トークンで所有構造側から課金・release。tree は AST、VM は bytecode chunk を課金）、および string リテラル/連結/f-string 経路の課金（生成点で `track_result` を通し cumulative + live heap を課金、tree/VM 両対応）、および I-O accounting（input / output / host call の count + bytes を reserve/commit/refund で課金。stdio は host call として co-charge。host call 対象は filesystem read/write と stdio に限り、その他 host 境界 builtin は Phase 2）を実装済みで、これで Slice 2 は完了。VM の push/pop の full-clone や f-string リテラル部分の個別課金のため configured 上限で tree と live/peak・cumulative が食い違い得るが、charge trace の tree/VM 完全一致は第14節 Slice 6（VM が experimental の間）で解消する。Slice 3（explicit continuation）は blast radius が大きいため PR-a（公開 state-machine surface + poll-to-terminal core）→ PR-b（statement / block / loop の明示 frame）→ PR-c（関数呼び出し・try handler の明示 frame）→ PR-d（slice fuel + yield）へ分割する。PR-a（公開 state-machine surface + poll-to-terminal core）・PR-b（statement / block / loop の明示 frame stack。tree evaluator の `drive_body` driver ループ + `Frame`/cursor で `exec_program`/`exec_block`/ループ再帰を置換し、continuation_frame heap を配線）・PR-c（関数呼び出し・try handler の明示 frame。`eval_call` / callback の `call_fn_value` を `FrameKind::Call` を積む形へ変換し、共通 `run_driver` + `drive_call_body` で本体を駆動。VM の `CallFrame` をミラーし、`try` handler は PR-b の `FrameKind::Try` が VM の `TryHandler` をミラーする）を実装済み。PR-d（slice fuel + yield）も PR-d-1（continuation を Evaluator 所有の `'static` 永続 frame stack へ。AST ブロック本体を `Rc<[Stmt]>` 化）と PR-d-2（slice-fuel accounting・文/反復境界での `Yielded(SliceFuelExhausted)`・`begin_execution` / `run_slice` による resume）で実装済み。残る PR-e（式の途中での slice yield。式評価を Rust 再帰から明示 continuation へ移し、関数本体・callback 本体の文/反復境界も yield 可能にする）は設計済み・未実装（本節「tree-expr-continuation 実装スライス」）。Slice 4（cancellation・pause・transaction）は `CancellationToken`・deadline checkpoint・pause/resume・AUD-024 rollback 規則・race linearization まで実装済みで完了。Slice 5（scheduler・host pending）も `SchedulerShared`/`AdmissionController` の bounded admission と run-turn FIFO backpressure、nonblocking host-call ticket（`HostCallTicket`/`ExecutionWaker`/`HostCallPoll`）と wake・deadline/cancel 伝播、独立上限の `AdapterExecutor` + `CooperativeAdapter`/`CapabilityCallContext.may_yield` まで実装済みで完了。Slice 6（VM charge parity）も完了（heap・string・I-O の会計。fuel の課金差は未解消で、第14節「F-1 実装スライス」で扱う）。さらに最終形移行 Slice 1（`ExecutionRequest` の `BudgetConfig` 必須所有 + deadline を `BudgetConfig.deadline` へ統合 + CLI 既定の有限化＝option B）を実装済み＝`embedding::ExecutionRequest` を `new(budget, clock) -> Result<_, ConfigError>` へ移し有限 `BudgetConfig` と deadline clock を必須所有させ、`with_deadline_clock` 独立経路と `EngineConfig.budget` の二重管理を解消（deadline は `budget.deadline` のみ）、`Engine::run` は実行直前に `Evaluator::reset_budget`（cancellation token を引き継ぐ）で budget を据え直す。CLI 既定は import なし経路で単一 `SystemMonotonicClock` を共有し `BudgetConfig::standard`（30s + 標準上限）を渡す有限 budget（import あり経路は E7 で統合）。最終形の `BudgetConfig` 必須所有は実装済みで、`CancellationToken` 必須所有（Slice 2）も実装済み＝`ExecutionRequest` が `cancellation: CancellationToken` を必須所有し `.cancellation(value)` builder で設定、`Engine::run` が実行直前に request-owned token を評価器へ install する。REV-015 最終形移行（budget + cancellation 必須所有）は完了し、残りは Phase 6（audit）のみ。詳細は第14節 Slice 3/Slice 5 を参照）
+設計ステータス: **到達目標の確定仕様（§1〜§13）＋ 実装の現在地（下記の逸脱一覧）**
+
+本文書の §1〜§13 は **到達目標の確定仕様**であり、現在の実装状態ではない。現在の実装が目標仕様からどう
+逸脱しているか・何が未実装かは、下の **逸脱一覧** と **未実装範囲** の 2 表が唯一の正本である（状態の正本は
+この 2 表に置き、§14 のスライス小節は再掲しない）。実装スライスの進捗の正本は [`slices.toml`](slices.toml)。
+
+2 表は現在の逸脱と未実装範囲だけを持つ。done にする実装 PR は、この 2 表に新しい逸脱・未実装範囲を追加し、
+解消した行を削除する（どのスライスで解消したかはスライス小節と git 履歴に任せる。[ドキュメント運用ガイド](documentation-guide.md)
+「逸脱一覧の持ち方」）。2 表は tree-expr-continuation-e1 の実装 PR で新設した。それ以前に完了したスライスの
+逸脱・未実装範囲は、事実を確かめられたものから順に載せる。
+
+## 逸脱一覧（目標仕様 §1〜§13 に対する現在の逸脱）
+
+| 逸脱内容 | 対象の節(§) | 発生スライス |
+|---|---|---|
+| tree evaluator の slice fuel の使用量は `count_step`（文・反復・呼び出しの fuel）だけを数え、builtin が台帳へ直接課金する per-element fuel（`sort` の走査・比較課金など）を数えない。total fuel は正しいが、1 回の poll で実行する fuel が「slice + 区間内の bulk builtin 1 回分」を超えうる（bulk builtin を含む文が 1 slice に複数回あると、その回数ぶん超える） | §4.2 | Slice 3 PR-d |
+
+## 未実装範囲（目標仕様 §1〜§13 のうち未着手・延期中）
+
+| 未実装範囲 | 対象の節(§) | 備考 |
+|---|---|---|
+| tree evaluator の式の途中での slice yield。式の途中にある呼び出し、callee や引数が呼び出しを含む呼び出し、`if` / `while` の条件・`for` の反復元・index 代入の index と値に現れる呼び出しは driver 上へ移しておらず、従来どおり Rust 再帰（`can_yield = false`）で完了まで実行する（その内側では yield しない＝§4.2 の超過として扱う）。文レベルの呼び出し（式文・`let`・再代入・`return` の値がそれ自体ユーザー関数呼び出しで、callee と引数が呼び出しを含まないもの）だけが driver 上で実行され、その関数本体の文/反復境界で yield する | §4.2/§9.3 | tree-expr-continuation-e2 |
+| builtin・登録 host function・cooperative host function の引数に現れる呼び出しの引数境界での slice yield（その呼び出しは Rust 再帰で完了まで実行する） | §4.2/§9.3 | tree-expr-continuation-e3 |
+| `map` / `filter` / `each` の要素境界と callback 本体の文/反復境界での slice yield（callback 本体は `can_yield = false` で完了まで実行する） | §4.2/§9.3 | tree-expr-continuation-e4 |
+| 関数本体・callback 本体の中での cooperative host-call の Pending yield と audit drain queue 上限の yield。どちらもトップレベル（driver 上の呼び出しの外）の文/反復境界だけで判定し、関数本体の中で Pending を返す adapter は `may_yield = false` の規約違反（catch 不能 `InternalControl`）になる | §4.2/§6.2 | §14「tree-expr-continuation 実装スライス」の逸脱（audit drain queue は [決定性・実行時監査仕様](determinism-and-audit.md) の逸脱一覧にも B-2 として記載） |
+| callback なし bulk builtin（`sort` / `join` / 文字列繰り返し / 大 collection コピー等）の chunk 境界での slice yield。現状は bulk builtin 1 回分を §4.2 の超過として扱い、chunk 前の確認は deadline / cancel だけ | §4.1/§4.2 | fuel-bulk-chunk-yield |
+| VM の式レベル continuation（VM の slice yield と continuation parity） | §9.3 | Slice 6（VM が experimental の間） |
+| script / host の明示 yield（`YieldReason::ExplicitYield`）。型はあるが trigger を配線していない | §9 | — |
+| §4.1 課金表の主要 charge point（statement / expression / operation 単位）への移行。現状の fuel は文・反復・呼び出しと一部 builtin の per-element だけ（`fuel_accounting_revision = 1`） | §4.1 | F-2 |
 
 ## 1. 位置づけ
 
@@ -965,6 +993,8 @@ Slice 2で追加した上限のlegacy key（`TSUMUGI_MAX_SINGLE_STRING_BYTES` / 
 
 ## 14. 実装slice
 
+各スライス小節はそのスライスを実装した時点の記録であり、書き換えない。現在の逸脱・未実装範囲は冒頭の逸脱一覧を見ること。
+
 各sliceは独立PRとし、前sliceの受入基準を満たしてから次へ進む。
 
 ### Slice 1: budget型とlegacy adapter
@@ -1677,6 +1707,28 @@ builtin・host のどれに解決されるかは静的には決まらない（us
 - **検証**: 全 sub-slice 共通の完了条件。テストは `tests/engine_api.rs`（TEC-AT-01/05/06）、
   `tests/defensive*.rs` への追加または既存の無改変緑（TEC-AT-04）、Call frame の受け渡し先と終了経路の
   unit test は `src/eval.rs`。
+- **実装（e1 実装 PR の時点の記録）**: `src/eval.rs` の `exec_stmt` が、yield 可能な driver
+  （`can_yield_ctx`）で 4 つの値の位置の式が上記の文レベル呼び出しのときだけ `exec_driver_call_stmt` を通す。
+  前処理は `eval_call` から分離した `prepare_call` を同期経路と共有し（同じ順序）、ユーザー関数なら
+  `FrameKind::Call { driver: Some(DriverCall { dest, .. }) }` を `StmtStep::Enter` で積む。`DriverCall` は
+  受け渡し先（`CallDest`：捨てる / `let` / 再代入 / `return`）と関数値（同期経路のローカル `func_value` と
+  同じ寿命で live heap を揃える）を持つ。本体完了・`return` は `finish_driver_call` が Call frame を畳んでから
+  受け渡し先へ届け、`break` / `continue` は Call frame を畳んでから「ループ外」エラーを呼び出し元の文のエラー
+  として捕捉処理する（`drive_flow` / `recover_error`）。callee 内のエラーは `handle_error` が driver 上の
+  Call frame を越えて呼び出し元の `try` を探す。`may_yield` と audit drain queue 上限は `in_driver_call()`
+  が偽のときだけ判定する。強制 yield フックは `Evaluator::force_yield_every_boundary`（テスト専用 surface は
+  `EmbeddingContext::force_yield_at_every_boundary_for_test`、`unstable-bytecode` 限定・`#[doc(hidden)]`）で、
+  slice で 1 文・1 反復以上進めた後の全境界で yield する。`abort_session` は yield 中の driver 上の呼び出しの
+  呼び出し元スコープと call trace を rollback より前に戻す。同期経路（`Evaluator::run` / `run_phased` /
+  `run_repl_submission`、`can_yield = false`）は従来の分岐だけを通り、再帰 1 段あたりの Rust stack 使用量も
+  増やさない（新しい処理は `#[inline(never)]` の別関数に置く）。
+  - 注記: 本小節と共通の完了条件は「同期経路」を `Engine::run` / `execute` / REPL と書くが、実装では
+    埋め込み `Engine::run`（CLI を含む）と alpha `Engine::execute` / `execute_repl_submission` は
+    `begin_execution` / `run_slice`（`can_yield = true`）を通る。したがって e1 の driver 上の呼び出しはこれらの
+    入口でも有効になる（slice 上限が大きいので通常は yield しない）。観測値は既存テストの無改変緑に加え、
+    TEC-AT-01 のテストで stdout・fuel・エラー行・trace を `can_yield = false` の `Evaluator::run` と、
+    audit event 列と terminal（usage を含む）を強制 yield なしの実行と、`src/eval.rs` の unit test で
+    `live_heap` / `peak_heap` を `Evaluator::run` と比べて一致を確かめた。
 
 ##### tree-expr-continuation-e2 実装スライス（式 frame：ユーザー関数呼び出しを含む部分式・call 引数境界）
 
