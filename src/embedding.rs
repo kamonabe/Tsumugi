@@ -1854,6 +1854,21 @@ impl ExecutionContext {
         }
     }
 
+    /// **test 専用 shim**: 強制 yield フックを設定する（execution-control §14
+    /// 「tree-expr-continuation-e1」「テスト専用の強制 yield フック」）。
+    ///
+    /// 有効にすると、この context で回す [`Engine::run`] / [`Engine::run_audited`] の各 slice が、
+    /// 全 yield 可能点（トップレベルと driver 上の関数本体の文/反復境界）で slice 残量に関係なく
+    /// yield する。現行課金では新しい yield 可能点の多くが 0 fuel で最小 slice でも yield しない
+    /// ため、resume の忠実性を全境界にわたって固定するテストだけが使う。外部 embedder 向けの
+    /// 安定した公開契約ではない（[`EngineBuilder::audit_slice_fuel`] と同じテスト用の内部 surface。
+    /// `#[doc(hidden)]` かつ `unstable-bytecode` feature 限定）。
+    #[cfg(feature = "unstable-bytecode")]
+    #[doc(hidden)]
+    pub fn force_yield_at_every_boundary_for_test(&mut self, enabled: bool) {
+        self.evaluator.set_force_yield_every_boundary(enabled);
+    }
+
     /// test 専用: 次の [`Engine::run`] で評価器境界を panic させる（E6 の panic 隔離検証用）。
     #[cfg(test)]
     fn inject_run_panic_for_test(&mut self) {

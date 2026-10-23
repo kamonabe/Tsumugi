@@ -174,6 +174,17 @@ impl Frame {
     fn is_call(&self) -> bool {
         matches!(self.kind, FrameKind::Call { .. })
     }
+
+    /// この frame が driver 上で実行している呼び出しの境界か（tree-expr-continuation-e1）。
+    fn is_driver_call(&self) -> bool {
+        matches!(
+            self.kind,
+            FrameKind::Call {
+                driver: Some(_),
+                ..
+            }
+        )
+    }
 }
 
 /// `while` / `for` 制御 frame が参照する compound 文の位置（REV-015 Slice 3 PR-d）。
@@ -258,6 +269,51 @@ enum FrameKind {
     Call {
         /// 呼び出し時に `env.push_call_frame()` が返した退避情報。pop 時に復元する。
         saved_scopes: crate::env::CallFrame,
+        /// この活性が yield 可能な driver 上で実行されているか（tree-expr-continuation-e1）。
+        ///
+        /// `None` は従来どおり `eval_call` → `drive_call_body` の Rust 再入で実行される活性
+        /// （`can_yield = false`、戻り値は `run_driver` の戻り値で返す）。`Some` は文レベルの
+        /// ユーザー関数呼び出しを driver 上で実行している活性で、frame が pop するときに戻り値を
+        /// 受け渡し先へ届ける。
+        driver: Option<DriverCall>,
+    },
+}
+
+/// driver 上で実行している文レベルのユーザー関数呼び出しの状態（tree-expr-continuation-e1）。
+struct DriverCall {
+    /// 戻り値の受け渡し先。
+    dest: CallDest,
+    /// 呼び出した関数値。同期経路の `eval_call` がローカル `func_value` を呼び出し完了まで
+    /// 生かしていたのと同じ寿命（＝同じ live heap）を保つために保持する。
+    _callee: Value,
+}
+
+/// 文レベルのユーザー関数呼び出しの戻り値の受け渡し先（tree-expr-continuation-e1）。
+///
+/// 同期経路で `exec_stmt` が `eval_expr` の戻り値に対して行っていた処理を、Call frame の
+/// pop 時に行う。
+enum CallDest {
+    /// 式文: 値を捨てる。
+    Discard,
+    /// `let`: 呼び出し元のスコープへ束縛する。
+    Let { name: String, line: usize },
+    /// 再代入: 既存 binding を更新する。
+    Assign { name: String, line: usize },
+    /// `return`: 呼び出し元の活性で `FlowSignal::Return` として unwind する。
+    Return,
+}
+
+/// ユーザー関数呼び出しの前処理の結果（tree-expr-continuation-e1）。
+///
+/// 同期経路の `eval_call` と driver 上の文レベル呼び出しが同じ前処理（同じ順序）を共有する。
+enum CallPrep {
+    /// builtin / cooperative host / 登録 host function に解決され、値まで評価した。
+    Done(Value),
+    /// ユーザー関数。`push_call_frame`・束縛・call trace の push まで済ませた。
+    User {
+        def: Rc<FnDef>,
+        saved_scopes: crate::env::CallFrame,
+        callee: Value,
     },
 }
 
@@ -475,6 +531,11 @@ pub struct Evaluator {
     /// "default-r1"`）。監査付き facade が実行単位で [`Self::set_redaction_policy`] で注入する。
     /// 非監査経路は triple を drain しないため無視され、観測挙動は不変（§1.1）。
     redaction_policy: crate::audit::RedactionPolicy,
+    /// テスト専用の強制 yield フック（tree-expr-continuation-e1、execution-control §14
+    /// 「テスト専用の強制 yield フック」）。`true` のとき、yield 可能な driver は全 yield 可能点で
+    /// slice 残量に関係なく yield する。既定 `false` で、`unstable-bytecode` feature のテスト専用
+    /// surface からだけ設定できる（production 既定経路には影響しない）。
+    force_yield_every_boundary: bool,
 }
 
 /// audit drain queue の byte 計器（Phase 6 B-2、`docs/determinism-and-audit.md` §10.2）。
@@ -571,7 +632,31 @@ impl Evaluator {
             // host-call redaction policy（Phase 6 R-1）。既定は default-r1。監査付き facade が
             // 実行単位で set_redaction_policy で注入する（非監査経路は無視）。
             redaction_policy: crate::audit::RedactionPolicy::default(),
+            force_yield_every_boundary: false,
         }
+    }
+
+    /// テスト専用の強制 yield フックを設定する（tree-expr-continuation-e1）。
+    #[cfg(feature = "unstable-bytecode")]
+    pub(crate) fn set_force_yield_every_boundary(&mut self, enabled: bool) {
+        self.force_yield_every_boundary = enabled;
+    }
+
+    /// 強制 yield フックにより、この境界で yield するか（tree-expr-continuation-e1）。
+    ///
+    /// この slice で 1 文・1 反復以上進めた後に限る（`audit_queue_progress` は slice 先頭で
+    /// `false` に戻り、文/反復を進めるたびに `true` になる前進フラグ）。resume 直後に何も進めず
+    /// 再 yield する livelock を防ぐ。
+    fn forced_yield_due(&self) -> bool {
+        self.force_yield_every_boundary && self.audit_queue_progress
+    }
+
+    /// 現在の文が driver 上で実行中の呼び出し（関数本体）の中にあるか（tree-expr-continuation-e1）。
+    ///
+    /// cooperative host-call の `may_yield` と audit drain queue 上限の yield は、従来どおり
+    /// トップレベル（driver 上の Call frame の外）だけで判定する（§14「can_yield の伝播」）。
+    fn in_driver_call(&self) -> bool {
+        self.frames.iter().any(Frame::is_driver_call)
     }
 
     /// この実行に使う有限 `BudgetConfig`・deadline clock・cancellation token を据え直す
@@ -1533,6 +1618,23 @@ impl Evaluator {
         // frame 巻き戻しの下限は session の base_depth（begin_execution で root frame を push した
         // 位置）。finalize_session が session.take() するため、先に base_depth を控える。
         let base_depth = self.session.as_ref().map(|s| s.base_depth);
+        // driver 上で実行中だった呼び出し（tree-expr-continuation-e1）は、yield を跨いで
+        // `env.push_call_frame` と call trace を保持している。terminal のエラー経路（run_driver が
+        // unwind してから finalize する）と同じ順序で、rollback より前に呼び出し元スコープと
+        // call trace を復元する。それ以外の frame の扱い（下の truncate）は従来どおり。
+        if let Some(base_depth) = base_depth {
+            while self.frames.len() > base_depth {
+                let frame = self.frames.pop().expect("len > base_depth");
+                if let FrameKind::Call {
+                    saved_scopes,
+                    driver: Some(_),
+                } = frame.kind
+                {
+                    self.call_stack.pop();
+                    self.env.pop_call_frame(saved_scopes);
+                }
+            }
+        }
         // session 有無の自己判定は finalize_session に委ねる（§4.6）。session があれば rollback、
         // 無ければ no-op。
         self.finalize_session(false);
@@ -1678,7 +1780,10 @@ impl Evaluator {
         self.frames.push(Frame {
             stmts: def.body.clone(),
             cursor: 0,
-            kind: FrameKind::Call { saved_scopes },
+            kind: FrameKind::Call {
+                saved_scopes,
+                driver: None,
+            },
             // Call frame 自身は呼び出し元がスコープ管理する（push_call_frame 済み）。関数用
             // ローカルスコープは push_call_frame が積み、pop_call_frame が畳むため、この frame
             // 自身は追加スコープを持たない（scope_base は現在の深さ、heap_charge は 0）。
@@ -1738,14 +1843,18 @@ impl Evaluator {
             // 巻き戻った安全な境界なので、`self.frames` を残したまま resume できる。yield
             // できるのはトップレベル実行の driver だけ（`can_yield`）。関数呼び出しの再入
             // （`drive_call_body`、式の途中）では yield せず活性を完了させる。
-            if can_yield && self.slice_exhausted() {
+            // tree-expr-continuation-e1: 文レベルのユーザー関数呼び出しは driver 上の Call frame
+            // で実行されるので、その関数本体の文/反復境界もここを通り、トップレベルと同じ判定で
+            // yield する。テスト専用の強制 yield フックもここで効く。
+            if can_yield && (self.slice_exhausted() || self.forced_yield_due()) {
                 return Ok(DriveOutcome::Yielded);
             }
 
             // audit drain queue 上限（Phase 6 B-2、§10.2）。slice fuel と同じトップレベル境界だけで
-            // 判定する soft limit で、関数呼び出し・callback の本体（`can_yield = false`）の中では
-            // 判定しない。計器が無い経路（sink 無し・engine-poll・REPL）では常に false。
-            if can_yield && self.audit_queue_exceeded() {
+            // 判定する soft limit で、関数呼び出し・callback の本体（`can_yield = false` の再入と、
+            // driver 上の Call frame の中）では判定しない（tree-expr-continuation-e1）。計器が無い
+            // 経路（sink 無し・engine-poll・REPL）では常に false。
+            if can_yield && self.audit_queue_exceeded() && !self.in_driver_call() {
                 self.yield_for_audit_queue = true;
                 return Ok(DriveOutcome::Yielded);
             }
@@ -1776,6 +1885,14 @@ impl Evaluator {
             if top.cursor >= top.stmts.len() {
                 // 反復境界を 1 つ進める（B-2 の前進保証）。
                 self.audit_queue_progress = true;
+                // driver 上の呼び出し（tree-expr-continuation-e1）の本体を return なしで実行し
+                // 切った: 同期経路の `EvalResult::Val` → `Value::Null` と同じく null を届ける。
+                if top.is_driver_call() {
+                    if let Some(result) = self.complete_driver_call(stop_depth)? {
+                        return Ok(DriveOutcome::Done(result));
+                    }
+                    continue;
+                }
                 match self.advance_frame() {
                     Ok(()) => {}
                     Err(e) => {
@@ -1813,7 +1930,7 @@ impl Evaluator {
                 Ok(StmtStep::Val) => {}
                 Ok(StmtStep::Enter(child)) => self.frames.push(child),
                 Ok(StmtStep::Flow(signal)) => {
-                    if let Some(result) = self.unwind_flow(signal, stop_depth)? {
+                    if let Some(result) = self.drive_flow(signal, stop_depth)? {
                         return Ok(DriveOutcome::Done(result));
                     }
                 }
@@ -1992,59 +2109,187 @@ impl Evaluator {
     ///   `break/continue outside loop` エラーへ写す。ループ frame が有れば、`Break` は
     ///   その frame を畳んで反復を終え、`Continue` は本体を残り分スキップして次反復の判定へ
     ///   進める。
+    ///
+    /// driver 上の呼び出し（tree-expr-continuation-e1）の Call frame に達したときは、同期経路の
+    /// `eval_call` → `drive_call_body` の再入と同じ結果になるように扱う。`Return(v)` はその
+    /// Call frame を畳んで `v` を受け渡し先へ届け（受け渡し先が `return` なら呼び出し元の活性で
+    /// unwind を続ける）、`Break` / `Continue` はその Call frame を畳んでから「ループ外」エラーを
+    /// `Err` で返す（呼び出し元の文のエラーとして [`Self::drive_flow`] が捕捉処理する）。
     fn unwind_flow(
+        &mut self,
+        mut signal: FlowSignal,
+        stop_depth: usize,
+    ) -> Result<Option<EvalResult>, TsumugiError> {
+        'signal: loop {
+            match signal {
+                FlowSignal::Return(v) => {
+                    // 関数活性境界（Call frame）まで、なければこの活性の下限 `stop_depth` まで
+                    // 畳む。Call frame の pop で `env.pop_call_frame` と call trace の巻き戻しが
+                    // 行われる（PR-c）。program 直下（Call frame の無い drive_body）では
+                    // stop_depth まで畳んで Return を surface し、exec_program が「関数外 return」
+                    // ではなく通常完了として扱う。共有スタックのため stop_depth より下（外側の
+                    // 活性）は侵さない。
+                    while self.frames.len() > stop_depth {
+                        let top = self.frames.last().expect("len > stop_depth");
+                        if top.is_driver_call() {
+                            // driver 上の呼び出しの return: 戻り値を受け渡し先へ届ける。
+                            match self.finish_driver_call(v)? {
+                                None => return Ok(None),
+                                Some(next) => {
+                                    signal = next;
+                                    continue 'signal;
+                                }
+                            }
+                        }
+                        let is_call = top.is_call();
+                        self.pop_frame();
+                        if is_call {
+                            break;
+                        }
+                    }
+                    return Ok(Some(EvalResult::Return(v)));
+                }
+                FlowSignal::Break(line) => {
+                    loop {
+                        if self.frames.len() <= stop_depth {
+                            // この活性内にループ frame が無い = ループ外 break。囲む文列
+                            // （exec_program / eval_call）がエラー化する。
+                            return Ok(Some(EvalResult::Break(line)));
+                        }
+                        let top = self.frames.last().expect("len > stop_depth");
+                        if top.is_loop() {
+                            // ループ frame を畳んで反復を終える。本体 Block frame は既に
+                            // pop 済みで、次に来るのがループ controller frame。break は
+                            // controller ごと畳んでループを終える。
+                            self.pop_frame();
+                            return Ok(None);
+                        }
+                        if top.is_driver_call() {
+                            // 関数本体の中にループが無い: 同期経路の eval_call と同じく、Call frame
+                            // を畳んでから offending 文の行で「ループ外」エラーにする。
+                            drop(self.pop_driver_call());
+                            return Err(TsumugiError::break_outside_loop(line));
+                        }
+                        self.pop_frame();
+                    }
+                }
+                FlowSignal::Continue(line) => {
+                    loop {
+                        if self.frames.len() <= stop_depth {
+                            return Ok(Some(EvalResult::Continue(line)));
+                        }
+                        let top = self.frames.last().expect("len > stop_depth");
+                        if top.is_loop() {
+                            // controller frame はそのまま残す。本体 Block frame は
+                            // 下で既に畳んだので、controller が次に advance_frame へ入り、
+                            // fuel 課金 + 次反復開始をする。
+                            return Ok(None);
+                        }
+                        if top.is_driver_call() {
+                            drop(self.pop_driver_call());
+                            return Err(TsumugiError::continue_outside_loop(line));
+                        }
+                        self.pop_frame();
+                    }
+                }
+            }
+        }
+    }
+
+    /// 制御フロー信号で frame stack を巻き戻し、巻き戻し中に起きたエラーを文のエラーと
+    /// 同じく捕捉処理する（tree-expr-continuation-e1、driver 内部用）。
+    ///
+    /// 巻き戻し中のエラーは、driver 上の呼び出し境界に達した `break` / `continue`（ループ外
+    /// エラー）と、戻り値の受け渡し（`let` / 再代入）の失敗だけである。同期経路ではどちらも
+    /// 呼び出し元の文（`exec_stmt`）のエラーとして呼び出し元の driver が捕捉処理していた。
+    fn drive_flow(
         &mut self,
         signal: FlowSignal,
         stop_depth: usize,
     ) -> Result<Option<EvalResult>, TsumugiError> {
-        match signal {
-            FlowSignal::Return(v) => {
-                // 関数活性境界（Call frame）まで、なければこの活性の下限 `stop_depth` まで
-                // 畳む。Call frame の pop で `env.pop_call_frame` と call trace の巻き戻しが
-                // 行われる（PR-c）。program 直下（Call frame の無い drive_body）では
-                // stop_depth まで畳んで Return を surface し、exec_program が「関数外 return」
-                // ではなく通常完了として扱う。共有スタックのため stop_depth より下（外側の
-                // 活性）は侵さない。
-                while self.frames.len() > stop_depth {
-                    let is_call = self.frames.last().expect("len > stop_depth").is_call();
-                    self.pop_frame();
-                    if is_call {
-                        break;
-                    }
-                }
-                Ok(Some(EvalResult::Return(v)))
+        match self.unwind_flow(signal, stop_depth) {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                self.recover_error(e, stop_depth)?;
+                Ok(None)
             }
-            FlowSignal::Break(line) => {
-                loop {
-                    if self.frames.len() <= stop_depth {
-                        // この活性内にループ frame が無い = ループ外 break。囲む文列
-                        // （exec_program / eval_call）がエラー化する。
-                        return Ok(Some(EvalResult::Break(line)));
-                    }
-                    if self.frames.last().expect("len > stop_depth").is_loop() {
-                        // ループ frame を畳んで反復を終える。本体 Block frame は既に
-                        // pop 済みで、次に来るのがループ controller frame。break は
-                        // controller ごと畳んでループを終える。
-                        self.pop_frame();
-                        return Ok(None);
-                    }
-                    self.pop_frame();
-                }
+        }
+    }
+
+    /// 文の実行中エラーを call trace 付きで最も近い `try` へ渡す（driver 内部用）。
+    ///
+    /// 捕捉できなければこの活性の frame を `stop_depth` まで畳んで `Err` を返す。
+    fn recover_error(
+        &mut self,
+        error: TsumugiError,
+        stop_depth: usize,
+    ) -> Result<(), TsumugiError> {
+        let error = self.attach_trace(error);
+        match self.handle_error(error, stop_depth) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.unwind_to(stop_depth);
+                Err(e)
             }
-            FlowSignal::Continue(line) => {
-                loop {
-                    if self.frames.len() <= stop_depth {
-                        return Ok(Some(EvalResult::Continue(line)));
-                    }
-                    if self.frames.last().expect("len > stop_depth").is_loop() {
-                        // controller frame はそのまま残す。本体 Block frame は
-                        // 下で既に畳んだので、controller が次に advance_frame へ入り、
-                        // fuel 課金 + 次反復開始をする。
-                        return Ok(None);
-                    }
-                    self.pop_frame();
-                }
+        }
+    }
+
+    /// 最上位の driver 上の Call frame から呼び出し状態を取り出して pop する
+    /// （tree-expr-continuation-e1）。pop で呼び出し元スコープと call trace が復元される。
+    fn pop_driver_call(&mut self) -> DriverCall {
+        let driver = match &mut self.frames.last_mut().expect("driver call frame").kind {
+            FrameKind::Call { driver, .. } => driver.take(),
+            _ => None,
+        }
+        .expect("top frame is a driver call");
+        self.pop_frame();
+        driver
+    }
+
+    /// driver 上の呼び出しの本体を return なしで実行し切ったときの遷移（tree-expr-continuation-e1）。
+    ///
+    /// 同期経路の `EvalResult::Val` → `Value::Null` と同じく null を受け渡し先へ届ける。
+    /// `run_driver_inner` の Rust frame を大きくしないよう別関数にする。
+    #[inline(never)]
+    fn complete_driver_call(
+        &mut self,
+        stop_depth: usize,
+    ) -> Result<Option<EvalResult>, TsumugiError> {
+        match self.finish_driver_call(Value::Null) {
+            Ok(None) => Ok(None),
+            Ok(Some(signal)) => self.drive_flow(signal, stop_depth),
+            Err(e) => self.recover_error(e, stop_depth).map(|()| None),
+        }
+    }
+
+    /// driver 上の呼び出しを終え、戻り値を受け渡し先へ届ける（tree-expr-continuation-e1）。
+    ///
+    /// 同期経路の順序（`drive_call_body` が Call frame を畳む → `eval_call` が関数値を drop して
+    /// 戻る → `exec_stmt` が値を束縛・代入・return する）をそのまま再現する。受け渡し先が
+    /// `return` なら、呼び出し元の活性で続ける `FlowSignal::Return` を返す。
+    fn finish_driver_call(&mut self, value: Value) -> Result<Option<FlowSignal>, TsumugiError> {
+        let DriverCall { dest, _callee } = self.pop_driver_call();
+        drop(_callee);
+        self.deliver_call_result(dest, value)
+    }
+
+    /// 文レベルの呼び出しの値を受け渡し先へ届ける（同期経路の `exec_stmt` の各文と同じ処理）。
+    fn deliver_call_result(
+        &mut self,
+        dest: CallDest,
+        value: Value,
+    ) -> Result<Option<FlowSignal>, TsumugiError> {
+        match dest {
+            CallDest::Discard => Ok(None),
+            CallDest::Let { name, line } => {
+                self.env_set(&name, value, line)?;
+                Ok(None)
             }
+            CallDest::Assign { name, line } => {
+                self.assign_existing(&name, value, line)?;
+                Ok(None)
+            }
+            CallDest::Return => Ok(Some(FlowSignal::Return(value))),
         }
     }
 
@@ -2244,6 +2489,13 @@ impl Evaluator {
         owner: &Block,
         stmt_index: usize,
     ) -> Result<StmtStep, TsumugiError> {
+        // tree-expr-continuation-e1: yield 可能な driver では、文レベルのユーザー関数呼び出しを
+        // driver 上で実行する。同期経路（`can_yield = false`）は従来の分岐だけを通る。
+        if self.can_yield_ctx
+            && let Some(step) = self.exec_driver_call_stmt(stmt)?
+        {
+            return Ok(step);
+        }
         match stmt {
             Stmt::Let { name, value, line } => {
                 let val = self.eval_expr(value, *line)?;
@@ -2253,15 +2505,7 @@ impl Evaluator {
 
             Stmt::Assign { name, value, line } => {
                 let val = self.eval_expr(value, *line)?;
-                match self.env.update(name, val) {
-                    Ok(()) => {}
-                    Err(crate::env::UpdateError::Undefined) => {
-                        return Err(TsumugiError::assign_undefined(*line, name));
-                    }
-                    Err(crate::env::UpdateError::Budget(stop)) => {
-                        return Err(self.control_stop_to_error(stop, *line));
-                    }
-                }
+                self.assign_existing(name, val, *line)?;
                 Ok(StmtStep::Val)
             }
 
@@ -2441,6 +2685,83 @@ impl Evaluator {
                 self.eval_expr(expr, *line)?;
                 Ok(StmtStep::Val)
             }
+        }
+    }
+
+    /// 再代入（`name = value`）を既存 binding へ適用する（`exec_stmt` と driver 上の呼び出しの
+    /// 戻り値の受け渡しで共有する。tree-expr-continuation-e1）。
+    fn assign_existing(&mut self, name: &str, val: Value, line: usize) -> Result<(), TsumugiError> {
+        match self.env.update(name, val) {
+            Ok(()) => Ok(()),
+            Err(crate::env::UpdateError::Undefined) => {
+                Err(TsumugiError::assign_undefined(line, name))
+            }
+            Err(crate::env::UpdateError::Budget(stop)) => {
+                Err(self.control_stop_to_error(stop, line))
+            }
+        }
+    }
+
+    /// 文の値位置（式文・`let` の右辺・再代入の右辺・`return` の値）にある式がそれ自体
+    /// `Expr::Call` で、callee と全引数が呼び出しを含まない文を実行する（tree-expr-continuation-e1、
+    /// yield 可能な driver だけ）。対象外の文なら `None` を返し、`exec_stmt` が従来どおり実行する。
+    ///
+    /// 前処理は同期経路の `eval_call` と共有する（[`Self::prepare_call`]、同じ順序）。callee が
+    /// ユーザー関数に解決されたら、関数本体を Rust 再帰（`drive_call_body`）で実行する代わりに
+    /// driver 上の Call frame を返す。builtin / cooperative / host に解決されたら、その値を同期経路と
+    /// 同じく文の受け渡し先へ届ける。`exec_stmt` の Rust frame を大きくしないよう別関数にする
+    /// （同期経路の再帰 1 段あたりの stack 使用量を変えない）。
+    #[inline(never)]
+    fn exec_driver_call_stmt(&mut self, stmt: &Stmt) -> Result<Option<StmtStep>, TsumugiError> {
+        let (expr, line) = match stmt {
+            Stmt::ExprStmt { expr, line } => (expr, *line),
+            Stmt::Let { value, line, .. }
+            | Stmt::Assign { value, line, .. }
+            | Stmt::Return { value, line } => (value, *line),
+            _ => return Ok(None),
+        };
+        let Expr::Call { callee, args } = expr else {
+            return Ok(None);
+        };
+        if crate::ast::contains_call(callee) || args.iter().any(crate::ast::contains_call) {
+            return Ok(None);
+        }
+        let dest = match stmt {
+            Stmt::Let { name, .. } => CallDest::Let {
+                name: name.clone(),
+                line,
+            },
+            Stmt::Assign { name, .. } => CallDest::Assign {
+                name: name.clone(),
+                line,
+            },
+            Stmt::Return { .. } => CallDest::Return,
+            _ => CallDest::Discard,
+        };
+        match self.prepare_call(callee, args, line)? {
+            CallPrep::Done(value) => Ok(Some(match self.deliver_call_result(dest, value)? {
+                Some(signal) => StmtStep::Flow(signal),
+                None => StmtStep::Val,
+            })),
+            CallPrep::User {
+                def,
+                saved_scopes,
+                callee,
+            } => Ok(Some(StmtStep::Enter(Frame {
+                stmts: def.body.clone(),
+                cursor: 0,
+                kind: FrameKind::Call {
+                    saved_scopes,
+                    driver: Some(DriverCall {
+                        dest,
+                        _callee: callee,
+                    }),
+                },
+                // drive_call_body と同じく、Call frame 自身は追加スコープを持たない
+                // （関数用ローカルスコープは push_call_frame が積み、pop_call_frame が畳む）。
+                scope_base: self.env.scope_depth(),
+                heap_charge: 0,
+            }))),
         }
     }
 
@@ -2961,13 +3282,56 @@ impl Evaluator {
         args: &[Expr],
         line: usize,
     ) -> Result<Value, TsumugiError> {
+        let (def, saved_scopes, func_value) = match self.prepare_call(callee, args, line)? {
+            CallPrep::Done(value) => return Ok(value),
+            CallPrep::User {
+                def,
+                saved_scopes,
+                callee,
+            } => (def, saved_scopes, callee),
+        };
+
+        // 関数本体を明示 Call frame として driver で実行する（REV-015 Slice 3 PR-c）。
+        // 呼び出し境界がヒープ frame stack 上の [`FrameKind::Call`] になり、スコープ退避
+        // （`saved_scopes`）と call trace の巻き戻しは全終了経路で Call frame の pop_frame が
+        // 行う。そのため eval_call 側では drive_call_body 後に env / trace を触らない
+        // （終了経路ごとの手動 pop_call_frame は不要になった）。エラー時のトレース付加は
+        // driver の attach_trace が担う。
+        let result = match self.drive_call_body(def, saved_scopes) {
+            Ok(EvalResult::Return(v)) => Ok(v),
+            Ok(EvalResult::Val) => Ok(Value::Null),
+            // ループ外 break/continue は offending 文の行番号でエラー化する（VM と一致）。
+            Ok(EvalResult::Break(err_line)) => Err(TsumugiError::break_outside_loop(err_line)),
+            Ok(EvalResult::Continue(err_line)) => {
+                Err(TsumugiError::continue_outside_loop(err_line))
+            }
+            Err(e) => Err(e),
+        };
+        // 関数値は呼び出し完了まで生かす（従来のローカル `func_value` と同じ寿命）。
+        drop(func_value);
+        result
+    }
+
+    /// 関数呼び出しの前処理（tree-expr-continuation-e1 で `eval_call` から分離）。
+    ///
+    /// builtin / cooperative host / 登録 host function に解決されたら値まで評価して
+    /// [`CallPrep::Done`] を返す。ユーザー関数なら `count_step` → 深度検査 → callee 評価 →
+    /// callable 検査 → arity 検査 → 引数評価 → `push_call_frame` → captured / self-binding /
+    /// 引数の束縛 → call trace の push まで行い、本体を実行する材料を [`CallPrep::User`] で返す。
+    /// 同期経路（`eval_call`）と driver 上の文レベル呼び出しが同じ順序を共有する。
+    fn prepare_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<CallPrep, TsumugiError> {
         // 識別子calleeはuser bindingを優先し、未定義の場合だけbuiltinへfallbackする。
         // printは予約tokenのため、通常どおりbindingなしでbuiltinへ到達する。
         if let Expr::Ident(name) = callee
             && self.env.get_cell(name).is_none()
             && let Some(value) = self.eval_builtin(name, args, line)?
         {
-            return Ok(value);
+            return Ok(CallPrep::Done(value));
         }
 
         // REV-015 Slice 5: cooperative（ブロックしない）host function（設計 §4.4/§4.7）。
@@ -2977,7 +3341,9 @@ impl Evaluator {
             && self.env.get_cell(name).is_none()
             && self.host_registry.contains_cooperative_name(name)
         {
-            return self.eval_cooperative_call(name, args, line);
+            return self
+                .eval_cooperative_call(name, args, line)
+                .map(CallPrep::Done);
         }
 
         // Phase 2 C8: user binding も builtin も該当しない識別子 callee が **登録 host function**
@@ -3014,7 +3380,7 @@ impl Evaluator {
                 .budget
                 .track_result(value, ExecutionPhase::Run)
                 .map_err(|stop| self.control_stop_to_error(stop, line))?;
-            return Ok(tracked);
+            return Ok(CallPrep::Done(tracked));
         }
 
         // ユーザー定義関数の呼び出し: ステップカウント + 深度チェック
@@ -3090,22 +3456,11 @@ impl Evaluator {
             line,
         });
 
-        // 関数本体を明示 Call frame として driver で実行する（REV-015 Slice 3 PR-c）。
-        // 呼び出し境界がヒープ frame stack 上の [`FrameKind::Call`] になり、スコープ退避
-        // （`saved_scopes`）と call trace の巻き戻しは全終了経路で Call frame の pop_frame が
-        // 行う。そのため eval_call 側では drive_call_body 後に env / trace を触らない
-        // （終了経路ごとの手動 pop_call_frame は不要になった）。エラー時のトレース付加は
-        // driver の attach_trace が担う。
-        match self.drive_call_body(def, saved_scopes) {
-            Ok(EvalResult::Return(v)) => Ok(v),
-            Ok(EvalResult::Val) => Ok(Value::Null),
-            // ループ外 break/continue は offending 文の行番号でエラー化する（VM と一致）。
-            Ok(EvalResult::Break(err_line)) => Err(TsumugiError::break_outside_loop(err_line)),
-            Ok(EvalResult::Continue(err_line)) => {
-                Err(TsumugiError::continue_outside_loop(err_line))
-            }
-            Err(e) => Err(e),
-        }
+        Ok(CallPrep::User {
+            def,
+            saved_scopes,
+            callee: func_value,
+        })
     }
 
     /// cooperative（ブロックしない）host function を dispatch する（REV-015 Slice 5、設計 §4.7）。
@@ -3155,7 +3510,10 @@ impl Evaluator {
 
         let call_id = self.next_host_call_id;
         self.next_host_call_id = self.next_host_call_id.wrapping_add(1);
-        let may_yield = self.can_yield_ctx;
+        // may_yield はトップレベル（driver 上の呼び出しの外）の yield 可能な driver だけ
+        // （tree-expr-continuation-e1、execution-control §14「can_yield の伝播」）。関数本体の中で
+        // Pending を返す adapter は従来どおり規約違反（catch 不能 InternalControl）になる。
+        let may_yield = self.can_yield_ctx && !self.in_driver_call();
 
         // CapabilityCallContext を組み立てる（capability / deadline / cancellation / 残量 / may_yield）。
         let mut ctx = crate::capability::CapabilityCallContext::new(
