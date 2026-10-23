@@ -2,9 +2,42 @@
 
 最終更新: 2026-10-21
 
-設計ステータス: **実装仕様確定・部分実装（Phase 6 A-1 subset ＋ `BudgetCharged` ＋ host-call lifecycle 3 event ＋ `Yielded` / `Resumed` emission ＋ R-1 redaction R-1a 実装済み）**
+設計ステータス: **到達目標の確定仕様（§1〜§13）＋ 実装の現在地（下記の逸脱一覧）**
 
-> Phase 6 の A-1 subset（schema v1・8 event 型・logical journal・`AuditSink`・fail-closed・opt-in、tree-only）に加え、`BudgetCharged`（§7.2/§7.3）、host-call lifecycle の 3 event（`CapabilityDecision` / `HostCallStarted` / `HostCallFinished`）、yield/resume lifecycle の 2 event（`Yielded` / `Resumed`、§7.2 tag 5/6）、`AuditBackpressure`-yield 配線（§10/§10.2、B-1、sink-Pending 由来）、§10.2 の audit drain queue byte 会計（B-2、per-execution 上限のみ）、および redaction 本体 R-1a（§9/§9.1、既定 policy を tree backend の監査付き host-call 経路へ配線・opt-in・破壊的変更〔`AuditPayload`/`AuditField` 差し替え〕を alpha として受容・`language_revision` bump なし）を tree backend で実装済み。これで §7.2 の 8 event 型が tree backend で emission され、host-call payload は §9.1 の redaction tree を載せる（backpressure も既存 `Yielded`/`Resumed` に `AuditYieldReason::AuditBackpressure` を載せる）。残る strict deterministic CBOR（§9.2）・record/replay・VM audit triple 対応・sink 必須化・body allow-list Reveal（R-1b）、および engine 全体の queue 上限（16 MiB）は未実装。進捗の唯一の正本は [ロードマップ](roadmap.md)。
+本章の §1〜§13 は **到達目標の確定仕様**であり、現在の実装状態ではない。現在の実装が目標仕様からどう
+逸脱しているか・何が未実装かは、下の **逸脱一覧** と **未実装範囲** の 2 表が唯一の正本である（状態の正本は
+この 2 表に置き、§14 のスライス小節は再掲しない）。進捗の唯一の正本は [ロードマップ](roadmap.md)。
+
+このファイルを参照する実装済みスライスは A-1 / B-1 / B-2 / R-1a の 4 件。done にする実装 PR は、この 2 表に
+新しい逸脱・未実装範囲を追加し、解消した逸脱を閉じる（[ドキュメント運用ガイド](documentation-guide.md)
+「逸脱一覧の持ち方」）。
+
+#### 逸脱一覧（目標仕様 §1〜§13 に対する現在の逸脱）
+
+| 逸脱内容 | 対象の節(§) | 発生スライス | 解消スライス | 状態 |
+|---|---|---|---|---|
+| 監査は `EngineBuilder::audit_sink` 設定時だけ有効（opt-in）。sink 未設定時は event を emission せず既存挙動と bit-identical。§1.1 の sink 必須（`ConfigError::AuditSinkRequired`）は未適用 | §1.1 | A-1 | — | 未解消 |
+| `ExecutionStarted.redaction_policy_id` が redaction 本体未実装のため固定既定値のまま | §7.1/§9 | A-1 | R-1a | 解消済み（R-1a で注入 policy の `policy_id`〔既定 `"default-r1"`〕を反映。`src/embedding.rs` の `ExecutionStarted` 構築、R-AT-04） |
+| host-call payload（`request`/`resource`/`response`）が redaction 本体未実装のため crate 内簡略型 `Omitted` で原本 byte 長だけを載せる | §9/§9.1 | A-1 | R-1a | 解消済み（R-1a で §9.1 `AuditField` ツリーへ差し替え。Path は Allow で `HmacSha256`・Deny で `Omitted`、identifier/public は Reveal、body は `Omitted{class:Body}`。構築は `src/builtin_core.rs::host_call_triple`、畳みは `src/audit.rs::fold_audit_field`、R-AT-01/02/03） |
+| Terminal 配送失敗後に完了済み script の language-state を rollback しない（commit が Terminal 配送より前に確定するため）。host は `AuditFailed` を受けた context を再利用してはならない | §10.1 | A-1 | — | 未解消 |
+| envelope の `timestamp.unix_nanoseconds` に wall/unix `AuditClock` でなく request の monotonic tick を流用（順序の正本は `sequence` なので影響限定） | §7.1 | A-1 | — | 未解消 |
+| host-call triple の §8 規則5/6 の timing（allow ack 前に外部効果を止める／`HostCallFinished` ack 前に response を露出させない）を満たさない。外部効果は `dispatch_fs` 内で同期完結。満たすのは triple の論理順序（規則3/4） | §8/§11 | A-1 | — | 未解消 |
+| §11 の host call 開始前 atomic reserve を pre-effect reservation でなく drain 時の容量チェックで代用。外部効果自体を reserve 失敗で止める faithful 実装は未了 | §11 | A-1 | — | 未解消 |
+| `AdmissionQueued` / `SchedulerPreempted` / `HostPaused` の yield は engine-poll 経路（sink 無し）でのみ生じるため写像は定義するが emission しない。sink-bearing な scheduler/pause 経路の配線が未了 | §7.2/§8 | A-1 | — | 未解消 |
+| audit triple / yield/resume の emission が tree-only。VM への配線は未了（既知の受容済み tree/VM 差分、Slice 6 で解消予定） | §2.1/§7.1 | A-1 | — | 未解消 |
+| B-1 時点で host-call triple と `Yielded`/`Resumed` を別 buffer から固定順で drain しており、resume 後の slice の host call が対の `Resumed` より前に配送され §8 規則8 に反していた（yield と host call が同一実行で起きる場合） | §8 規則8 | B-1 | B-2 | 解消済み（B-2 で評価器 buffer を temporal 順の 1 本に統合。`src/eval.rs` の `audit_events`、B2-AT-03／回帰 `slice_fuel_yield_with_host_calls_keeps_resumed_before_next_work`） |
+| audit drain queue byte 上限の判定がトップレベル境界だけの soft limit。関数・callback 本体の中では効かず、queue は上限を超えて溜まり得る（超過量は host-call 回数 budget で有界） | §10.2 | B-2 | — | 未解消 |
+
+#### 未実装範囲（目標仕様 §1〜§13 のうち未着手・延期中）
+
+| 未実装範囲 | 対象の節(§) | 状態 | 備考 |
+|---|---|---|---|
+| sink 必須化（§1.1、`ConfigError::AuditSinkRequired`。opt-in を既定から外す） | §1.1 | 未実装 | CLI 側の sink 構築が整う後続スライスへ延期 |
+| strict deterministic CBOR。現 `encoded_bytes` は naive 推定で後で差し替え可能に隔離 | §9.2 | 未実装 | — |
+| record/replay | §6 | 未実装 | — |
+| VM の audit triple 対応（監査 wiring） | §2.1 | 未実装 | Slice 6（VM conformance）へ延期 |
+| body allow-list Reveal（`reveal_body_fields` と `max_revealed_body_bytes > 0` による `audit_safe` field の明示開示）。R-1a は型だけ用意し常に `Omitted` に畳む | §9/§9.1 | 未実装 | 未実装 ready。スライス R-1b |
+| engine 全体の audit drain queue byte 上限（16 MiB）。per-execution 上限（`max_pending_bytes`）は B-2 で実装済み | §10.2 | 未実装 | 複数 execution 共有の queue 会計と wake 経路が scheduler（E10 統合）と不可分なため延期 |
 
 ## 1. 位置づけ
 
@@ -744,6 +777,8 @@ Phase 5のproduction gateで解消する。StableErrorのcode、script type、me
 本文書4.7の`FunctionId`で解消する。同じsource/chunkでも動的評価ごとに別instanceとし、VMへclosure生成単位のidentity tokenを追加する。treeをcompile chunk共有単位へ寄せて別instanceを等しくする案は、現行言語仕様に反するため採用しない。
 
 ## 14. 実装slice
+
+各スライス小節はそのスライスを実装した時点の記録であり、書き換えない。現在の逸脱・未実装範囲は冒頭の逸脱一覧を見ること。
 
 各sliceは独立PRとし、前sliceの受入基準を満たしてから次へ進む。
 
@@ -1565,8 +1600,9 @@ canonical label の `HmacSha256`・Deny で `Omitted{class:Path}`（raw path/lab
 > 状態: **未実装**（設計のみ）。本小節は R-1a が型だけ用意して常に `Omitted` に畳んでいる body
 > allow-list Reveal 経路（`reveal_body_fields` と `max_revealed_body_bytes > 0` による `audit_safe`
 > field の明示開示）を有効化する最小縦切り（R-1b）の slice 定義である。仕様（本章 §9/§9.1）が正本で
-> あり、以下は R-1b で実装する範囲と意図的に延期する逸脱の記録である。R-1a 小節冒頭の状態注記
-> （body allow-list Reveal〔R-1b〕は未実装）は実装 PR で直すものなので本スライスでは触らない。
+> あり、以下は R-1b で実装する範囲と意図的に延期する逸脱の記録である。R-1a 小節はその時点の記録として
+> 触らない（過去のスライス小節を後から直さない）。現在の逸脱・未実装範囲は冒頭の逸脱一覧が正本であり、
+> R-1b の done 実装 PR で body allow-list Reveal を未実装範囲から外す。
 
 R-1a は §9.1 の `AuditField` ツリーと `RedactionPolicy`（`reveal_body_fields` /
 `max_revealed_body_bytes` を含む）を型として用意したが、body を扱う畳み規則
