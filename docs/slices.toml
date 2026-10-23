@@ -105,17 +105,61 @@ depends_on = ["R-1a"]
 # 未着手（roadmap.md「現在地」「Phase 6 残」から分解。order は暫定）
 # ════════════════════════════════════════════════════════════════
 
+# tree-expr-continuation（Slice 3 PR-e、元の設計 PR #242、分割は PR #250）は 1 晩・1 PR に収まらないため、issue #248 で
+# e1〜e4 の 4 スライスへ分割した（spec「tree-expr-continuation の sub-slice 分割」）。元の id は置き換えて
+# 残さない。「tree-expr-continuation が done」は e1〜e4 がすべて done を意味する。
+# acceptance は各スライスが担当する受入基準の ID。複数スライスにまたがる基準（TEC-AT-01 等）の
+# どの部分を満たせば完了かは、各スライスの spec 小節「受入基準（eN が満たす部分）」に書く。
+# e2〜e4 は設計確定済みだが、DoR 3（depends_on がすべて done）を満たさないため todo に置く。
+# 前段が done になった時点で状態整理 PR で todo → ready にする（F-2 と同じ運用）。
 [[slice]]
-id         = "tree-expr-continuation"
-title      = "tree evaluator の式レベル continuation（式の途中で slice yield 可能に、§4.2/§9.3）"
+id         = "tree-expr-continuation-e1"
+title      = "tree evaluator の式レベル continuation e1：文レベルのユーザー関数呼び出しを driver 上で実行し関数本体の文/反復境界で slice yield（強制 yield フック）"
 status     = "ready"
 parent     = "REV-015"
 spec_slice = "exec-control Slice 3"
-spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation 実装スライス（Slice 3 PR-e：式の途中での slice yield）" }
-acceptance = ["TEC-AT-01..07"]
+spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation-e1 実装スライス（文レベルの関数呼び出しを driver 上で実行・関数本体の yield・強制 yield フック）" }
+acceptance = ["TEC-AT-01", "TEC-AT-03..06"]
 depends_on = ["F-1"]
-design_pr  = 242
-order      = 15
+design_pr  = 250
+issues     = [248]
+order      = 11
+
+[[slice]]
+id         = "tree-expr-continuation-e2"
+title      = "tree evaluator の式レベル continuation e2：式 frame（FrameKind::Expr）でユーザー関数呼び出しを含む部分式・call 引数境界を yield 可能に"
+status     = "todo"
+parent     = "REV-015"
+spec_slice = "exec-control Slice 3"
+spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation-e2 実装スライス（式 frame：ユーザー関数呼び出しを含む部分式・call 引数境界）" }
+acceptance = ["TEC-AT-01..06"]
+depends_on = ["tree-expr-continuation-e1"]
+design_pr  = 250
+order      = 12
+
+[[slice]]
+id         = "tree-expr-continuation-e3"
+title      = "tree evaluator の式レベル continuation e3：builtin・host function の呼び出しで呼び出しを含む引数の境界を yield 可能に"
+status     = "todo"
+parent     = "REV-015"
+spec_slice = "exec-control Slice 3"
+spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation-e3 実装スライス（builtin・host function の呼び出し引数境界）" }
+acceptance = ["TEC-AT-01..03"]
+depends_on = ["tree-expr-continuation-e2"]
+design_pr  = 250
+order      = 13
+
+[[slice]]
+id         = "tree-expr-continuation-e4"
+title      = "tree evaluator の式レベル continuation e4：map / filter / each の要素ループを明示反復にし callback 本体・要素境界を yield 可能に"
+status     = "todo"
+parent     = "REV-015"
+spec_slice = "exec-control Slice 3"
+spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation-e4 実装スライス（`map` / `filter` / `each` の段階実行）" }
+acceptance = ["TEC-AT-01..03", "TEC-AT-05..07"]
+depends_on = ["tree-expr-continuation-e3"]
+design_pr  = 250
+order      = 14
 
 # tree-expr-continuation が呼び出し・反復を必ず yield 可能点にした後、callback なし bulk builtin
 # （sort/join/文字列繰り返し/大 collection コピー等）を chunk（256 element/16 KiB）単位で中断・再開
@@ -127,10 +171,10 @@ title      = "callback なし bulk builtin の chunk 境界 slice yield（§4.1 
 status     = "todo"
 parent     = "REV-015"
 spec_slice = "exec-control Slice 3"
-depends_on = ["tree-expr-continuation"]
+depends_on = ["tree-expr-continuation-e4"]
 order      = 17
 
-# 設計は PR #241 で確定済みだが、前段 tree-expr-continuation が done になるまで着手不可。
+# 設計は PR #241 で確定済みだが、前段 tree-expr-continuation（e1〜e4、最後は e4）が done になるまで着手不可。
 # DoR 3（depends_on がすべて done）を満たさないため status は todo のまま置き、
 # 前段が done になった時点で状態整理 PR で todo → ready にする（documentation-guide の運用どおり）。
 [[slice]]
@@ -141,7 +185,7 @@ parent     = "REV-015"
 spec_slice = "exec-control Slice 6"
 spec       = { doc = "docs/execution-control.md", section = "F-2 実装スライス（§4.1 課金表への移行：主要 charge point・既定 total_fuel 見直し・fuel 会計 revision）" }
 acceptance = ["F2-AT-01..08", "F2-AT-01b"]
-depends_on = ["F-1", "tree-expr-continuation"]
+depends_on = ["F-1", "tree-expr-continuation-e4"]
 design_pr  = 241
 order      = 20
 
