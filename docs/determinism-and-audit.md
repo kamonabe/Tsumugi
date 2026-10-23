@@ -32,17 +32,17 @@
 
 ## 未実装範囲（目標仕様 §1〜§13 のうち未着手・延期中）
 
-| 未実装範囲 | 対象の節(§) | 状態 | 備考 |
-|---|---|---|---|
-| sink 必須化（§1.1、`ConfigError::AuditSinkRequired`。opt-in を既定から外す） | §1.1 | 未実装 | CLI 側の sink 構築が整う後続スライスへ延期 |
-| 監査設定の公開 setter（`EngineBuilder::audit_redaction_policy` / `EngineBuilder::audit_budget`）と `ConfigError` への `AuditConfigError` 接続。現状は `#[doc(hidden)]` のテスト用 shim（`audit_redaction_policy_for_test` / `audit_budget_for_test`、不正 budget は panic）だけ | §1.1/§9.1/§10.2 | 未実装 | sink 必須化スライスへ延期 |
-| strict deterministic CBOR。現 `encoded_bytes` は naive 推定で後で差し替え可能に隔離 | §9.2 | 未実装 | — |
-| 60 KiB 縮退規則（normal event の最大 60 KiB、超過時 Body → Path → Identifier の順で `Omitted` へ縮退、なお超過で `EventTooLarge`）。`AuditFailure::EventTooLarge` は型としてあるが、判定は単一 event が通常 byte 枠全体（`max_encoded_bytes` − Terminal 予約）を超える場合だけで、60 KiB 判定と縮退は無い | §7.2/§9 | 未実装 | 正確な byte 推定が前提のため strict CBOR スライスへ延期 |
-| record/replay | §6 | 未実装 | — |
-| record/replay での redaction 再適用（record 済み redacted payload を盲目コピーせず現行 policy を適用） | §12 | 未実装 | record/replay スライスへ延期 |
-| VM の audit triple 対応（監査 wiring） | §2.1 | 未実装 | Slice 6（VM conformance）へ延期 |
-| body allow-list Reveal（`reveal_body_fields` と `max_revealed_body_bytes > 0` による `audit_safe` field の明示開示）。R-1a は型だけ用意し常に `Omitted` に畳む | §9/§9.1 | 未実装 | スライス R-1b |
-| engine 全体の audit drain queue byte 上限（16 MiB）。per-execution 上限（`max_pending_bytes`）は B-2 で実装済み | §10.2 | 未実装 | 複数 execution 共有の queue 会計と wake 経路が scheduler（E10 統合）と不可分なため延期 |
+| 未実装範囲 | 対象の節(§) | 備考 |
+|---|---|---|
+| sink 必須化（§1.1、`ConfigError::AuditSinkRequired`。opt-in を既定から外す） | §1.1 | CLI 側の sink 構築が整う後続スライスへ延期 |
+| 監査設定の公開 setter（`EngineBuilder::audit_redaction_policy` / `EngineBuilder::audit_budget`）と `ConfigError` への `AuditConfigError` 接続。現状は `#[doc(hidden)]` のテスト用 shim（`audit_redaction_policy_for_test` / `audit_budget_for_test`、不正 budget は panic）だけ | §1.1/§9.1/§10.2 | sink 必須化スライスへ延期 |
+| strict deterministic CBOR。現 `encoded_bytes` は naive 推定で後で差し替え可能に隔離 | §9.2 | — |
+| 60 KiB 縮退規則（normal event の最大 60 KiB、超過時 Body → Path → Identifier の順で `Omitted` へ縮退、なお超過で `EventTooLarge`）。`AuditFailure::EventTooLarge` は型としてあるが、判定は単一 event が通常 byte 枠全体（`max_encoded_bytes` − Terminal 予約）を超える場合だけで、60 KiB 判定と縮退は無い | §7.2/§9 | 正確な byte 推定が前提のため strict CBOR スライスへ延期 |
+| record/replay | §6 | — |
+| record/replay での redaction 再適用（record 済み redacted payload を盲目コピーせず現行 policy を適用） | §12 | record/replay スライスへ延期 |
+| VM の audit triple 対応（監査 wiring） | §2.1 | Slice 6（VM conformance）へ延期 |
+| body allow-list Reveal（`reveal_body_fields` と `max_revealed_body_bytes > 0` による `audit_safe` field の明示開示）。R-1a は型だけ用意し常に `Omitted` に畳む | §9/§9.1 | スライス R-1b |
+| engine 全体の audit drain queue byte 上限（16 MiB）。per-execution 上限（`max_pending_bytes`）は B-2 で実装済み | §10.2 | 複数 execution 共有の queue 会計と wake 経路が scheduler（E10 統合）と不可分なため延期 |
 
 ## 1. 位置づけ
 
