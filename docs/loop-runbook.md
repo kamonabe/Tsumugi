@@ -199,7 +199,7 @@ B：<選択肢>
 4. 該当が無ければ、何も書き込まずに終了する
 5. spec の小節と受入基準のとおりに実装する。spec に無い判断が必要になったら §7 に従って止める
 6. CI と同じゲートを通す: `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test`
-7. 運用ガイドの「ready → done」の遷移に従って `slices.toml` と spec の状態注記を更新する
+7. 運用ガイドの「ready → done」の遷移と「done の条件（Definition of Done）」に従い、その spec の逸脱一覧（新しい逸脱・未実装範囲の追加、解消した行の削除）と `slices.toml` を更新する。過去のスライス小節は書き換えない
 8. ブランチ `feat/<スライスID>`（修正なら `fix/<スライスID>`）で PR を出し、`loop:impl` ラベルを付ける。
    本文は [PR テンプレート](../.github/pull_request_template.md) に従い、「仕様外で判断した点」を全件書く。PR 番号が決まったら `impl_pr` を同じ PR に追記する
 
