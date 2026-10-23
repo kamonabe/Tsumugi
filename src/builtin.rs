@@ -219,7 +219,15 @@ impl Evaluator {
                             })
                             .unwrap_or(0);
                         let op_id = self.alloc_host_call_operation_id(line)?;
-                        let triple = crate::builtin_core::host_call_triple(
+                        let bodies = crate::builtin_core::host_call_body_values(
+                            name,
+                            &evaluated,
+                            &fs_result,
+                            request_bytes_for_audit,
+                            response_bytes,
+                            self.redaction_policy(),
+                        );
+                        let triple = crate::builtin_core::host_call_triple_with_bodies(
                             op_id,
                             name,
                             request_bytes_for_audit,
@@ -228,6 +236,8 @@ impl Evaluator {
                             self.redaction_policy(),
                             fs_label.as_deref(),
                             requested_path_bytes,
+                            bodies.request,
+                            bodies.response,
                         );
                         self.push_host_call_events(triple);
                     }

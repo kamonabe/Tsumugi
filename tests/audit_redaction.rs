@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU128;
 use std::sync::Arc;
 
+use tsumugi::{AuditDirection, AuditFieldKey, AuditScalar, AuditValue, RedactionMode};
 use tsumugi::{
     AuditEvent, AuditField, AuditFieldClass, AuditSink, BudgetConfig, CapabilityDecisionKind,
     CapabilitySet, CompileOptions, EmbeddingContext, EmbeddingEngine, EmbeddingOutcome,
@@ -692,4 +693,325 @@ fn r_at_09_terminal_error_has_no_script_visible_message() {
     // tsumugi の 0 除算 message は「0 で除算」等の自由文。payload にはその自由文を載せない。
     assert_no_substring(&envelopes, "除算");
     assert_no_substring(&envelopes, "ゼロ");
+}
+
+// -----------------------------------------------------------------------------
+// R-1b: body allow-list Reveal（R1b-AT-01〜05・07）。allow-list 入り policy は test shim で注入する。
+// -----------------------------------------------------------------------------
+
+fn body_key(op: &str, direction: AuditDirection, field: &str) -> AuditFieldKey {
+    AuditFieldKey {
+        operation: op.to_string(),
+        direction,
+        field: field.to_string(),
+    }
+}
+
+fn reveal_policy(keys: Vec<AuditFieldKey>, max: u64) -> RedactionPolicy {
+    RedactionPolicy {
+        body_mode: RedactionMode::Reveal,
+        reveal_body_fields: keys.into_iter().collect(),
+        max_revealed_body_bytes: max,
+        ..RedactionPolicy::default()
+    }
+}
+
+/// `policy` を注入して script を実行し、host-call 3 event 列と全 envelope を返す。
+fn run_with_policy(
+    policy: RedactionPolicy,
+    id: u128,
+    text: &'static str,
+    base: &std::path::Path,
+) -> Vec<tsumugi::AuditEnvelope> {
+    let sink = Arc::new(InMemoryAuditSink::new());
+    let engine = EmbeddingEngine::builder()
+        .audit_sink(sink.clone() as Arc<dyn AuditSink>)
+        .audit_redaction_policy_for_test(policy)
+        .build()
+        .expect("build");
+    let script = link_source(&engine, "m", text);
+    let linked = engine.link(&script, link_request()).expect("link");
+    let mut ctx = EmbeddingContext::new(&engine);
+    let audited = engine.run_audited(
+        &linked,
+        &mut ctx,
+        run_request(id, fs_capabilities(rw_fs(base))),
+    );
+    assert!(matches!(
+        audited.outcome(),
+        Some(EmbeddingOutcome::Completed { .. })
+    ));
+    sink.snapshot()
+}
+
+fn utf8(s: &str) -> AuditValue {
+    AuditValue::Scalar(AuditScalar::Utf8(s.to_string()))
+}
+
+/// write_file の (request.body, arguments[1]) と read_file の response.body を取り出す。
+fn write_bodies(envelopes: &[tsumugi::AuditEnvelope]) -> (AuditField, AuditField) {
+    let hc = host_call_events(envelopes);
+    match hc[0] {
+        AuditEvent::HostCallStarted { request, .. } => {
+            let body = request.fields.get("body").expect("body").clone();
+            let args = match request.fields.get("arguments").expect("arguments") {
+                AuditField::Revealed {
+                    value: AuditValue::Sequence(items),
+                    ..
+                } => items.clone(),
+                other => panic!("{other:?}"),
+            };
+            (body, args[1].clone())
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+fn response_body(envelopes: &[tsumugi::AuditEnvelope], triple_index: usize) -> AuditField {
+    let hc = host_call_events(envelopes);
+    match hc[triple_index * 3 + 2] {
+        AuditEvent::HostCallFinished { response, .. } => {
+            response.fields.get("body").expect("body").clone()
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn r1b_at_01_allow_listed_body_within_limit_is_revealed() {
+    let base = temp_dir("r1b01");
+    let policy = reveal_policy(
+        vec![
+            body_key("write_file", AuditDirection::Request, "body"),
+            body_key("write_file", AuditDirection::Request, "1"),
+            body_key("read_file", AuditDirection::Response, "body"),
+        ],
+        16,
+    );
+    let envelopes = run_with_policy(
+        policy,
+        1101,
+        "write_file(\"@data/b.txt\", \"HELLO-BODY\")\nlet c = read_file(\"@data/b.txt\")\n",
+        &base,
+    );
+    let revealed = AuditField::Revealed {
+        class: AuditFieldClass::Body,
+        value: utf8("HELLO-BODY"),
+        original_bytes: 10,
+    };
+    let (req_body, arg1) = write_bodies(&envelopes);
+    assert_eq!(req_body, revealed);
+    assert_eq!(arg1, revealed);
+    assert_eq!(response_body(&envelopes, 1), revealed);
+    // write の response は body を持たない（Omitted のまま）。
+    assert!(matches!(
+        response_body(&envelopes, 0),
+        AuditField::Omitted {
+            class: AuditFieldClass::Body,
+            original_bytes: 0
+        }
+    ));
+    // path は allow-list と無関係に HMAC のまま、raw path は漏れない。
+    assert!(matches!(
+        resource_path(&host_call_events(&envelopes)[0..3]),
+        AuditField::HmacSha256 { .. }
+    ));
+    assert_no_substring(&envelopes, "b.txt");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn r1b_at_02_over_limit_body_is_omitted_without_prefix() {
+    let base = temp_dir("r1b02");
+    let policy = reveal_policy(
+        vec![
+            body_key("write_file", AuditDirection::Request, "body"),
+            body_key("write_file", AuditDirection::Request, "1"),
+        ],
+        9, // "CANARYBODY" は 10 byte
+    );
+    let envelopes = run_with_policy(
+        policy,
+        1102,
+        "write_file(\"@data/o.txt\", \"CANARYBODY\")\n",
+        &base,
+    );
+    let omitted = AuditField::Omitted {
+        class: AuditFieldClass::Body,
+        original_bytes: 10,
+    };
+    let (req_body, arg1) = write_bodies(&envelopes);
+    assert_eq!(req_body, omitted);
+    assert_eq!(arg1, omitted);
+    assert_no_substring(&envelopes, "CAN");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn r1b_at_03_key_mismatch_is_omitted() {
+    let base = temp_dir("r1b03");
+    // direction 違い・field 違い・operation 違いのいずれも一致しない。
+    let policy = reveal_policy(
+        vec![
+            body_key("write_file", AuditDirection::Response, "body"),
+            body_key("write_file", AuditDirection::Request, "0"),
+            body_key("append_file", AuditDirection::Request, "body"),
+            body_key("append_file", AuditDirection::Request, "1"),
+        ],
+        100,
+    );
+    let envelopes = run_with_policy(
+        policy,
+        1103,
+        "write_file(\"@data/m.txt\", \"MISMATCH\")\n",
+        &base,
+    );
+    let (req_body, arg1) = write_bodies(&envelopes);
+    for f in [req_body, arg1] {
+        assert!(matches!(
+            f,
+            AuditField::Omitted {
+                class: AuditFieldClass::Body,
+                original_bytes: 8
+            }
+        ));
+    }
+    assert_no_substring(&envelopes, "MISMATCH");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn r1b_at_04_path_argument_zero_is_never_body_revealed() {
+    let base = temp_dir("r1b04");
+    let policy = reveal_policy(
+        vec![
+            body_key("write_file", AuditDirection::Request, "0"),
+            body_key("write_file", AuditDirection::Request, "1"),
+        ],
+        100,
+    );
+    let envelopes = run_with_policy(policy, 1104, "write_file(\"@data/p0.txt\", \"X\")\n", &base);
+    let hc = host_call_events(&envelopes);
+    match hc[0] {
+        AuditEvent::HostCallStarted { request, .. } => match request.fields.get("arguments") {
+            Some(AuditField::Revealed {
+                value: AuditValue::Sequence(items),
+                ..
+            }) => {
+                assert!(matches!(
+                    items[0],
+                    AuditField::Omitted {
+                        class: AuditFieldClass::Path,
+                        ..
+                    }
+                ));
+                assert!(matches!(items[1], AuditField::Revealed { .. }));
+            }
+            other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    }
+    assert_no_substring(&envelopes, "p0.txt");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn r1b_at_05_non_reveal_body_mode_never_reveals() {
+    let base = temp_dir("r1b05");
+    for (i, mode) in [RedactionMode::Omit, RedactionMode::HmacSha256]
+        .into_iter()
+        .enumerate()
+    {
+        let policy = RedactionPolicy {
+            body_mode: mode,
+            ..reveal_policy(
+                vec![
+                    body_key("write_file", AuditDirection::Request, "body"),
+                    body_key("write_file", AuditDirection::Request, "1"),
+                ],
+                100,
+            )
+        };
+        let envelopes = run_with_policy(
+            policy,
+            1105 + i as u128,
+            "write_file(\"@data/n.txt\", \"NOREVEAL\")\n",
+            &base,
+        );
+        assert_no_substring(&envelopes, "NOREVEAL");
+        let (req_body, _) = write_bodies(&envelopes);
+        assert!(matches!(req_body, AuditField::Omitted { .. }));
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn r1b_read_lines_response_reveals_each_line_in_order() {
+    let base = temp_dir("r1bl");
+    let policy = reveal_policy(
+        vec![body_key("read_lines", AuditDirection::Response, "body")],
+        100,
+    );
+    let envelopes = run_with_policy(
+        policy,
+        1107,
+        "write_file(\"@data/l.txt\", \"a\\nbc\")\nlet c = read_lines(\"@data/l.txt\")\n",
+        &base,
+    );
+    match response_body(&envelopes, 1) {
+        AuditField::Revealed {
+            class: AuditFieldClass::Body,
+            value: AuditValue::Sequence(items),
+            original_bytes: 3,
+        } => {
+            let texts: Vec<_> = items
+                .iter()
+                .map(|f| match f {
+                    AuditField::Revealed {
+                        value: AuditValue::Scalar(AuditScalar::Utf8(t)),
+                        ..
+                    } => t.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(texts, vec!["a".to_string(), "bc".to_string()]);
+        }
+        other => panic!("read_lines response は行ごとの Sequence のはず: {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn r1b_at_07_determinism_100_runs_identical_with_reveal() {
+    let base = temp_dir("r1b07");
+    let run_once = || -> Vec<(u64, String)> {
+        let policy = reveal_policy(
+            vec![
+                body_key("write_file", AuditDirection::Request, "body"),
+                body_key("read_file", AuditDirection::Response, "body"),
+            ],
+            64,
+        );
+        let envelopes = run_with_policy(
+            policy,
+            1108,
+            "write_file(\"@data/d.txt\", \"det\")\nlet c = read_file(\"@data/d.txt\")\n",
+            &base,
+        );
+        envelopes
+            .iter()
+            .skip(1) // ExecutionStarted は FakeClock の clock_id が run ごとに動く
+            .map(|e| (e.sequence, format!("{:?}", e.event)))
+            .collect()
+    };
+    let baseline = run_once();
+    assert!(baseline.iter().any(|(_, e)| e.contains("Revealed")));
+    for _ in 0..100 {
+        assert_eq!(
+            baseline,
+            run_once(),
+            "Reveal 結果は 100 回一致（R1b-AT-07）"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&base);
 }
