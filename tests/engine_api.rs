@@ -1618,3 +1618,458 @@ fn embedding_standard_budget_request_completes_import_less_script() {
         EmbeddingOutcome::Completed { .. }
     ));
 }
+
+// =============================================================================
+// tree-expr-continuation-e1（実行制御仕様 §14「tree-expr-continuation-e1 実装スライス」）
+//
+// 文レベルのユーザー関数呼び出しを driver 上で実行し、関数本体の文/反復境界で yield/resume
+// する。強制 yield フック（テスト専用、`unstable-bytecode` 限定）で全 yield 可能点を跨いだ
+// poll 経路の結果が、yield しない同期実行と一致することを固定する。
+// =============================================================================
+
+#[cfg(feature = "unstable-bytecode")]
+mod tree_expr_continuation_e1 {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use tsumugi::embedding::CompileOptions;
+    use tsumugi::{
+        AdapterError, AuditEvent, AuditSink, AuditedOutcome, BudgetConfig, CapabilitySet,
+        EmbeddingContext, EmbeddingEngine, EmbeddingOutcome, EmbeddingRequest, Engine,
+        ExecutionContext, ExecutionId, ExecutionRequest, FakeClock, InMemoryAuditSink, LinkRequest,
+        MonotonicClock, PollResult, PollSlice, Source, SourceId,
+    };
+
+    /// stdout を buffer へ写す capturing な Output。
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl tsumugi::Output for Capture {
+        fn policy_id(&self) -> std::num::NonZeroU128 {
+            std::num::NonZeroU128::new(1).expect("non-zero")
+        }
+        fn write_all(&self, bytes: &[u8]) -> Result<(), AdapterError> {
+            self.0.lock().expect("lock").extend_from_slice(bytes);
+            Ok(())
+        }
+        fn flush(&self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    fn stdout_caps() -> (CapabilitySet, Arc<Mutex<Vec<u8>>>) {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let caps = CapabilitySet::builder()
+            .stdout(Arc::new(Capture(Arc::clone(&buffer))))
+            .expect("stdout grant")
+            .build();
+        (caps, buffer)
+    }
+
+    /// 比較する実行どうしで同じ clock（clock_id）を使い、ExecutionStarted の budget を揃える。
+    fn shared_clock() -> Arc<dyn MonotonicClock> {
+        thread_local! {
+            static CLOCK: Arc<dyn MonotonicClock> = Arc::new(FakeClock::new());
+        }
+        CLOCK.with(Arc::clone)
+    }
+
+    fn request(caps: CapabilitySet) -> EmbeddingRequest {
+        let clock = shared_clock();
+        let budget = BudgetConfig::standard(clock.as_ref()).expect("standard budget");
+        EmbeddingRequest::new(budget, clock)
+            .expect("standard budget は同 domain")
+            .with_execution_id(ExecutionId::new(7u128.try_into().expect("nonzero")))
+            .with_capabilities(caps)
+    }
+
+    fn link(engine: &EmbeddingEngine, text: &str) -> tsumugi::LinkedScript {
+        let script = engine
+            .compile(
+                Source::new(SourceId::new("m").expect("source id"), text),
+                &CompileOptions {
+                    retain_source: true,
+                },
+            )
+            .expect("compile");
+        let budget = BudgetConfig::standard(shared_clock().as_ref()).expect("standard budget");
+        let link_request = LinkRequest::new(
+            ExecutionId::new(7u128.try_into().expect("nonzero")),
+            CapabilitySet::empty(),
+            budget,
+        );
+        engine.link(&script, link_request).expect("link")
+    }
+
+    /// 監査付き実行 1 回の観測値。
+    #[derive(Debug, PartialEq)]
+    struct Observed {
+        outcome: EmbeddingOutcome,
+        stdout: String,
+        /// `Yielded` / `Resumed` / `BudgetCharged` 以外の audit event 列。
+        events: Vec<AuditEvent>,
+        /// `BudgetCharged` を (resource, reason) ごとに集計した (committed, released, 回数)。
+        /// yield 境界ごとに flush されるため、列ではなく合計で比べる（§8 規則7）。
+        charges: BTreeMap<String, (u64, u64, u64)>,
+    }
+
+    /// 監査付き `Engine::run` 経路で 1 回実行する。`forced` なら強制 yield フックを有効にする。
+    /// 戻り値の 2 つ目は Yielded の回数。
+    fn run_audited(text: &str, forced: bool) -> (Observed, usize) {
+        let sink = Arc::new(InMemoryAuditSink::new());
+        let engine = EmbeddingEngine::builder()
+            .audit_sink(sink.clone() as Arc<dyn AuditSink>)
+            .build()
+            .expect("build");
+        let linked = link(&engine, text);
+        let mut ctx = EmbeddingContext::new(&engine);
+        ctx.force_yield_at_every_boundary_for_test(forced);
+        let (caps, buffer) = stdout_caps();
+        let outcome = match engine.run_audited(&linked, &mut ctx, request(caps)) {
+            AuditedOutcome::Outcome(outcome) => *outcome,
+            other => panic!("監査は成立する: {other:?}"),
+        };
+        let mut events = Vec::new();
+        let mut charges = BTreeMap::new();
+        let mut yields = 0;
+        for envelope in sink.snapshot() {
+            match envelope.event {
+                AuditEvent::Yielded { .. } => yields += 1,
+                AuditEvent::Resumed { .. } => {}
+                AuditEvent::BudgetCharged {
+                    resource,
+                    reason,
+                    committed_delta,
+                    released_delta,
+                    charge_count,
+                    ..
+                } => {
+                    let entry = charges
+                        .entry(format!("{resource:?}/{reason:?}"))
+                        .or_insert((0, 0, 0));
+                    entry.0 += committed_delta;
+                    entry.1 += released_delta;
+                    entry.2 += charge_count;
+                }
+                other => events.push(other),
+            }
+        }
+        let stdout = String::from_utf8(buffer.lock().expect("lock").clone()).expect("utf-8");
+        let observed = Observed {
+            outcome,
+            stdout,
+            events,
+            charges,
+        };
+        (observed, yields)
+    }
+
+    /// sink 無しの `Engine::run`（run_guarded 経路）で実行し、(outcome, stdout) を返す。
+    fn run_plain(text: &str, forced: bool) -> (EmbeddingOutcome, String) {
+        let engine = EmbeddingEngine::builder().build().expect("build");
+        let linked = link(&engine, text);
+        let mut ctx = EmbeddingContext::new(&engine);
+        ctx.force_yield_at_every_boundary_for_test(forced);
+        let (caps, buffer) = stdout_caps();
+        let outcome = engine.run(&linked, &mut ctx, request(caps));
+        let stdout = String::from_utf8(buffer.lock().expect("lock").clone()).expect("utf-8");
+        (outcome, stdout)
+    }
+
+    /// Rust 再帰の同期経路（`Evaluator::run`、`can_yield = false`）で実行し、
+    /// (結果, stdout, committed fuel) を返す。
+    fn run_recursive(text: &str) -> (Result<(), tsumugi::error::TsumugiError>, String, u64) {
+        let text = text.to_string();
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let program =
+                    tsumugi::parser::Parser::new(tsumugi::lexer::Lexer::new(&text).tokenize())
+                        .parse()
+                        .expect("parse");
+                let (caps, buffer) = stdout_caps();
+                let mut evaluator = tsumugi::eval::Evaluator::new();
+                evaluator.set_capabilities(caps);
+                let result = evaluator.run(&program, text.len() as u64);
+                let stdout =
+                    String::from_utf8(buffer.lock().expect("lock").clone()).expect("utf-8");
+                (result, stdout, evaluator.budget_usage().committed.fuel)
+            })
+            .expect("spawn")
+            .join()
+            .expect("join")
+    }
+
+    /// 強制 yield の poll 経路が同期実行と一致することを検査し、強制側の Yielded 回数を返す。
+    fn assert_matches_sync(text: &str) -> usize {
+        let (forced, yields) = run_audited(text, true);
+        let (plain, _) = run_audited(text, false);
+        assert_eq!(
+            forced, plain,
+            "監査付き: 強制 yield と同期実行が食い違う\n{text}"
+        );
+        assert_eq!(run_plain(text, true), run_plain(text, false), "{text}");
+
+        // Rust 再帰の同期経路とも stdout・terminal 種別・エラー行と trace・fuel が一致する。
+        let (result, stdout, fuel) = run_recursive(text);
+        assert_eq!(forced.stdout, stdout, "{text}");
+        match (&forced.outcome, &result) {
+            (EmbeddingOutcome::Completed { usage }, Ok(())) => {
+                assert_eq!(usage.committed.fuel, fuel, "{text}");
+            }
+            (EmbeddingOutcome::RuntimeError { error, usage }, Err(e)) => {
+                assert_eq!(error.line, Some(e.line() as u32), "{text}");
+                assert_eq!(error.safe_message, e.message(), "{text}");
+                let tsumugi::error::TsumugiError::Runtime { trace, .. } = e else {
+                    panic!("runtime error を期待: {e:?}");
+                };
+                let trace: Vec<(String, Option<u32>)> = trace
+                    .iter()
+                    .map(|frame| (frame.name.clone(), Some(frame.line as u32)))
+                    .collect();
+                let observed: Vec<(String, Option<u32>)> = error
+                    .trace
+                    .iter()
+                    .map(|frame| (frame.function.clone(), frame.line))
+                    .collect();
+                assert_eq!(observed, trace, "{text}");
+                assert_eq!(usage.committed.fuel, fuel, "{text}");
+            }
+            other => panic!("terminal 種別が食い違う: {other:?}\n{text}"),
+        }
+        yields
+    }
+
+    /// TEC-AT-01（e1 分）: 4 つの値の位置・入れ子の文レベル呼び出し・関数本体のループ・再帰を
+    /// 跨いで全境界で yield しても、同期実行と stdout・fuel・terminal・audit event 列が一致する。
+    #[test]
+    fn tec_at_01_statement_level_calls_match_sync_path() {
+        let text = "\
+fn add(a, b)
+  return a + b
+end
+fn count(n)
+  let i = 0
+  let acc = 0
+  while i < n
+    acc = add(acc, i)
+    i = i + 1
+  end
+  for x in [1, 2, 3]
+    print(x)
+  end
+  return acc
+end
+fn fact(n)
+  if n <= 1
+    return 1
+  end
+  let r = fact(n - 1)
+  return n * r
+end
+fn noret(x)
+  print(x)
+end
+fn tail(n)
+  if n == 0
+    return \"done\"
+  end
+  return tail(n - 1)
+end
+let total = count(10)
+print(total)
+total = count(5)
+print(total)
+noret(3)
+let nothing = noret(4)
+print(nothing)
+let f = fact(6)
+print(f)
+let t = tail(40)
+print(t)
+let twice = fn(a) a * 2 end
+let d = twice(21)
+print(d)
+";
+        let yields = assert_matches_sync(text);
+        assert!(yields > 100, "関数本体の境界でも yield している: {yields}");
+    }
+
+    /// TEC-AT-01（e1 分）の終了経路: callee 内エラーを呼び出し元の try が捕捉する・未捕捉で
+    /// terminal・関数内の break / continue がループ外エラー・受け渡し（再代入）の失敗。
+    #[test]
+    fn tec_at_01_exit_paths_match_sync_path() {
+        let cases = [
+            "fn boom(n)\n  let i = 0\n  while i < 3\n    i = i + 1\n  end\n  return n / 0\nend\n\
+             fn wrapper()\n  try\n    let v = boom(1)\n    print(\"unreachable\")\n  catch e\n    print(e[\"type\"])\n  end\n  return 7\nend\n\
+             let w = wrapper()\nprint(w)\n",
+            "fn inner()\n  let x = missing\nend\nfn outer()\n  inner()\nend\nprint(1)\nouter()\n",
+            "fn brk()\n  print(1)\n  break\nend\nbrk()\n",
+            "fn cnt()\n  continue\nend\ntry\n  cnt()\ncatch e\n  print(e[\"type\"])\nend\n",
+            "fn one()\n  return 1\nend\ntry\n  undefined_target = one()\ncatch e\n  print(e[\"type\"])\nend\nundefined_target = one()\n",
+        ];
+        for text in cases {
+            assert_matches_sync(text);
+        }
+    }
+
+    /// TEC-AT-04（e1 分）: poll 経路で `return f(n - 1)` 形の深い再帰が、同期経路と同じ
+    /// `call_depth_limit`（同じ行・同じ trace）で止まる。
+    #[test]
+    fn tec_at_04_deep_recursion_hits_same_depth_limit() {
+        let text = "fn down(n)\n  return down(n - 1)\nend\ndown(1000)\n";
+        assert_matches_sync(text);
+        let (forced, _) = run_audited(text, true);
+        match forced.outcome {
+            EmbeddingOutcome::RuntimeError { error, .. } => {
+                assert!(error.safe_message.contains("128"), "{error:?}");
+                assert_eq!(error.line, Some(2));
+            }
+            other => panic!("call_depth_limit を期待: {other:?}"),
+        }
+    }
+
+    /// TEC-AT-05（e1 分）: 関数本体の途中の yield を跨いでも submission journal が保持され、
+    /// terminal でだけ commit / rollback される。
+    #[test]
+    fn tec_at_05_transaction_spans_yields_inside_function_body() {
+        let engine = EmbeddingEngine::builder().build().expect("build");
+        let mut ctx = EmbeddingContext::new(&engine);
+        ctx.force_yield_at_every_boundary_for_test(true);
+        let run = |ctx: &mut EmbeddingContext, text: &str| {
+            let linked = link(&engine, text);
+            engine.run(&linked, ctx, request(CapabilitySet::empty()))
+        };
+        let body = "fn work()\n  let i = 0\n  while i < 5\n    i = i + 1\n  end\n  return i\nend\n";
+
+        // 成功: 関数本体の途中で何度も yield しても、terminal で commit される。
+        let ok = format!("let marker = 1\n{body}let got = work()\n");
+        assert!(matches!(
+            run(&mut ctx, &ok),
+            EmbeddingOutcome::Completed { .. }
+        ));
+        assert!(matches!(
+            run(&mut ctx, "let probe = marker + got\n"),
+            EmbeddingOutcome::Completed { .. }
+        ));
+
+        // 失敗: 関数本体の途中の yield の後で未捕捉エラーになると、yield より前の束縛も rollback。
+        let bad = format!(
+            "let later = 2\n{body}fn fail()\n  let n = work()\n  let x = missing\nend\nfail()\n"
+        );
+        assert!(matches!(
+            run(&mut ctx, &bad),
+            EmbeddingOutcome::RuntimeError { .. }
+        ));
+        assert!(matches!(
+            run(&mut ctx, "let probe = later\n"),
+            EmbeddingOutcome::RuntimeError { .. }
+        ));
+        assert!(matches!(
+            run(&mut ctx, "let probe = marker\n"),
+            EmbeddingOutcome::Completed { .. }
+        ));
+    }
+
+    /// TEC-AT-06（e1 分）: 文レベルで呼んだ関数の本体にループを持つ script を最小 slice
+    /// （16）で実行したとき、1 poll の実行 fuel が「slice + 区間内の bulk builtin 1 回分の単独
+    /// 実測 fuel」以内（式起因の超過は現行課金で 0）。e1 以前は関数呼び出し全体が 1 poll で
+    /// 実行されていた。
+    #[test]
+    fn tec_at_06_poll_fuel_is_bounded_inside_function_body() {
+        let list = (0..40)
+            .rev()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let prelude = format!("let xs = [{list}]\n");
+        let engine = Engine::new();
+        let total_fuel = |text: &str| {
+            let script = engine.compile(text).expect("compile");
+            let mut ctx = ExecutionContext::new();
+            let mut handle = engine
+                .create_execution(&script, &mut ctx, ExecutionRequest::new())
+                .expect("admit");
+            match handle.poll(PollSlice { max_fuel: u64::MAX }).expect("poll") {
+                PollResult::Terminal { usage, .. } => usage.committed.fuel,
+                other => panic!("terminal を期待: {other:?}"),
+            }
+        };
+        let bulk = total_fuel(&format!("{prelude}let s = sort(xs)\n")) - total_fuel(&prelude);
+        assert!(bulk >= 40, "sort 1 回分は要素数以上: {bulk}");
+
+        let text = format!(
+            "{prelude}fn work(n, xs)\n  let s = sort(xs)\n  let i = 0\n  while i < n\n    i = i + 1\n  end\n  return i\nend\nlet r = work(300, xs)\n"
+        );
+        let script = engine.compile(&text).expect("compile");
+        let mut ctx = ExecutionContext::new();
+        let mut handle = engine
+            .create_execution(&script, &mut ctx, ExecutionRequest::new())
+            .expect("admit");
+        let mut previous = 0;
+        let mut polls = 0;
+        loop {
+            let result = handle.poll(PollSlice { max_fuel: 16 }).expect("poll");
+            let fuel = handle.usage().committed.fuel;
+            assert!(
+                fuel - previous <= 16 + bulk,
+                "1 poll の実行 fuel が上限を超えた: {} > 16 + {bulk}",
+                fuel - previous
+            );
+            previous = fuel;
+            polls += 1;
+            if let PollResult::Terminal { outcome, .. } = result {
+                assert_eq!(outcome, tsumugi::ExecutionOutcome::Completed);
+                break;
+            }
+        }
+        assert!(
+            polls > 300 / 16,
+            "関数本体のループの途中で yield している: {polls}"
+        );
+    }
+
+    /// TEC-AT-06（e1 分）: 関数本体の中での slice yield でも Yielded / Resumed が対になり、
+    /// poll_index が単調に増える。
+    #[test]
+    fn tec_at_06_yield_resume_pairs_inside_function_body() {
+        let sink = Arc::new(InMemoryAuditSink::new());
+        let engine = EmbeddingEngine::builder()
+            .audit_sink(sink.clone() as Arc<dyn AuditSink>)
+            .audit_slice_fuel(16)
+            .build()
+            .expect("build");
+        let text = "fn work(n)\n  let i = 0\n  while i < n\n    i = i + 1\n  end\n  return i\nend\nlet r = work(200)\n";
+        let linked = link(&engine, text);
+        let mut ctx = EmbeddingContext::new(&engine);
+        let outcome = engine.run_audited(&linked, &mut ctx, request(CapabilitySet::empty()));
+        assert!(matches!(
+            outcome.outcome(),
+            Some(EmbeddingOutcome::Completed { .. })
+        ));
+        let mut pending: Option<u64> = None;
+        let mut last: Option<u64> = None;
+        let mut pairs = 0;
+        for envelope in sink.snapshot() {
+            match envelope.event {
+                AuditEvent::Yielded { poll_index, .. } => {
+                    assert!(pending.is_none(), "Yielded が連続した");
+                    assert!(
+                        last.is_none_or(|prev| poll_index > prev),
+                        "poll_index が単調でない"
+                    );
+                    pending = Some(poll_index);
+                    last = Some(poll_index);
+                }
+                AuditEvent::Resumed { poll_index, .. } => {
+                    assert_eq!(pending.take(), Some(poll_index), "Resumed が対にならない");
+                    pairs += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(pending.is_none());
+        // work(200) の本体は 1 呼び出しで 200 反復ぶんの fuel を使う。関数本体の中で yield できる
+        // ので、slice 16 の pair はおよそ 200 / 16 回以上になる。
+        assert!(pairs >= 200 / 16, "関数本体の中で yield している: {pairs}");
+    }
+}

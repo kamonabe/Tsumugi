@@ -4003,6 +4003,145 @@ mod tests {
         assert_eq!(e_small.env.get("marker"), None);
     }
 
+    // -------------------------------------------------------------------------
+    // tree-expr-continuation-e1: 文レベルのユーザー関数呼び出しを driver 上で実行する
+    // （Call frame の受け渡し先と終了経路、execution-control §14）
+    // -------------------------------------------------------------------------
+
+    /// 強制 yield フック付きで poll 経路を terminal まで回し、(結果, 評価器, yield 回数) を返す。
+    /// 各 yield 時点で `observe` を呼ぶ。
+    fn run_forced(
+        input: &str,
+        mut observe: impl FnMut(&Evaluator),
+    ) -> (Result<(), TsumugiError>, Evaluator, usize) {
+        let program = parse_program(input);
+        let mut eval = Evaluator::new();
+        eval.force_yield_every_boundary = true;
+        eval.begin_execution(&program, input.len() as u64, false)
+            .expect("begin_execution");
+        let mut yields = 0usize;
+        let result = loop {
+            match eval.run_slice(u64::MAX) {
+                SliceOutcome::Terminal(result) => break result,
+                _ => {
+                    yields += 1;
+                    assert!(yields < 1_000_000, "terminal に到達しない");
+                    observe(&eval);
+                }
+            }
+        };
+        (result, eval, yields)
+    }
+
+    /// 同期経路（`run`、Rust 再帰）で実行して (結果, 評価器) を返す。
+    fn run_sync(input: &str) -> (Result<(), TsumugiError>, Evaluator) {
+        let program = parse_program(input);
+        let mut eval = Evaluator::new();
+        let result = eval.run(&program, input.len() as u64);
+        (result, eval)
+    }
+
+    /// 4 つの値の位置（式文・`let`・再代入・`return`）の受け渡し先が、同期経路と同じ binding・
+    /// fuel・heap になる。関数本体の文境界で yield し（driver 上の Call frame が積まれている）、
+    /// terminal では Call frame・call trace・呼び出しスコープがすべて畳まれている。
+    #[test]
+    fn e1_driver_call_destinations_match_sync_path() {
+        let src = "fn inc(n)\n  let i = 0\n  while i < 2\n    i = i + 1\n  end\n  return n + i\nend\n\
+                   fn none()\n  let unused = 1\nend\n\
+                   fn via_return(n)\n  return inc(n)\nend\n\
+                   let a = inc(1)\nlet b = 0\nb = inc(a)\ninc(b)\nlet c = via_return(b)\n\
+                   let d = none()\nlet lam = fn(x) x * 3 end\nlet e = lam(c)\n";
+        let mut saw_driver_call = false;
+        let (forced, forced_eval, yields) = run_forced(src, |eval| {
+            if eval.in_driver_call() {
+                saw_driver_call = true;
+                // 関数本体の途中: driver 上の呼び出しが call trace と呼び出しスコープを保持している。
+                assert!(!eval.call_stack.is_empty());
+            }
+        });
+        let (sync, sync_eval) = run_sync(src);
+        assert!(forced.is_ok() && sync.is_ok(), "{forced:?} / {sync:?}");
+        assert!(yields > 10, "強制 yield で多数の境界を跨ぐ: {yields}");
+        assert!(saw_driver_call, "関数本体の文境界で yield していない");
+        for name in ["a", "b", "c", "d", "e"] {
+            assert_eq!(forced_eval.env.get(name), sync_eval.env.get(name), "{name}");
+        }
+        assert_eq!(forced_eval.env.get("e"), Some(Value::Int(21)));
+        assert_eq!(forced_eval.env.get("d"), Some(Value::Null));
+        let (f, s) = (forced_eval.budget_usage(), sync_eval.budget_usage());
+        assert_eq!(f.committed.fuel, s.committed.fuel);
+        assert_eq!(f.live_heap_bytes, s.live_heap_bytes);
+        assert_eq!(f.peak_heap_bytes, s.peak_heap_bytes);
+        assert!(forced_eval.frames.is_empty() && forced_eval.call_stack.is_empty());
+        assert_eq!(forced_eval.env.scope_depth(), sync_eval.env.scope_depth());
+    }
+
+    /// 終了経路: callee 内エラーを呼び出し元の try が捕捉する・ループ外 break / continue・
+    /// 受け渡し（再代入）の失敗が、同期経路と同じエラー種別・行・trace・catch 先になる。
+    #[test]
+    fn e1_driver_call_exit_paths_match_sync_path() {
+        // 同期経路の深い再帰（Rust 再帰）を CLI と同じ 8 MiB の実行スレッドで回す。
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(e1_exit_paths_body)
+            .expect("spawn")
+            .join()
+            .expect("e1 exit paths");
+    }
+
+    fn e1_exit_paths_body() {
+        let cases = [
+            "fn boom()\n  let i = 0\n  while i < 2\n    i = i + 1\n  end\n  return 1 / 0\nend\n\
+             let r = 0\ntry\n  r = boom()\ncatch e\n  r = e[\"type\"]\nend\n",
+            "fn inner()\n  let x = missing\nend\nfn outer()\n  inner()\nend\nouter()\n",
+            "fn brk()\n  break\nend\nbrk()\n",
+            "fn cnt()\n  continue\nend\nlet r = 0\ntry\n  cnt()\ncatch e\n  r = e[\"type\"]\nend\n",
+            "fn one()\n  return 1\nend\nundefined_target = one()\n",
+            "fn deep(n)\n  return deep(n + 1)\nend\ndeep(0)\n",
+        ];
+        for src in cases {
+            let (forced, forced_eval, _) = run_forced(src, |_| {});
+            let (sync, sync_eval) = run_sync(src);
+            match (&forced, &sync) {
+                (Ok(()), Ok(())) => {}
+                // 種別・行・メッセージ・trace を含めて一致する。
+                (Err(f), Err(s)) => assert_eq!(f, s, "{src}"),
+                _ => panic!("結果が一致しない: {forced:?} / {sync:?}\n{src}"),
+            }
+            assert_eq!(forced_eval.env.get("r"), sync_eval.env.get("r"), "{src}");
+            assert_eq!(
+                forced_eval.budget_usage().committed.fuel,
+                sync_eval.budget_usage().committed.fuel,
+                "{src}"
+            );
+            assert!(forced_eval.frames.is_empty() && forced_eval.call_stack.is_empty());
+        }
+    }
+
+    /// 関数本体の途中で yield した session を中断すると、driver 上の呼び出しが保持していた
+    /// call trace と呼び出しスコープが巻き戻される。
+    #[test]
+    fn e1_abort_inside_driver_call_restores_call_state() {
+        let src = "fn work()\n  let i = 0\n  while i < 5\n    i = i + 1\n  end\nend\nwork()\n";
+        let program = parse_program(src);
+        let mut eval = Evaluator::new();
+        eval.force_yield_every_boundary = true;
+        let depth_before = eval.env.scope_depth();
+        eval.begin_execution(&program, src.len() as u64, true)
+            .expect("begin_execution");
+        while !eval.in_driver_call() {
+            assert!(!matches!(
+                eval.run_slice(u64::MAX),
+                SliceOutcome::Terminal(_)
+            ));
+        }
+        assert_eq!(eval.call_stack.len(), 1);
+        eval.abort_session();
+        assert!(eval.frames.is_empty() && eval.call_stack.is_empty());
+        assert_eq!(eval.env.scope_depth(), depth_before);
+        assert_eq!(eval.env.get("work"), None, "transaction は rollback される");
+    }
+
     #[test]
     fn arithmetic() {
         // Should not error
