@@ -41,7 +41,6 @@
 | record/replay | §6 | — |
 | record/replay での redaction 再適用（record 済み redacted payload を盲目コピーせず現行 policy を適用） | §12 | record/replay スライスへ延期 |
 | VM の audit triple 対応（監査 wiring） | §2.1 | Slice 6（VM conformance）へ延期 |
-| body allow-list Reveal（`reveal_body_fields` と `max_revealed_body_bytes > 0` による `audit_safe` field の明示開示）。R-1a は型だけ用意し常に `Omitted` に畳む | §9/§9.1 | スライス R-1b |
 | engine 全体の audit drain queue byte 上限（16 MiB）。per-execution 上限（`max_pending_bytes`）は B-2 で実装済み | §10.2 | 複数 execution 共有の queue 会計と wake 経路が scheduler（E10 統合）と不可分なため延期 |
 
 ## 1. 位置づけ

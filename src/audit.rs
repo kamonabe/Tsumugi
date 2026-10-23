@@ -414,11 +414,11 @@ pub struct RedactionPolicy {
     pub path_mode: RedactionMode,
     /// body class の mode（既定 Omit）。
     pub body_mode: RedactionMode,
-    /// body allow-list（R-1 では空・常に Omit）。
+    /// body allow-list（§9.1）。`body_mode == Reveal` かつ上限内のときだけここに載る key の body を開示する。既定は空。
     pub reveal_body_fields: BTreeSet<AuditFieldKey>,
     /// path HMAC に使う秘密鍵。
     pub hmac_key: SecretBytes,
-    /// Reveal できる body の上限 byte 数（R-1 既定 0）。
+    /// Reveal できる body の上限 byte 数（既定 0＝Reveal 不可。超過 body は全体 `Omitted`）。
     pub max_revealed_body_bytes: u64,
 }
 
@@ -474,8 +474,9 @@ impl RedactionPolicy {
 /// - **`Path`**: `path_mode == HmacSha256` かつ `label` が `Some` のときだけ canonical label の
 ///   `HmacSha256` digest。それ以外（mode が HMAC でない・label 不在）は raw を出さず `Omitted`
 ///   へ fail-safe で畳む（label 不在時は raw path を漏らさないため `original_bytes` のみ）。
-/// - **`Body`**: R-1 では allow-list Reveal を実装しないため `body_mode` に関わらず常に `Omitted`。
-///   （R-1b で `reveal_body_fields` を参照する Reveal 経路を有効化する。）
+/// - **`Body`**: この関数は allow-list の key を受け取らないため常に `Omitted`。body の allow-list
+///   Reveal（§9.1、R-1b）は key と値を受け取る [`fold_body_field`] が担い、本関数の Body 分岐は
+///   key 無しでそこへ委譲する（key が無ければ Reveal 条件を満たさず `Omitted`）。
 /// - **`Public` / `Identifier`**: `Reveal`（既定）のとき呼び出し側が渡す `value` を `Revealed`。
 ///   `Omit`/`HmacSha256` 設定時は `Omitted`（Identifier を HMAC する経路は R-1 範囲外）。
 ///
@@ -507,11 +508,8 @@ pub(crate) fn fold_audit_field(
                 original_bytes,
             },
         },
-        // Body は R-1 では allow-list を無視して常に Omit（R-1b で Reveal 経路を有効化）。
-        AuditFieldClass::Body => AuditField::Omitted {
-            class,
-            original_bytes,
-        },
+        // Body は key 無しでは allow-list に載り得ないので Omitted（Reveal は fold_body_field）。
+        AuditFieldClass::Body => fold_body_field(policy, None, original_bytes, value),
         // Public / Identifier は Reveal 既定。Omit/HMAC 設定時は Omitted（Identifier HMAC は範囲外）。
         AuditFieldClass::Public | AuditFieldClass::Identifier => match class_mode(policy, class) {
             RedactionMode::Reveal => match value {
@@ -530,6 +528,67 @@ pub(crate) fn fold_audit_field(
                 class,
                 original_bytes,
             },
+        },
+    }
+}
+
+/// 最大 nesting 段数（§9.1）。これを超える subtree は Body/Omitted へ縮退し Reveal しない。
+const MAX_AUDIT_VALUE_DEPTH: usize = 64;
+
+/// [`AuditValue`] の nesting 段数（scalar=1、Sequence/Object は子の最大段数 + 1）。
+fn audit_value_depth(value: &AuditValue) -> usize {
+    fn field_depth(field: &AuditField) -> usize {
+        match field {
+            AuditField::Revealed { value, .. } => audit_value_depth(value),
+            _ => 1,
+        }
+    }
+    match value {
+        AuditValue::Scalar(_) => 1,
+        AuditValue::Sequence(items) => 1 + items.iter().map(field_depth).max().unwrap_or(0),
+        AuditValue::Object(map) => 1 + map.values().map(field_depth).max().unwrap_or(0),
+    }
+}
+
+impl RedactionPolicy {
+    /// body を Reveal してよいか（§9.1 の 3 条件）。`body_mode == Reveal` かつ `key` が
+    /// `reveal_body_fields` にあり、`max_revealed_body_bytes > 0` かつ
+    /// `original_bytes <= max_revealed_body_bytes`。1 つでも欠ければ false。
+    pub(crate) fn allows_body_reveal(&self, key: &AuditFieldKey, original_bytes: u64) -> bool {
+        self.body_mode == RedactionMode::Reveal
+            && self.max_revealed_body_bytes > 0
+            && original_bytes <= self.max_revealed_body_bytes
+            && self.reveal_body_fields.contains(key)
+    }
+}
+
+/// Body class の 1 field を畳む（§9.1 body allow-list Reveal、R-1b）。
+///
+/// `key` が `Some`、[`RedactionPolicy::allows_body_reveal`] を満たし、`value` があり、`value` の
+/// nesting が 64 段以内のときだけ `Revealed { class: Body, value, original_bytes }`。それ以外
+/// （key 無し・allow-list 外・上限超過・mode 不一致・値無し・64 段超）は truncation せず全体を
+/// `Omitted { class: Body, original_bytes }` にする。
+pub(crate) fn fold_body_field(
+    policy: &RedactionPolicy,
+    key: Option<&AuditFieldKey>,
+    original_bytes: u64,
+    value: Option<AuditValue>,
+) -> AuditField {
+    let class = AuditFieldClass::Body;
+    match (key, value) {
+        (Some(key), Some(value))
+            if policy.allows_body_reveal(key, original_bytes)
+                && audit_value_depth(&value) <= MAX_AUDIT_VALUE_DEPTH =>
+        {
+            AuditField::Revealed {
+                class,
+                value,
+                original_bytes,
+            }
+        }
+        _ => AuditField::Omitted {
+            class,
+            original_bytes,
         },
     }
 }
@@ -3058,6 +3117,163 @@ mod tests {
                 original_bytes: 16
             }
         ));
+    }
+
+    // --- R-1b（§9.1）: body allow-list Reveal の畳み規則 ---
+
+    fn r1b_key(field: &str) -> AuditFieldKey {
+        AuditFieldKey {
+            operation: "write_file".to_string(),
+            direction: AuditDirection::Request,
+            field: field.to_string(),
+        }
+    }
+
+    fn r1b_policy(max: u64) -> RedactionPolicy {
+        RedactionPolicy {
+            body_mode: RedactionMode::Reveal,
+            reveal_body_fields: [r1b_key("body")].into_iter().collect(),
+            max_revealed_body_bytes: max,
+            ..RedactionPolicy::default()
+        }
+    }
+
+    fn r1b_text(s: &str) -> Option<AuditValue> {
+        Some(AuditValue::Scalar(AuditScalar::Utf8(s.to_string())))
+    }
+
+    /// R1b-AT-01/02: 3 条件を満たすと Revealed、上限超過は prefix も残さず全体 Omitted。
+    #[test]
+    fn r1b_body_reveal_within_limit_and_omit_over_limit() {
+        let key = r1b_key("body");
+        match fold_body_field(&r1b_policy(6), Some(&key), 6, r1b_text("CANARY")) {
+            AuditField::Revealed {
+                class: AuditFieldClass::Body,
+                value,
+                original_bytes: 6,
+            } => assert_eq!(value, r1b_text("CANARY").unwrap()),
+            other => panic!("上限内は Revealed のはず: {other:?}"),
+        }
+        let over = fold_body_field(&r1b_policy(5), Some(&key), 6, r1b_text("CANARY"));
+        assert_eq!(
+            over,
+            AuditField::Omitted {
+                class: AuditFieldClass::Body,
+                original_bytes: 6
+            }
+        );
+        assert!(!format!("{over:?}").contains("CAN"));
+    }
+
+    /// R1b-AT-03/05: key 不一致（operation / direction / field）・mode 不一致・max=0 は Omitted。
+    #[test]
+    fn r1b_body_omitted_when_any_condition_fails() {
+        let omitted = AuditField::Omitted {
+            class: AuditFieldClass::Body,
+            original_bytes: 6,
+        };
+        let fold = |policy: &RedactionPolicy, key: &AuditFieldKey| {
+            fold_body_field(policy, Some(key), 6, r1b_text("CANARY"))
+        };
+        let policy = r1b_policy(100);
+        let mut other_op = r1b_key("body");
+        other_op.operation = "append_file".to_string();
+        let mut other_dir = r1b_key("body");
+        other_dir.direction = AuditDirection::Response;
+        for key in [other_op, other_dir, r1b_key("1")] {
+            assert_eq!(
+                fold(&policy, &key),
+                omitted,
+                "key 不一致は Omitted: {key:?}"
+            );
+        }
+        for mode in [RedactionMode::Omit, RedactionMode::HmacSha256] {
+            let p = RedactionPolicy {
+                body_mode: mode,
+                ..r1b_policy(100)
+            };
+            assert_eq!(fold(&p, &r1b_key("body")), omitted);
+        }
+        // max_revealed_body_bytes = 0（既定）は allow-list に載っても Reveal しない。
+        assert_eq!(fold(&r1b_policy(0), &r1b_key("body")), omitted);
+        // key 無し・値無しも Omitted。
+        assert_eq!(
+            fold_body_field(&policy, None, 6, r1b_text("CANARY")),
+            omitted
+        );
+        assert_eq!(
+            fold_body_field(&policy, Some(&r1b_key("body")), 6, None),
+            omitted
+        );
+    }
+
+    /// R1b-AT-04: Secret / Path は allow-list より優先、64 段超の subtree は Reveal しない。
+    #[test]
+    fn r1b_class_precedence_over_allow_list() {
+        let policy = r1b_policy(100);
+        assert!(matches!(
+            fold_audit_field(
+                &policy,
+                AuditFieldClass::Secret,
+                6,
+                None,
+                r1b_text("CANARY")
+            ),
+            AuditField::Omitted {
+                class: AuditFieldClass::Secret,
+                ..
+            }
+        ));
+        // Path は Body 分岐へ来ず decision 規則（label 無し＝Omitted）のまま。
+        assert!(matches!(
+            fold_audit_field(&policy, AuditFieldClass::Path, 6, None, r1b_text("CANARY")),
+            AuditField::Omitted {
+                class: AuditFieldClass::Path,
+                ..
+            }
+        ));
+        // 深さ 64 は Reveal、65 は Omitted。
+        let nest = |levels: usize| -> AuditValue {
+            let mut v = AuditValue::Scalar(AuditScalar::Null);
+            for _ in 1..levels {
+                v = AuditValue::Sequence(vec![AuditField::Revealed {
+                    class: AuditFieldClass::Body,
+                    value: v,
+                    original_bytes: 1,
+                }]);
+            }
+            v
+        };
+        let key = r1b_key("body");
+        assert!(matches!(
+            fold_body_field(&policy, Some(&key), 1, Some(nest(64))),
+            AuditField::Revealed { .. }
+        ));
+        assert!(matches!(
+            fold_body_field(&policy, Some(&key), 1, Some(nest(65))),
+            AuditField::Omitted {
+                class: AuditFieldClass::Body,
+                original_bytes: 1
+            }
+        ));
+    }
+
+    /// R1b-AT-08: Reveal された body を載せても host-call event の byte 推定は 128 固定のまま。
+    #[test]
+    fn r1b_at_08_estimate_unchanged_with_revealed_body() {
+        let key = r1b_key("body");
+        let body = fold_body_field(&r1b_policy(100), Some(&key), 6, r1b_text("CANARY"));
+        assert!(matches!(body, AuditField::Revealed { .. }));
+        let started = AuditEvent::HostCallStarted {
+            operation_id: 1,
+            call_id: 1,
+            function: "write_file".to_string(),
+            request: AuditPayload {
+                fields: [("body".to_string(), body)].into_iter().collect(),
+            },
+            request_bytes: 6,
+        };
+        assert_eq!(estimate_event_bytes(&started), 128);
     }
 
     /// Identifier は既定（Reveal）で渡した value を `Revealed`、Omit 設定時は `Omitted`。

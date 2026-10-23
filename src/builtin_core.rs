@@ -1078,7 +1078,7 @@ fn identifier_field(
 /// 既定 policy を [`crate::audit::fold_audit_field`] で適用して §9.1 の `AuditField` ツリーへ
 /// 畳む。path は Path class なので Allow では canonical label の `HmacSha256`（生 path を漏らさ
 /// ない）・Deny では `Omitted`（label の有無を問わず raw/label 非露出）。request/response body は
-/// Body class で常に `Omitted`（R-1 は allow-list Reveal 未実装）。`arguments` は外側
+/// Body class で、既定 policy では常に `Omitted`（allow-list Reveal は R-1b、`fold_body_field`）。`arguments` は外側
 /// `Revealed{class:Public, Sequence}`（個数と並びだけ開示）で各要素を Path/Body へ畳む。
 /// `function` / `capability` / `action` / `rule_id` は Identifier class（既定 Reveal）で載せる
 /// （ユーザー判断 A＝(イ)）。`error_code` は安定 `ErrorCode` 文字列（`ErrorKind::as_str`）で
@@ -1097,9 +1097,105 @@ pub fn host_call_triple(
     label: Option<&str>,
     requested_path_bytes: u64,
 ) -> [crate::audit::AuditEvent; 3] {
+    // 本文値を渡さない公開入口。body は Reveal する値が無いので常に `Omitted`（R-1a 互換）。
+    host_call_triple_with_bodies(
+        id,
+        name,
+        request_bytes,
+        result,
+        response_bytes,
+        policy,
+        label,
+        requested_path_bytes,
+        None,
+        None,
+    )
+}
+
+/// host call の body 値（R-1b）。Reveal 条件を満たすときだけ組む（[`host_call_body_values`]）。
+pub(crate) struct HostCallBodies {
+    /// request 側の自由文（write/append の書き込み内容）。
+    pub(crate) request: Option<crate::audit::AuditValue>,
+    /// response 側の自由文（read の読み込み内容）。
+    pub(crate) response: Option<crate::audit::AuditValue>,
+}
+
+/// body allow-list Reveal（§9.1、R-1b）に渡す本文値を組む。各 body の `AuditFieldKey`
+/// （operation=host function 名・direction・field=`"body"`／arguments は index 文字列）が
+/// [`crate::audit::RedactionPolicy::allows_body_reveal`] を満たすものだけ値を clone する
+/// （既定 policy では何も clone しない）。
+pub(crate) fn host_call_body_values(
+    name: &str,
+    args: &[Value],
+    result: &Result<Value, TsumugiError>,
+    request_bytes: u64,
+    response_bytes: u64,
+    policy: &crate::audit::RedactionPolicy,
+) -> HostCallBodies {
+    use crate::audit::{AuditDirection, AuditField, AuditFieldClass, AuditFieldKey};
+    use crate::audit::{AuditScalar, AuditValue};
+    let key = |direction, field: &str| AuditFieldKey {
+        operation: name.to_string(),
+        direction,
+        field: field.to_string(),
+    };
+    let utf8 = |s: &str| AuditValue::Scalar(AuditScalar::Utf8(s.to_string()));
+    let mut bodies = HostCallBodies {
+        request: None,
+        response: None,
+    };
+    if matches!(name, "write_file" | "append_file")
+        && (policy.allows_body_reveal(&key(AuditDirection::Request, "body"), request_bytes)
+            || policy.allows_body_reveal(&key(AuditDirection::Request, "1"), request_bytes))
+    {
+        bodies.request = match args.get(1) {
+            Some(Value::Str(s)) => Some(utf8(s.as_str())),
+            Some(other) => Some(utf8(&other.to_string())),
+            None => None,
+        };
+    }
+    if policy.allows_body_reveal(&key(AuditDirection::Response, "body"), response_bytes) {
+        bodies.response = match (name, result) {
+            ("read_file", Ok(Value::Str(s))) => Some(utf8(s.as_str())),
+            // read_lines は各行を独立の Body 要素として並びを保つ（行の結合で内容を変えない）。
+            ("read_lines", Ok(Value::List(items))) => Some(AuditValue::Sequence(
+                items
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Str(s) => Some(AuditField::Revealed {
+                            class: AuditFieldClass::Body,
+                            value: utf8(s.as_str()),
+                            original_bytes: s.len() as u64,
+                        }),
+                        _ => None,
+                    })
+                    .collect(),
+            )),
+            _ => None,
+        };
+    }
+    bodies
+}
+
+/// [`host_call_triple`] の本体。`request_body` / `response_body` は Reveal 候補の本文値
+/// （[`host_call_body_values`]）で、`None` なら該当 body は `Omitted` になる。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn host_call_triple_with_bodies(
+    id: u64,
+    name: &str,
+    request_bytes: u64,
+    result: &Result<Value, TsumugiError>,
+    response_bytes: u64,
+    policy: &crate::audit::RedactionPolicy,
+    label: Option<&str>,
+    requested_path_bytes: u64,
+    request_body: Option<crate::audit::AuditValue>,
+    response_body: Option<crate::audit::AuditValue>,
+) -> [crate::audit::AuditEvent; 3] {
     use crate::audit::{
-        AuditEvent, AuditField, AuditFieldClass, AuditPayload, AuditValue, CapabilityDecisionKind,
-        EffectStatus, HostCallOutcome, fold_audit_field,
+        AuditDirection, AuditEvent, AuditField, AuditFieldClass, AuditFieldKey, AuditPayload,
+        AuditValue, CapabilityDecisionKind, EffectStatus, HostCallOutcome, fold_audit_field,
+        fold_body_field,
     };
     use crate::error::ErrorKind;
     use std::collections::BTreeMap;
@@ -1161,10 +1257,20 @@ pub fn host_call_triple(
 
     // §9.1 redaction tree（既定 policy）を適用して payload を組む。畳み規則はすべて
     // `fold_audit_field` へ集約する（Secret は常に Omit、Path は HMAC mode だけ digest ほか、
-    // R-1 スライス）。R-1 は body allow-list Reveal を実装しないため、Body は `body_mode` に
-    // 関わらず常に Omit へ畳む（R-1b で `reveal_body_fields` を参照する Reveal 経路を有効化する）。
-    let body_field = |original_bytes: u64| -> AuditField {
-        fold_audit_field(policy, AuditFieldClass::Body, original_bytes, None, None)
+    // R-1 スライス）。Body は `fold_body_field` が allow-list Reveal を判定する（R-1b）。
+    // Body は §9.1 の allow-list Reveal 条件を `fold_body_field` が判定する（R-1b）。key は
+    // operation=host function 名・direction・field（payload の key 名、arguments は index 文字列）。
+    let body_field = |direction: AuditDirection,
+                      field: &str,
+                      original_bytes: u64,
+                      value: Option<AuditValue>|
+     -> AuditField {
+        let key = AuditFieldKey {
+            operation: name.to_string(),
+            direction,
+            field: field.to_string(),
+        };
+        fold_body_field(policy, Some(&key), original_bytes, value)
     };
     // decision が Allow のとき Path を HMAC、Deny のとき Omitted に畳む helper。label の有無・
     // original_bytes を渡し、HMAC 入力・raw 非露出は `fold_audit_field` が一元管理する
@@ -1193,7 +1299,15 @@ pub fn host_call_triple(
 
     // request payload: body（原本 byte 長）＋ arguments。
     let mut request_fields: BTreeMap<String, AuditField> = BTreeMap::new();
-    request_fields.insert("body".to_string(), body_field(request_bytes));
+    request_fields.insert(
+        "body".to_string(),
+        body_field(
+            AuditDirection::Request,
+            "body",
+            request_bytes,
+            request_body.clone(),
+        ),
+    );
     // arguments は §9.1 どおり外側を Revealed{class:Public, Sequence([..])} とし、開示するのは
     // 引数の個数と並びだけにする。各要素は引数の種類に応じて Path（path 引数）/ Body（書き込み
     // 内容などの自由文）へ畳むため raw path も自由文も露出しない。path の HMAC は resource 側だけが
@@ -1212,7 +1326,12 @@ pub fn host_call_triple(
     // write/append は第 2 引数が書き込み内容（自由文）＝ Body。original_bytes は内容 byte 長
     // （= request_bytes）。read 系は第 2 引数を持たない。
     if is_write {
-        argument_elements.push(body_field(request_bytes));
+        argument_elements.push(body_field(
+            AuditDirection::Request,
+            "1",
+            request_bytes,
+            request_body,
+        ));
     }
     let arguments_original_bytes =
         requested_path_bytes.saturating_add(if is_write { request_bytes } else { 0 });
@@ -1247,7 +1366,15 @@ pub fn host_call_triple(
 
     // response payload: body（原本 byte 長）。
     let mut response_fields: BTreeMap<String, AuditField> = BTreeMap::new();
-    response_fields.insert("body".to_string(), body_field(response_bytes));
+    response_fields.insert(
+        "body".to_string(),
+        body_field(
+            AuditDirection::Response,
+            "body",
+            response_bytes,
+            response_body,
+        ),
+    );
     let response_payload = AuditPayload {
         fields: response_fields,
     };
@@ -2078,6 +2205,81 @@ mod host_call_triple_tests {
             label,
             requested_path_bytes,
         )
+    }
+
+    /// R-1b: allow-list 入り policy で write 系の body が Reveal され、read 系 request は body 無し。
+    #[test]
+    fn body_reveal_follows_allow_list_for_write_and_read() {
+        use crate::audit::{AuditDirection, AuditFieldKey, AuditScalar, RedactionMode};
+        use crate::builtin_core::host_call_triple_with_bodies;
+        let key = |op: &str, direction, field: &str| AuditFieldKey {
+            operation: op.to_string(),
+            direction,
+            field: field.to_string(),
+        };
+        let policy = RedactionPolicy {
+            body_mode: RedactionMode::Reveal,
+            reveal_body_fields: [
+                key("write_file", AuditDirection::Request, "body"),
+                key("write_file", AuditDirection::Request, "1"),
+            ]
+            .into_iter()
+            .collect(),
+            max_revealed_body_bytes: 8,
+            ..RedactionPolicy::default()
+        };
+        let text = AuditValue::Scalar(AuditScalar::Utf8("hello".to_string()));
+        let ok: Result<Value, TsumugiError> = Ok(Value::Bool(true));
+        let t = host_call_triple_with_bodies(
+            1,
+            "write_file",
+            5,
+            &ok,
+            0,
+            &policy,
+            Some("@data/a"),
+            7,
+            Some(text.clone()),
+            None,
+        );
+        let revealed = AuditField::Revealed {
+            class: AuditFieldClass::Body,
+            value: text,
+            original_bytes: 5,
+        };
+        match &t[0] {
+            AuditEvent::HostCallStarted { request, .. } => {
+                assert_eq!(request.fields["body"], revealed);
+                match &request.fields["arguments"] {
+                    AuditField::Revealed {
+                        value: AuditValue::Sequence(items),
+                        ..
+                    } => {
+                        assert!(matches!(
+                            items[0],
+                            AuditField::Omitted {
+                                class: AuditFieldClass::Path,
+                                ..
+                            }
+                        ));
+                        assert_eq!(items[1], revealed);
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+        // response 側は allow-list 外なので Omitted。
+        match &t[2] {
+            AuditEvent::HostCallFinished { response, .. } => assert!(matches!(
+                response.fields["body"],
+                AuditField::Omitted {
+                    class: AuditFieldClass::Body,
+                    original_bytes: 0
+                }
+            )),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// triple[1]（CapabilityDecision）の resource.path field を取り出す。
