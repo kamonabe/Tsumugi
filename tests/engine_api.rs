@@ -1970,6 +1970,66 @@ print(d)
         ));
     }
 
+    /// TEC-AT-05（e1 分、REPL transaction）: REPL 経路（`link_for_repl` → `run_for_repl`）の
+    /// submission でも、関数本体の途中の yield を跨いで journal が保持され、成功した submission は
+    /// commit、未捕捉エラーで終わった submission は submission 開始時点へ rollback される。
+    #[test]
+    fn tec_at_05_repl_transaction_spans_yields_inside_function_body() {
+        let engine = EmbeddingEngine::builder().build().expect("build");
+        let mut ctx = EmbeddingContext::new(&engine);
+        ctx.force_yield_at_every_boundary_for_test(true);
+        let submit = |ctx: &mut EmbeddingContext, text: &str| {
+            let script = engine
+                .compile(
+                    Source::new(SourceId::new("repl").expect("source id"), text),
+                    &CompileOptions {
+                        retain_source: true,
+                    },
+                )
+                .expect("compile");
+            let budget = BudgetConfig::standard(shared_clock().as_ref()).expect("budget");
+            let link_request = LinkRequest::new(
+                ExecutionId::new(7u128.try_into().expect("nonzero")),
+                CapabilitySet::empty(),
+                budget,
+            );
+            let linked = engine.link_for_repl(&script, link_request).expect("link");
+            engine.run_for_repl(&linked, ctx, request(CapabilitySet::empty()))
+        };
+        let body = "fn work()\n  let i = 0\n  while i < 5\n    i = i + 1\n  end\n  return i\nend\n";
+
+        // 成功 submission: 関数本体の途中で yield を挟んでも commit され、次の submission から見える。
+        let ok = format!("let marker = 1\n{body}let got = work()\n");
+        assert!(matches!(
+            submit(&mut ctx, &ok),
+            EmbeddingOutcome::Completed { .. }
+        ));
+        assert!(matches!(
+            submit(&mut ctx, "let probe = marker + got\n"),
+            EmbeddingOutcome::Completed { .. }
+        ));
+
+        // 失敗 submission: 関数本体の途中の yield の後の未捕捉エラーで、その submission の束縛は
+        // すべて rollback される。前の submission の commit は残る。
+        let bad = "let later = 2\nfn fail()\n  let n = work()\n  let x = missing\nend\nfail()\n";
+        assert!(matches!(
+            submit(&mut ctx, bad),
+            EmbeddingOutcome::RuntimeError { .. }
+        ));
+        assert!(matches!(
+            submit(&mut ctx, "let probe = later\n"),
+            EmbeddingOutcome::RuntimeError { .. }
+        ));
+        assert!(matches!(
+            submit(&mut ctx, "let probe = fail\n"),
+            EmbeddingOutcome::RuntimeError { .. }
+        ));
+        assert!(matches!(
+            submit(&mut ctx, "let probe = marker + got + work()\n"),
+            EmbeddingOutcome::Completed { .. }
+        ));
+    }
+
     /// TEC-AT-06（e1 分）: 文レベルで呼んだ関数の本体にループを持つ script を最小 slice
     /// （16）で実行したとき、1 poll の実行 fuel が「slice + 区間内の bulk builtin 1 回分の単独
     /// 実測 fuel」以内（式起因の超過は現行課金で 0）。e1 以前は関数呼び出し全体が 1 poll で
