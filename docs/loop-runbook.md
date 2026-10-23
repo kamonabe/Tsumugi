@@ -28,6 +28,9 @@ git clone git@github.com:kamonabe/kanade.git develop
 git clone git@github.com:kamonabe/Tsumugi.git develop/tsumugi
 ```
 
+クラウドの実行環境では GitHub の GraphQL API が使えないため、`gh pr create`・`gh pr merge` などの `gh pr` 系コマンドは失敗する。
+PR の作成・コメント・ラベル・マージは REST API（`gh api repos/kamonabe/Tsumugi/...`）で行う。
+
 そのうえで、次を読んでから作業を始める。
 
 1. `develop/CLAUDE.md` と、そこから読み込まれる kanade の steering（共通ルール）
@@ -97,7 +100,8 @@ PR 上の kamonabe のコメントは、先頭の書式で扱いを決める。
 マージは merge commit で行い、マージ後にブランチを削除する。
 
 ```bash
-gh pr merge <番号> --merge --delete-branch
+gh api -X PUT repos/kamonabe/Tsumugi/pulls/<番号>/merge -f merge_method=merge
+gh api -X DELETE repos/kamonabe/Tsumugi/git/refs/heads/<ブランチ名>
 ```
 
 マージしたら、PR に「🤖 Claude Code: kamonabe の承認（<コメントへのリンク>）によりマージしました」と残す。
