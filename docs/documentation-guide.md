@@ -99,8 +99,8 @@ AI エージェント・人間のどちらも、新しい情報を書く前に�
 |---|---|---|
 | （新規追加）→ todo | 設計 PR または状態整理 PR | `slices.toml` へのエントリ追加 |
 | （新規追加）→ ready（issue から、[開発ループ手順書](loop-runbook.md)「issue の仕分け」） | 設計 PR | `slices.toml` へのエントリ追加と、todo → ready と同じもの。ready の条件を満たさなければ todo で追加する |
-| todo → ready | 設計 PR | spec の実装スライス小節の追加・更新、`status` の変更、`spec`・`acceptance`・`design_pr` の記入 |
-| ready → done | 実装 PR | 実装・テスト、spec の逸脱一覧の更新（新しい逸脱・未実装範囲の追加、解消した行の削除）、`status` の変更、`impl_pr` の記入 |
+| todo → ready | 設計 PR | spec の実装スライス小節の追加・更新、`status` の変更、`spec`・`acceptance`・`design_pr` の記入、ロードマップの「現在地」の更新（次のスライスが変わる場合） |
+| ready → done | 実装 PR | 実装・テスト、spec の逸脱一覧の更新（新しい逸脱・未実装範囲の追加、解消した行の削除）、`status` の変更、`impl_pr` の記入、ロードマップの「現在地」と「ステータス一覧」の該当行の更新（状態が変わる場合） |
 | ready → todo（差し戻しの確定） | 設計 PR | spec の修正、`issues` への追記、needs-design issue のクローズ |
 | → blocked / blocked → todo | 状態整理 PR | `blocked_reason` の記入・削除 |
 
@@ -121,7 +121,7 @@ main 上の `status` には承認済みの状態だけを書く。設計中・�
 PR・issue とスライスは次の命名で紐付ける。
 
 - ブランチ: `docs/<スライスID>`（設計 PR）、`feat/<スライスID>` または `fix/<スライスID>`（実装 PR）。prefix はワークスペース共通の Git 運用ルールに合わせる
-- ラベル: `loop:design`、`loop:impl`、`needs-design`
+- ラベル: `loop:design`、`loop:impl`、`needs-design`、`loop:drift`（文書と実装のずれの記録。[開発ループ手順書](loop-runbook.md)「整合点検」）
 - issue タイトル: `[needs-design] <スライスID>: <止まった理由の要約>`
 
 ### ready の条件（Definition of Ready）
