@@ -619,7 +619,7 @@ pub struct RedactionPolicy {
 
 canonical CBORでは`AuditField`のvariantを`0=Revealed`、`1=HmacSha256`、`2=Omitted`、classは表の順を0始まりのtagとし、fieldを持たないenumとして9.2節の一般規則どおり`[tag]`でencodeする（bare integerにしない。`AuditField`のvariantはfieldを持つので常に`[tag, field...]`であり、ここで定めるのはtagの値だけ。§14「audit-strict-cbor-c1 実装スライス」の判断Q1）。`AuditPayload.fields`と`AuditValue::Object`はUTF-8 key byte順、Sequenceはargument/element順を維持する。host call引数は`fields["arguments"] = Sequence(...)`、operation固有metadataは別keyにする。各sequence element/object valueを独立した`AuditField`にするため、argument indexやnested fieldごとにredactionできる。nestingは64段までとし、それ以上のsubtreeはBody/Omittedへ縮退する。
 
-`original_bytes`はredaction前のcanonical subtree payload長であり、omit/hash後も保持する。redaction前subtreeは、子fieldをすべて`Revealed`（同じclass）とし、子の`original_bytes`も同じ規則で下から再帰的に求めた値として9.2節のencodingで表し、その長さを測る。host call引数のうち`AuditValue`へ写せない値（型エラーで文字列でない引数など）は`original_bytes = 0`の`Omitted`とする（§14「audit-strict-cbor-c3 実装スライス」の判断Q2・Q3）。Secret classの親は子を走査・記録せず必ずsubtree全体を`Omitted`、Pathの既定は`HmacSha256`、Bodyは`body_mode == Reveal`かつkeyが`reveal_body_fields`にあり上限内の場合だけ`Revealed`となる。
+`original_bytes`はredaction前のcanonical subtree payload長であり、omit/hash後も保持する。redaction前subtreeは、子fieldをすべて`Revealed`（各子のclassはそのまま）とし、子の`original_bytes`も同じ規則で下から再帰的に求めた値として9.2節のencodingで表し、その長さを測る。ただし`AuditValue`へ写せない子は`Omitted{class, original_bytes: 0}`のまま置く（要素は落とさず、Sequenceの長さとargument indexを保つ）。host call引数のうち`AuditValue`へ写せない値（型エラーで文字列でない引数など）は`original_bytes = 0`の`Omitted`とする（§14「audit-strict-cbor-c3 実装スライス」の判断Q2・Q3）。Secret classの親は子を走査・記録せず必ずsubtree全体を`Omitted`、Pathの既定は`HmacSha256`、Bodyは`body_mode == Reveal`かつkeyが`reveal_body_fields`にあり上限内の場合だけ`Revealed`となる。
 
 | class | 例 | 既定 |
 |---|---|---|
@@ -1863,7 +1863,7 @@ c1 は byte 計測にも redaction にも配線しないため、c1 だけでは
 > 状態: **未実装**（設計のみ）。c1 が done になってから着手する。判断 Q2・Q3 は kamonabe の選択（Q2 = A、Q3 = 3a・3b・3c とも A）で決まり、以下の実装範囲はその選択で書いている（§9.1 にも反映済み）。
 
 - **実装範囲**:
-  - `AuditField` の `original_bytes` を、その field の redaction 前の値（`AuditValue`）の §9.2 encoding の byte 長にする（Q3a = A）。入れ子の値は（Q3b = A）、子 field をすべて `Revealed`（同じ class、子自身の `original_bytes` も同じ規則で下から求めた値）とした redaction 前 subtree を encode して測る。対象は R-1a/R-1b の host-call payload（Path・Body・`arguments` の各要素と外側の `Sequence`）。
+  - `AuditField` の `original_bytes` を、その field の redaction 前の値（`AuditValue`）の §9.2 encoding の byte 長にする（Q3a = A）。入れ子の値は（Q3b = A）、子 field をすべて `Revealed`（各子の class はそのまま、子自身の `original_bytes` も同じ規則で下から求めた値）とした redaction 前 subtree を encode して測る。`AuditValue` へ写せない子は `Omitted { class, original_bytes: 0 }` のまま置く（要素は落とさず、Sequence の長さと argument index を保つ）。対象は R-1a/R-1b の host-call payload（Path・Body・`arguments` の各要素と外側の `Sequence`）。
   - Path の HMAC-SHA-256 の入力を、canonical label の生 byte から「label を値とする `AuditValue::Scalar(AuditScalar::Utf8(label))` の §9.2 encoding」へ変える（§9.1「field payload全体」・§9.2 末尾。Q3a = A）。Deny で label を使わない規則（R-1a）は変えない。
   - R-1b の `max_revealed_body_bytes` との比較は新しい `original_bytes`（CBOR の header を含む長さ）で行う（Q3c = A）。
   - 引数の型エラーで `AuditValue` へ写せない引数（文字列でない引数など）は、現行どおり `original_bytes = 0` の `Omitted` とする（Q2 = A、§9.1）。
@@ -1874,14 +1874,14 @@ c1 は byte 計測にも redaction にも配線しないため、c1 だけでは
   - B: script の値を `AuditValue` へ写す規則（Null/Bool/Int/Float/String → Scalar、List → Sequence、Dict → Object、関数などは型名）を §9.1 に足し、その encode 長を測る。§9.1 の定義を文字どおり満たすが、record 用の Value encoding（§9.2 `RecordedHostRequest`）と別の写像が増える。
 - **判断 Q3（kamonabe の選択: 3a・3b・3c とも A）**: redaction 前 subtree の encoding の定義（§9.1「field payload全体」・§9.2「redaction前subtree」はどちらにも読める。`AuditField::Revealed` 全体は `original_bytes` を含み循環するので候補から外す）。
   - **3a. Path の HMAC 入力**: A（推奨）`AuditValue::Scalar(AuditScalar::Utf8(label))` の encoding（field の値として他の field と同じ規則で測れ、`original_bytes` と同じ入力になる。根拠: §9.1「field payload全体」、manifesto 原則 8）。B: label の CBOR text 単体（`AuditValue`/`AuditScalar` の tag を含まない。§9.1「canonical resource label」に近い）。どちらでも digest の値は現行から変わる。
-  - **3b. 入れ子の `original_bytes`**: A（推奨）子 field をすべて `Revealed`（同じ class）にし、子の `original_bytes` も同じ規則で下から求めた subtree の encode 長（子を単独で測った値と親の中の子の値が一致し、決定的。根拠: §9.1「redaction前のcanonical subtree payload長」、manifesto 原則 5）。B: 子の `original_bytes` を 0 とみなして測る（再帰が無く単純だが、親の中の子の表現が実際の Revealed 子と一致しない）。
+  - **3b. 入れ子の `original_bytes`**: A（推奨）子 field をすべて `Revealed`（各子の class はそのまま）にし、子の `original_bytes` も同じ規則で下から求めた subtree の encode 長（子を単独で測った値と親の中の子の値が一致し、決定的。根拠: §9.1「redaction前のcanonical subtree payload長」、manifesto 原則 5）。B: 子の `original_bytes` を 0 とみなして測る（再帰が無く単純だが、親の中の子の表現が実際の Revealed 子と一致しない）。
   - **3c. R-1b の上限比較**: A（推奨）CBOR header を含む新しい `original_bytes` と比較する（§9.1 の「上限内」と `original_bytes` が同じ量を指し、比較対象が 1 つで済む。Reveal の境界が header 分ずれる。根拠: §9.1、R-1b 小節の「比較対象は `original_bytes`」）。B: 原本の UTF-8 byte 長と比較する（host が設定する上限の意味が R-1b のまま変わらない。比較用の長さを `original_bytes` と別に持つ）。
 - **受入基準（c3）**:
   - **SC-AT-11**: Path（Allow / Deny）・Body（write/append の内容、read の response）・`arguments` の各要素の `original_bytes` が、redaction 前の値の §9.2 encoding の長さと一致する（例: 5 byte の ASCII 文字列は `Scalar(Utf8)` の encode 長）。
   - **SC-AT-12**: Path の digest が `HMAC-SHA-256(hmac_key, deterministic_cbor(Scalar(Utf8(label))))` と一致する（既知の key・label による test vector）。同じ key・label なら一致し、key か label が違えば変わる（§15.4）。
   - **SC-AT-13**: R-1b の上限判定が新しい `original_bytes` で行われる。上限と等しい body は Reveal され、1 byte 超えると全体 `Omitted` になる（境界が CBOR header 分ずれることを固定する）。
   - **SC-AT-14**: canary を入れた path・body が encode 後の byte 列に平文で現れない（§15.4）。同じ入力では 100 回一致する。
-  - **SC-AT-15**: 外側の `arguments`（`Sequence`）の `original_bytes` が、子をすべて `Revealed` とした redaction 前 subtree の encode 長と一致する。
+  - **SC-AT-15**: 外側の `arguments`（`Sequence`）の `original_bytes` が、子をすべて `Revealed` とした redaction 前 subtree の encode 長と一致する。型エラーの引数（`AuditValue` へ写せない引数）を含む `arguments` では、その子を `Omitted { class, original_bytes: 0 }` として測った長さと一致する。
 - **想定の変更規模**: `src/audit.rs`・`src/builtin_core.rs` で約 60〜120 行。既存の R-1a/R-1b のテストの `original_bytes` と digest の期待値を更新する。仕組みは redaction 1 つ。
 
 #### audit-strict-cbor-c4 実装スライス（60 KiB 縮退規則と Terminal `Emergency`）
