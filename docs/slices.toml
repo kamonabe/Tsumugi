@@ -216,6 +216,7 @@ spec       = { doc = "docs/determinism-and-audit.md", section = "audit-strict-cb
 acceptance = ["SC-AT-01..05"]
 depends_on = ["A-1"]
 design_pr  = 256
+impl_pr    = 261
 
 [[slice]]
 id         = "audit-strict-cbor-c2"
