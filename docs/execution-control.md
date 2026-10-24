@@ -1893,9 +1893,10 @@ builtin・host のどれに解決されるかは静的には決まらない（us
       その状態を heap へ移しただけなので、課金しなくても「予算の外で増えるメモリ」は同期経路から増えない
       （Rust stack 側の上限は 8 MiB スレッドと深度上限が引き続き抑える）。
       §5.1 との関係: §5.1 の表は continuation frame を種類で区別せず「96 + local slot 32 × count」としているが、
-      実装はすでにスコープを作る frame（ループ本体 1 反復の Block・Scoped・Try）だけを 96 byte 課金し、program 直下の
-      Block・Call・`while` / `for` の制御 frame は 0 である。A を選ぶ場合は、§5.1 の表に「課金するのはスコープを作る
-      frame。Call・ループ制御・式 frame は同期経路の Rust 再帰が持つ状態の置き換えなので課金しない」と注記して目標仕様を実装に合わせる（逸脱一覧には足さない）。
+      実装はすでにスコープを作る frame だけに「96 + local slot 32 × count」を課金し（`while` の反復・`if` の分岐・`try`
+      本体は 96、`for` の反復・`catch` 本体は 128）、program 直下の Block・Call・`while` / `for` の制御 frame は 0 である。
+      A を選ぶ場合は、§5.1 の表に「課金するのはスコープを作る frame（96 + local slot 32 × count）。Call・ループ制御・
+      式 frame は同期経路の Rust 再帰が持つ状態の置き換えなので課金しない」と注記して目標仕様を実装に合わせる（逸脱一覧には足さない）。
       あわせて上の小節・e2b・e4 の 96 byte の記述を 0 に揃える。
     - **B**: 確定どおり 96 byte を課金し、poll 経路（`Engine::run` / CLI を含む）の `peak_heap` が、呼び出しを含む
       式の段階評価の深さ × 96 byte 増えることを意図的な差として明記する。根拠: §5.1 の continuation frame の課金表を
