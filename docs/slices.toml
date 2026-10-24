@@ -115,13 +115,14 @@ depends_on = ["R-1a"]
 [[slice]]
 id         = "tree-expr-continuation-e1"
 title      = "tree evaluator の式レベル continuation e1：文レベルのユーザー関数呼び出しを driver 上で実行し関数本体の文/反復境界で slice yield（強制 yield フック）"
-status     = "ready"
+status     = "done"
 parent     = "REV-015"
 spec_slice = "exec-control Slice 3"
 spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation-e1 実装スライス（文レベルの関数呼び出しを driver 上で実行・関数本体の yield・強制 yield フック）" }
 acceptance = ["TEC-AT-01", "TEC-AT-03..06"]
 depends_on = ["F-1"]
 design_pr  = 250
+impl_pr    = 254
 issues     = [248]
 order      = 11
 

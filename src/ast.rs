@@ -363,6 +363,35 @@ pub(crate) fn is_side_effect_free(expr: &Expr) -> bool {
     }
 }
 
+/// 部分式のどこかに `Expr::Call` を含むか（静的判定、execution-control §14
+/// 「tree-expr-continuation の sub-slice 分割」の「呼び出しを含む式」）。
+///
+/// `Expr::Lambda` の本体は定義時に評価されないので数えない。式の中で反復を起こすのは
+/// 呼び出しだけなので、「呼び出し・反復を含む部分式」はこの判定と一致する。
+/// AST深度は`MAX_AST_DEPTH`で制限されているため再帰で走査する。
+pub(crate) fn contains_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { .. } => true,
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Ident(_)
+        | Expr::Lambda { .. } => false,
+        Expr::List(items) => items.iter().any(contains_call),
+        Expr::Dict(pairs) => pairs
+            .iter()
+            .any(|(key, value)| contains_call(key) || contains_call(value)),
+        Expr::BinOp { left, right, .. } => contains_call(left) || contains_call(right),
+        Expr::UnaryOp { expr, .. } => contains_call(expr),
+        Expr::Index { object, index } => contains_call(object) || contains_call(index),
+        Expr::FStr(parts) => parts
+            .iter()
+            .any(|part| matches!(part, FStrExprPart::Expr(child) if contains_call(child))),
+    }
+}
+
 /// クロージャ捕捉用に、本体で言及される識別子名を集める（非再帰）。
 ///
 /// 自由変数の保守的な近似である。`let`で束縛される名前、parameter、`for`変数、
