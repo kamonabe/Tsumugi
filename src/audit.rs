@@ -2080,6 +2080,587 @@ fn wrong_execution_id(id: ExecutionId) -> ExecutionId {
     ExecutionId::new(nonzero)
 }
 
+// =============================================================================
+// §9.2 deterministic CBOR encoder（audit-strict-cbor-c1、crate 内部・未配線）
+// =============================================================================
+
+/// §9.2 の deterministic CBOR encoder（schema v1）。size pass と write pass を 1 つの走査で共有する。
+///
+/// 同じ [`cbor::Encode`] の走査を、長さだけ数える [`cbor::SizeOut`]（size pass、checked 加算）と
+/// `Vec<u8>`（write pass）に通す。別実装の size 推定を持たない（§9.2 末尾）。c1 では journal・queue・
+/// redaction のどこにも配線しないため、本番ビルドでは未使用である（c2 以降で使われた時点で外す）。
+///
+/// 入れ子の再帰は `AuditValue` の nesting 上限（64 段、§9.1）を前提にしており、上限の強制は
+/// 呼び出し側（redaction、c4）の責務である。
+pub(crate) mod cbor {
+    #![cfg_attr(not(test), expect(dead_code))]
+
+    use super::*;
+
+    /// encode の失敗。
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum CborError {
+        /// size pass の長さが `u64` を超えた。
+        LengthOverflow,
+        /// write pass の byte 長が size pass の長さと一致しない（internal audit failure）。
+        LengthMismatch,
+    }
+
+    /// encode の出力先。size pass は長さだけを数え、write pass は byte を書く。
+    pub(crate) trait CborOut {
+        /// `bytes` を末尾へ足す。
+        fn put(&mut self, bytes: &[u8]) -> Result<(), CborError>;
+    }
+
+    /// size pass の出力先。byte は保持せず、checked 加算で長さだけを数える。
+    #[derive(Debug, Default)]
+    pub(crate) struct SizeOut {
+        len: u64,
+    }
+
+    impl SizeOut {
+        /// 長さ 0 から数える。
+        pub(crate) fn new() -> Self {
+            Self::default()
+        }
+
+        /// `len` から数える（overflow 経路の検証用）。
+        pub(crate) fn starting_at(len: u64) -> Self {
+            Self { len }
+        }
+
+        /// ここまでに数えた長さ。
+        pub(crate) fn len(&self) -> u64 {
+            self.len
+        }
+    }
+
+    impl CborOut for SizeOut {
+        fn put(&mut self, bytes: &[u8]) -> Result<(), CborError> {
+            self.len = self
+                .len
+                .checked_add(bytes.len() as u64)
+                .ok_or(CborError::LengthOverflow)?;
+            Ok(())
+        }
+    }
+
+    /// write pass の出力先。
+    impl CborOut for Vec<u8> {
+        fn put(&mut self, bytes: &[u8]) -> Result<(), CborError> {
+            self.extend_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    // ---- primitive（RFC 8949 §4.2.1: 最短幅・定長） ----
+
+    fn head<O: CborOut>(out: &mut O, major: u8, arg: u64) -> Result<(), CborError> {
+        let m = major << 5;
+        let mut buf = [0u8; 9];
+        let n = if arg < 24 {
+            buf[0] = m | arg as u8;
+            1
+        } else if arg <= 0xff {
+            buf[0] = m | 24;
+            buf[1] = arg as u8;
+            2
+        } else if arg <= 0xffff {
+            buf[0] = m | 25;
+            buf[1..3].copy_from_slice(&(arg as u16).to_be_bytes());
+            3
+        } else if arg <= 0xffff_ffff {
+            buf[0] = m | 26;
+            buf[1..5].copy_from_slice(&(arg as u32).to_be_bytes());
+            5
+        } else {
+            buf[0] = m | 27;
+            buf[1..9].copy_from_slice(&arg.to_be_bytes());
+            9
+        };
+        out.put(&buf[..n])
+    }
+
+    /// unsigned integer（major type 0）。値で最短幅を選ぶ。
+    pub(crate) fn uint<O: CborOut>(out: &mut O, v: u64) -> Result<(), CborError> {
+        head(out, 0, v)
+    }
+
+    /// signed integer。0 以上は major type 0、負は major type 1（`-1 - v`）。
+    pub(crate) fn int<O: CborOut>(out: &mut O, v: i64) -> Result<(), CborError> {
+        if v >= 0 {
+            head(out, 0, v as u64)
+        } else {
+            head(out, 1, !v as u64)
+        }
+    }
+
+    /// 定長 byte string。
+    pub(crate) fn bytes<O: CborOut>(out: &mut O, v: &[u8]) -> Result<(), CborError> {
+        head(out, 2, v.len() as u64)?;
+        out.put(v)
+    }
+
+    /// 定長 text string（UTF-8 を正規化しない）。
+    pub(crate) fn text<O: CborOut>(out: &mut O, v: &str) -> Result<(), CborError> {
+        head(out, 3, v.len() as u64)?;
+        out.put(v.as_bytes())
+    }
+
+    /// 定長 array の header。
+    pub(crate) fn array_header<O: CborOut>(out: &mut O, len: usize) -> Result<(), CborError> {
+        head(out, 4, len as u64)
+    }
+
+    /// bool（simple value 20 / 21）。
+    pub(crate) fn boolean<O: CborOut>(out: &mut O, v: bool) -> Result<(), CborError> {
+        out.put(&[if v { 0xf5 } else { 0xf4 }])
+    }
+
+    /// null（simple value 22）。
+    pub(crate) fn null<O: CborOut>(out: &mut O) -> Result<(), CborError> {
+        out.put(&[0xf6])
+    }
+
+    /// `[tag, field0, ...]` の header（array header と tag）。`fields` は tag 以降の要素数。
+    fn tagged<O: CborOut>(out: &mut O, tag: u64, fields: usize) -> Result<(), CborError> {
+        array_header(out, 1 + fields)?;
+        uint(out, tag)
+    }
+
+    // ---- 合成規則（§9.2） ----
+
+    /// §9.2 の deterministic CBOR で encode できる型。
+    pub(crate) trait Encode {
+        /// `out` へ encode する。
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError>;
+    }
+
+    /// struct = 宣言順の array。要素数は列挙した field の数から決まる。
+    macro_rules! encode_struct {
+        ($out:expr, $s:expr; $($f:ident),+) => {{
+            array_header($out, [$(stringify!($f)),+].len())?;
+            $( $s.$f.encode($out)?; )+
+            Ok(())
+        }};
+    }
+
+    /// field を持つ enum variant = `[tag, field...]`。
+    macro_rules! encode_variant {
+        ($out:expr, $tag:expr; $($f:expr),+) => {{
+            tagged($out, $tag, [$(stringify!($f)),+].len())?;
+            $( $f.encode($out)?; )+
+            Ok(())
+        }};
+    }
+
+    /// field を持たない enum = 宣言順の 0 始まり tag を `[tag]` で encode する（判断 Q1 = A）。
+    /// 全 variant を明示するので、variant を足すと match の網羅性で compile error になる。
+    macro_rules! encode_fieldless {
+        ($t:ty { $($v:ident = $tag:expr),+ $(,)? }) => {
+            impl Encode for $t {
+                fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+                    let tag: u64 = match self { $(<$t>::$v => $tag),+ };
+                    tagged(out, tag, 0)
+                }
+            }
+        };
+    }
+
+    macro_rules! encode_uint {
+        ($($t:ty),+) => {$(
+            impl Encode for $t {
+                fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+                    uint(out, u64::from(*self))
+                }
+            }
+        )+};
+    }
+    encode_uint!(u8, u16, u32, u64);
+
+    impl Encode for bool {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            boolean(out, *self)
+        }
+    }
+
+    impl Encode for String {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            text(out, self)
+        }
+    }
+
+    /// `[u8; 32]` の hash / digest は 32 byte の byte string。
+    impl Encode for [u8; 32] {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            bytes(out, self)
+        }
+    }
+
+    /// `Option` = `[0]` / `[1, v]`。
+    impl<T: Encode> Encode for Option<T> {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            match self {
+                None => tagged(out, 0, 0),
+                Some(v) => encode_variant!(out, 1; v),
+            }
+        }
+    }
+
+    /// Vec = 元順の array。
+    impl<T: Encode> Encode for Vec<T> {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            array_header(out, self.len())?;
+            self.iter().try_for_each(|v| v.encode(out))
+        }
+    }
+
+    /// `BTreeMap` = `[[key, value], ...]`（UTF-8 key byte 順）。
+    impl<T: Encode> Encode for BTreeMap<String, T> {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            array_header(out, self.len())?;
+            for (k, v) in self {
+                array_header(out, 2)?;
+                text(out, k)?;
+                v.encode(out)?;
+            }
+            Ok(())
+        }
+    }
+
+    // ---- schema v1 の型 ----
+
+    impl Encode for ExecutionId {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            bytes(out, &self.get().get().to_be_bytes())
+        }
+    }
+
+    impl Encode for HostTimestamp {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            array_header(out, 1)?;
+            bytes(out, &self.unix_nanoseconds.to_be_bytes())
+        }
+    }
+
+    impl Encode for AuditEnvelope {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            encode_struct!(out, self; schema_version, execution_id, source_hash,
+                language_revision, sequence, timestamp, event)
+        }
+    }
+
+    encode_fieldless!(Backend {
+        TreeWalk = 0, VmExperimental = 1
+    });
+    encode_fieldless!(crate::engine::AdmissionPhase {
+        Created = 0, Linked = 1
+    });
+    encode_fieldless!(ExecutionMode {
+        Live = 0, Record = 1, Replay = 2
+    });
+    encode_fieldless!(CapabilityDecisionKind {
+        Allow = 0, Deny = 1
+    });
+    encode_fieldless!(HostCallOutcome {
+        Success = 0, Denied = 1, HostError = 2, Cancelled = 3, Detached = 4
+    });
+    encode_fieldless!(EffectStatus {
+        None = 0, Committed = 1, Unknown = 2
+    });
+    encode_fieldless!(AuditFieldClass {
+        Public = 0, Identifier = 1, Path = 2, Body = 3, Secret = 4
+    });
+    encode_fieldless!(BudgetChargeReason {
+        Statement = 0, Expression = 1, Operation = 2, Function = 3, Loop = 4, HostCall = 5,
+        BulkElements = 6, BulkBytes = 7, Allocation = 8, Source = 9, Input = 10, Output = 11
+    });
+    encode_fieldless!(BudgetResource {
+        Fuel = 0, HeapBytes = 1, SingleStringBytes = 2, StringAllocations = 3, StringBytes = 4,
+        SingleSourceBytes = 5, SourceCount = 6, SourceBytes = 7, ImportCount = 8, ImportBytes = 9,
+        CollectionElements = 10, InputCalls = 11, InputBytes = 12, OutputCalls = 13, OutputBytes =
+        14, HostCalls = 15, HostRequestBytes = 16, HostResponseBytes = 17, HostCallBytes = 18
+    });
+
+    impl Encode for AuditYieldReason {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            match self {
+                Self::AdmissionQueued { resume_to } => encode_variant!(out, 0; resume_to),
+                Self::SliceFuelExhausted => tagged(out, 1, 0),
+                Self::ExplicitYield => tagged(out, 2, 0),
+                Self::HostCallPending { call_id } => encode_variant!(out, 3; call_id),
+                Self::AuditBackpressure => tagged(out, 4, 0),
+                Self::SchedulerPreempted => tagged(out, 5, 0),
+                Self::HostPaused => tagged(out, 6, 0),
+            }
+        }
+    }
+
+    impl Encode for TerminalOutcome {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            match self {
+                Self::Completed => tagged(out, 0, 0),
+                Self::Exited(code) => encode_variant!(out, 1; code),
+                Self::Denied => tagged(out, 2, 0),
+                Self::LinkError => tagged(out, 3, 0),
+                Self::RuntimeError => tagged(out, 4, 0),
+                Self::HostError => tagged(out, 5, 0),
+                Self::BudgetExceeded(resource) => encode_variant!(out, 6; resource),
+                Self::DeadlineExceeded => tagged(out, 7, 0),
+                Self::Cancelled => tagged(out, 8, 0),
+                Self::AuditFailure => tagged(out, 9, 0),
+                Self::InternalFailure => tagged(out, 10, 0),
+                Self::RecordFailure => tagged(out, 11, 0),
+                Self::ReplayMismatch => tagged(out, 12, 0),
+            }
+        }
+    }
+
+    /// `MonotonicInstant` は opaque な u64 ns tick だけ（clock instance の識別子は含めない、§9.2）。
+    impl Encode for crate::budget::MonotonicInstant {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            uint(out, self.as_nanos())
+        }
+    }
+
+    impl Encode for BudgetConfig {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            encode_struct!(out, self; heap_accounting_revision, total_fuel, max_live_heap_bytes,
+                max_string_allocations, max_string_bytes, max_single_string_bytes,
+                max_source_count, max_source_bytes, max_single_source_bytes, max_import_count,
+                max_import_bytes, max_collection_elements, max_input_calls, max_input_bytes,
+                max_output_calls, max_output_bytes, max_host_calls, max_host_request_bytes,
+                max_host_response_bytes, max_host_call_bytes, deadline)
+        }
+    }
+
+    impl Encode for crate::budget::BudgetCounters {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            encode_struct!(out, self; fuel, string_allocations, string_bytes, source_count,
+                source_bytes, import_count, import_bytes, input_calls, input_bytes, output_calls,
+                output_bytes, host_calls, host_request_bytes, host_response_bytes,
+                host_call_bytes)
+        }
+    }
+
+    impl Encode for crate::budget::BudgetPeaks {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            encode_struct!(out, self; single_string_bytes, single_source_bytes,
+                collection_elements)
+        }
+    }
+
+    impl Encode for BudgetUsage {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            encode_struct!(out, self; committed, reserved, live_heap_bytes, reserved_heap_bytes,
+                peak_heap_bytes, peaks)
+        }
+    }
+
+    impl Encode for AuditFrame {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            encode_struct!(out, self; function, module_id, line)
+        }
+    }
+
+    impl Encode for AuditError {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            encode_struct!(out, self; code, message_id, module_id, line, column, trace,
+                omitted_trace_frames)
+        }
+    }
+
+    impl Encode for AuditErrorPayload {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            match self {
+                Self::Full(error) => encode_variant!(out, 0; error),
+                Self::Emergency {
+                    code,
+                    message_id,
+                    full_error_bytes,
+                    full_error_sha256,
+                } => encode_variant!(out, 1; code, message_id, full_error_bytes, full_error_sha256),
+            }
+        }
+    }
+
+    impl Encode for AuditScalar {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            match self {
+                Self::Null => tagged(out, 0, 0),
+                Self::Bool(v) => encode_variant!(out, 1; v),
+                Self::Int(v) => {
+                    tagged(out, 2, 1)?;
+                    int(out, *v)
+                }
+                Self::Float(bits) => {
+                    tagged(out, 3, 1)?;
+                    bytes(out, &bits.to_be_bytes())
+                }
+                Self::Utf8(v) => encode_variant!(out, 4; v),
+                Self::Bytes(v) => {
+                    tagged(out, 5, 1)?;
+                    bytes(out, v)
+                }
+            }
+        }
+    }
+
+    impl Encode for AuditValue {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            match self {
+                Self::Scalar(v) => encode_variant!(out, 0; v),
+                Self::Sequence(v) => encode_variant!(out, 1; v),
+                Self::Object(v) => encode_variant!(out, 2; v),
+            }
+        }
+    }
+
+    impl Encode for AuditPayload {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            encode_struct!(out, self; fields)
+        }
+    }
+
+    impl Encode for AuditField {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            match self {
+                Self::Revealed {
+                    class,
+                    value,
+                    original_bytes,
+                } => encode_variant!(out, 0; class, value, original_bytes),
+                Self::HmacSha256 {
+                    class,
+                    digest,
+                    original_bytes,
+                } => encode_variant!(out, 1; class, digest, original_bytes),
+                Self::Omitted {
+                    class,
+                    original_bytes,
+                } => encode_variant!(out, 2; class, original_bytes),
+            }
+        }
+    }
+
+    impl Encode for AuditEvent {
+        fn encode<O: CborOut>(&self, out: &mut O) -> Result<(), CborError> {
+            match self {
+                Self::ExecutionStarted {
+                    engine_version,
+                    backend,
+                    rules_revision,
+                    heap_accounting_revision,
+                    budget,
+                    capability_policy_hash,
+                    redaction_policy_id,
+                    mode,
+                } => encode_variant!(out, 0; engine_version, backend, rules_revision,
+                    heap_accounting_revision, budget, capability_policy_hash,
+                    redaction_policy_id, mode),
+                Self::CapabilityDecision {
+                    operation_id,
+                    call_id,
+                    capability,
+                    action,
+                    resource,
+                    decision,
+                    rule_id,
+                } => encode_variant!(out, 1; operation_id, call_id, capability, action, resource,
+                    decision, rule_id),
+                Self::HostCallStarted {
+                    operation_id,
+                    call_id,
+                    function,
+                    request,
+                    request_bytes,
+                } => encode_variant!(out, 2; operation_id, call_id, function, request,
+                    request_bytes),
+                Self::HostCallFinished {
+                    operation_id,
+                    call_id,
+                    outcome,
+                    response,
+                    response_bytes,
+                    error_code,
+                    effect_status,
+                } => encode_variant!(out, 3; operation_id, call_id, outcome, response,
+                    response_bytes, error_code, effect_status),
+                Self::BudgetCharged {
+                    resource,
+                    committed_delta,
+                    released_delta,
+                    usage_after,
+                    peak_after,
+                    charge_count,
+                    reason,
+                } => encode_variant!(out, 4; resource, committed_delta, released_delta,
+                    usage_after, peak_after, charge_count, reason),
+                Self::Yielded {
+                    reason,
+                    poll_index,
+                    usage,
+                } => encode_variant!(out, 5; reason, poll_index, usage),
+                Self::Resumed {
+                    previous_reason,
+                    poll_index,
+                    usage,
+                } => encode_variant!(out, 6; previous_reason, poll_index, usage),
+                Self::Terminal {
+                    outcome,
+                    error,
+                    usage,
+                    import_graph_hash,
+                    context_committed,
+                    host_effects_may_remain,
+                } => encode_variant!(out, 7; outcome, error, usage, import_graph_hash,
+                    context_committed, host_effects_may_remain),
+            }
+        }
+    }
+
+    // ---- 入口（crate 内部） ----
+
+    /// size pass: `value` の encode 長を checked arithmetic で返す。
+    pub(crate) fn encoded_len<T: Encode>(value: &T) -> Result<u64, CborError> {
+        let mut size = SizeOut::new();
+        value.encode(&mut size)?;
+        Ok(size.len())
+    }
+
+    /// write pass: `value` の canonical bytes を返す。先に size pass で長さを求め、write pass の
+    /// byte 長と一致しなければ [`CborError::LengthMismatch`] とする（§11）。
+    pub(crate) fn encode_to_vec<T: Encode>(value: &T) -> Result<Vec<u8>, CborError> {
+        let len = encoded_len(value)?;
+        let mut buf = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+        value.encode(&mut buf)?;
+        if buf.len() as u64 != len {
+            return Err(CborError::LengthMismatch);
+        }
+        Ok(buf)
+    }
+
+    /// envelope 固定部（`event` を除く）の長さの上限値。`sequence` を最大幅（`u64::MAX`、9 byte）と
+    /// みなす。sequence 確定前の event を queue で計上する c2 のための入口で、
+    /// `envelope_fixed_len_upper_bound(rev) + encoded_len(event)` が sequence 確定後の実長以上になる。
+    pub(crate) fn envelope_fixed_len_upper_bound(
+        language_revision: &str,
+    ) -> Result<u64, CborError> {
+        let mut size = SizeOut::new();
+        array_header(&mut size, 7)?;
+        uint(&mut size, 1)?; // schema_version（常に 1）
+        bytes(&mut size, &[0u8; 16])?; // execution_id
+        bytes(&mut size, &[0u8; 32])?; // source_hash
+        text(&mut size, language_revision)?;
+        uint(&mut size, u64::MAX)?; // sequence の最大幅
+        HostTimestamp {
+            unix_nanoseconds: 0,
+        }
+        .encode(&mut size)?; // timestamp は 18 byte 固定
+        Ok(size.len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3374,5 +3955,830 @@ mod tests {
         assert_eq!(estimate_event_bytes(&started), 128);
         assert_eq!(estimate_event_bytes(&decision), 128);
         assert_eq!(estimate_event_bytes(&finished), 128);
+    }
+}
+
+// =============================================================================
+// §9.2 deterministic CBOR encoder の unit test（audit-strict-cbor-c1、SC-AT-01〜04）
+// =============================================================================
+
+#[cfg(test)]
+mod cbor_tests {
+    use super::cbor::*;
+    use super::*;
+    use crate::budget::{
+        BudgetCounters, BudgetPeaks, BudgetUsage, FakeClock, MonotonicClock, MonotonicInstant,
+    };
+    use std::num::NonZeroU128;
+
+    /// 手で組んだ期待 byte 列と一致し、size pass の長さが write pass の byte 長と一致することを確かめる
+    /// （SC-AT-01/02 と SC-AT-03 を兼ねる）。
+    fn check<T: Encode>(value: &T, expected: &[u8]) {
+        let got = encode_to_vec(value).expect("encode");
+        assert_eq!(got, expected, "got {got:02x?}");
+        assert_eq!(encoded_len(value), Ok(expected.len() as u64));
+    }
+
+    fn s(v: &str) -> AuditField {
+        AuditField::Revealed {
+            class: AuditFieldClass::Path,
+            value: AuditValue::Scalar(AuditScalar::Utf8(v.to_string())),
+            original_bytes: 1,
+        }
+    }
+
+    fn cat(parts: &[&[u8]]) -> Vec<u8> {
+        parts.concat()
+    }
+
+    #[test]
+    fn cbor_unsigned_integer_width_boundaries() {
+        let cases: [(u64, &[u8]); 10] = [
+            (0, &[0x00]),
+            (23, &[0x17]),
+            (24, &[0x18, 0x18]),
+            (255, &[0x18, 0xff]),
+            (256, &[0x19, 0x01, 0x00]),
+            (65535, &[0x19, 0xff, 0xff]),
+            (65536, &[0x1a, 0x00, 0x01, 0x00, 0x00]),
+            (u32::MAX as u64, &[0x1a, 0xff, 0xff, 0xff, 0xff]),
+            (
+                1 << 32,
+                &[0x1b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00],
+            ),
+            (
+                u64::MAX,
+                &[0x1b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            ),
+        ];
+        for (v, expected) in cases {
+            check(&v, expected);
+        }
+        // 宣言型の幅ではなく値で最短幅を選ぶ。
+        check(&5u8, &[0x05]);
+        check(&300u16, &[0x19, 0x01, 0x2c]);
+        check(&300u32, &[0x19, 0x01, 0x2c]);
+    }
+
+    /// primitive を write pass（`Vec<u8>`）と size pass（`SizeOut`）の両方に通し、write pass が期待 byte 列と
+    /// 一致し、size pass の長さが同じ byte 長になることを確かめる（SC-AT-01/03）。
+    macro_rules! prim {
+        ($expected:expr, $o:ident => $e:expr) => {{
+            let expected: &[u8] = &$expected;
+            let mut $o = Vec::new();
+            $e.expect("write pass");
+            assert_eq!($o, expected);
+            let mut $o = SizeOut::new();
+            $e.expect("size pass");
+            assert_eq!($o.len(), expected.len() as u64);
+        }};
+    }
+
+    #[test]
+    fn cbor_negative_integer_boundaries() {
+        prim!([0x20], o => int(&mut o, -1));
+        prim!([0x37], o => int(&mut o, -24));
+        prim!([0x38, 0x18], o => int(&mut o, -25));
+        prim!([0x3b, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], o => int(&mut o, i64::MIN));
+        prim!([0x07], o => int(&mut o, 7));
+        prim!([0x1b, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], o => int(&mut o, i64::MAX));
+        // AuditScalar::Int は i64 をこの規則で包む。
+        check(&AuditScalar::Int(-1), &[0x82, 0x02, 0x20]);
+    }
+
+    #[test]
+    fn cbor_text_bytes_bool_null_primitives() {
+        prim!([0x60], o => text(&mut o, ""));
+        prim!([0x61, 0x61], o => text(&mut o, "a"));
+        // 24 byte で長さ header が 2 byte になる。UTF-8 は正規化せず byte 長で数える。
+        let long = "x".repeat(24);
+        let expected = cat(&[&[0x78, 0x18], long.as_bytes()]);
+        prim!(expected, o => text(&mut o, &long));
+        prim!([0x62, 0xc3, 0xa9], o => text(&mut o, "é"));
+        prim!([0x40], o => bytes(&mut o, &[]));
+        prim!([0x42, 0x01, 0x02], o => bytes(&mut o, &[1, 2]));
+        let expected = cat(&[&[0x59, 0x01, 0x00], &[7u8; 256]]);
+        prim!(expected, o => bytes(&mut o, &[7u8; 256]));
+        prim!([0xf5], o => boolean(&mut o, true));
+        prim!([0xf4], o => boolean(&mut o, false));
+        prim!([0xf6], o => null(&mut o));
+        check(&true, &[0xf5]);
+        check(&"a".to_string(), &[0x61, 0x61]);
+    }
+
+    #[test]
+    fn cbor_option_vec_btreemap_composition() {
+        check(&None::<u64>, &[0x81, 0x00]);
+        check(&Some(5u64), &[0x82, 0x01, 0x05]);
+        check(&Some(None::<u64>), &[0x82, 0x01, 0x81, 0x00]);
+        check(&Vec::<u64>::new(), &[0x80]);
+        check(&vec![3u64, 1, 2], &[0x83, 0x03, 0x01, 0x02]);
+        let mut m = BTreeMap::new();
+        m.insert("b".to_string(), 2u64);
+        m.insert("a".to_string(), 1u64);
+        check(&m, &[0x82, 0x82, 0x61, 0x61, 0x01, 0x82, 0x61, 0x62, 0x02]);
+        check(&BTreeMap::<String, u64>::new(), &[0x80]);
+    }
+
+    #[test]
+    fn cbor_i128_timestamp_and_float_bits_are_fixed_width_big_endian() {
+        let ts = |v: i128| HostTimestamp {
+            unix_nanoseconds: v,
+        };
+        let prefix = [0x81, 0x50];
+        check(&ts(0), &cat(&[&prefix, &[0u8; 16]]));
+        check(&ts(-1), &cat(&[&prefix, &[0xffu8; 16]]));
+        let mut min = [0u8; 16];
+        min[0] = 0x80;
+        check(&ts(i128::MIN), &cat(&[&prefix, &min]));
+        let mut max = [0xffu8; 16];
+        max[0] = 0x7f;
+        check(&ts(i128::MAX), &cat(&[&prefix, &max]));
+        let mut one = [0u8; 16];
+        one[15] = 1;
+        check(&ts(1), &cat(&[&prefix, &one]));
+        // HostTimestamp は値によらず 18 byte 固定。
+        assert_eq!(encoded_len(&ts(i128::MIN)), Ok(18));
+        // Float は canonicalized binary64 bits の 8 byte BE byte string（CBOR float 型を使わない）。
+        check(
+            &AuditScalar::Float(0x3ff0_0000_0000_0000),
+            &[0x82, 0x03, 0x48, 0x3f, 0xf0, 0, 0, 0, 0, 0, 0],
+        );
+    }
+
+    #[test]
+    fn cbor_fieldless_enums_encode_as_one_element_array_with_declaration_order_tag() {
+        fn all<T: Encode>(variants: &[T]) {
+            for (i, v) in variants.iter().enumerate() {
+                check(v, &[0x81, i as u8]);
+            }
+        }
+        all(&[Backend::TreeWalk, Backend::VmExperimental]);
+        all(&[
+            crate::engine::AdmissionPhase::Created,
+            crate::engine::AdmissionPhase::Linked,
+        ]);
+        all(&[
+            ExecutionMode::Live,
+            ExecutionMode::Record,
+            ExecutionMode::Replay,
+        ]);
+        all(&[CapabilityDecisionKind::Allow, CapabilityDecisionKind::Deny]);
+        all(&[
+            HostCallOutcome::Success,
+            HostCallOutcome::Denied,
+            HostCallOutcome::HostError,
+            HostCallOutcome::Cancelled,
+            HostCallOutcome::Detached,
+        ]);
+        all(&[
+            EffectStatus::None,
+            EffectStatus::Committed,
+            EffectStatus::Unknown,
+        ]);
+        all(&[
+            AuditFieldClass::Public,
+            AuditFieldClass::Identifier,
+            AuditFieldClass::Path,
+            AuditFieldClass::Body,
+            AuditFieldClass::Secret,
+        ]);
+        use BudgetChargeReason as R;
+        all(&[
+            R::Statement,
+            R::Expression,
+            R::Operation,
+            R::Function,
+            R::Loop,
+            R::HostCall,
+            R::BulkElements,
+            R::BulkBytes,
+            R::Allocation,
+            R::Source,
+            R::Input,
+            R::Output,
+        ]);
+        use BudgetResource as B;
+        all(&[
+            B::Fuel,
+            B::HeapBytes,
+            B::SingleStringBytes,
+            B::StringAllocations,
+            B::StringBytes,
+            B::SingleSourceBytes,
+            B::SourceCount,
+            B::SourceBytes,
+            B::ImportCount,
+            B::ImportBytes,
+            B::CollectionElements,
+            B::InputCalls,
+            B::InputBytes,
+            B::OutputCalls,
+            B::OutputBytes,
+            B::HostCalls,
+            B::HostRequestBytes,
+            B::HostResponseBytes,
+            B::HostCallBytes,
+        ]);
+    }
+
+    #[test]
+    fn cbor_yield_reason_and_terminal_outcome_variants() {
+        use AuditYieldReason as Y;
+        check(
+            &Y::AdmissionQueued {
+                resume_to: crate::engine::AdmissionPhase::Linked,
+            },
+            &[0x82, 0x00, 0x81, 0x01],
+        );
+        check(&Y::SliceFuelExhausted, &[0x81, 0x01]);
+        check(&Y::ExplicitYield, &[0x81, 0x02]);
+        check(&Y::HostCallPending { call_id: 4 }, &[0x82, 0x03, 0x04]);
+        check(&Y::AuditBackpressure, &[0x81, 0x04]);
+        check(&Y::SchedulerPreempted, &[0x81, 0x05]);
+        check(&Y::HostPaused, &[0x81, 0x06]);
+
+        use TerminalOutcome as T;
+        check(&T::Completed, &[0x81, 0x00]);
+        check(&T::Exited(3), &[0x82, 0x01, 0x03]);
+        check(&T::Denied, &[0x81, 0x02]);
+        check(&T::LinkError, &[0x81, 0x03]);
+        check(&T::RuntimeError, &[0x81, 0x04]);
+        check(&T::HostError, &[0x81, 0x05]);
+        check(
+            &T::BudgetExceeded(BudgetResource::Fuel),
+            &[0x82, 0x06, 0x81, 0x00],
+        );
+        check(&T::DeadlineExceeded, &[0x81, 0x07]);
+        check(&T::Cancelled, &[0x81, 0x08]);
+        check(&T::AuditFailure, &[0x81, 0x09]);
+        check(&T::InternalFailure, &[0x81, 0x0a]);
+        check(&T::RecordFailure, &[0x81, 0x0b]);
+        check(&T::ReplayMismatch, &[0x81, 0x0c]);
+    }
+
+    #[test]
+    fn cbor_audit_field_value_and_scalar_variants() {
+        use AuditScalar as S;
+        check(&S::Null, &[0x81, 0x00]);
+        check(&S::Bool(true), &[0x82, 0x01, 0xf5]);
+        check(&S::Utf8("p".into()), &[0x82, 0x04, 0x61, 0x70]);
+        check(&S::Bytes(vec![1, 2]), &[0x82, 0x05, 0x42, 0x01, 0x02]);
+
+        let revealed = cat(&[
+            &[0x84, 0x00, 0x81, 0x02, 0x82, 0x00, 0x82, 0x04, 0x61, 0x70],
+            &[0x01],
+        ]);
+        check(&s("p"), &revealed);
+        check(
+            &AuditField::HmacSha256 {
+                class: AuditFieldClass::Path,
+                digest: [0x33; 32],
+                original_bytes: 5,
+            },
+            &cat(&[&[0x84, 0x01, 0x81, 0x02, 0x58, 0x20], &[0x33; 32], &[0x05]]),
+        );
+        let omitted = [0x83, 0x02, 0x81, 0x03, 0x07];
+        let omitted_field = AuditField::Omitted {
+            class: AuditFieldClass::Body,
+            original_bytes: 7,
+        };
+        check(&omitted_field, &omitted);
+
+        check(
+            &AuditValue::Sequence(vec![omitted_field.clone()]),
+            &cat(&[&[0x82, 0x01, 0x81], &omitted]),
+        );
+        let mut obj = BTreeMap::new();
+        obj.insert("k".to_string(), omitted_field.clone());
+        check(
+            &AuditValue::Object(obj.clone()),
+            &cat(&[&[0x82, 0x02, 0x81, 0x82, 0x61, 0x6b], &omitted]),
+        );
+        check(&AuditValue::Scalar(S::Null), &[0x82, 0x00, 0x81, 0x00]);
+        // AuditPayload は fields を 1 つ持つ struct。
+        check(
+            &AuditPayload {
+                fields: BTreeMap::new(),
+            },
+            &[0x81, 0x80],
+        );
+        check(
+            &AuditPayload { fields: obj },
+            &cat(&[&[0x81, 0x81, 0x82, 0x61, 0x6b], &omitted]),
+        );
+    }
+
+    #[test]
+    fn cbor_error_payload_variants() {
+        let err = AuditError {
+            code: "c".into(),
+            message_id: "m".into(),
+            module_id: Some("x".into()),
+            line: Some(4),
+            column: None,
+            trace: vec![AuditFrame {
+                function: "f".into(),
+                module_id: "m".into(),
+                line: 5,
+            }],
+            omitted_trace_frames: 2,
+        };
+        check(
+            &err,
+            &[
+                0x87, 0x61, 0x63, 0x61, 0x6d, 0x82, 0x01, 0x61, 0x78, 0x82, 0x01, 0x04, 0x81, 0x00,
+                0x81, 0x83, 0x61, 0x66, 0x61, 0x6d, 0x05, 0x02,
+            ],
+        );
+        check(
+            &AuditErrorPayload::Full(err),
+            &cat(&[
+                &[
+                    0x82, 0x00, 0x87, 0x61, 0x63, 0x61, 0x6d, 0x82, 0x01, 0x61, 0x78, 0x82, 0x01,
+                ],
+                &[
+                    0x04, 0x81, 0x00, 0x81, 0x83, 0x61, 0x66, 0x61, 0x6d, 0x05, 0x02,
+                ],
+            ]),
+        );
+        check(
+            &AuditErrorPayload::Emergency {
+                code: "c".into(),
+                message_id: "m".into(),
+                full_error_bytes: 9,
+                full_error_sha256: [0x22; 32],
+            },
+            &cat(&[
+                &[0x85, 0x01, 0x61, 0x63, 0x61, 0x6d, 0x09, 0x58, 0x20],
+                &[0x22; 32],
+            ]),
+        );
+    }
+
+    /// 各 field が区別できる値（1 から連番）を持つ `BudgetConfig`。
+    fn numbered_config() -> BudgetConfig {
+        let clock = FakeClock::new();
+        BudgetConfig {
+            heap_accounting_revision: 1,
+            total_fuel: 2,
+            max_live_heap_bytes: 3,
+            max_string_allocations: 4,
+            max_string_bytes: 5,
+            max_single_string_bytes: 6,
+            max_source_count: 7,
+            max_source_bytes: 8,
+            max_single_source_bytes: 9,
+            max_import_count: 10,
+            max_import_bytes: 11,
+            max_collection_elements: 12,
+            max_input_calls: 13,
+            max_input_bytes: 14,
+            max_output_calls: 15,
+            max_output_bytes: 16,
+            max_host_calls: 17,
+            max_host_request_bytes: 18,
+            max_host_response_bytes: 19,
+            max_host_call_bytes: 20,
+            deadline: clock.instant_at(21),
+        }
+    }
+
+    fn numbered_config_bytes() -> Vec<u8> {
+        let mut v = vec![0x95];
+        v.extend(1..=21u8);
+        v
+    }
+
+    fn numbered_usage() -> BudgetUsage {
+        let counters = |base: [u64; 15]| BudgetCounters {
+            fuel: base[0],
+            string_allocations: base[1],
+            string_bytes: base[2],
+            source_count: base[3] as u32,
+            source_bytes: base[4],
+            import_count: base[5] as u32,
+            import_bytes: base[6],
+            input_calls: base[7],
+            input_bytes: base[8],
+            output_calls: base[9],
+            output_bytes: base[10],
+            host_calls: base[11],
+            host_request_bytes: base[12],
+            host_response_bytes: base[13],
+            host_call_bytes: base[14],
+        };
+        let up: [u64; 15] = std::array::from_fn(|i| i as u64 + 1);
+        let down: [u64; 15] = std::array::from_fn(|i| 15 - i as u64);
+        BudgetUsage {
+            committed: counters(up),
+            reserved: counters(down),
+            live_heap_bytes: 16,
+            reserved_heap_bytes: 17,
+            peak_heap_bytes: 18,
+            peaks: BudgetPeaks {
+                single_string_bytes: 19,
+                single_source_bytes: 20,
+                collection_elements: 21,
+            },
+        }
+    }
+
+    fn numbered_usage_bytes() -> Vec<u8> {
+        let mut v = vec![0x86, 0x8f];
+        v.extend(1..=15u8);
+        v.push(0x8f);
+        v.extend((1..=15u8).rev());
+        v.extend([16, 17, 18, 0x83, 19, 20, 21]);
+        v
+    }
+
+    #[test]
+    fn cbor_budget_config_and_usage_use_declaration_order() {
+        check(&numbered_config(), &numbered_config_bytes());
+        check(&numbered_usage(), &numbered_usage_bytes());
+    }
+
+    fn resource_payload() -> (AuditPayload, Vec<u8>) {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "k".to_string(),
+            AuditField::Omitted {
+                class: AuditFieldClass::Body,
+                original_bytes: 7,
+            },
+        );
+        (
+            AuditPayload { fields },
+            vec![0x81, 0x81, 0x82, 0x61, 0x6b, 0x83, 0x02, 0x81, 0x03, 0x07],
+        )
+    }
+
+    /// 8 variant すべての event と期待 byte 列（tag 0〜7、payload は 7.2 節の宣言順）。
+    fn event_cases() -> Vec<(AuditEvent, Vec<u8>)> {
+        let (payload, payload_bytes) = resource_payload();
+        let empty_payload = AuditPayload {
+            fields: BTreeMap::new(),
+        };
+        vec![
+            (
+                AuditEvent::ExecutionStarted {
+                    engine_version: "e".into(),
+                    backend: Backend::TreeWalk,
+                    rules_revision: 2,
+                    heap_accounting_revision: 1,
+                    budget: numbered_config(),
+                    capability_policy_hash: [0x11; 32],
+                    redaction_policy_id: "r".into(),
+                    mode: ExecutionMode::Record,
+                },
+                cat(&[
+                    &[0x89, 0x00, 0x61, 0x65, 0x81, 0x00, 0x02, 0x01],
+                    &numbered_config_bytes(),
+                    &[0x58, 0x20],
+                    &[0x11; 32],
+                    &[0x61, 0x72, 0x81, 0x01],
+                ]),
+            ),
+            (
+                AuditEvent::CapabilityDecision {
+                    operation_id: 5,
+                    call_id: Some(6),
+                    capability: "c".into(),
+                    action: "a".into(),
+                    resource: payload.clone(),
+                    decision: CapabilityDecisionKind::Deny,
+                    rule_id: "r".into(),
+                },
+                cat(&[
+                    &[0x88, 0x01, 0x05, 0x82, 0x01, 0x06, 0x61, 0x63, 0x61, 0x61],
+                    &payload_bytes,
+                    &[0x81, 0x01, 0x61, 0x72],
+                ]),
+            ),
+            (
+                AuditEvent::HostCallStarted {
+                    operation_id: 5,
+                    call_id: 6,
+                    function: "f".into(),
+                    request: empty_payload.clone(),
+                    request_bytes: 9,
+                },
+                vec![0x86, 0x02, 0x05, 0x06, 0x61, 0x66, 0x81, 0x80, 0x09],
+            ),
+            (
+                AuditEvent::HostCallFinished {
+                    operation_id: 5,
+                    call_id: 6,
+                    outcome: HostCallOutcome::HostError,
+                    response: empty_payload,
+                    response_bytes: 9,
+                    error_code: Some("e".into()),
+                    effect_status: EffectStatus::Unknown,
+                },
+                vec![
+                    0x88, 0x03, 0x05, 0x06, 0x81, 0x02, 0x81, 0x80, 0x09, 0x82, 0x01, 0x61, 0x65,
+                    0x81, 0x02,
+                ],
+            ),
+            (
+                AuditEvent::BudgetCharged {
+                    resource: BudgetResource::HostCalls,
+                    committed_delta: 1,
+                    released_delta: 2,
+                    usage_after: 3,
+                    peak_after: None,
+                    charge_count: 4,
+                    reason: BudgetChargeReason::HostCall,
+                },
+                vec![
+                    0x88, 0x04, 0x81, 0x0f, 0x01, 0x02, 0x03, 0x81, 0x00, 0x04, 0x81, 0x05,
+                ],
+            ),
+            (
+                AuditEvent::Yielded {
+                    reason: AuditYieldReason::ExplicitYield,
+                    poll_index: 8,
+                    usage: numbered_usage(),
+                },
+                cat(&[&[0x84, 0x05, 0x81, 0x02, 0x08], &numbered_usage_bytes()]),
+            ),
+            (
+                AuditEvent::Resumed {
+                    previous_reason: AuditYieldReason::HostPaused,
+                    poll_index: 9,
+                    usage: BudgetUsage::default(),
+                },
+                cat(&[&[0x84, 0x06, 0x81, 0x06, 0x09], &default_usage_bytes()]),
+            ),
+            (terminal_event(), terminal_event_bytes()),
+        ]
+    }
+
+    fn default_usage_bytes() -> Vec<u8> {
+        let mut v = vec![0x86, 0x8f];
+        v.extend([0u8; 15]);
+        v.push(0x8f);
+        v.extend([0u8; 15]);
+        v.extend([0, 0, 0, 0x83, 0, 0, 0]);
+        v
+    }
+
+    fn terminal_event() -> AuditEvent {
+        AuditEvent::Terminal {
+            outcome: TerminalOutcome::Completed,
+            error: None,
+            usage: BudgetUsage::default(),
+            import_graph_hash: None,
+            context_committed: true,
+            host_effects_may_remain: false,
+        }
+    }
+
+    fn terminal_event_bytes() -> Vec<u8> {
+        cat(&[
+            &[0x87, 0x07, 0x81, 0x00, 0x81, 0x00],
+            &default_usage_bytes(),
+            &[0x81, 0x00, 0xf5, 0xf4],
+        ])
+    }
+
+    #[test]
+    fn cbor_all_eight_event_variants_match_golden_bytes() {
+        let cases = event_cases();
+        assert_eq!(cases.len(), 8);
+        for (event, expected) in &cases {
+            check(event, expected);
+        }
+        // Terminal の optional field が埋まった形も確かめる。
+        let full = AuditEvent::Terminal {
+            outcome: TerminalOutcome::AuditFailure,
+            error: Some(AuditErrorPayload::Emergency {
+                code: "c".into(),
+                message_id: "m".into(),
+                full_error_bytes: 9,
+                full_error_sha256: [0x22; 32],
+            }),
+            usage: BudgetUsage::default(),
+            import_graph_hash: Some([0x44; 32]),
+            context_committed: false,
+            host_effects_may_remain: true,
+        };
+        let expected = cat(&[
+            &[0x87, 0x07, 0x81, 0x09, 0x82, 0x01],
+            &[0x85, 0x01, 0x61, 0x63, 0x61, 0x6d, 0x09, 0x58, 0x20],
+            &[0x22; 32],
+            &default_usage_bytes(),
+            &[0x82, 0x01, 0x58, 0x20],
+            &[0x44; 32],
+            &[0xf4, 0xf5],
+        ]);
+        check(&full, &expected);
+    }
+
+    fn envelope(sequence: u64, event: AuditEvent) -> AuditEnvelope {
+        AuditEnvelope {
+            schema_version: 1,
+            execution_id: ExecutionId::new(NonZeroU128::new(1).unwrap()),
+            source_hash: [0xab; 32],
+            language_revision: "0.20".into(),
+            sequence,
+            timestamp: HostTimestamp {
+                unix_nanoseconds: 0,
+            },
+            event,
+        }
+    }
+
+    #[test]
+    fn cbor_envelope_field_order_matches_spec() {
+        let mut id = [0u8; 16];
+        id[15] = 1;
+        let expected = cat(&[
+            &[0x87, 0x01, 0x50],
+            &id,
+            &[0x58, 0x20],
+            &[0xab; 32],
+            &[0x64, 0x30, 0x2e, 0x32, 0x30, 0x03, 0x81, 0x50],
+            &[0u8; 16],
+            &terminal_event_bytes(),
+        ]);
+        check(&envelope(3, terminal_event()), &expected);
+    }
+
+    #[test]
+    fn cbor_envelope_fixed_len_upper_bound_covers_every_sequence_width() {
+        for (event, _) in event_cases() {
+            let body = encoded_len(&event).unwrap();
+            let bound = envelope_fixed_len_upper_bound("0.20").unwrap() + body;
+            // sequence が u64::MAX のときちょうど一致し、小さい sequence では以下になる。
+            assert_eq!(encoded_len(&envelope(u64::MAX, event.clone())), Ok(bound));
+            for seq in [0u64, 23, 24, 255, 256, 65536, 1 << 32] {
+                let len = encoded_len(&envelope(seq, event.clone())).unwrap();
+                assert!(len <= bound && bound - len <= 8, "seq {seq}");
+            }
+        }
+    }
+
+    #[test]
+    fn cbor_size_pass_matches_write_pass_on_extremes() {
+        // 全 u64 field が u64::MAX。
+        let max = u64::MAX;
+        let counters = BudgetCounters {
+            fuel: max,
+            string_allocations: max,
+            string_bytes: max,
+            source_count: u32::MAX,
+            source_bytes: max,
+            import_count: u32::MAX,
+            import_bytes: max,
+            input_calls: max,
+            input_bytes: max,
+            output_calls: max,
+            output_bytes: max,
+            host_calls: max,
+            host_request_bytes: max,
+            host_response_bytes: max,
+            host_call_bytes: max,
+        };
+        let usage = BudgetUsage {
+            committed: counters,
+            reserved: counters,
+            live_heap_bytes: max,
+            reserved_heap_bytes: max,
+            peak_heap_bytes: max,
+            peaks: BudgetPeaks {
+                single_string_bytes: max,
+                single_source_bytes: max,
+                collection_elements: max,
+            },
+        };
+        let event = AuditEvent::Yielded {
+            reason: AuditYieldReason::HostCallPending { call_id: max },
+            poll_index: max,
+            usage,
+        };
+        let env = envelope(max, event);
+        let bytes = encode_to_vec(&env).unwrap();
+        assert_eq!(encoded_len(&env), Ok(bytes.len() as u64));
+        // u64::MAX は 9 byte。usage だけで 2*15 + 6 個の u64/u32 以上を 5〜9 byte で持つ。
+        assert!(bytes.len() > 300);
+
+        // 長い text（header が 3 byte になる 64 KiB 超を含む）。
+        let long = AuditScalar::Utf8("あ".repeat(30_000));
+        let b = encode_to_vec(&long).unwrap();
+        assert_eq!(encoded_len(&long), Ok(b.len() as u64));
+        // [4, text]: array header 1 + tag 1 + text header 5（0x7a + u32）+ 90_000 byte。
+        assert_eq!(b.len(), 1 + 1 + 5 + 90_000);
+
+        // 64 段 nesting の AuditValue。
+        let mut value = AuditValue::Scalar(AuditScalar::Null);
+        for depth in 0..64 {
+            let field = AuditField::Revealed {
+                class: AuditFieldClass::Body,
+                value,
+                original_bytes: depth,
+            };
+            value = if depth % 2 == 0 {
+                AuditValue::Sequence(vec![field])
+            } else {
+                AuditValue::Object(BTreeMap::from([("k".to_string(), field)]))
+            };
+        }
+        let b = encode_to_vec(&value).unwrap();
+        assert_eq!(encoded_len(&value), Ok(b.len() as u64));
+    }
+
+    #[test]
+    fn cbor_size_pass_detects_length_overflow() {
+        let mut size = SizeOut::starting_at(u64::MAX - 1);
+        assert_eq!(size.put(&[0]), Ok(()));
+        assert_eq!(size.len(), u64::MAX);
+        assert_eq!(size.put(&[0]), Err(CborError::LengthOverflow));
+        // 合成 encode の途中でも overflow が伝わる。
+        let mut size = SizeOut::starting_at(u64::MAX - 2);
+        assert_eq!(Some(1u64).encode(&mut size), Err(CborError::LengthOverflow));
+        // 空の put は長さを変えない。
+        let mut size = SizeOut::starting_at(u64::MAX);
+        assert_eq!(size.put(&[]), Ok(()));
+    }
+
+    #[test]
+    fn cbor_same_value_encodes_to_same_bytes_100_times() {
+        for (event, _) in event_cases() {
+            let env = envelope(7, event);
+            let first = encode_to_vec(&env).unwrap();
+            for _ in 0..100 {
+                assert_eq!(encode_to_vec(&env).unwrap(), first);
+            }
+        }
+    }
+
+    #[test]
+    fn cbor_map_order_ignores_insertion_order_and_is_utf8_byte_order() {
+        let keys = ["b", "a", "é", "aa", "A"];
+        let build = |order: &[&str]| {
+            let mut fields = BTreeMap::new();
+            for k in order {
+                fields.insert(
+                    k.to_string(),
+                    AuditField::Omitted {
+                        class: AuditFieldClass::Public,
+                        original_bytes: 0,
+                    },
+                );
+            }
+            AuditPayload { fields }
+        };
+        let forward = encode_to_vec(&build(&keys)).unwrap();
+        let mut reversed = keys;
+        reversed.reverse();
+        assert_eq!(encode_to_vec(&build(&reversed)).unwrap(), forward);
+        // key は UTF-8 byte 順（"A" < "a" < "aa" < "b" < "é"）で出る。
+        let order: Vec<&[u8]> = vec![
+            &[0x61, 0x41],
+            &[0x61, 0x61],
+            &[0x62, 0x61, 0x61],
+            &[0x61, 0x62],
+            &[0x62, 0xc3, 0xa9],
+        ];
+        let mut pos = 0;
+        for key_bytes in order {
+            let at = forward[pos..]
+                .windows(key_bytes.len())
+                .position(|w| w == key_bytes)
+                .expect("key in order");
+            pos += at + key_bytes.len();
+        }
+    }
+
+    #[test]
+    fn cbor_monotonic_instant_ignores_clock_instance() {
+        let a = FakeClock::new();
+        let b = FakeClock::new();
+        assert_ne!(a.clock_id(), b.clock_id());
+        let at = |clock: &FakeClock| -> MonotonicInstant { clock.instant_at(1_000) };
+        let mut cfg_a = numbered_config();
+        let mut cfg_b = numbered_config();
+        cfg_a.deadline = at(&a);
+        cfg_b.deadline = at(&b);
+        assert_ne!(cfg_a, cfg_b); // clock instance が違うので値は等しくない
+        assert_eq!(
+            encode_to_vec(&cfg_a).unwrap(),
+            encode_to_vec(&cfg_b).unwrap()
+        );
+        // deadline は u64 の tick だけ（1000 = 0x19 0x03e8）。
+        let bytes = encode_to_vec(&cfg_a).unwrap();
+        assert_eq!(&bytes[bytes.len() - 3..], [0x19, 0x03, 0xe8]);
+    }
+
+    #[test]
+    fn cbor_encode_to_vec_reports_ok_for_consistent_passes() {
+        // 公開しない入口が Result を返し、一致時は Ok になる（LengthMismatch は不変条件の破れのみ）。
+        assert!(encode_to_vec(&terminal_event()).is_ok());
+        assert_eq!(
+            envelope_fixed_len_upper_bound("0.20"),
+            Ok(1 + 1 + 17 + 34 + 5 + 9 + 18)
+        );
     }
 }
