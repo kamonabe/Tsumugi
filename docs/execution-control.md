@@ -1729,6 +1729,25 @@ builtin・host のどれに解決されるかは静的には決まらない（us
     TEC-AT-01 のテストで stdout・fuel・エラー行・trace を `can_yield = false` の `Evaluator::run` と、
     audit event 列と terminal（usage を含む）を強制 yield なしの実行と、`src/eval.rs` の unit test で
     `live_heap` / `peak_heap` を `Evaluator::run` と比べて一致を確かめた。
+- **判断の記録（e1 実装 PR #254 のレビューで判断待ちにしたもの。kamonabe が 2026-10-24 に選択）**:
+  - **「同期経路」の扱い（Q1 = A）**: 実装はこのまま受け入れる。tree-expr-continuation の各小節と
+    sub-slice 共通の完了条件でいう「同期経路」は、`can_yield = false` の `Evaluator::run` 系
+    （`Evaluator::run` / `run_phased` / `run_repl_submission`）と読み替える。`Engine::run`（CLI を含む）・
+    alpha `execute` / `execute_repl_submission`・`run_for_repl` のように terminal まで poll する入口は、
+    コードパスを変えないことではなく**観測値を変えないこと**を条件にする。
+    理由: §9.2 で `Engine::run` は同じ handle を terminal まで poll する入口と定めており、入口ごとに
+    実行経路を分けると production に同じ文を実行する経路が 2 つでき（`audit_slice_fuel` を使う
+    `Engine::run` は結局 driver 経路を通るため、分けても文言どおりにはならない）、e2〜e4 でさらに広がる。
+    観測値の一致は比較テストで固定しており、マニフェストの予測可能性を保てる。
+    共通の完了条件と TEC-AT-01/03 の文言（「同期経路 `Engine::run`」など）は、e2 の前の PR で直す。
+  - **slice fuel の既存逸脱と TEC-AT-06（Q2 = A）**: e1 はこのまま受け入れる。slice の使用量が
+    `count_step` だけを数え、builtin の per-element fuel を数えない挙動（Slice 3 PR-d から）は冒頭の
+    逸脱一覧の行で記録し、解消は後続に回す（`fuel-bulk-chunk-yield` の設計範囲に含めるか、
+    `needs-design` issue を立てる）。TEC-AT-06（e1 分）は bulk builtin を 1 回だけ呼ぶ script で確かめる。
+    理由: 直すと yield の位置（poll の粒度）が変わり既存の slice 系テストに響きうるため、e1 の範囲
+    （課金と観測を変えない）とスライスの大きさの目安（仕組みは 1 つまで、[開発ループ手順書](loop-runbook.md)
+    「1 回分の上限」）を越える。現状は逸脱一覧で正しく記録する（[ドキュメント運用ガイド](documentation-guide.md)
+    「逸脱一覧の持ち方」）。
 
 ##### tree-expr-continuation-e2 実装スライス（式 frame：ユーザー関数呼び出しを含む部分式・call 引数境界）
 
