@@ -201,14 +201,53 @@ spec_slice = "exec-control Slice 6"
 depends_on = ["F-2"]
 order      = 25
 
+# audit-strict-cbor（strict deterministic CBOR、§9.2）は 1 PR の大きさの目安に収まらないため、
+# c1〜c4 の 4 スライスへ分割した（spec「audit-strict-cbor の sub-slice 分割」）。元の id は置き換えて残さない。
+# 「strict CBOR スライス」と書かれた既存の延期先は c1〜c4 全体を指す。
+# c2〜c4 は depends_on が done でないため todo。c3・c4 は spec 小節に書いた判断待ちが決まるまで ready にしない。
 [[slice]]
-id         = "audit-strict-cbor"
-title      = "strict deterministic CBOR（§9.2）"
+id         = "audit-strict-cbor-c1"
+title      = "strict deterministic CBOR c1：§9.2 encoder 本体（schema v1 全型・size pass / write pass、crate 内部、未配線）"
+status     = "ready"
+parent     = "Phase 6 残"
+spec_slice = "determinism Slice 5"
+spec       = { doc = "docs/determinism-and-audit.md", section = "audit-strict-cbor-c1 実装スライス（§9.2 encoder 本体と size pass）" }
+acceptance = ["SC-AT-01..05"]
+depends_on = ["A-1"]
+order      = 30
+
+[[slice]]
+id         = "audit-strict-cbor-c2"
+title      = "strict deterministic CBOR c2：journal・audit drain queue の byte 計測を encoder の実長へ差し替え（§11）"
 status     = "todo"
 parent     = "Phase 6 残"
 spec_slice = "determinism Slice 5"
-depends_on = ["A-1"]
-order      = 30
+spec       = { doc = "docs/determinism-and-audit.md", section = "audit-strict-cbor-c2 実装スライス（journal・audit drain queue の byte 計測を encoder の実長へ差し替え）" }
+acceptance = ["SC-AT-06..10"]
+depends_on = ["audit-strict-cbor-c1"]
+order      = 31
+
+[[slice]]
+id         = "audit-strict-cbor-c3"
+title      = "strict deterministic CBOR c3：original_bytes と Path HMAC 入力を canonical encoding へ（§9.1）"
+status     = "todo"
+parent     = "Phase 6 残"
+spec_slice = "determinism Slice 5"
+spec       = { doc = "docs/determinism-and-audit.md", section = "audit-strict-cbor-c3 実装スライス（`original_bytes` と Path HMAC 入力を canonical encoding へ）" }
+acceptance = ["SC-AT-11..15"]
+depends_on = ["audit-strict-cbor-c1"]
+order      = 32
+
+[[slice]]
+id         = "audit-strict-cbor-c4"
+title      = "strict deterministic CBOR c4：60 KiB 縮退規則と Terminal Emergency（§7.2）"
+status     = "todo"
+parent     = "Phase 6 残"
+spec_slice = "determinism Slice 5"
+spec       = { doc = "docs/determinism-and-audit.md", section = "audit-strict-cbor-c4 実装スライス（60 KiB 縮退規則と Terminal `Emergency`）" }
+acceptance = ["SC-AT-16..20"]
+depends_on = ["audit-strict-cbor-c2", "audit-strict-cbor-c3"]
+order      = 33
 
 [[slice]]
 id         = "audit-sink-required"

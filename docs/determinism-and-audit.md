@@ -1,6 +1,6 @@
 # Tsumugi 決定性・実行時監査仕様
 
-最終更新: 2026-10-23
+最終更新: 2026-10-24
 
 設計ステータス: **到達目標の確定仕様（§1〜§13）＋ 実装の現在地（下記の逸脱一覧）**
 
@@ -29,6 +29,8 @@
 | **（セキュリティ）** 既定 `hmac_key` が crate 内の固定値（`src/audit.rs` の `DEFAULT_HMAC_KEY`）で秘匿性がない。raw path を直接載せないことだけを担保し、key が公開されているため digest から候補 path を総当たりで推測・復元できる（§9.1 の辞書攻撃耐性は得られない）。秘匿性のある key を host から渡す経路は sink 必須化スライスへ延期 | §9.1 | R-1a |
 | host-call lifecycle event（および `Yielded` / `Resumed` / `BudgetCharged`）の byte 見積もりが payload 非依存の 128 固定（`estimate_event_bytes` の `_ => 128`）。上限保証ではなく、HMAC digest や Identifier、Reveal された body（最大 `max_revealed_body_bytes`）を含む実 encode 長を過小評価し得るため、journal の byte 予算・B-2 の queue 会計・§11 の判定は概算依存（strict CBOR スライスへ延期） | §9.2/§11 | R-1a |
 | `AuditField` の `original_bytes` を §9.1 の canonical subtree 長（§9.2 の encoding で測る）ではなく値の UTF-8 byte 長で代用（Path は canonical label または requested path の長さ、引数型エラーは 0）。strict CBOR スライスで揃える | §9.1 | R-1a |
+| Path の HMAC-SHA-256 の入力が canonical label の UTF-8 生 byte（`src/audit.rs::RedactionPolicy::hmac_path`）。§9.1/§9.2 の「redaction 前 subtree の canonical encoding」（label を値とする `AuditValue` の deterministic CBOR）ではないため、digest 値が目標仕様と異なる（秘匿性・決定性は保たれる）。strict CBOR スライスで揃える | §9.1/§9.2 | R-1a |
+| `AuditFrame.module_id` / `AuditError.module_id` が §7.2 の `AuditField`（Identifier/Path policy 適用済み）ではなく plain `String`（`Option<String>`）。現在は常に空文字列 / `None` で埋めており（`src/embedding.rs` の Terminal error 構築）module 情報を記録しない。§9.2 の encoding も `AuditField` ではなく text / `Option` になる | §7.2/§9.1 | A-1 |
 
 ## 未実装範囲（目標仕様 §1〜§13 のうち未着手・延期中）
 
@@ -615,7 +617,7 @@ pub struct RedactionPolicy {
 }
 ```
 
-canonical CBORでは`AuditField`のvariantを`0=Revealed`、`1=HmacSha256`、`2=Omitted`、classを表の順のu8としてencodeする。`AuditPayload.fields`と`AuditValue::Object`はUTF-8 key byte順、Sequenceはargument/element順を維持する。host call引数は`fields["arguments"] = Sequence(...)`、operation固有metadataは別keyにする。各sequence element/object valueを独立した`AuditField`にするため、argument indexやnested fieldごとにredactionできる。nestingは64段までとし、それ以上のsubtreeはBody/Omittedへ縮退する。
+canonical CBORでは`AuditField`のvariantを`0=Revealed`、`1=HmacSha256`、`2=Omitted`、classを表の順（`0=Public`〜`4=Secret`）のtagとしてencodeする。classもfieldを持たないenumであり、9.2節の一般規則どおり`[tag]`の形でencodeする（tagが常にu8に収まるという意味で、bare integerにする特例ではない）。`AuditPayload.fields`と`AuditValue::Object`はUTF-8 key byte順、Sequenceはargument/element順を維持する。host call引数は`fields["arguments"] = Sequence(...)`、operation固有metadataは別keyにする。各sequence element/object valueを独立した`AuditField`にするため、argument indexやnested fieldごとにredactionできる。nestingは64段までとし、それ以上のsubtreeはBody/Omittedへ縮退する。
 
 `original_bytes`はredaction前のcanonical subtree payload長であり、omit/hash後も保持する。Secret classの親は子を走査・記録せず必ずsubtree全体を`Omitted`、Pathの既定は`HmacSha256`、Bodyは`body_mode == Reveal`かつkeyが`reveal_body_fields`にあり上限内の場合だけ`Revealed`となる。
 
@@ -640,11 +642,13 @@ error messageはpath、argument、host responseを含み得るため、auditで�
 schema version 1のbyte表現はRFC 8949 deterministic CBORの次のsubsetへ固定する。
 
 - structはRust field宣言順のCBOR array、enumは`[u16 tag, field0, ...]`、`Option`は`[0]`または`[1, value]`でencodeする。mapとしてfield名をencodeしない。
-- unsigned/signed integerは値を表せる最短幅、Stringは正規化しないUTF-8 text、byte列はCBOR byte string、bool/nullは標準primitiveとする。
+- unsigned/signed integerは値を表せる最短幅、Stringは正規化しないUTF-8 text、byte列はCBOR byte string、bool/nullは標準primitiveとする。Rustの符号なし整数（u8〜u64）はmajor type 0、符号付き整数（i64）は0以上ならmajor type 0、負ならmajor type 1とし、宣言型の幅ではなく値で最短幅を選ぶ。array・text・byte stringは常に定長（definite length）で、indefinite-length encodingを使わない。CBOR tag（major type 6）は使わない。
+- enumのvariantは、fieldなしなら`[tag]`、tuple variantなら`[tag, field0, ...]`、struct variantなら`[tag, field...]`（7.2節・9.1節の宣言順）とする。tagは各enumの宣言順を0始まりで振る。
 - `HostTimestamp.unix_nanoseconds`は16 byte two's-complement big-endian byte string、Floatはcanonicalized binary64 bitsの8 byte big-endian byte stringとし、CBOR float型を使わない。
 - `BTreeMap`は`[[key, value], ...]`としてUTF-8 key byte順、`BTreeSet`もsort済みarray、Vec/sequenceは元順でencodeする。
 - `BudgetConfig`、`BudgetCounters`、`BudgetUsage`は[実行予算・協調実行仕様](execution-control.md)のfield宣言順を使う。unknown schema fieldを末尾へ追加せず、schema versionを上げる。
-- `AuditEnvelope`は`[schema_version, execution_id(16 bytes), source_hash(32 bytes), language_revision, sequence, timestamp, event]`である。
+- `AuditEnvelope`は`[schema_version, execution_id(16 bytes), source_hash(32 bytes), language_revision, sequence, timestamp, event]`である。`execution_id`はu128を16 byte big-endianのbyte string、`[u8; 32]`のhash/digestは32 byteのbyte stringとする。
+- `MonotonicInstant`（`BudgetConfig.deadline`）は[実行予算・協調実行仕様](execution-control.md)のとおりopaqueなu64 nanosecond tickとしてu64でencodeする。clock domainを区別するための実装内部の識別子（clock instanceごとに異なる値）はencodeしない。実行ごとに変わる値をencodeすると§15.1の決定性を壊すため。
 - `AuditEvent` tagは`0=ExecutionStarted`、`1=CapabilityDecision`、`2=HostCallStarted`、`3=HostCallFinished`、`4=BudgetCharged`、`5=Yielded`、`6=Resumed`、`7=Terminal`とする。payload fieldは7.2節の宣言順である。
 - `AuditField` / class / direction / nested valueのtagは9.1節の宣言順を0始まりで使う。HMAC対象と`original_bytes`はredaction前subtreeのこのencodingである。
 
@@ -1784,6 +1788,106 @@ R-1b はこの 1 か所の畳み規則を §9.1 の Body Reveal 条件へ差し�
   R1b-AT-08 は `src/audit.rs` の unit test（見積もり据え置きと Body 畳み規則）で担保。allow-list 判定・
   class 優先順位の畳み規則は `src/audit.rs::fold_audit_field` と `src/builtin_core.rs::host_call_triple_tests`
   の unit test に Reveal/Omit の分岐ケースを追加する。
+
+#### audit-strict-cbor の sub-slice 分割
+
+> 状態: 設計のみ（本小節以下 4 小節は設計時点の記録）。現在の逸脱・未実装範囲は冒頭の逸脱一覧が正本である。
+
+`slices.toml` の `audit-strict-cbor`（strict deterministic CBOR、§9.2）は、次の 4 つを含む。
+
+1. §9.2 の encoder 本体（schema v1 の全型の deterministic CBOR と、§11 の size pass / write pass）
+2. journal・audit drain queue の byte 計測を naive 推定（`estimate_encoded_bytes` / `estimate_event_bytes`、host-call 系は 128 固定）から encoder の実長へ差し替えること
+3. `original_bytes` と Path の HMAC 入力を §9.1/§9.2 の「redaction 前 subtree の canonical encoding」へ揃えること
+4. §7.2 の 60 KiB 縮退規則（Body → Path → Identifier の `Omitted` 化、`EventTooLarge`、Terminal の `Emergency` 置換）
+
+まとめると `src/` の差分は 700 行を超え、触る仕組みも encoder・journal/queue 会計・redaction・縮退の 4 つになる。[開発ループ手順書](loop-runbook.md)「スライスの大きさの目安」（400 行・仕組み 1 つ・受入基準 5 項目）に収まらないため、c1〜c4 の 4 スライスに分ける。元の id `audit-strict-cbor` は置き換えて残さない。「strict CBOR スライス」と書かれた既存の延期先（R-1a/R-1b/B-2 小節、逸脱一覧）は c1〜c4 全体を指す。
+
+| スライス | 仕組み | 依存 | 受入基準 |
+|---|---|---|---|
+| audit-strict-cbor-c1 | encoder 本体（`src/audit.rs` 内、crate 内部） | A-1 | SC-AT-01..05 |
+| audit-strict-cbor-c2 | journal・queue の byte 計測の差し替え | c1 | SC-AT-06..10 |
+| audit-strict-cbor-c3 | `original_bytes`・HMAC 入力の canonical encoding 化（redaction） | c1 | SC-AT-11..15 |
+| audit-strict-cbor-c4 | 60 KiB 縮退規則と Terminal `Emergency` | c2・c3 | SC-AT-16..20 |
+
+c1 は byte 計測にも redaction にも配線しないため、c1 だけでは観測できる挙動は変わらない。挙動（`committed_bytes`・yield 位置・digest・`original_bytes`）が変わるのは c2 以降である。
+
+#### audit-strict-cbor-c1 実装スライス（§9.2 encoder 本体と size pass）
+
+> 状態: **未実装**（設計のみ）。仕様（§9.1・§9.2・§11）が正本であり、以下は c1 で実装する範囲と延期する範囲の記録である。
+
+- **実装範囲**:
+  - §9.2 の deterministic CBOR encoder を `src/audit.rs` の中に置く（新しい依存 crate は足さない。SHA-256/HMAC と同じく自前実装）。primitive（unsigned/negative integer の最短幅、定長 text/byte string、array header、bool/null）と、§9.2 の合成規則（struct = 宣言順 array、enum = `[tag, ...]`、`Option` = `[0]` / `[1, v]`、`BTreeMap` = `[[k, v], ...]`、Vec = 元順、`i128` = 16 byte BE byte string、Float = 8 byte BE byte string、u128 の `execution_id` = 16 byte BE byte string、`MonotonicInstant` = u64 tick のみ）を実装する。
+  - schema v1 の全型に encode を与える: `AuditEnvelope`・`HostTimestamp`・`AuditEvent`（8 variant、tag 0〜7）・`AuditYieldReason`（`AdmissionPhase` を含む）・`Backend`・`ExecutionMode`・`CapabilityDecisionKind`・`HostCallOutcome`・`EffectStatus`・`BudgetChargeReason`・`BudgetResource`・`TerminalOutcome`・`BudgetConfig`・`BudgetUsage`・`BudgetCounters`・`BudgetPeaks`・`AuditErrorPayload`・`AuditError`・`AuditFrame`・`AuditPayload`・`AuditField`・`AuditFieldClass`・`AuditValue`・`AuditScalar`。tag は各 enum の Rust 宣言順（§7.2・§9.1 の宣言順と同じ）を 0 始まりで振る。`BudgetConfig` 系の field 順は [実行予算・協調実行仕様](execution-control.md) の宣言順（現行 `src/budget.rs` と一致）を使う。
+  - §11 の 2 pass を 1 つの encoder で持つ。同じ走査を「長さだけ数える出力」（size pass）と「`Vec<u8>` へ書く出力」（write pass）に通す形にし、size pass は checked arithmetic で長さを返す（overflow は `None` / error）。別実装の size 推定を持たない（§9.2 末尾）。
+  - 入口は crate 内部（`pub(crate)`）の 2 関数程度に絞る（例: envelope を encode して bytes を返す関数、event 本体と envelope 固定部の長さを返す関数）。c1 時点では本番経路から呼ばれないため、未使用警告を c1 の間だけ局所的に許す（`#[cfg_attr(not(test), expect(dead_code))]` など。c2 で使われた時点で外れる書き方にする）。
+- **範囲外（逸脱・延期）**:
+  - journal・queue の byte 計測の差し替えは c2。c1 の間は逸脱一覧の「128 固定見積もり」行と未実装範囲の「strict deterministic CBOR」行はそのまま残る（c1 の done PR では逸脱一覧を変えない）。
+  - `original_bytes`・HMAC 入力は c3、60 KiB 縮退と `Emergency` は c4。
+  - **encoder の公開**（host が envelope の canonical bytes を得る公開関数、sink へ bytes を渡す API）は行わない。`AuditSink` は従来どおり `Arc<[AuditEnvelope]>` を受け取る。公開面は sink 必須化（§1.1）または record/replay（§6）のスライスで、record store の fingerprint（§9.2 `RecordedHostRequest`）とあわせて決める。`RecordedHostRequest` の encode も c1 の範囲外（record/replay スライス）。
+  - `AuditFrame.module_id` / `AuditError.module_id` は現行の型（`String` / `Option<String>`）のまま encode する（逸脱一覧の該当行）。`AuditField` への型変更は c1 の範囲外。
+  - VM は対象外。
+- **受入基準（c1）**:
+  - **SC-AT-01（primitive の golden）**: unsigned integer の幅の境界（0・23・24・255・256・65535・65536・2^32−1・2^32・u64::MAX）、負の i64（−1・−24・−25・i64::MIN）、空と非空の text / byte string、`Option` の `None` / `Some`、`i128`（0・−1・i128::MIN・i128::MAX）の 16 byte BE、Float bits の 8 byte BE が、手で組んだ期待 byte 列と一致する（RFC 8949 §4.2.1 の最短幅・定長）。
+  - **SC-AT-02（schema v1 の全型の golden）**: `AuditEvent` の 8 variant と、上記の全 enum の全 variant について、§9.2 の tag と field 順で組んだ期待 byte 列と一致する。`AuditEnvelope` は `[schema_version, execution_id(16), source_hash(32), language_revision, sequence, timestamp, event]` の順になる。
+  - **SC-AT-03（size pass と write pass の一致）**: SC-AT-01/02 の全ケースと、極値（全 u64 field が u64::MAX、長い text、64 段 nesting の `AuditValue`）で、size pass の長さが write pass の byte 長と一致する。size pass の加算は checked で、overflow を検出できる（unit test で overflow 経路を直接呼ぶ）。
+  - **SC-AT-04（決定性）**: 同じ値は 100 回 encode しても同じ byte 列になる。`BTreeMap` / `AuditValue::Object` は挿入順に関係なく UTF-8 key byte 順で出る。clock instance だけが異なる（tick は同じ）`MonotonicInstant` を含む `BudgetConfig` は同じ byte 列になる（§9.2・§15.1）。
+  - **SC-AT-05（非破壊）**: 既存の `tests/audit_*.rs` が無改変で緑。sink なし経路・sink あり経路とも観測結果（envelope 列・`committed_bytes`・yield 位置・出力 byte・exit code）が変わらない（c1 は計測にも redaction にも配線しない）。
+- **想定の変更規模**: `src/audit.rs` に約 350〜400 行（primitive と 2 pass で約 100 行、残りは型ごとの定型の encode）。テストは `src/audit.rs` の unit test（golden の期待 byte 列）。他の `src/` ファイルは変えない。仕組みは encoder 1 つ、受入基準は 5 項目。
+- **テスト配置**: SC-AT-01〜04 は `src/audit.rs` の unit test（`cbor_` 接頭辞）。SC-AT-05 は既存の `tests/audit_*.rs` の無改変緑。
+
+#### audit-strict-cbor-c2 実装スライス（journal・audit drain queue の byte 計測を encoder の実長へ差し替え）
+
+> 状態: **未実装**（設計のみ）。c1 が done になってから着手する。
+
+- **実装範囲**:
+  - journal（`AuditJournal::append_normal` / `append_terminal`）が計上する byte を、c1 の encoder で測った envelope の実 encode 長にする（§11「encoded byte数は9.2節のdeterministic CBORでencodeした実byte長」）。append の前に size pass で長さを求めて budget 判定に使い、write pass を行う場合はその長さと一致しなければ `AuditFailure::InvariantViolation`（internal audit failure、fail-closed）とする。
+  - audit drain queue（B-2、`AuditQueueMeter`）は、sequence 確定前の event を「envelope 固定部の上限値（sequence を u64 の最大幅 9 byte とみなす。timestamp は 17 byte 固定、`language_revision` は execution 内で不変）＋ event 本体の実 encode 長」で計上する（B-2 小節「逸脱」に書いた方針どおり）。ack 時は push 時に足した値と同じ値を引く。
+  - `estimate_encoded_bytes` / `estimate_envelope_overhead_bytes` / `estimate_event_bytes` を encoder の size pass へ置き換える（関数名を残すかどうかは実装者に任せる。naive 推定の実装は削除する）。
+  - `can_reserve_host_call` の 60 KiB / close reserve の判定は現行どおり（定数による上限値）とし、変えない。
+- **範囲外（逸脱・延期）**: `original_bytes`・HMAC は c3、60 KiB 縮退は c4。§11 の pre-effect reservation（逸脱一覧の該当行）と関数内の queue soft limit（B-2 の逸脱）は変えない。VM は対象外。
+- **c2 の done PR で行う逸脱一覧の更新**: 「128 固定見積もり」の行と未実装範囲の「strict deterministic CBOR」行を削除する。
+- **受入基準（c2）**:
+  - **SC-AT-06（journal の実長）**: Started・host-call triple・`BudgetCharged`・`Yielded`/`Resumed`・Terminal を含む実行で、journal の `committed_bytes`（Terminal は reserve 側）が各 envelope の c1 encoder による byte 長の和と一致する。Reveal された body を含む host-call event は payload に応じた長さで計上される（128 固定でない）。
+  - **SC-AT-07（queue の上限値計上）**: B2-AT-10 を置き換える。各 event の push 時計上値は、同じ event を journal へ append したときの増分以上で、その差は sequence の encode 幅の差（0〜8 byte）に限られる。flush 後に queue は 0 へ戻る。
+  - **SC-AT-08（実長での上限判定）**: `max_encoded_bytes` を小さく注入した実行で、実長の合計が通常枠を超えた時点で `AuditFailure::BudgetExceeded`、単一 event の実長が通常枠を超えると `EventTooLarge` になり、Terminal は予約枠で必ず append される（§10.1・§11）。
+  - **SC-AT-09（回帰の更新範囲）**: 既存の `tests/audit_*.rs` は、byte 値に依存する期待値（`committed_bytes` の値、`tests/audit_queue_bytes.rs` の yield が起きる位置）だけを更新し、それ以外（event の中身・sequence・triple の完全性・§8 の順序）は無改変で緑。sink なし経路は不変。
+  - **SC-AT-10（決定性）**: 同じ script・同じ注入 budget・同じ sink 応答列で、`committed_bytes` と yield 位置と envelope 列が 100 回一致する（§15.1）。
+- **想定の変更規模**: `src/audit.rs`・`src/eval.rs`・`src/embedding.rs`・`src/budget.rs` で約 80〜150 行（推定関数の置き換えと呼び出し側）。仕組みは監査の byte 会計 1 つ。
+
+#### audit-strict-cbor-c3 実装スライス（`original_bytes` と Path HMAC 入力を canonical encoding へ）
+
+> 状態: **未実装**（設計のみ）。c1 が done になってから着手する。下記の判断待ち（引数型エラー時の `original_bytes`）が決まるまで ready にしない。
+
+- **実装範囲**:
+  - `AuditField` の `original_bytes` を、その field の redaction 前の値（`AuditValue`）の §9.2 encoding の byte 長にする。入れ子の値は、子 field をすべて `Revealed`（同じ class、子自身の `original_bytes` も同じ規則で下から求めた値）とした redaction 前 subtree を encode して測る。対象は R-1a/R-1b の host-call payload（Path・Body・`arguments` の各要素と外側の `Sequence`）。
+  - Path の HMAC-SHA-256 の入力を、canonical label の生 byte から「label を値とする `AuditValue::Scalar(AuditScalar::Utf8(label))` の §9.2 encoding」へ変える（§9.1「field payload全体」・§9.2 末尾）。Deny で label を使わない規則（R-1a）は変えない。
+  - R-1b の `max_revealed_body_bytes` との比較は新しい `original_bytes`（CBOR の header を含む長さ）で行う。
+- **範囲外（逸脱・延期）**: 60 KiB 縮退は c4。`AuditFrame.module_id` の型は変えない。VM は対象外。
+- **c3 の done PR で行う逸脱一覧の更新**: 「`original_bytes` を UTF-8 byte 長で代用」の行と「HMAC 入力が label の生 byte」の行を削除する。
+- **受入基準（c3）**:
+  - **SC-AT-11**: Path（Allow / Deny）・Body（write/append の内容、read の response）・`arguments` の各要素の `original_bytes` が、redaction 前の値の §9.2 encoding の長さと一致する（例: 5 byte の ASCII 文字列は `Scalar(Utf8)` の encode 長）。
+  - **SC-AT-12**: Path の digest が `HMAC-SHA-256(hmac_key, deterministic_cbor(Scalar(Utf8(label))))` と一致する（既知の key・label による test vector）。同じ key・label なら一致し、key か label が違えば変わる（§15.4）。
+  - **SC-AT-13**: R-1b の上限判定が新しい `original_bytes` で行われる。上限と等しい body は Reveal され、1 byte 超えると全体 `Omitted` になる（境界が CBOR header 分ずれることを固定する）。
+  - **SC-AT-14**: canary を入れた path・body が encode 後の byte 列に平文で現れない（§15.4）。同じ入力では 100 回一致する。
+  - **SC-AT-15**: 外側の `arguments`（`Sequence`）の `original_bytes` が、子をすべて `Revealed` とした redaction 前 subtree の encode 長と一致する。
+- **想定の変更規模**: `src/audit.rs`・`src/builtin_core.rs` で約 60〜120 行。既存の R-1a/R-1b のテストの `original_bytes` と digest の期待値を更新する。仕組みは redaction 1 つ。
+
+#### audit-strict-cbor-c4 実装スライス（60 KiB 縮退規則と Terminal `Emergency`）
+
+> 状態: **未実装**（設計のみ）。c2・c3 が done になってから着手する。下記の判断待ち（縮退の粒度）が決まるまで ready にしない。
+
+- **実装範囲**:
+  - 通常 event の実 encode 長が 60 KiB を超える場合、§7.2 のとおり Body → Path → Identifier の順に `AuditField` を `Omitted { class, original_bytes }` へ縮退して測り直し、それでも超える event は `AuditFailure::EventTooLarge`（fail-closed）とする。縮退は event を評価器 buffer へ積む前（queue 計上の前）に行い、queue と journal は縮退後の長さを使う。Secret と、`AuditField` でない field（関数名・capability 名・error code など）は縮退の対象にしない。
+  - Terminal は、`Full(AuditError)` を含む Terminal 全体の実長が 60 KiB を超える場合に `Emergency { code, message_id, full_error_bytes, full_error_sha256 }` へ置き換える。`full_error_bytes` と `full_error_sha256` は redaction 済み `AuditError` の §9.2 encoding に対して求める。Emergency の Terminal 全体は 4 KiB 以下になる（code / message_id は各 128 byte まで）。
+- **範囲外**: `max_revealed_body_bytes` の既定や allow-list の規則は変えない。VM は対象外。
+- **c4 の done PR で行う逸脱一覧の更新**: 未実装範囲の「60 KiB 縮退規則」行を削除する。
+- **受入基準（c4）**:
+  - **SC-AT-16**: Reveal で 60 KiB を超える Body を持つ event が、Body の `Omitted` 化で 60 KiB 以下に収まり、`original_bytes` は保持される。
+  - **SC-AT-17**: Body を縮退しても超える場合は Path、次に Identifier を縮退する。全部縮退しても超える event は `EventTooLarge` で AuditFailure terminal になる（§10.1）。
+  - **SC-AT-18**: Terminal の `Full` が 60 KiB を超える場合に `Emergency` になり、`full_error_bytes`・`full_error_sha256` が `AuditError` の encoding と一致し、Terminal 全体が 4 KiB 以下になる。
+  - **SC-AT-19**: 60 KiB 以下の event は縮退されず、c3 時点と byte 単位で一致する（既存テストは無改変で緑）。
+  - **SC-AT-20**: 同じ入力では縮退結果と envelope 列が 100 回一致する（§15.1）。
+- **想定の変更規模**: `src/audit.rs`・`src/eval.rs`（または event を積む箇所）・`src/embedding.rs` で約 100〜180 行。仕組みは縮退 1 つ。
 
 ### Slice 6: VM conformance
 
