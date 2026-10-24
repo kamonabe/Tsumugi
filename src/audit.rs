@@ -4020,61 +4020,48 @@ mod cbor_tests {
         check(&300u32, &[0x19, 0x01, 0x2c]);
     }
 
+    /// primitive を write pass（`Vec<u8>`）と size pass（`SizeOut`）の両方に通し、write pass が期待 byte 列と
+    /// 一致し、size pass の長さが同じ byte 長になることを確かめる（SC-AT-01/03）。
+    macro_rules! prim {
+        ($expected:expr, $o:ident => $e:expr) => {{
+            let expected: &[u8] = &$expected;
+            let mut $o = Vec::new();
+            $e.expect("write pass");
+            assert_eq!($o, expected);
+            let mut $o = SizeOut::new();
+            $e.expect("size pass");
+            assert_eq!($o.len(), expected.len() as u64);
+        }};
+    }
+
     #[test]
     fn cbor_negative_integer_boundaries() {
-        let mut out = Vec::new();
-        for (v, expected) in [
-            (-1i64, vec![0x20]),
-            (-24, vec![0x37]),
-            (-25, vec![0x38, 0x18]),
-            (
-                i64::MIN,
-                vec![0x3b, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-            ),
-            (7, vec![0x07]),
-            (
-                i64::MAX,
-                vec![0x1b, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-            ),
-        ] {
-            out.clear();
-            int(&mut out, v).expect("int");
-            assert_eq!(out, expected, "v = {v}");
-        }
+        prim!([0x20], o => int(&mut o, -1));
+        prim!([0x37], o => int(&mut o, -24));
+        prim!([0x38, 0x18], o => int(&mut o, -25));
+        prim!([0x3b, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], o => int(&mut o, i64::MIN));
+        prim!([0x07], o => int(&mut o, 7));
+        prim!([0x1b, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], o => int(&mut o, i64::MAX));
         // AuditScalar::Int は i64 をこの規則で包む。
         check(&AuditScalar::Int(-1), &[0x82, 0x02, 0x20]);
     }
 
     #[test]
     fn cbor_text_bytes_bool_null_primitives() {
-        let mut o = Vec::new();
-        text(&mut o, "").unwrap();
-        assert_eq!(o, [0x60]);
-        o.clear();
-        text(&mut o, "a").unwrap();
-        assert_eq!(o, [0x61, 0x61]);
+        prim!([0x60], o => text(&mut o, ""));
+        prim!([0x61, 0x61], o => text(&mut o, "a"));
         // 24 byte で長さ header が 2 byte になる。UTF-8 は正規化せず byte 長で数える。
-        o.clear();
-        text(&mut o, &"x".repeat(24)).unwrap();
-        assert_eq!(&o[..2], [0x78, 0x18]);
-        assert_eq!(o.len(), 26);
-        o.clear();
-        text(&mut o, "é").unwrap();
-        assert_eq!(o, [0x62, 0xc3, 0xa9]);
-        o.clear();
-        bytes(&mut o, &[]).unwrap();
-        assert_eq!(o, [0x40]);
-        o.clear();
-        bytes(&mut o, &[1, 2]).unwrap();
-        assert_eq!(o, [0x42, 0x01, 0x02]);
-        o.clear();
-        bytes(&mut o, &[7u8; 256]).unwrap();
-        assert_eq!(&o[..3], [0x59, 0x01, 0x00]);
-        o.clear();
-        boolean(&mut o, true).unwrap();
-        boolean(&mut o, false).unwrap();
-        null(&mut o).unwrap();
-        assert_eq!(o, [0xf5, 0xf4, 0xf6]);
+        let long = "x".repeat(24);
+        let expected = cat(&[&[0x78, 0x18], long.as_bytes()]);
+        prim!(expected, o => text(&mut o, &long));
+        prim!([0x62, 0xc3, 0xa9], o => text(&mut o, "é"));
+        prim!([0x40], o => bytes(&mut o, &[]));
+        prim!([0x42, 0x01, 0x02], o => bytes(&mut o, &[1, 2]));
+        let expected = cat(&[&[0x59, 0x01, 0x00], &[7u8; 256]]);
+        prim!(expected, o => bytes(&mut o, &[7u8; 256]));
+        prim!([0xf5], o => boolean(&mut o, true));
+        prim!([0xf4], o => boolean(&mut o, false));
+        prim!([0xf6], o => null(&mut o));
         check(&true, &[0xf5]);
         check(&"a".to_string(), &[0x61, 0x61]);
     }
