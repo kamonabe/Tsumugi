@@ -506,7 +506,7 @@ pub enum AuditErrorPayload {
 }
 ```
 
-各normal audit eventのencoded長は最大60 KiBとする。redaction後payloadが超える場合、Body/Path/Identifierの順に`Omitted`へ縮退し、それでも超えるeventは`AuditFailure::EventTooLarge`とする。Terminalだけは失敗を再帰させず、`Full(AuditError)`を60 KiB以内にできない場合に`Emergency`へ置換する。Emergencyはredaction済みfull errorのbyte長とSHA-256だけを持ち、Terminal全体を4 KiB以下にする。したがって64 KiB Terminal reserveで必ずencodeできる。traceは先頭32 frameだけを保持し、残数を`omitted_trace_frames`へ記録する。
+各normal audit eventのencoded長は最大60 KiBとする。redaction後payloadが超える場合、Body/Path/Identifierの順に`Omitted`へ縮退し（classごとにまとめて行う。まずevent内のBodyをすべて`Omitted`にして測り直し、なお超えればPathをすべて、次にIdentifierをすべて`Omitted`にする。§14「audit-strict-cbor-c4 実装スライス」の判断Q4）、それでも超えるeventは`AuditFailure::EventTooLarge`とする。Terminalだけは失敗を再帰させず、`Full(AuditError)`を60 KiB以内にできない場合に`Emergency`へ置換する。Emergencyはredaction済みfull errorのbyte長とSHA-256だけを持ち、Terminal全体を4 KiB以下にする。したがって64 KiB Terminal reserveで必ずencodeできる。traceは先頭32 frameだけを保持し、残数を`omitted_trace_frames`へ記録する。
 
 `ExecutionOutcome`と`TerminalOutcome`は上の全variantを1対1に対応させる。APIの`Exited { code, usage }`は`TerminalOutcome::Exited(code)`、`InternalFailure`は同名へ写像する。Phase 1/2内部bootstrapに別名の`InternalFault` terminal、Phase 3/4に別のusage型、Phase 6に別event enumを残さない。raw Rust error、backtrace、source本文をpayloadへ入れない。
 
@@ -617,9 +617,9 @@ pub struct RedactionPolicy {
 }
 ```
 
-canonical CBORでは`AuditField`のvariantを`0=Revealed`、`1=HmacSha256`、`2=Omitted`、classを表の順のu8としてencodeする。この文言（bare integer）と9.2節の一般規則（enumは`[tag, ...]`）のどちらでclass（fieldを持たないenum）をencodeするかは未確定で（`AuditField`のvariantはfieldを持つので常に`[tag, field...]`であり、ここで定めるのはtagの値だけ）、§14「audit-strict-cbor-c1 実装スライス」の判断待ちQ1で決める。`AuditPayload.fields`と`AuditValue::Object`はUTF-8 key byte順、Sequenceはargument/element順を維持する。host call引数は`fields["arguments"] = Sequence(...)`、operation固有metadataは別keyにする。各sequence element/object valueを独立した`AuditField`にするため、argument indexやnested fieldごとにredactionできる。nestingは64段までとし、それ以上のsubtreeはBody/Omittedへ縮退する。
+canonical CBORでは`AuditField`のvariantを`0=Revealed`、`1=HmacSha256`、`2=Omitted`、classは表の順を0始まりのtagとし、fieldを持たないenumとして9.2節の一般規則どおり`[tag]`でencodeする（bare integerにしない。`AuditField`のvariantはfieldを持つので常に`[tag, field...]`であり、ここで定めるのはtagの値だけ。§14「audit-strict-cbor-c1 実装スライス」の判断Q1）。`AuditPayload.fields`と`AuditValue::Object`はUTF-8 key byte順、Sequenceはargument/element順を維持する。host call引数は`fields["arguments"] = Sequence(...)`、operation固有metadataは別keyにする。各sequence element/object valueを独立した`AuditField`にするため、argument indexやnested fieldごとにredactionできる。nestingは64段までとし、それ以上のsubtreeはBody/Omittedへ縮退する。
 
-`original_bytes`はredaction前のcanonical subtree payload長であり、omit/hash後も保持する。Secret classの親は子を走査・記録せず必ずsubtree全体を`Omitted`、Pathの既定は`HmacSha256`、Bodyは`body_mode == Reveal`かつkeyが`reveal_body_fields`にあり上限内の場合だけ`Revealed`となる。
+`original_bytes`はredaction前のcanonical subtree payload長であり、omit/hash後も保持する。redaction前subtreeは、子fieldをすべて`Revealed`（同じclass）とし、子の`original_bytes`も同じ規則で下から再帰的に求めた値として9.2節のencodingで表し、その長さを測る。host call引数のうち`AuditValue`へ写せない値（型エラーで文字列でない引数など）は`original_bytes = 0`の`Omitted`とする（§14「audit-strict-cbor-c3 実装スライス」の判断Q2・Q3）。Secret classの親は子を走査・記録せず必ずsubtree全体を`Omitted`、Pathの既定は`HmacSha256`、Bodyは`body_mode == Reveal`かつkeyが`reveal_body_fields`にあり上限内の場合だけ`Revealed`となる。
 
 | class | 例 | 既定 |
 |---|---|---|
@@ -631,9 +631,9 @@ canonical CBORでは`AuditField`のvariantを`0=Revealed`、`1=HmacSha256`、`2=
 
 `Secret<T>`を型で区別し、`Debug` / `Display` / generic serializerを実装しない。secretの存在とbyte数だけをPublic metadataとして記録できる。
 
-BodyをRevealできるのは、policyのallow-listで特定host function fieldを`audit_safe`と明示し、`max_revealed_body_bytes > 0`の場合だけである。上限を超えたbodyはtruncationせず全体をomitし、`truncated = true`ではなく`omitted = true`とbyte数を記録する。prefixだけを残してsecretを漏らさない。
+BodyをRevealできるのは、policyのallow-listで特定host function fieldを`audit_safe`と明示し、`max_revealed_body_bytes > 0`の場合だけである。上限と比べる長さは`original_bytes`（CBOR header込みのencode長）とする。上限を超えたbodyはtruncationせず全体をomitし、`truncated = true`ではなく`omitted = true`とbyte数を記録する。prefixだけを残してsecretを漏らさない。
 
-pathはproviderが認可に使ったcanonical resource labelのfield payload全体へHMAC-SHA-256を適用する。host absolute pathをlabelへ含めない。単純SHA-256は辞書攻撃に弱いため使わない。deny eventでもraw requested pathを出さない。
+pathはproviderが認可に使ったcanonical resource labelのfield payload全体（labelを値とする`AuditValue::Scalar(AuditScalar::Utf8(label))`の9.2節のencoding）へHMAC-SHA-256を適用する。host absolute pathをlabelへ含めない。単純SHA-256は辞書攻撃に弱いため使わない。deny eventでもraw requested pathを出さない。
 
 error messageはpath、argument、host responseを含み得るため、auditでは安定`ErrorCode`、`message_id`、source位置、redacted parameter summaryだけを保存する。script-visible messageをそのまま保存しない。
 
@@ -1817,7 +1817,7 @@ c1 は byte 計測にも redaction にも配線しないため、c1 だけでは
 
 - **実装範囲**:
   - §9.2 の deterministic CBOR encoder を `src/audit.rs` の中に置く（新しい依存 crate は足さない。SHA-256/HMAC と同じく自前実装）。primitive（unsigned/negative integer の最短幅、定長 text/byte string、array header、bool/null）と、§9.2 の合成規則（struct = 宣言順 array、enum = `[tag, ...]`、`Option` = `[0]` / `[1, v]`、`BTreeMap` = `[[k, v], ...]`、Vec = 元順、`i128` = 16 byte BE byte string、Float = 8 byte BE byte string、u128 の `execution_id` = 16 byte BE byte string、`MonotonicInstant` = u64 tick のみ）を実装する。`HostTimestamp` は field 1 つの struct なので、§9.2 の一般規則どおり 1 要素の array `[bstr(16)]`（array header 1 + byte string header 1 + 16 = 18 byte 固定）として encode する。
-  - schema v1 の全型に encode を与える: `AuditEnvelope`・`HostTimestamp`・`AuditEvent`（8 variant、tag 0〜7）・`AuditYieldReason`（`AdmissionPhase` を含む）・`Backend`・`ExecutionMode`・`CapabilityDecisionKind`・`HostCallOutcome`・`EffectStatus`・`BudgetChargeReason`・`BudgetResource`・`TerminalOutcome`・`BudgetConfig`・`BudgetUsage`・`BudgetCounters`・`BudgetPeaks`・`AuditErrorPayload`・`AuditError`・`AuditFrame`・`AuditPayload`・`AuditField`・`AuditFieldClass`・`AuditValue`・`AuditScalar`。tag は各 enum の Rust 宣言順（§7.2・§9.1 の宣言順と同じ）を 0 始まりで振る。fieldless enum（`AuditFieldClass` など。field を持つ variant は常に `[tag, field...]`）を `[tag]` にするか bare integer にするかは下記の判断待ち Q1 の回答に従う。`BudgetConfig` 系の field 順は [実行予算・協調実行仕様](execution-control.md) の宣言順（現行 `src/budget.rs` と一致）を使う。
+  - schema v1 の全型に encode を与える: `AuditEnvelope`・`HostTimestamp`・`AuditEvent`（8 variant、tag 0〜7）・`AuditYieldReason`（`AdmissionPhase` を含む）・`Backend`・`ExecutionMode`・`CapabilityDecisionKind`・`HostCallOutcome`・`EffectStatus`・`BudgetChargeReason`・`BudgetResource`・`TerminalOutcome`・`BudgetConfig`・`BudgetUsage`・`BudgetCounters`・`BudgetPeaks`・`AuditErrorPayload`・`AuditError`・`AuditFrame`・`AuditPayload`・`AuditField`・`AuditFieldClass`・`AuditValue`・`AuditScalar`。tag は各 enum の Rust 宣言順（§7.2・§9.1 の宣言順と同じ）を 0 始まりで振る。fieldless enum（`AuditFieldClass` など。field を持つ variant は常に `[tag, field...]`）は §9.2 の一般規則どおり `[tag]` で encode する（下記の判断 Q1 = A）。`BudgetConfig` 系の field 順は [実行予算・協調実行仕様](execution-control.md) の宣言順（現行 `src/budget.rs` と一致）を使う。
   - §11 の 2 pass を 1 つの encoder で持つ。同じ走査を「長さだけ数える出力」（size pass）と「`Vec<u8>` へ書く出力」（write pass）に通す形にし、size pass は checked arithmetic で長さを返す（overflow は `None` / error）。別実装の size 推定を持たない（§9.2 末尾）。
   - 入口は crate 内部（`pub(crate)`）の 2 関数程度に絞る（例: envelope を encode して bytes を返す関数、event 本体と envelope 固定部の長さを返す関数）。c1 時点では本番経路から呼ばれないため、未使用警告を c1 の間だけ局所的に許す（`#[cfg_attr(not(test), expect(dead_code))]` など。c2 で使われた時点で外れる書き方にする）。
 - **範囲外（逸脱・延期）**:
@@ -1826,10 +1826,10 @@ c1 は byte 計測にも redaction にも配線しないため、c1 だけでは
   - **encoder の公開**（host が envelope の canonical bytes を得る公開関数、sink へ bytes を渡す API）は行わない。`AuditSink` は従来どおり `Arc<[AuditEnvelope]>` を受け取る。公開面は sink 必須化（§1.1）または record/replay（§6）のスライスで、record store の fingerprint（§9.2 `RecordedHostRequest`）とあわせて決める。`RecordedHostRequest` の encode も c1 の範囲外（record/replay スライス）。
   - `AuditFrame.module_id` / `AuditError.module_id` は現行の型（`String` / `Option<String>`）のまま encode する（逸脱一覧の該当行）。`AuditField` への型変更は c1 の範囲外。
   - VM は対象外。
-- **判断待ち Q1（c1 の実装前に決める）**: §9.1 の class（`AuditFieldClass` などの field を持たない enum。`AuditField` の variant は field を持つので常に `[tag, field...]` で、Q1 の対象外）を、§9.2 の一般規則どおり `[tag]`（array、例 `0x81 0x00`、2 byte）で encode するか、§9.1 の文言どおり bare u8（例 `0x00`、1 byte）で encode するか。変更前の spec は 2 通りに読め、どちらを採るかで全 `AuditField` の byte 列・`original_bytes`・digest・journal の byte 会計が変わる。
+- **判断 Q1（kamonabe の選択: A）**: §9.1 の class（`AuditFieldClass` などの field を持たない enum。`AuditField` の variant は field を持つので常に `[tag, field...]` で、Q1 の対象外）を、§9.2 の一般規則どおり `[tag]`（array、例 `0x81 0x00`、2 byte）で encode するか、§9.1 の文言どおり bare u8（例 `0x00`、1 byte）で encode するか。変更前の spec は 2 通りに読め、どちらを採るかで全 `AuditField` の byte 列・`original_bytes`・digest・journal の byte 会計が変わる。
   - A（推奨）: 一般規則どおり `[tag]`。例外の無い 1 つの規則で済み、encoder も検証も単純になる。根拠: manifesto 原則 8（小さく理解可能な中核）・原則 5（予測可能性）、§9.2 の一般規則。
   - B: §9.1 の文言どおり bare u8。`AuditField` 1 つあたり 1 byte 小さいが、fieldless enum の中で class だけが例外になる。根拠: §9.1 の文言。
-  - **c1 は Q1 の回答を spec（§9.1・本小節）へ反映してから実装する。** status は ready のままとするが、回答が出るまでこの設計 PR は判断待ちでありマージされない。
+  - **選択: A**（kamonabe の選択、2026-10-24、PR #256）。§9.1 と本小節の実装範囲へ反映した。
 - **受入基準（c1）**:
   - **SC-AT-01（primitive の golden）**: unsigned integer の幅の境界（0・23・24・255・256・65535・65536・2^32−1・2^32・u64::MAX）、負の i64（−1・−24・−25・i64::MIN）、空と非空の text / byte string、`Option` の `None` / `Some`、`i128`（0・−1・i128::MIN・i128::MAX）の 16 byte BE、Float bits の 8 byte BE が、手で組んだ期待 byte 列と一致する（RFC 8949 §4.2.1 の最短幅・定長）。
   - **SC-AT-02（schema v1 の全型の golden）**: `AuditEvent` の 8 variant と、上記の全 enum の全 variant について、§9.2 の tag と field 順で組んだ期待 byte 列と一致する。`AuditEnvelope` は `[schema_version, execution_id(16), source_hash(32), language_revision, sequence, timestamp, event]` の順になる。
@@ -1860,18 +1860,19 @@ c1 は byte 計測にも redaction にも配線しないため、c1 だけでは
 
 #### audit-strict-cbor-c3 実装スライス（`original_bytes` と Path HMAC 入力を canonical encoding へ）
 
-> 状態: **未実装**（設計のみ）。c1 が done になってから着手する。下記の判断待ち Q2・Q3 が決まるまで ready にしない。以下の実装範囲のうち Q3 にかかる部分は推奨案で書いており、回答に合わせて直す。
+> 状態: **未実装**（設計のみ）。c1 が done になってから着手する。判断 Q2・Q3 は kamonabe の選択（Q2 = A、Q3 = 3a・3b・3c とも A）で決まり、以下の実装範囲はその選択で書いている（§9.1 にも反映済み）。
 
 - **実装範囲**:
-  - `AuditField` の `original_bytes` を、その field の redaction 前の値（`AuditValue`）の §9.2 encoding の byte 長にする（Q3a の推奨）。入れ子の値は（Q3b の推奨）、子 field をすべて `Revealed`（同じ class、子自身の `original_bytes` も同じ規則で下から求めた値）とした redaction 前 subtree を encode して測る。対象は R-1a/R-1b の host-call payload（Path・Body・`arguments` の各要素と外側の `Sequence`）。
-  - Path の HMAC-SHA-256 の入力を、canonical label の生 byte から「label を値とする `AuditValue::Scalar(AuditScalar::Utf8(label))` の §9.2 encoding」へ変える（§9.1「field payload全体」・§9.2 末尾。Q3a の推奨）。Deny で label を使わない規則（R-1a）は変えない。
-  - R-1b の `max_revealed_body_bytes` との比較は新しい `original_bytes`（CBOR の header を含む長さ）で行う（Q3c の推奨）。
+  - `AuditField` の `original_bytes` を、その field の redaction 前の値（`AuditValue`）の §9.2 encoding の byte 長にする（Q3a = A）。入れ子の値は（Q3b = A）、子 field をすべて `Revealed`（同じ class、子自身の `original_bytes` も同じ規則で下から求めた値）とした redaction 前 subtree を encode して測る。対象は R-1a/R-1b の host-call payload（Path・Body・`arguments` の各要素と外側の `Sequence`）。
+  - Path の HMAC-SHA-256 の入力を、canonical label の生 byte から「label を値とする `AuditValue::Scalar(AuditScalar::Utf8(label))` の §9.2 encoding」へ変える（§9.1「field payload全体」・§9.2 末尾。Q3a = A）。Deny で label を使わない規則（R-1a）は変えない。
+  - R-1b の `max_revealed_body_bytes` との比較は新しい `original_bytes`（CBOR の header を含む長さ）で行う（Q3c = A）。
+  - 引数の型エラーで `AuditValue` へ写せない引数（文字列でない引数など）は、現行どおり `original_bytes = 0` の `Omitted` とする（Q2 = A、§9.1）。
 - **範囲外（逸脱・延期）**: 60 KiB 縮退は c4。`AuditFrame.module_id` の型は変えない。VM は対象外。
 - **c3 の done PR で行う逸脱一覧の更新**: 「`original_bytes` を UTF-8 byte 長で代用」の行と「HMAC 入力が label の生 byte」の行を削除する。
-- **判断待ち Q2**: 引数の型エラーで引数が文字列でないとき（現在は `original_bytes = 0`）、`original_bytes` をどうするか。script の値（Int・List・関数など）を `AuditValue` へ写す規則は spec に無い。
+- **判断 Q2（kamonabe の選択: A）**: 引数の型エラーで引数が文字列でないとき（現在は `original_bytes = 0`）、`original_bytes` をどうするか。script の値（Int・List・関数など）を `AuditValue` へ写す規則は spec に無い。
   - A（推奨）: 0 のままとし、§9.1 に「`AuditValue` へ写せない引数（型エラー）は `original_bytes = 0` の `Omitted`」と明記する。型エラーの引数は Path/Body として意味を持たず、写像の規則を足さずに済む。根拠: manifesto 原則 8・原則 5、§9.1。
   - B: script の値を `AuditValue` へ写す規則（Null/Bool/Int/Float/String → Scalar、List → Sequence、Dict → Object、関数などは型名）を §9.1 に足し、その encode 長を測る。§9.1 の定義を文字どおり満たすが、record 用の Value encoding（§9.2 `RecordedHostRequest`）と別の写像が増える。
-- **判断待ち Q3**: redaction 前 subtree の encoding の定義（§9.1「field payload全体」・§9.2「redaction前subtree」はどちらにも読める。`AuditField::Revealed` 全体は `original_bytes` を含み循環するので候補から外す）。
+- **判断 Q3（kamonabe の選択: 3a・3b・3c とも A）**: redaction 前 subtree の encoding の定義（§9.1「field payload全体」・§9.2「redaction前subtree」はどちらにも読める。`AuditField::Revealed` 全体は `original_bytes` を含み循環するので候補から外す）。
   - **3a. Path の HMAC 入力**: A（推奨）`AuditValue::Scalar(AuditScalar::Utf8(label))` の encoding（field の値として他の field と同じ規則で測れ、`original_bytes` と同じ入力になる。根拠: §9.1「field payload全体」、manifesto 原則 8）。B: label の CBOR text 単体（`AuditValue`/`AuditScalar` の tag を含まない。§9.1「canonical resource label」に近い）。どちらでも digest の値は現行から変わる。
   - **3b. 入れ子の `original_bytes`**: A（推奨）子 field をすべて `Revealed`（同じ class）にし、子の `original_bytes` も同じ規則で下から求めた subtree の encode 長（子を単独で測った値と親の中の子の値が一致し、決定的。根拠: §9.1「redaction前のcanonical subtree payload長」、manifesto 原則 5）。B: 子の `original_bytes` を 0 とみなして測る（再帰が無く単純だが、親の中の子の表現が実際の Revealed 子と一致しない）。
   - **3c. R-1b の上限比較**: A（推奨）CBOR header を含む新しい `original_bytes` と比較する（§9.1 の「上限内」と `original_bytes` が同じ量を指し、比較対象が 1 つで済む。Reveal の境界が header 分ずれる。根拠: §9.1、R-1b 小節の「比較対象は `original_bytes`」）。B: 原本の UTF-8 byte 長と比較する（host が設定する上限の意味が R-1b のまま変わらない。比較用の長さを `original_bytes` と別に持つ）。
@@ -1885,14 +1886,14 @@ c1 は byte 計測にも redaction にも配線しないため、c1 だけでは
 
 #### audit-strict-cbor-c4 実装スライス（60 KiB 縮退規則と Terminal `Emergency`）
 
-> 状態: **未実装**（設計のみ）。c2・c3 が done になってから着手する。下記の判断待ち Q4 が決まるまで ready にしない。以下の実装範囲は Q4 の推奨案で書いている。
+> 状態: **未実装**（設計のみ）。c2・c3 が done になってから着手する。判断 Q4 は kamonabe の選択（A: class ごと）で決まり、以下の実装範囲はその選択で書いている（§7.2 にも反映済み）。
 
 - **実装範囲**:
-  - 通常 event の実 encode 長が 60 KiB を超える場合、§7.2 のとおり Body → Path → Identifier の順に `AuditField` を `Omitted { class, original_bytes }` へ縮退して測り直し、それでも超える event は `AuditFailure::EventTooLarge`（fail-closed）とする。縮退は event を評価器 buffer へ積む前（queue 計上の前）に行い、queue と journal は縮退後の長さを使う。Secret と、`AuditField` でない field（関数名・capability 名・error code など）は縮退の対象にしない。
+  - 通常 event の実 encode 長が 60 KiB を超える場合、§7.2 のとおり Body → Path → Identifier の順に、class ごとにまとめて（Q4 = A。その class の `AuditField` をすべて）`Omitted { class, original_bytes }` へ縮退して測り直し、それでも超える event は `AuditFailure::EventTooLarge`（fail-closed）とする。縮退は event を評価器 buffer へ積む前（queue 計上の前）に行い、queue と journal は縮退後の長さを使う。Secret と、`AuditField` でない field（関数名・capability 名・error code など）は縮退の対象にしない。
   - Terminal は、`Full(AuditError)` を含む Terminal 全体の実長が 60 KiB を超える場合に `Emergency { code, message_id, full_error_bytes, full_error_sha256 }` へ置き換える。`full_error_bytes` と `full_error_sha256` は redaction 済み `AuditError` の §9.2 encoding に対して求める。Emergency の Terminal 全体は 4 KiB 以下になる（code / message_id は各 128 byte まで）。
 - **範囲外**: `max_revealed_body_bytes` の既定や allow-list の規則は変えない。VM は対象外。
 - **c4 の done PR で行う逸脱一覧の更新**: 未実装範囲の「60 KiB 縮退規則」行を削除する。
-- **判断待ち Q4**: §7.2「Body/Path/Identifierの順にOmittedへ縮退」をどの粒度で行うか。
+- **判断 Q4（kamonabe の選択: A）**: §7.2「Body/Path/Identifierの順にOmittedへ縮退」をどの粒度で行うか。
   - A（推奨）: class ごと。event 内の Body をすべて `Omitted` にして測り直し、まだ超えれば Path をすべて、次に Identifier をすべて `Omitted` にする。段は最大 3 つで、結果が入力から一意に決まり、実装・検証が単純。根拠: manifesto 原則 5・原則 8、§7.2 の文言の素直な読み方。
   - B: field ごと。同じ class の中で大きい field から 1 つずつ `Omitted` にし、60 KiB 以下になったら止める。残る情報は多いが、同じ長さのときの順番などの規則を新しく決める必要があり、測り直しの回数も増える。
 - **受入基準（c4）**:

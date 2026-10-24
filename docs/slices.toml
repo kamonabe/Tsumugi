@@ -204,7 +204,7 @@ order      = 25
 # audit-strict-cbor（strict deterministic CBOR、§9.2）は 1 PR の大きさの目安に収まらないため、
 # c1〜c4 の 4 スライスへ分割した（spec「audit-strict-cbor の sub-slice 分割」）。元の id は置き換えて残さない。
 # 「strict CBOR スライス」と書かれた既存の延期先は c1〜c4 全体を指す。
-# c2〜c4 は depends_on が done でないため todo。c3・c4 は spec 小節に書いた判断待ちが決まるまで ready にしない。
+# c2〜c4 は depends_on が done でないため todo。c3・c4 の判断（Q2〜Q4）は kamonabe の選択で決まり、spec 小節に記録済み。
 [[slice]]
 id         = "audit-strict-cbor-c1"
 title      = "strict deterministic CBOR c1：§9.2 encoder 本体（schema v1 全型・size pass / write pass、crate 内部、未配線）"
