@@ -209,14 +209,13 @@ order      = 25
 [[slice]]
 id         = "audit-strict-cbor-c1"
 title      = "strict deterministic CBOR c1：§9.2 encoder 本体（schema v1 全型・size pass / write pass、crate 内部、未配線）"
-status     = "ready"
+status     = "done"
 parent     = "Phase 6 残"
 spec_slice = "determinism Slice 5"
 spec       = { doc = "docs/determinism-and-audit.md", section = "audit-strict-cbor-c1 実装スライス（§9.2 encoder 本体と size pass）" }
 acceptance = ["SC-AT-01..05"]
 depends_on = ["A-1"]
 design_pr  = 256
-order      = 30
 
 [[slice]]
 id         = "audit-strict-cbor-c2"
