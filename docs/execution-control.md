@@ -349,6 +349,8 @@ heap quotaはallocator、platform、Rust compilerに依存しない論理サイ�
 | exception handler / loop handler | 32 |
 | rollback journal entry | 48 + 保持する旧valueの到達payload |
 
+continuation frameの課金対象は、スコープを作るframe（96 + local slot 32 × count）だけである。Call frame・ループ制御frame・式frameは、同期経路のRust再帰が持つ状態をheapへ移したものなので課金しない（0）。
+
 `Value::Str`はValue slotとString body、`Value::List`はValue slotとList body、そこから初めて到達する子payloadを課金する。Dict keyはentryの64 bytesにString header 24 bytesを含むため、追加するのはkey payload byteだけである。
 
 ### 5.2 `Rc`共有と二重計上回避
@@ -1441,18 +1443,19 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
   - **保留中の二項/単項/index 演算**: operand を揃えた後に適用する演算の種別（左右の値が揃うまで
     frame に保持し、揃ったら適用）。
 
-- **式 frame の heap 課金（確定）**: 式評価用の frame は local slot を持たないため、§5.1 の
-  `continuation_frame`（96 + local slot 32 × count）をそのまま使うと式 frame は **96 byte 固定**に
-  なる。operand stack に積む中間値は **既に別所で課金済みの `Value`（§5.1 の Value slot ほか）を
-  参照保持するだけ**とし、式 frame 側では operand を二重課金しない（§5.2「共有は 1 回課金」に従う）。
+- **式 frame の heap 課金（確定。e2a 判断 Q1 = A で改訂）**: 式評価用の frame は**課金しない**
+  （`heap_charge` は 0。Call frame・`while` / `for` の制御 frame と同じ）。式 frame は同期経路の Rust 再帰（未課金）が
+  持つ評価状態を heap へ移しただけで、新しい値は作らない。operand stack に積む中間値は **既に別所で課金済みの
+  `Value`（§5.1 の Value slot ほか）を参照保持するだけ**とし、operand を二重課金しない（§5.2「共有は 1 回課金」に従う）。
+  当初は式 frame を 96 byte 固定で課金すると確定していたが、e1 判断 Q1 = A（terminal まで poll する入口は観測値を
+  変えない）と両立しないため改めた（理由は e2a 小節の判断の記録）。
   - **同期経路でも式 frame を積むか**: **積まない**。同期経路（`can_yield = false`）は従来どおり
     `eval_expr` の Rust 再帰で評価し、式 frame を作らない。式 frame を作る（明示段階評価に入る）のは
     **poll 経路（`can_yield = true`）で、かつ呼び出し・反復を含む部分式**に限る。これにより同期経路の
     `live_heap` / `peak_heap` は現状と 1 byte も変わらず、TEC-AT-03（観測不変）と衝突しない。VM との
     heap 差も広げない。
-  - **poll 経路の heap 観測**: poll 経路で式 frame を積む分 `continuation_frame`（96 byte）が増えるが、
-    これは既存の文/反復/Call frame と同じ課金規律の延長であり、poll 経路は元々 yield/resume のための
-    continuation heap を持つ経路なので許容する（同期経路の観測値は上記のとおり不変）。
+  - **poll 経路の heap 観測**: 式 frame は課金しないので、poll 経路で式 frame を積んでも `live_heap` /
+    `peak_heap` は同期経路と一致する。
 
 - **yield 可能点（どの境界で slice 残量を確認するか）**: §4.2「次の論理 charge が slice 残量を
   超える場合は charge せず `Yielded(SliceFuelExhausted)` を返す」を次の境界に適用する。
@@ -1511,8 +1514,7 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
     エラー伝播・結果順序は現状維持。`sort` は書き換えない（上記）。
   - `src/env.rs`: 式 frame の一時値スコープ管理が要る場合は PR-b の `scope_depth()` /
     `truncate_scopes(len)` 規律に合わせる（新 API は増やさない想定）。
-  - continuation heap 課金: 式 frame の push/pop を §5.1 `continuation_frame`（96 byte 固定、上記）へ
-    配線。poll 経路でだけ積む。
+  - continuation heap 課金: 式 frame は課金しない（`heap_charge` 0、上記）。poll 経路でだけ積む。
   - docs: 本小節、§4.2（超過例外・追記済み）、§14 冒頭・第1節の「Slice 3 完了」記述（PR-e 追加に更新
     済み）、roadmap。VM は対象外（下記逸脱）。
 
@@ -1559,7 +1561,7 @@ PR-c の実装注記が明言するとおり、現状は「式評価が Rust 再
     （`Evaluator::run` 系）と一致**することを固定する。
   - **TEC-AT-03（観測不変・既定 slice）**: 既定 slice（同期経路と、terminal まで poll する入口）で、既存の全テスト（`tests/`・
     unit test、PR-d の 597 tests green を含む）が無改変で緑。fuel 値・エラー行・trace・stdout・
-    exit code・`live_heap`/`peak_heap` が現状と一致する（同期経路は式 frame を積まないため heap 不変）。
+    exit code・`live_heap`/`peak_heap` が現状と一致する（式 frame は課金しないため heap 不変）。
     terminal まで poll する入口（`Engine::run`〔CLI を含む〕・alpha `execute` / `execute_repl_submission`・
     `run_for_repl`）は driver 経路を通ってよいが、観測値は現状と一致させる（e1 判断 Q1 = A）。
     意図的に変えた差があれば本基準の例外として明記し、tree/VM parity を壊さないことを別途固定する。
@@ -1761,7 +1763,7 @@ builtin・host のどれに解決されるかは静的には決まらない（us
 > **e2a（式 frame の導入と、e1 の 4 位置での call・二項・単項）** と **e2b（index・list / dict リテラル・
 > f-string と、文の式スロット）** の 2 つの実装スライスへ割った。本小節は e2 全体の設計の記録であり、
 > 実装範囲・受入基準・完了条件は e2a / e2b の小節を正とする。「e2 が done」は e2a と e2b がともに done を
-> 意味する。本小節の heap の記述（式 frame 1 個につき 96 byte）は e2a の「判断待ち」で見直している。
+> 意味する。式 frame の heap は、e2a の判断 Q1 = A で課金なし（0）に確定した（本小節の元の記述は 96 byte 固定だった）。
 
 - **範囲**:
   - `FrameKind::Expr` を追加する。保存するのは上の小節「continuation へ保存する式の評価状態」のうち
@@ -1778,8 +1780,7 @@ builtin・host のどれに解決されるかは静的には決まらない（us
     評価順序（index 代入は binding 解決 → index → value の規範順序）とエラー行は同期経路と一致させる。
   - yield 可能点: call の各引数評価の境界（引数 i の評価後・引数 i+1 の評価前、全引数評価後・本体へ入る前）と、
     呼び出しを含む operand の境界。強制 yield フックをこれらへ広げる。
-  - heap: 式 frame の push で `continuation_frame` 96 byte 固定を課金し、pop / unwind で release する
-    （poll 経路だけ。operand は二重課金しない）。
+  - heap: 式 frame は課金しない（`heap_charge` 0。operand は二重課金しない。e2a の判断 Q1 = A）。
   - 式 frame の途中で起きたエラーの捕捉（最も近い `try`）、`break` / `continue` / `return` による unwind で
     式 frame を正しく畳み、heap を release する。
 - **範囲外（後続 sub-slice）**: builtin / host / cooperative の呼び出しで引数が呼び出しを含む場合（e3）。
@@ -1791,15 +1792,15 @@ builtin・host のどれに解決されるかは静的には決まらない（us
     最終値と副作用列が同期経路と一致する。operand stack・式 cursor・部分評価済み引数が保存されることを
     unit test で固定する。
   - **TEC-AT-03（e2 分）**: 既存テスト無改変で緑。同期経路の `live_heap` / `peak_heap` が不変
-    （同期経路は式 frame を積まない）。
+    （同期経路は式 frame を積まず、poll 経路の式 frame も課金しない）。
   - **TEC-AT-04（e2 分）**: poll 経路で `f(n - 1) + 1` 形（式の途中の再帰）が同期経路と同じ
     `call_depth_limit` で止まり、深い呼び出しを含まない式は従来どおり有限停止する。
   - **TEC-AT-05（e2 分）**: 式の途中の yield を跨いでも submission journal が保持され、terminal でだけ
     commit / rollback される。
   - **TEC-AT-06（e2 分）**: 式の中で呼んだ関数の本体にループを持つ script を最小 slice で実行し、1 poll の
     実行量が e1 と同じ上限以内。
-  - 式 frame の heap: poll 経路で式 frame 1 個につき 96 byte が push で課金され、pop・unwind・エラー捕捉で
-    release されて、terminal 時点の `live_heap` が同期経路と一致する（unit test）。
+  - 式 frame の heap: 式 frame は課金されず、push・pop・unwind・エラー捕捉のどこでも `live_heap` が動かない。
+    poll 経路の `live_heap` / `peak_heap` が同じ script の同期経路と一致する（unit test）。
 - **検証**: 全 sub-slice 共通の完了条件。テストは `tests/engine_api.rs`（TEC-AT-01/02/05/06）、
   `tests/defensive*.rs`（TEC-AT-04）、式 frame の不変条件と heap は `src/eval.rs` の unit test。
 
@@ -1847,8 +1848,8 @@ builtin・host のどれに解決されるかは静的には決まらない（us
     返した場合（`may_yield` は e1 と同じく driver 上の Call frame の外で真）、その文の式 frame をすべて畳み、文の
     cursor を戻して yield する。resume では文全体を最初から評価し直す（現行 §4.7「同じ文の再評価」と同じ観測。
     式の途中状態からは再開しない）。関数本体の中は e1 と同じく `may_yield = false`。
-  - **heap**: 判断待ち（下記 Q1）。推奨案では、式 frame の `heap_charge` は Call frame・`while` / `for` の制御 frame と
-    同じく **0** とし、operand は課金済みの `Value` を参照するだけで二重課金しない。
+  - **heap**: 式 frame の `heap_charge` は Call frame・`while` / `for` の制御 frame と同じく **0** とする（下記の判断 Q1 = A）。
+    operand は課金済みの `Value` を参照するだけで二重課金しない。
 - **範囲外（後続）**: index・list / dict リテラル・f-string の段階評価と、`if` / `while` の条件・`for` の反復元・index
   代入の index と値（e2b）。builtin / host / cooperative の引数に現れる呼び出し（e3）。`map` / `filter` / `each`（e4）。
   これらの内側は e2a 時点では `can_yield = false` で完了まで実行し、§4.2 の超過として扱う。
@@ -1868,43 +1869,40 @@ builtin・host のどれに解決されるかは静的には決まらない（us
     unit test で固定する。
   - **TEC-AT-03（e2a 分）**: 既存テスト無改変で緑（`may_yield_false_requires_ready_else_internal_terminal` と B2-AT-09、
     cooperative host-call の Pending を含む既存テストを含む）。同期経路と、terminal まで poll する入口の観測値が不変。
-    poll 経路の `live_heap` / `peak_heap` が同じ script の `Evaluator::run` と一致する（Q1 が推奨案のとき。unit test）。
+    poll 経路の `live_heap` / `peak_heap` が同じ script の `Evaluator::run` と一致する（unit test）。
   - **TEC-AT-04（e2a 分）**: poll 経路で `f(n - 1) + 1` 形（式の途中の再帰）が同期経路と同じ `call_depth_limit`
     （同じ行）で止まる。既存 `tests/defensive*.rs` は無改変で緑。
   - **TEC-AT-05（e2a 分）**: 式の途中の yield を跨いでも submission journal が保持され、terminal でだけ commit /
     rollback される（REPL transaction の成功・失敗の両方）。
 - **検証**: 全 sub-slice 共通の完了条件。テストは `tests/engine_api.rs`（TEC-AT-01/02/05）、`tests/defensive*.rs` への
   追加または既存の無改変緑（TEC-AT-04）、式 frame の保存状態・終了経路・heap の unit test は `src/eval.rs`。
-- **判断待ち（設計 PR で kamonabe に確認する。決まるまで e2a は `todo`）**:
-  - **Q1. 式 frame の heap 課金**。上の小節「式 frame の heap 課金（確定）」は「同期経路は式 frame を積まないので
-    `live_heap` / `peak_heap` は変わらない」を前提に 96 byte 固定を課金すると決めた。ところが e1 判断 Q1 = A により
-    `Engine::run`（CLI を含む）と alpha `execute` は driver 経路を通り、それらは観測値を変えないことが条件になった。
-    96 byte を課金すると、これらの入口の `peak_heap` と heap 上限で止まる位置が変わる。
-    - **A（推奨）**: 式 frame の `heap_charge` を 0 にする（Call frame・`while` / `for` の制御 frame と同じ）。
-      式 frame は同期経路では Rust 再帰（未課金）が持つ評価状態を heap へ移しただけで、新しい値は作らない。
-      operand は課金済みの `Value` を参照するだけ。
-      根拠: (i) e1 判断 Q1 = A（terminal まで poll する入口は観測値を変えない）。(ii) manifesto 原則 5「同じ言語
-      version、スクリプト、入力…から、同じ結果…が得られる」: B では同じ script が `Evaluator::run` と `Engine::run` で
+- **判断の記録（返信なしのため推奨案で確定）**:
+  - **Q1. 式 frame の heap 課金: A（式 frame の `heap_charge` を 0 にする）で確定。** kamonabe の返信が 2 時間無かったため、
+    [開発ループ手順書](loop-runbook.md) §7.5 により推奨案で確定した（[Slack スレッド](https://kamo-dev.slack.com/archives/C0CB1H2HHJB/p1792869955313449)）。
+    上の小節「式 frame の heap 課金」は「同期経路は式 frame を積まないので `live_heap` / `peak_heap` は変わらない」を前提に
+    96 byte 固定を課金すると決めていた。ところが e1 判断 Q1 = A により `Engine::run`（CLI を含む）と alpha `execute` は
+    driver 経路を通り、それらは観測値を変えないことが条件になった。96 byte を課金すると、これらの入口の `peak_heap` と
+    heap 上限で止まる位置が変わる。そこで式 frame を課金しないことにした（Call frame・`while` / `for` の制御 frame と同じ）。
+    - **理由**: (i) e1 判断 Q1 = A（terminal まで poll する入口は観測値を変えない）。(ii) manifesto 原則 5「同じ言語
+      version、スクリプト、入力…から、同じ結果…が得られる」: 課金すると同じ script が `Evaluator::run` と `Engine::run` で
       heap 上限に達して止まる位置が変わる。(iii) 原則 5「意味論、評価順、エラー、資源消費が実行backendごとに変わる
-      ことを許容しない」と上の小節「VM との heap 差も広げない」: B では tree だけが式 frame を課金し、VM（value stack は
-      未課金）との heap 差が広がる。(iv) §5.2（共有は 1 回課金）。
-      原則 3（すべての実行に予算を設ける）との比較: 式 frame の個数は `MAX_AST_DEPTH`（256）× 呼び出し深度 128 で
+      ことを許容しない」と上の小節「VM との heap 差も広げない」: 課金すると tree だけが式 frame を課金し、VM（value stack は
+      未課金）との heap 差が広がる。(iv) §5.2（共有は 1 回課金）。式 frame は同期経路では Rust 再帰（未課金）が持つ評価状態を
+      heap へ移しただけで、新しい値は作らない。operand は課金済みの `Value` を参照するだけ。
+    - **原則 3（すべての実行に予算を設ける）との比較**: 式 frame の個数は `MAX_AST_DEPTH`（256）× 呼び出し深度 128 で
       有界（最大で約 3.3 万個）。同期経路では同じ深さの評価状態を Rust stack が持ち、これも課金していない。式 frame は
       その状態を heap へ移しただけなので、課金しなくても「予算の外で増えるメモリ」は同期経路から増えない
       （Rust stack 側の上限は 8 MiB スレッドと深度上限が引き続き抑える）。
-      §5.1 との関係: §5.1 の表は continuation frame を種類で区別せず「96 + local slot 32 × count」としているが、
+    - **§5.1 との関係**: §5.1 の表は continuation frame を種類で区別せず「96 + local slot 32 × count」としていたが、
       実装はすでにスコープを作る frame だけに「96 + local slot 32 × count」を課金し（`while` の反復・`if` の分岐・`try`
       本体は 96、`for` の反復・`catch` 本体は 128）、program 直下の Block・Call・`while` / `for` の制御 frame は 0 である。
-      A を選ぶ場合は、§5.1 の表に「課金するのはスコープを作る frame（96 + local slot 32 × count）。Call・ループ制御・
-      式 frame は同期経路の Rust 再帰が持つ状態の置き換えなので課金しない」と注記して目標仕様を実装に合わせる（逸脱一覧には足さない）。
-      あわせて上の小節・e2b・e4 の 96 byte の記述を 0 に揃える。
-    - **B**: 確定どおり 96 byte を課金し、poll 経路（`Engine::run` / CLI を含む）の `peak_heap` が、呼び出しを含む
-      式の段階評価の深さ × 96 byte 増えることを意図的な差として明記する。根拠: §5.1 の continuation frame の課金表を
-      文字どおり適用する、manifesto 原則 3（メモリを予算で制御する）。
-      欠点と結果: e1 判断 Q1 = A と食い違う。この PR で書き換えた TEC-AT-03 と全 sub-slice 共通の完了条件は「terminal
-      まで poll する入口の観測値（`live_heap` / `peak_heap` を含む）を変えない」「既存テスト無改変」を求めているので、
-      B を選ぶなら両方に「poll 経路の `peak_heap` は式 frame の分だけ増える」という例外を明記し、それに当たる既存の
-      heap 系テストの期待値を変える（無改変の例外として実装 PR に列挙する）。VM との heap 差も広がる。
+      §5.1 の表に「課金するのはスコープを作る frame（96 + local slot 32 × count）。Call・ループ制御・式 frame は課金しない」と
+      注記して目標仕様を実装に合わせた（逸脱一覧には足さない）。
+    - **反映した箇所**: §5.1 の表の注記、上の小節（式 frame の heap 課金・poll 経路の heap 観測・continuation heap 課金・
+      TEC-AT-03）、e2 小節の範囲と受入基準、e2a の heap、e4 の反復 frame の heap。
+    - **採らなかった案 B**（確定どおり 96 byte を課金する）: 根拠は §5.1 の課金表を文字どおり適用することと manifesto 原則 3。
+      ただし e1 判断 Q1 = A と食い違い、TEC-AT-03 と共通の完了条件に例外を足して既存の heap 系テストの期待値を変える
+      必要があり、VM との heap 差も広がるため採らなかった。
 
 ###### tree-expr-continuation-e2b 実装スライス（index・list / dict・f-string と、文の式スロット）
 
@@ -1986,7 +1984,7 @@ builtin・host のどれに解決されるかは静的には決まらない（us
     （`call_fn_value` の現行実装）と一致させる。`sort` は書き換えない。
   - yield 可能点: 各要素の処理の境界（callback 呼び出しの前後）と callback 本体の文/反復境界。強制 yield
     フックをここへ広げる。
-  - heap: 反復 frame は式 frame と同じく `continuation_frame` 96 byte 固定（poll 経路だけ）。部分結果の
+  - heap: 反復 frame は式 frame と同じく課金しない（`heap_charge` 0。e2a の判断 Q1 = A）。部分結果の
     collection は同期経路と同じ課金規律で作る（同期経路と terminal 時点の `live_heap` が一致する）。
 - **受入基準（e4 が満たす部分。e4 の done で TEC-AT-01〜07 がすべて満たされる）**:
   - **TEC-AT-07**: 本文どおり。要素の途中・callback 本体の途中の両方で強制 yield を起こし、`map` / `filter` /
