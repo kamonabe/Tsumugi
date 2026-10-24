@@ -1755,9 +1755,9 @@ builtin・host のどれに解決されるかは静的には決まらない（us
 
 ##### tree-expr-continuation-e2 実装スライス（式 frame：ユーザー関数呼び出しを含む部分式・call 引数境界）
 
-> **e2a / e2b への分割（e2 の設計 PR）**: e2 は 1 PR に収まらない（e1 の実装 PR #254 で `src/` の差分が
-> 約 650 行だった。e2 はその機構の上に式 frame・7 つの式種・4 つの文の式スロットを足すため、
-> [開発ループ手順書](loop-runbook.md)「スライスの大きさの目安」の 400 行を大きく超える）。そこで下の
+> **e2a / e2b への分割（e2 の設計 PR）**: e2 は 1 PR に収まらない（e1 の実装 PR #254 で `src/` の差分がテストを除いて
+> +478 / -76 行だった〔`src/eval.rs` 434・`src/ast.rs` 29・`src/embedding.rs` 15。`mod tests` は数えない〕。e2 はその機構の上に式 frame・7 つの式種・4 つの文の式スロットを足すため、
+> [開発ループ手順書](loop-runbook.md)「スライスの大きさの目安」の 400 行を大きく超える。受入基準も 7 項目あり、5 を超える）。そこで下の
 > **e2a（式 frame の導入と、e1 の 4 位置での call・二項・単項）** と **e2b（index・list / dict リテラル・
 > f-string と、文の式スロット）** の 2 つの実装スライスへ割った。本小節は e2 全体の設計の記録であり、
 > 実装範囲・受入基準・完了条件は e2a / e2b の小節を正とする。「e2 が done」は e2a と e2b がともに done を
@@ -1821,7 +1821,8 @@ builtin・host のどれに解決されるかは静的には決まらない（us
     - e2a で段階評価しない式種（index・list / dict リテラル・f-string。e2b）のノード。呼び出しを含んでいても
       まるごと 1 つの operand として評価する。
     - callee が識別子で、その時点で user binding を持たない call（builtin / cooperative host / 登録 host function、
-      または未定義名）。call 全体を従来の経路（`prepare_call` → `CallPrep::Done`）で評価する（引数の段階評価は e3）。
+      または未定義名）。call 全体を従来の `eval_call` 経路で評価する（builtin / host / cooperative は `CallPrep::Done`、
+      未定義名は `count_step` → callee の評価で未定義名エラー。引数の段階評価は e3）。
   - **call の段階評価**: 同期経路の `prepare_call` と同じ順序で進める。`count_step` → 深度検査 → callee 評価
     （呼び出しを含むなら段階評価）→ callable 検査 → arity 検査（AST の引数の個数で行い、引数評価より前）→ 引数を
     左から 1 つずつ評価（呼び出しを含むものは段階評価）→ `push_call_frame` → captured / self-binding / 引数の束縛 →
@@ -1854,7 +1855,8 @@ builtin・host のどれに解決されるかは静的には決まらない（us
 - **想定の変更規模**: `src/eval.rs` がおおむね 400 行（式 frame の型と経路の辿り方 50、call の段階評価と
   `prepare_call` の段分け 110、二項・単項 50、4 位置からの入口と受け渡し先 80、終了経路・Pending・`abort_session`
   70、境界の判定と強制 yield フック 40）。`src/ast.rs` は経路で子を辿る補助が要れば 30 行以内。触る仕組みは tree
-  evaluator の driver 1 つ。受入基準は下の 5 項目。
+  evaluator の driver 1 つ。受入基準は下の 5 項目。実装中に 400 行を大きく超えそうなら、短絡（`and` / `or`）と単項の
+  段階評価を e2b へ回してよい（そのときは実装 PR を止めて、本小節と e2b 小節を直す設計 PR を先に出す）。
 - **受入基準（e2a が満たす部分）**:
   - **TEC-AT-01（e2a 分）**: 強制 yield フックで全境界を yield させ、4 位置それぞれで call の引数・callee・二項・単項・
     短絡に呼び出しを含む script（例: `let y = f(x) + g(x)`、`return h(f(x), 1)`、`f(x)(y)`、`not f(x)`、
@@ -1880,13 +1882,28 @@ builtin・host のどれに解決されるかは静的には決まらない（us
     96 byte を課金すると、これらの入口の `peak_heap` と heap 上限で止まる位置が変わる。
     - **A（推奨）**: 式 frame の `heap_charge` を 0 にする（Call frame・`while` / `for` の制御 frame と同じ）。
       式 frame は同期経路では Rust 再帰（未課金）が持つ評価状態を heap へ移しただけで、新しい値は作らない。
-      operand は課金済みの `Value` を参照するだけ。個数は `MAX_AST_DEPTH` × 呼び出し深度 128 で有界。
-      根拠: e1 判断 Q1 = A（terminal まで poll する入口は観測値を変えない）、manifesto 原則 5（同じ script の
-      資源消費を実行経路ごとに変えない）、§5.2（共有は 1 回課金）。
-    - **B**: 確定どおり 96 byte を課金し、poll 経路（`Engine::run` / CLI を含む）の `peak_heap` が呼び出しを含む
-      式の深さ × 96 byte 増えることを意図的な差として明記する。根拠: §5.1 の continuation frame の課金表、manifesto
-      原則 3。欠点: e1 判断 Q1 = A と食い違い、既存の heap 系テストの期待値が変わりうる（TEC-AT-03）。
-    - A を選んだ場合、上の小節の heap の記述と e2b / e4 の heap の記述（96 byte）も同じ PR で 0 に揃える。
+      operand は課金済みの `Value` を参照するだけ。
+      根拠: (i) e1 判断 Q1 = A（terminal まで poll する入口は観測値を変えない）。(ii) manifesto 原則 5「同じ言語
+      version、スクリプト、入力…から、同じ結果…が得られる」: B では同じ script が `Evaluator::run` と `Engine::run` で
+      heap 上限に達して止まる位置が変わる。(iii) 原則 5「意味論、評価順、エラー、資源消費が実行backendごとに変わる
+      ことを許容しない」と上の小節「VM との heap 差も広げない」: B では tree だけが式 frame を課金し、VM（value stack は
+      未課金）との heap 差が広がる。(iv) §5.2（共有は 1 回課金）。
+      原則 3（すべての実行に予算を設ける）との比較: 式 frame の個数は `MAX_AST_DEPTH`（256）× 呼び出し深度 128 で
+      有界（最大で約 3.3 万個）。同期経路では同じ深さの評価状態を Rust stack が持ち、これも課金していない。式 frame は
+      その状態を heap へ移しただけなので、課金しなくても「予算の外で増えるメモリ」は同期経路から増えない
+      （Rust stack 側の上限は 8 MiB スレッドと深度上限が引き続き抑える）。
+      §5.1 との関係: §5.1 の表は continuation frame を種類で区別せず「96 + local slot 32 × count」としているが、
+      実装はすでにスコープを作る frame（ループ本体 1 反復の Block・Scoped・Try）だけを 96 byte 課金し、program 直下の
+      Block・Call・`while` / `for` の制御 frame は 0 である。A を選ぶ場合は、§5.1 の表に「課金するのはスコープを作る
+      frame。Call・ループ制御・式 frame は同期経路の Rust 再帰が持つ状態の置き換えなので課金しない」と注記して目標仕様を実装に合わせる（逸脱一覧には足さない）。
+      あわせて上の小節・e2b・e4 の 96 byte の記述を 0 に揃える。
+    - **B**: 確定どおり 96 byte を課金し、poll 経路（`Engine::run` / CLI を含む）の `peak_heap` が、呼び出しを含む
+      式の段階評価の深さ × 96 byte 増えることを意図的な差として明記する。根拠: §5.1 の continuation frame の課金表を
+      文字どおり適用する、manifesto 原則 3（メモリを予算で制御する）。
+      欠点と結果: e1 判断 Q1 = A と食い違う。この PR で書き換えた TEC-AT-03 と全 sub-slice 共通の完了条件は「terminal
+      まで poll する入口の観測値（`live_heap` / `peak_heap` を含む）を変えない」「既存テスト無改変」を求めているので、
+      B を選ぶなら両方に「poll 経路の `peak_heap` は式 frame の分だけ増える」という例外を明記し、それに当たる既存の
+      heap 系テストの期待値を変える（無改変の例外として実装 PR に列挙する）。VM との heap 差も広がる。
 
 ###### tree-expr-continuation-e2b 実装スライス（index・list / dict・f-string と、文の式スロット）
 
@@ -1911,6 +1928,10 @@ builtin・host のどれに解決されるかは静的には決まらない（us
 - **範囲外（後続）**: builtin / host / cooperative の引数に現れる呼び出し（e3）。`map` / `filter` / `each`（e4）。
 - **想定の変更規模**: `src/eval.rs` がおおむね 300 行（index・list・dict・f-string の段階評価 120、`if` / `for` の
   入口 60、`while` の条件の再評価 60、index 代入 50）。触る仕組みは tree evaluator の driver 1 つ。受入基準は下の 4 項目。
+- **TEC-AT-04 / 05 を持たない理由**: 深度検査と journal の扱いは、e2a が段階評価に入れた call の前処理（`prepare_call` と
+  共有する段）と driver 上の Call frame の中にあり、e2b は呼び出しの経路を新しく足さない（足すのは式種と、式 frame へ
+  入る文の位置だけ）。式 frame の途中の yield が transaction 境界でないことも e2a の TEC-AT-05 で固定済みで、e2b の
+  式 frame は同じ frame 種別である。したがって e2a の TEC-AT-04 / 05 がそのまま e2b の位置にも効く。
 - **受入基準（e2b が満たす部分）**:
   - **TEC-AT-01（e2b 分）**: 強制 yield フックで、index・list / dict リテラル・f-string の中の呼び出しと、`if` / `while` の
     条件・`for` の反復元・index 代入の index と値に呼び出しを含む script が、同期経路と一致する（検査項目は
@@ -1918,7 +1939,8 @@ builtin・host のどれに解決されるかは静的には決まらない（us
   - **TEC-AT-02（e2b 分）**: list / dict の要素の途中・f-string の部分の途中・`while` の条件の途中で yield させ、resume 後の
     最終値と副作用列が同期経路と一致する。
   - **TEC-AT-03（e2b 分）**: 既存テスト無改変で緑。同期経路と、terminal まで poll する入口の観測値が不変。
-  - **TEC-AT-06（e2b 分）**: `while` の条件や `for` の反復元で呼んだ関数の本体にループを持つ script を
+  - **TEC-AT-06（e2a・e2b 分）**: e2a / e2b の式種と式スロットの中で呼んだ関数の本体にループを持つ script（例:
+    `let y = f(x) + 1`、`return h(f(x), 1)`、`[f(x)]`、`while f(x) > 0`、`for v in f(x)`）を
     `PollSlice::max_fuel = 16` で実行し、1 回の poll の実行量が e1 と同じ上限以内。`Yielded`/`Resumed` が対で順序が単調。
 - **検証**: 全 sub-slice 共通の完了条件。テストは `tests/engine_api.rs`（TEC-AT-01/02/06）、式種ごとの保存状態の
   unit test は `src/eval.rs`。
