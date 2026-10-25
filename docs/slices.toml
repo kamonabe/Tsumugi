@@ -105,6 +105,20 @@ depends_on = ["R-1a"]
 # 未着手（roadmap.md「現在地」「Phase 6 残」から分解。order は暫定）
 # ════════════════════════════════════════════════════════════════
 
+# loop:drift #263 D-3 (e)（Q2=A、返信なしのため推奨案で確定）で見つかった不具合の fix。
+# capability-model §11.1「host function ID は registry 内で一意」に対し、register_cooperative が
+# 名前の衝突だけを見て ID の重複（cooperative 同士・同期 function との間）を検査しない。
+# 逸脱一覧（capability-model.md 冒頭）の行がこのスライスを参照する。order は loop-runbook §8.1 の既定
+# （ready・todo より前の空いている値）。parent は該当する Phase 2 の項目が「ステータス一覧」に無いため、
+# register_cooperative を入れた exec-control Slice 5（C12）が属する REV-015 にした。
+[[slice]]
+id         = "fix-host-function-id-unique"
+title      = "register_cooperative で host function ID の重複を build error にする（capability-model §11.1）"
+status     = "todo"
+parent     = "REV-015"
+spec_slice = "C12"
+order      = 10
+
 # tree-expr-continuation（Slice 3 PR-e、元の設計 PR #242、分割は PR #250）は 1 晩・1 PR に収まらないため、issue #248 で
 # e1〜e4 の 4 スライスへ分割した（e2 はさらに e2a / e2b に分割）（spec「tree-expr-continuation の sub-slice 分割」）。元の id は置き換えて
 # 残さない。「tree-expr-continuation が done」は e1〜e4 がすべて done を意味する。
