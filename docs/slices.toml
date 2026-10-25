@@ -106,11 +106,11 @@ depends_on = ["R-1a"]
 # ════════════════════════════════════════════════════════════════
 
 # tree-expr-continuation（Slice 3 PR-e、元の設計 PR #242、分割は PR #250）は 1 晩・1 PR に収まらないため、issue #248 で
-# e1〜e4 の 4 スライスへ分割した（spec「tree-expr-continuation の sub-slice 分割」）。元の id は置き換えて
+# e1〜e4 の 4 スライスへ分割した（e2 はさらに e2a / e2b に分割）（spec「tree-expr-continuation の sub-slice 分割」）。元の id は置き換えて
 # 残さない。「tree-expr-continuation が done」は e1〜e4 がすべて done を意味する。
 # acceptance は各スライスが担当する受入基準の ID。複数スライスにまたがる基準（TEC-AT-01 等）の
 # どの部分を満たせば完了かは、各スライスの spec 小節「受入基準（eN が満たす部分）」に書く。
-# e2〜e4 は設計確定済みだが、DoR 3（depends_on がすべて done）を満たさないため todo に置く。
+# e2b〜e4 は設計確定済みだが、DoR 3（depends_on がすべて done）を満たさないため todo に置く。
 # 前段が done になった時点で状態整理 PR で todo → ready にする（F-2 と同じ運用）。
 [[slice]]
 id         = "tree-expr-continuation-e1"
@@ -126,17 +126,32 @@ impl_pr    = 254
 issues     = [248]
 order      = 11
 
+# e2 は 1 PR に収まらないため e2a / e2b に分割した（spec「tree-expr-continuation-e2 実装スライス」の注記）。
+# 元の id は置き換えて残さない。「e2 が done」は e2a・e2b がともに done を意味する。
+# e2a の判断待ち（式 frame の heap 課金）は、返信なしのため推奨案（課金なし）で確定した（loop-runbook §7.5）。
 [[slice]]
-id         = "tree-expr-continuation-e2"
-title      = "tree evaluator の式レベル continuation e2：式 frame（FrameKind::Expr）でユーザー関数呼び出しを含む部分式・call 引数境界を yield 可能に"
+id         = "tree-expr-continuation-e2a"
+title      = "tree evaluator の式レベル continuation e2a：式 frame（FrameKind::Expr）を導入し、文の 4 位置の式に現れる call・二項・単項を段階評価して call 引数・operand 境界で yield 可能に"
+status     = "ready"
+parent     = "REV-015"
+spec_slice = "exec-control Slice 3"
+spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation-e2a 実装スライス（式 frame の導入：e1 の 4 位置での call・二項・単項）" }
+acceptance = ["TEC-AT-01..05"]
+depends_on = ["tree-expr-continuation-e1"]
+design_pr  = 262
+order      = 12
+
+[[slice]]
+id         = "tree-expr-continuation-e2b"
+title      = "tree evaluator の式レベル continuation e2b：index・list / dict・f-string の段階評価と、if / while の条件・for の反復元・index 代入の式スロットを yield 可能に"
 status     = "todo"
 parent     = "REV-015"
 spec_slice = "exec-control Slice 3"
-spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation-e2 実装スライス（式 frame：ユーザー関数呼び出しを含む部分式・call 引数境界）" }
-acceptance = ["TEC-AT-01..06"]
-depends_on = ["tree-expr-continuation-e1"]
-design_pr  = 250
-order      = 12
+spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation-e2b 実装スライス（index・list / dict・f-string と、文の式スロット）" }
+acceptance = ["TEC-AT-01..03", "TEC-AT-06"]
+depends_on = ["tree-expr-continuation-e2a"]
+design_pr  = 262
+order      = 13
 
 [[slice]]
 id         = "tree-expr-continuation-e3"
@@ -146,9 +161,9 @@ parent     = "REV-015"
 spec_slice = "exec-control Slice 3"
 spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation-e3 実装スライス（builtin・host function の呼び出し引数境界）" }
 acceptance = ["TEC-AT-01..03"]
-depends_on = ["tree-expr-continuation-e2"]
+depends_on = ["tree-expr-continuation-e2b"]
 design_pr  = 250
-order      = 13
+order      = 15
 
 [[slice]]
 id         = "tree-expr-continuation-e4"
@@ -160,7 +175,7 @@ spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuat
 acceptance = ["TEC-AT-01..03", "TEC-AT-05..07"]
 depends_on = ["tree-expr-continuation-e3"]
 design_pr  = 250
-order      = 14
+order      = 16
 
 # tree-expr-continuation が呼び出し・反復を必ず yield 可能点にした後、callback なし bulk builtin
 # （sort/join/文字列繰り返し/大 collection コピー等）を chunk（256 element/16 KiB）単位で中断・再開
