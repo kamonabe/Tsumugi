@@ -121,7 +121,7 @@ main 上の `status` には承認済みの状態だけを書く。設計中・�
 PR・issue とスライスは次の命名で紐付ける。
 
 - ブランチ: `docs/<スライスID>`（設計 PR）、`feat/<スライスID>` または `fix/<スライスID>`（実装 PR）。prefix はワークスペース共通の Git 運用ルールに合わせる
-- ラベル: `loop:design`、`loop:impl`、`needs-design`、`loop:drift`（文書と実装のずれの記録。[開発ループ手順書](loop-runbook.md)「整合点検」）
+- ラベル: `loop:design`、`loop:impl`、`needs-design`、`loop:drift`（文書と実装のずれの記録。[開発ループ手順書](loop-runbook.md)「整合点検」）、`loop:plan`（週次計画。[開発ループ手順書](loop-runbook.md)「週次計画」）
 - issue タイトル: `[needs-design] <スライスID>: <止まった理由の要約>`
 
 ### ready の条件（Definition of Ready）
