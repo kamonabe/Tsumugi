@@ -27,7 +27,7 @@
 #   issues          任意。このスライスで立った needs-design issue の番号（履歴として残す）
 #
 # ready の条件（Definition of Ready）は documentation-guide.md を参照。
-# 将来 tests/slices_contract.rs で CI 検証する（未実装）。
+# フィールド定義どおりに書かれているかは tests/slices_contract.rs が cargo test（CI）で検証する。
 
 # ════════════════════════════════════════════════════════════════
 # 実装済み（依存関係の起点として載せる）
