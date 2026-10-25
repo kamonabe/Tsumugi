@@ -1,6 +1,6 @@
 # Tsumugi 実行予算・協調実行仕様
 
-最終更新: 2026-10-24
+最終更新: 2026-10-25
 
 設計ステータス: **到達目標の確定仕様（§1〜§13）＋ 実装の現在地（下記の逸脱一覧）**
 
@@ -23,8 +23,8 @@
 
 | 未実装範囲 | 対象の節(§) | 備考 |
 |---|---|---|
-| tree evaluator の式の途中での slice yield。式の途中にある呼び出し、callee や引数が呼び出しを含む呼び出し、`if` / `while` の条件・`for` の反復元・index 代入の index と値に現れる呼び出しは driver 上へ移しておらず、従来どおり Rust 再帰（`can_yield = false`）で完了まで実行する（その内側では yield しない＝§4.2 の超過として扱う）。文レベルの呼び出し（式文・`let`・再代入・`return` の値がそれ自体ユーザー関数呼び出しで、callee と引数が呼び出しを含まないもの）だけが driver 上で実行され、その関数本体の文/反復境界で yield する | §4.2/§9.3 | tree-expr-continuation-e2a / e2b |
-| builtin・登録 host function・cooperative host function の引数に現れる呼び出しの引数境界での slice yield（その呼び出しは Rust 再帰で完了まで実行する） | §4.2/§9.3 | tree-expr-continuation-e3 |
+| tree evaluator の index・list / dict リテラル・f-string の段階評価と、`if` / `while` の条件・`for` の反復元・index 代入の index と値の式スロット。これらは式 frame で段階評価せず、呼び出しを含んでいても従来どおり `eval_expr` の Rust 再帰（`can_yield = false`）で 1 つの値として完了まで実行する（その内側では yield しない＝§4.2 の超過として扱う）。式 frame で段階評価するのは、文の値の 4 位置（式文・`let` / 再代入の右辺・`return` の値）の式に現れる call（callee が識別子以外のもの、または user binding を持つ識別子のもの）・二項演算・単項演算だけで、その call 引数・operand の境界と、呼んだ関数本体の文/反復境界で yield する | §4.2/§9.3 | tree-expr-continuation-e2b |
+| builtin・登録 host function・cooperative host function の引数に現れる呼び出しの引数境界での slice yield（その呼び出しは Rust 再帰で完了まで実行する。callee が識別子でその時点で user binding を持たない call は、式 frame の中でも call 全体を従来の `eval_call` で評価する） | §4.2/§9.3 | tree-expr-continuation-e3 |
 | `map` / `filter` / `each` の要素境界と callback 本体の文/反復境界での slice yield（callback 本体は `can_yield = false` で完了まで実行する） | §4.2/§9.3 | tree-expr-continuation-e4 |
 | 関数本体・callback 本体の中での cooperative host-call の Pending yield と audit drain queue 上限の yield。どちらもトップレベル（driver 上の呼び出しの外）の文/反復境界だけで判定し、関数本体の中で Pending を返す adapter は `may_yield = false` の規約違反（catch 不能 `InternalControl`）になる | §4.2/§6.2 | §14「tree-expr-continuation 実装スライス」の逸脱（audit drain queue は [決定性・実行時監査仕様](determinism-and-audit.md) の逸脱一覧にも B-2 として記載） |
 | callback なし bulk builtin（`sort` / `join` / 文字列繰り返し / 大 collection コピー等）の chunk 境界での slice yield。現状は bulk builtin 1 回分を §4.2 の超過として扱い、chunk 前の確認は deadline / cancel だけ | §4.1/§4.2 | fuel-bulk-chunk-yield |
@@ -1903,6 +1903,20 @@ builtin・host のどれに解決されるかは静的には決まらない（us
     - **採らなかった案 B**（確定どおり 96 byte を課金する）: 根拠は §5.1 の課金表を文字どおり適用することと manifesto 原則 3。
       ただし e1 判断 Q1 = A と食い違い、TEC-AT-03 と共通の完了条件に例外を足して既存の heap 系テストの期待値を変える
       必要があり、VM との heap 差も広がるため採らなかった。
+
+- **実装（e2a 実装 PR の時点の記録）**: `src/eval.rs` に `FrameKind::Expr(Box<ExprFrame>)` を足した。`ExprFrame` は
+  所有する Block・文の index・式スロットから評価中のノードまでの子の位置の経路（`ast::expr_child` の index 列）・文の行・
+  operand stack・call の前処理の段（`started` / `checked`）・受け渡し先（`CallDest`）を持ち、AST を借用しない。
+  `exec_driver_call_stmt` は 4 位置の式が e1 の形でなく `needs_expr_frame`（呼び出しを含む call〔callee が user binding を
+  持たない識別子のものを除く〕・二項・単項）なら根の式 frame を `StmtStep::Enter` で積む。driver ループは最上位が式 frame の
+  とき、slice fuel と強制 yield フックの判定だけをしてから `drive_expr_step` → `step_expr` で 1 段（operand を 1 つ評価する
+  か、子の式 frame を積むか、演算を適用して値を届ける）進め、audit drain queue 上限と cancel / deadline の checkpoint は
+  文/反復境界だけで行う。call の前処理は `prepare_call` を `begin_user_call`（`count_step` → 深度検査）・
+  `check_user_callee`（callable → arity）・`bind_user_call`（`push_call_frame` → 束縛 → call trace）に分けて同期経路と
+  共有し、本体は `CallDest::ExprResult` を受け渡し先にした driver 上の Call frame で実行する。子の式 frame の値は
+  `CallDest::Operand` で親の operand stack へ積む。強制 yield フックの前進条件に `expr_progress`（この slice で式 frame を
+  1 段以上進めた）を足した。cooperative host-call の Pending は、その文の式 frame をすべて畳んで文の cursor を戻して
+  yield する。式 frame は Call frame と同じく `abort_session` の巻き戻しで畳まれる（特別な処理は要らない）。
 
 ###### tree-expr-continuation-e2b 実装スライス（index・list / dict・f-string と、文の式スロット）
 

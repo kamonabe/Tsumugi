@@ -505,6 +505,46 @@ fn host_pending_waker_roundtrip() {
     assert_eq!(outcome, ExecutionOutcome::Completed);
 }
 
+/// tree-expr-continuation-e2a: トップレベルの文の式 frame の中（ユーザー関数呼び出しを含む二項演算の
+/// 右辺）で cooperative host-call が Pending になっても、HostCallPending で yield し、resume で文を
+/// 評価し直して完了する（規約違反の InternalControl にならない）。
+#[test]
+fn cooperative_pending_inside_expression_frame_yields_and_resumes() {
+    let engine = Engine::with_limits(limits(1, 0));
+    let adapter = FakeCooperativeAdapter::pending(1, "fetch");
+    let (registry, caps) = coop_setup(1, "fetch", adapter.clone());
+
+    let script = engine
+        .compile("fn one()\n  return 1\nend\nlet x = one() + fetch()\n")
+        .unwrap();
+    let mut ctx = coop_context(registry, caps);
+    let mut handle = engine
+        .create_execution(&script, &mut ctx, ExecutionRequest::new())
+        .expect("active");
+
+    let r = loop {
+        match handle.poll(PollSlice::default()).unwrap() {
+            PollResult::Yielded {
+                reason: YieldReason::HostCallPending { .. },
+                ..
+            } => break true,
+            PollResult::Yielded { .. } => continue,
+            other => panic!("HostCallPending を期待: {other:?}"),
+        }
+    };
+    assert!(r);
+    let completer = take_stashed_completer().expect("completer");
+    completer.complete(Ok(Value::Int(41)));
+    let outcome = loop {
+        match handle.poll(PollSlice::default()).unwrap() {
+            PollResult::Terminal { outcome, .. } => break outcome,
+            PollResult::Yielded { .. } => continue,
+            PollResult::Paused { .. } => panic!("pause は要求していない"),
+        }
+    };
+    assert_eq!(outcome, ExecutionOutcome::Completed);
+}
+
 /// 両 interleaving で lost wake が起きない（Finding 1、設計 §6.3）。
 /// ticket プロトコルを直接駆動して register/complete の順序を両方向で固定する。
 #[test]
