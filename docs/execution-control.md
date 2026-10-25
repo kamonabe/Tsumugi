@@ -23,7 +23,7 @@
 
 | 未実装範囲 | 対象の節(§) | 備考 |
 |---|---|---|
-| tree evaluator の index・list / dict リテラル・f-string の段階評価と、`if` / `while` の条件・`for` の反復元・index 代入の index と値の式スロット。これらは式 frame で段階評価せず、呼び出しを含んでいても従来どおり `eval_expr` の Rust 再帰（`can_yield = false`）で 1 つの値として完了まで実行する（その内側では yield しない＝§4.2 の超過として扱う）。式 frame で段階評価するのは、文の値の 4 位置（式文・`let` / 再代入の右辺・`return` の値）の式に現れる call（callee が user binding を持つもの）・二項演算・単項演算だけで、その call 引数・operand の境界と、呼んだ関数本体の文/反復境界で yield する | §4.2/§9.3 | tree-expr-continuation-e2b |
+| tree evaluator の index・list / dict リテラル・f-string の段階評価と、`if` / `while` の条件・`for` の反復元・index 代入の index と値の式スロット。これらは式 frame で段階評価せず、呼び出しを含んでいても従来どおり `eval_expr` の Rust 再帰（`can_yield = false`）で 1 つの値として完了まで実行する（その内側では yield しない＝§4.2 の超過として扱う）。式 frame で段階評価するのは、文の値の 4 位置（式文・`let` / 再代入の右辺・`return` の値）の式に現れる call（callee が識別子以外のもの、または user binding を持つ識別子のもの）・二項演算・単項演算だけで、その call 引数・operand の境界と、呼んだ関数本体の文/反復境界で yield する | §4.2/§9.3 | tree-expr-continuation-e2b |
 | builtin・登録 host function・cooperative host function の引数に現れる呼び出しの引数境界での slice yield（その呼び出しは Rust 再帰で完了まで実行する。callee が識別子でその時点で user binding を持たない call は、式 frame の中でも call 全体を従来の `eval_call` で評価する） | §4.2/§9.3 | tree-expr-continuation-e3 |
 | `map` / `filter` / `each` の要素境界と callback 本体の文/反復境界での slice yield（callback 本体は `can_yield = false` で完了まで実行する） | §4.2/§9.3 | tree-expr-continuation-e4 |
 | 関数本体・callback 本体の中での cooperative host-call の Pending yield と audit drain queue 上限の yield。どちらもトップレベル（driver 上の呼び出しの外）の文/反復境界だけで判定し、関数本体の中で Pending を返す adapter は `may_yield = false` の規約違反（catch 不能 `InternalControl`）になる | §4.2/§6.2 | §14「tree-expr-continuation 実装スライス」の逸脱（audit drain queue は [決定性・実行時監査仕様](determinism-and-audit.md) の逸脱一覧にも B-2 として記載） |
