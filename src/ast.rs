@@ -392,6 +392,26 @@ pub(crate) fn contains_call(expr: &Expr) -> bool {
     }
 }
 
+/// 式 frame が段階評価する式ノードの子を位置で返す（tree-expr-continuation-e2a）。
+///
+/// call は 0 が callee・`i` が引数 `i - 1`、二項は 0 が左辺・1 が右辺、単項は 0 が operand。
+/// それ以外の式種・範囲外の位置は `None`。
+pub(crate) fn expr_child(expr: &Expr, index: usize) -> Option<&Expr> {
+    match expr {
+        Expr::Call { callee, args } => match index {
+            0 => Some(callee),
+            i => args.get(i - 1),
+        },
+        Expr::BinOp { left, right, .. } => match index {
+            0 => Some(left),
+            1 => Some(right),
+            _ => None,
+        },
+        Expr::UnaryOp { expr, .. } if index == 0 => Some(expr),
+        _ => None,
+    }
+}
+
 /// クロージャ捕捉用に、本体で言及される識別子名を集める（非再帰）。
 ///
 /// 自由変数の保守的な近似である。`let`で束縛される名前、parameter、`for`変数、

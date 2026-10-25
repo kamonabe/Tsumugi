@@ -277,6 +277,34 @@ enum FrameKind {
         /// 受け渡し先へ届ける。
         driver: Option<DriverCall>,
     },
+    /// 段階評価中の式ノード 1 つ（tree-expr-continuation-e2a）。`stmts` は空で、driver は
+    /// 文の実行ではなく [`Evaluator::step_expr`] でこの frame を進める。`heap_charge` は 0。
+    Expr(Box<ExprFrame>),
+}
+
+/// 式 frame の状態（tree-expr-continuation-e2a、execution-control §14「continuation へ保存する
+/// 式の評価状態」）。
+///
+/// AST は借用せず、所有する Block と文の index・文の値の式スロットから評価中のノードまでの子の
+/// 位置の経路（[`crate::ast::expr_child`] の index 列）でノードを辿る。
+struct ExprFrame {
+    /// 文の値の式スロット（式文・`let` / 再代入の右辺・`return` の値）を持つ文を含む Block。
+    owner: Block,
+    /// `owner` 内の文の index。
+    stmt_index: usize,
+    /// 式スロットの根から評価中のノードまでの子の位置の経路。
+    path: Vec<usize>,
+    /// 文の行（同期経路の `eval_expr` と同じく、式のエラー行は文の行）。
+    line: usize,
+    /// 評価済みの operand（operand stack）。call は callee・引数の順、二項は左・右、単項は 1 個。
+    /// 長さが式 cursor（次に評価する子の位置）を表す。
+    operands: Vec<Value>,
+    /// call: `count_step` と深度検査を済ませたか。
+    started: bool,
+    /// call: callable / arity 検査を済ませたか。
+    checked: bool,
+    /// 値の受け渡し先（親の式 frame の operand stack、または根なら文の受け渡し先）。
+    dest: CallDest,
 }
 
 /// driver 上で実行している文レベルのユーザー関数呼び出しの状態（tree-expr-continuation-e1）。
@@ -301,6 +329,11 @@ enum CallDest {
     Assign { name: String, line: usize },
     /// `return`: 呼び出し元の活性で `FlowSignal::Return` として unwind する。
     Return,
+    /// 最上位の式 frame の operand stack へ積む（tree-expr-continuation-e2a。子の式 frame の値）。
+    Operand,
+    /// 最上位の式 frame（call ノード）をこの値で完了する（tree-expr-continuation-e2a。式の中の
+    /// ユーザー関数呼び出しの戻り値）。
+    ExprResult,
 }
 
 /// ユーザー関数呼び出しの前処理の結果（tree-expr-continuation-e1）。
@@ -335,6 +368,26 @@ impl LoopSite {
             _ => unreachable!("for LoopSite は Stmt::For を指す"),
         }
     }
+}
+
+/// 文の値の式スロット（式文・`let` / 再代入の右辺・`return` の値）を返す（tree-expr-continuation-e2a）。
+fn stmt_value_expr(stmt: &Stmt) -> Option<&Expr> {
+    match stmt {
+        Stmt::ExprStmt { expr, .. } => Some(expr),
+        Stmt::Let { value, .. } | Stmt::Assign { value, .. } | Stmt::Return { value, .. } => {
+            Some(value)
+        }
+        _ => None,
+    }
+}
+
+/// 式 frame が指す式ノードを辿る（tree-expr-continuation-e2a）。
+fn expr_at<'a>(owner: &'a Block, stmt_index: usize, path: &[usize]) -> &'a Expr {
+    let mut node = stmt_value_expr(&owner[stmt_index]).expect("式スロットを持つ文");
+    for &index in path {
+        node = crate::ast::expr_child(node, index).expect("経路の子が存在する");
+    }
+    node
 }
 
 /// 空の [`Block`]（`Rc<[Stmt]>`）を返す（REV-015 Slice 3 PR-d）。
@@ -536,6 +589,11 @@ pub struct Evaluator {
     /// slice 残量に関係なく yield する。既定 `false` で、`unstable-bytecode` feature のテスト専用
     /// surface からだけ設定できる（production 既定経路には影響しない）。
     force_yield_every_boundary: bool,
+    /// この slice で式 frame の operand を 1 つ以上評価したか（tree-expr-continuation-e2a）。
+    ///
+    /// 強制 yield フックの前進条件に使う。B-2 の前進フラグ（`audit_queue_progress`）とは別に持ち、
+    /// 式の operand 境界は audit drain queue 上限の判定に影響しない。
+    expr_progress: bool,
 }
 
 /// audit drain queue の byte 計器（Phase 6 B-2、`docs/determinism-and-audit.md` §10.2）。
@@ -633,6 +691,7 @@ impl Evaluator {
             // 実行単位で set_redaction_policy で注入する（非監査経路は無視）。
             redaction_policy: crate::audit::RedactionPolicy::default(),
             force_yield_every_boundary: false,
+            expr_progress: false,
         }
     }
 
@@ -647,8 +706,10 @@ impl Evaluator {
     /// この slice で 1 文・1 反復以上進めた後に限る（`audit_queue_progress` は slice 先頭で
     /// `false` に戻り、文/反復を進めるたびに `true` になる前進フラグ）。resume 直後に何も進めず
     /// 再 yield する livelock を防ぐ。
+    /// tree-expr-continuation-e2a: 式 frame の operand を 1 つ以上評価したことも前進に数える
+    /// （`expr_progress`）。
     fn forced_yield_due(&self) -> bool {
-        self.force_yield_every_boundary && self.audit_queue_progress
+        self.force_yield_every_boundary && (self.audit_queue_progress || self.expr_progress)
     }
 
     /// 現在の文が driver 上で実行中の呼び出し（関数本体）の中にあるか（tree-expr-continuation-e1）。
@@ -1492,6 +1553,7 @@ impl Evaluator {
         // B-2 の前進保証: この slice ではまだ 1 文も実行していない。resume 直後の境界では
         // queue 上限を判定しない（Resumed を積んだだけで再 yield する livelock を防ぐ）。
         self.audit_queue_progress = false;
+        self.expr_progress = false;
 
         let outcome = self.run_driver(base_depth, true);
 
@@ -1848,6 +1910,19 @@ impl Evaluator {
             // yield する。テスト専用の強制 yield フックもここで効く。
             if can_yield && (self.slice_exhausted() || self.forced_yield_due()) {
                 return Ok(DriveOutcome::Yielded);
+            }
+
+            // tree-expr-continuation-e2a: 最上位が式 frame なら 1 段進める。式の operand 境界では
+            // slice fuel の判定と強制 yield フック（上）だけを行い、audit drain queue 上限と
+            // cancel / deadline の checkpoint（下）は文/反復境界だけで行う。
+            if matches!(
+                self.frames.last().map(|frame| &frame.kind),
+                Some(FrameKind::Expr(_))
+            ) {
+                if let Some(outcome) = self.drive_expr_step(stop_depth)? {
+                    return Ok(outcome);
+                }
+                continue;
             }
 
             // audit drain queue 上限（Phase 6 B-2、§10.2）。slice fuel と同じトップレベル境界だけで
@@ -2290,6 +2365,246 @@ impl Evaluator {
                 Ok(None)
             }
             CallDest::Return => Ok(Some(FlowSignal::Return(value))),
+            CallDest::Operand => {
+                self.expr_frame_mut().operands.push(value);
+                Ok(None)
+            }
+            CallDest::ExprResult => self.finish_expr_frame(value),
+        }
+    }
+
+    /// 最上位の式 frame（tree-expr-continuation-e2a）。
+    fn expr_frame_mut(&mut self) -> &mut ExprFrame {
+        match &mut self.frames.last_mut().expect("expr frame").kind {
+            FrameKind::Expr(frame) => frame,
+            _ => unreachable!("最上位は式 frame"),
+        }
+    }
+
+    /// 最上位の式 frame を畳み、その値を受け渡し先へ届ける（tree-expr-continuation-e2a）。
+    fn finish_expr_frame(&mut self, value: Value) -> Result<Option<FlowSignal>, TsumugiError> {
+        let frame = self.frames.pop().expect("expr frame");
+        self.budget.release_heap(frame.heap_charge);
+        self.env.truncate_scopes(frame.scope_base);
+        let FrameKind::Expr(expr_frame) = frame.kind else {
+            unreachable!("最上位は式 frame");
+        };
+        let ExprFrame { dest, operands, .. } = *expr_frame;
+        drop(operands);
+        self.deliver_call_result(dest, value)
+    }
+
+    /// この式を式 frame で段階評価するか（tree-expr-continuation-e2a、yield 可能な driver だけ）。
+    ///
+    /// 呼び出しを含む call・二項・単項に限る。callee が識別子でその時点で user binding を持たない
+    /// call（builtin / cooperative host / 登録 host function / 未定義名）と、e2a で段階評価しない式種は
+    /// 従来どおり `eval_expr` で 1 つの値として評価する。
+    fn needs_expr_frame(&self, expr: &Expr) -> bool {
+        if !crate::ast::contains_call(expr) {
+            return false;
+        }
+        match expr {
+            Expr::Call { callee, .. } => !matches!(
+                callee.as_ref(),
+                Expr::Ident(name) if self.env.get_cell(name).is_none()
+            ),
+            Expr::BinOp { .. } | Expr::UnaryOp { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// 式 frame を組み立てる（tree-expr-continuation-e2a）。式 frame は課金しない（`heap_charge` 0、
+    /// execution-control §14 e2a の判断 Q1 = A）。
+    fn new_expr_frame(
+        &self,
+        owner: Block,
+        stmt_index: usize,
+        path: Vec<usize>,
+        line: usize,
+        dest: CallDest,
+    ) -> Frame {
+        Frame {
+            stmts: empty_block(),
+            cursor: 0,
+            kind: FrameKind::Expr(Box::new(ExprFrame {
+                owner,
+                stmt_index,
+                path,
+                line,
+                operands: Vec::new(),
+                started: false,
+                checked: false,
+                dest,
+            })),
+            scope_base: self.env.scope_depth(),
+            heap_charge: 0,
+        }
+    }
+
+    /// 式 frame の子 `index` の評価を始める（tree-expr-continuation-e2a）。段階評価する子なら子の
+    /// 式 frame を積み、そうでなければ `eval_expr` で値にして operand stack へ積む。
+    fn begin_expr_child(
+        &mut self,
+        owner: &Block,
+        stmt_index: usize,
+        path: &[usize],
+        index: usize,
+        line: usize,
+    ) -> Result<Option<FlowSignal>, TsumugiError> {
+        let node = expr_at(owner, stmt_index, path);
+        let child = crate::ast::expr_child(node, index).expect("child exists");
+        if self.needs_expr_frame(child) {
+            let mut child_path = path.to_vec();
+            child_path.push(index);
+            let frame = self.new_expr_frame(
+                owner.clone(),
+                stmt_index,
+                child_path,
+                line,
+                CallDest::Operand,
+            );
+            self.frames.push(frame);
+        } else {
+            let value = self.eval_expr(child, line)?;
+            self.expr_frame_mut().operands.push(value);
+        }
+        Ok(None)
+    }
+
+    /// 最上位の式 frame を 1 段進める（tree-expr-continuation-e2a）。
+    ///
+    /// 1 段は「operand を 1 つ評価する（または子の式 frame を積む）」か「揃った operand で演算を
+    /// 適用して値を受け渡し先へ届ける」のどちらか。段の間が式の yield 可能点になる。call は同期経路の
+    /// `prepare_call` と同じ順序（`count_step` → 深度検査 → callee → callable / arity 検査 → 引数を
+    /// 左から → 束縛 → call trace）で進め、本体は driver 上の Call frame で実行する。
+    fn step_expr(&mut self) -> Result<Option<FlowSignal>, TsumugiError> {
+        let (owner, stmt_index, path, line) = {
+            let frame = self.expr_frame_mut();
+            (
+                frame.owner.clone(),
+                frame.stmt_index,
+                frame.path.clone(),
+                frame.line,
+            )
+        };
+        let node = expr_at(&owner, stmt_index, &path);
+        match node {
+            Expr::Call { callee, args } => {
+                if !self.expr_frame_mut().started {
+                    self.begin_user_call(line)?;
+                    self.expr_frame_mut().started = true;
+                    let Expr::Ident(name) = callee.as_ref() else {
+                        return self.begin_expr_child(&owner, stmt_index, &path, 0, line);
+                    };
+                    let value = self
+                        .env
+                        .get(name)
+                        .ok_or_else(|| TsumugiError::undefined_name(line, name))?;
+                    self.expr_frame_mut().operands.push(value);
+                }
+                let frame = self.expr_frame_mut();
+                if !frame.checked {
+                    Self::check_user_callee(&frame.operands[0], args.len(), line)?;
+                    self.expr_frame_mut().checked = true;
+                }
+                let next = self.expr_frame_mut().operands.len();
+                if next <= args.len() {
+                    return self.begin_expr_child(&owner, stmt_index, &path, next, line);
+                }
+                let mut operands = std::mem::take(&mut self.expr_frame_mut().operands);
+                let callee_value = operands.remove(0);
+                let (def, saved_scopes) = self.bind_user_call(&callee_value, operands, line)?;
+                let frame = Frame {
+                    stmts: def.body.clone(),
+                    cursor: 0,
+                    kind: FrameKind::Call {
+                        saved_scopes,
+                        driver: Some(DriverCall {
+                            dest: CallDest::ExprResult,
+                            _callee: callee_value,
+                        }),
+                    },
+                    scope_base: self.env.scope_depth(),
+                    heap_charge: 0,
+                };
+                self.frames.push(frame);
+                Ok(None)
+            }
+            Expr::BinOp { op, .. } => {
+                let count = self.expr_frame_mut().operands.len();
+                match (op, count) {
+                    (_, 0) => self.begin_expr_child(&owner, stmt_index, &path, 0, line),
+                    (BinOpKind::And | BinOpKind::Or, 1) => {
+                        let truthy = self.expr_frame_mut().operands[0].is_truthy();
+                        let short = match op {
+                            BinOpKind::And => !truthy,
+                            _ => truthy,
+                        };
+                        if short {
+                            let left = self.expr_frame_mut().operands.pop().expect("left");
+                            self.finish_expr_frame(left)
+                        } else {
+                            self.begin_expr_child(&owner, stmt_index, &path, 1, line)
+                        }
+                    }
+                    (BinOpKind::And | BinOpKind::Or, _) => {
+                        let right = self.expr_frame_mut().operands.pop().expect("right");
+                        self.finish_expr_frame(right)
+                    }
+                    (_, 1) => self.begin_expr_child(&owner, stmt_index, &path, 1, line),
+                    _ => {
+                        let operands = std::mem::take(&mut self.expr_frame_mut().operands);
+                        let result = self.eval_binop(&operands[0], op, &operands[1], line)?;
+                        let value = self
+                            .budget
+                            .track_result(result, ExecutionPhase::Run)
+                            .map_err(|stop| self.control_stop_to_error(stop, line))?;
+                        drop(operands);
+                        self.finish_expr_frame(value)
+                    }
+                }
+            }
+            Expr::UnaryOp { op, .. } => {
+                if self.expr_frame_mut().operands.is_empty() {
+                    return self.begin_expr_child(&owner, stmt_index, &path, 0, line);
+                }
+                let operands = std::mem::take(&mut self.expr_frame_mut().operands);
+                let value = self.eval_unary(op, &operands[0], line)?;
+                drop(operands);
+                self.finish_expr_frame(value)
+            }
+            _ => unreachable!("式 frame は call・二項・単項だけを段階評価する"),
+        }
+    }
+
+    /// 最上位の式 frame を 1 段進め、その結果で driver を遷移させる（tree-expr-continuation-e2a、
+    /// driver 内部用）。`run_driver_inner` の Rust frame を大きくしないよう別関数にする。
+    ///
+    /// cooperative host-call の Pending は、その文の式 frame をすべて畳み、文の cursor を戻して
+    /// yield する（resume で文全体を最初から評価し直す。§4.7「同じ文の再評価」と同じ観測）。
+    #[inline(never)]
+    fn drive_expr_step(&mut self, stop_depth: usize) -> Result<Option<DriveOutcome>, TsumugiError> {
+        self.expr_progress = true;
+        match self.step_expr() {
+            Ok(None) => Ok(None),
+            Ok(Some(signal)) => Ok(self.drive_flow(signal, stop_depth)?.map(DriveOutcome::Done)),
+            Err(e) => {
+                if self.yield_for_host_call {
+                    self.yield_for_host_call = false;
+                    while matches!(
+                        self.frames.last().map(|frame| &frame.kind),
+                        Some(FrameKind::Expr(_))
+                    ) {
+                        self.pop_frame();
+                    }
+                    if let Some(top) = self.frames.last_mut() {
+                        top.cursor = top.cursor.saturating_sub(1);
+                    }
+                    return Ok(Some(DriveOutcome::Yielded));
+                }
+                self.recover_error(e, stop_depth)?;
+                Ok(None)
+            }
         }
     }
 
@@ -2492,7 +2807,7 @@ impl Evaluator {
         // tree-expr-continuation-e1: yield 可能な driver では、文レベルのユーザー関数呼び出しを
         // driver 上で実行する。同期経路（`can_yield = false`）は従来の分岐だけを通る。
         if self.can_yield_ctx
-            && let Some(step) = self.exec_driver_call_stmt(stmt)?
+            && let Some(step) = self.exec_driver_call_stmt(stmt, owner, stmt_index)?
         {
             return Ok(step);
         }
@@ -2712,18 +3027,22 @@ impl Evaluator {
     /// 同じく文の受け渡し先へ届ける。`exec_stmt` の Rust frame を大きくしないよう別関数にする
     /// （同期経路の再帰 1 段あたりの stack 使用量を変えない）。
     #[inline(never)]
-    fn exec_driver_call_stmt(&mut self, stmt: &Stmt) -> Result<Option<StmtStep>, TsumugiError> {
-        let (expr, line) = match stmt {
-            Stmt::ExprStmt { expr, line } => (expr, *line),
-            Stmt::Let { value, line, .. }
-            | Stmt::Assign { value, line, .. }
-            | Stmt::Return { value, line } => (value, *line),
-            _ => return Ok(None),
-        };
-        let Expr::Call { callee, args } = expr else {
+    fn exec_driver_call_stmt(
+        &mut self,
+        stmt: &Stmt,
+        owner: &Block,
+        stmt_index: usize,
+    ) -> Result<Option<StmtStep>, TsumugiError> {
+        let Some(expr) = stmt_value_expr(stmt) else {
             return Ok(None);
         };
-        if crate::ast::contains_call(callee) || args.iter().any(crate::ast::contains_call) {
+        let line = stmt.line();
+        let e1_shape = matches!(
+            expr,
+            Expr::Call { callee, args }
+                if !crate::ast::contains_call(callee) && !args.iter().any(crate::ast::contains_call)
+        );
+        if !e1_shape && !self.needs_expr_frame(expr) {
             return Ok(None);
         }
         let dest = match stmt {
@@ -2737,6 +3056,16 @@ impl Evaluator {
             },
             Stmt::Return { .. } => CallDest::Return,
             _ => CallDest::Discard,
+        };
+        // tree-expr-continuation-e2a: e1 の形でない呼び出しを含む式は、根の式 frame で段階評価する。
+        let (Expr::Call { callee, args }, true) = (expr, e1_shape) else {
+            return Ok(Some(StmtStep::Enter(self.new_expr_frame(
+                owner.clone(),
+                stmt_index,
+                Vec::new(),
+                line,
+                dest,
+            ))));
         };
         match self.prepare_call(callee, args, line)? {
             CallPrep::Done(value) => Ok(Some(match self.deliver_call_result(dest, value)? {
@@ -3384,10 +3713,7 @@ impl Evaluator {
         }
 
         // ユーザー定義関数の呼び出し: ステップカウント + 深度チェック
-        self.count_step(line)?;
-        if self.call_stack.len() >= MAX_USER_CALL_DEPTH {
-            return Err(TsumugiError::call_depth_limit(line, MAX_USER_CALL_DEPTH));
-        }
+        self.begin_user_call(line)?;
 
         // callee を評価して関数値を取得
         // 識別子の場合: 変数として検索
@@ -3399,30 +3725,69 @@ impl Evaluator {
             // 識別子以外（式の評価結果を呼び出す）
             self.eval_expr(callee, line)?
         };
-
-        let Value::Fn { def, captured, .. } = &func_value else {
-            return Err(TsumugiError::not_callable(line, &func_value));
-        };
-        // Rcを複製して以降の借用から切り離す（値の複製は起きない）
-        let def = Rc::clone(def);
-        let captured = Rc::clone(captured);
-        let func_name = def.name.as_str();
-        let params = &def.params;
-
-        if args.len() != params.len() {
-            return Err(TsumugiError::user_arity(
-                line,
-                func_name,
-                params.len(),
-                args.len(),
-            ));
-        }
+        Self::check_user_callee(&func_value, args.len(), line)?;
 
         // 引数を評価
         let mut arg_values = Vec::new();
         for arg in args {
             arg_values.push(self.eval_expr(arg, line)?);
         }
+
+        let (def, saved_scopes) = self.bind_user_call(&func_value, arg_values, line)?;
+        Ok(CallPrep::User {
+            def,
+            saved_scopes,
+            callee: func_value,
+        })
+    }
+
+    /// ユーザー関数呼び出しの入口: `count_step` → 深度検査（同期経路と式 frame で共有する段、
+    /// tree-expr-continuation-e2a）。
+    fn begin_user_call(&mut self, line: usize) -> Result<(), TsumugiError> {
+        self.count_step(line)?;
+        if self.call_stack.len() >= MAX_USER_CALL_DEPTH {
+            return Err(TsumugiError::call_depth_limit(line, MAX_USER_CALL_DEPTH));
+        }
+        Ok(())
+    }
+
+    /// callable 検査 → arity 検査（AST の引数の個数で、引数評価より前。同期経路と式 frame で共有）。
+    fn check_user_callee(
+        func_value: &Value,
+        arg_count: usize,
+        line: usize,
+    ) -> Result<(), TsumugiError> {
+        let Value::Fn { def, .. } = func_value else {
+            return Err(TsumugiError::not_callable(line, func_value));
+        };
+        if arg_count != def.params.len() {
+            return Err(TsumugiError::user_arity(
+                line,
+                &def.name,
+                def.params.len(),
+                arg_count,
+            ));
+        }
+        Ok(())
+    }
+
+    /// `push_call_frame` → captured / self-binding / 引数の束縛 → call trace の push
+    /// （同期経路と式 frame で共有する段、tree-expr-continuation-e2a）。`func_value` は
+    /// [`Self::check_user_callee`] を通った関数値。
+    fn bind_user_call(
+        &mut self,
+        func_value: &Value,
+        arg_values: Vec<Value>,
+        line: usize,
+    ) -> Result<(Rc<FnDef>, crate::env::CallFrame), TsumugiError> {
+        let Value::Fn { def, captured, .. } = func_value else {
+            return Err(TsumugiError::not_callable(line, func_value));
+        };
+        // Rcを複製して以降の借用から切り離す（値の複製は起きない）
+        let def = Rc::clone(def);
+        let captured = Rc::clone(captured);
+        let func_name = def.name.as_str();
+        let params = &def.params;
 
         // レキシカルスコープ: 呼び出し元のスコープを退避し、独立環境で実行
         let saved_scopes = self.env.push_call_frame();
@@ -3455,12 +3820,7 @@ impl Evaluator {
             name: func_name.to_string(),
             line,
         });
-
-        Ok(CallPrep::User {
-            def,
-            saved_scopes,
-            callee: func_value,
-        })
+        Ok((def, saved_scopes))
     }
 
     /// cooperative（ブロックしない）host function を dispatch する（REV-015 Slice 5、設計 §4.7）。
@@ -4136,6 +4496,148 @@ mod tests {
             ));
         }
         assert_eq!(eval.call_stack.len(), 1);
+        eval.abort_session();
+        assert!(eval.frames.is_empty() && eval.call_stack.is_empty());
+        assert_eq!(eval.env.scope_depth(), depth_before);
+        assert_eq!(eval.env.get("work"), None, "transaction は rollback される");
+    }
+
+    // -------------------------------------------------------------------------
+    // tree-expr-continuation-e2a: 式 frame（e1 の 4 位置での call・二項・単項の段階評価）
+    // -------------------------------------------------------------------------
+
+    /// 最上位の式 frame の (operand 数, 経路の長さ)。式 frame が無ければ `None`。
+    fn top_expr_state(eval: &Evaluator) -> Option<(usize, usize)> {
+        eval.frames
+            .iter()
+            .rev()
+            .find_map(|frame| match &frame.kind {
+                FrameKind::Expr(expr) => Some((expr.operands.len(), expr.path.len())),
+                _ => None,
+            })
+    }
+
+    /// TEC-AT-02（e2a 分）: operand stack・式 cursor・部分評価済み引数が yield を跨いで保存され、
+    /// resume 後の値・fuel・heap が同期経路と一致する。
+    /// TEC-AT-03（e2a 分）: poll 経路の `live_heap` / `peak_heap` が同じ script の `Evaluator::run` と
+    /// 一致する（式 frame は課金しない）。
+    #[test]
+    fn e2a_expr_frame_preserves_operands_across_yields() {
+        let src = "fn inc(n)\n  let i = 0\n  while i < 2\n    i = i + 1\n  end\n  return n + i\nend\n\
+                   fn pick(a, b, c)\n  return a * 100 + b * 10 + c\nend\n\
+                   fn mk()\n  return inc\nend\n\
+                   let a = inc(1) + inc(2)\n\
+                   let b = pick(inc(0), 1, inc(inc(1)))\n\
+                   let c = mk()(5)\n\
+                   let d = not inc(0)\n\
+                   let e = -inc(1)\n\
+                   let f = inc(0) and inc(1)\n\
+                   let g = inc(-2) and inc(1)\n\
+                   let h = inc(-2) or inc(1)\n\
+                   let k = [inc(0)][0] + inc(1)\n\
+                   let s = \"x\"\ns = s + to_str(inc(1))\n\
+                   fn wrap(n)\n  return inc(n) * 2 + 1\nend\nlet w = wrap(3)\n";
+        let mut max_operands = 0;
+        let mut max_depth = 0;
+        let (forced, forced_eval, yields) = run_forced(src, |eval| {
+            if let Some((operands, depth)) = top_expr_state(eval) {
+                max_operands = max_operands.max(operands);
+                max_depth = max_depth.max(depth);
+            }
+        });
+        let (sync, sync_eval) = run_sync(src);
+        assert!(forced.is_ok() && sync.is_ok(), "{forced:?} / {sync:?}");
+        assert!(yields > 50, "式の境界でも yield する: {yields}");
+        // pick(inc(0), 1, inc(...)) の途中: callee と評価済みの引数 2 個が operand stack にある。
+        assert!(
+            max_operands >= 3,
+            "部分評価済みの引数が保存される: {max_operands}"
+        );
+        // inc(inc(1)) の内側: 根から 2 段下の式 frame で yield している。
+        assert!(
+            max_depth >= 2,
+            "入れ子の式 frame で yield する: {max_depth}"
+        );
+        for name in ["a", "b", "c", "d", "e", "f", "g", "h", "k", "s", "w"] {
+            assert_eq!(forced_eval.env.get(name), sync_eval.env.get(name), "{name}");
+        }
+        assert_eq!(forced_eval.env.get("b"), Some(Value::Int(215)));
+        let (f, s) = (forced_eval.budget_usage(), sync_eval.budget_usage());
+        assert_eq!(f.committed.fuel, s.committed.fuel);
+        assert_eq!(f.live_heap_bytes, s.live_heap_bytes);
+        assert_eq!(f.peak_heap_bytes, s.peak_heap_bytes);
+        assert!(forced_eval.frames.is_empty() && forced_eval.call_stack.is_empty());
+        assert_eq!(forced_eval.env.scope_depth(), sync_eval.env.scope_depth());
+    }
+
+    /// 式 frame の途中のエラー（callee 内・callable・arity・未定義名・演算）と、式の中で呼んだ
+    /// 関数内の break / continue が、同期経路と同じエラー・行・trace・catch 先・fuel になり、
+    /// 式 frame がすべて畳まれる。
+    #[test]
+    fn e2a_expr_frame_exit_paths_match_sync_path() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(e2a_exit_paths_body)
+            .expect("spawn")
+            .join()
+            .expect("e2a exit paths");
+    }
+
+    fn e2a_exit_paths_body() {
+        let cases = [
+            "fn boom()\n  return 1 / 0\nend\nfn one()\n  return 1\nend\n\
+             let r = 0\ntry\n  r = one() + boom()\ncatch e\n  r = e[\"type\"]\nend\n",
+            "fn one()\n  return 1\nend\nlet x = 3\nlet r = one() + x(1)\n",
+            "fn one()\n  return 1\nend\nfn two(a, b)\n  return a\nend\nlet r = 0\n\
+             try\n  r = two(one()) + 1\ncatch e\n  r = e[\"type\"]\nend\n",
+            "fn one()\n  return 1\nend\nlet r = one() + missing(1)\n",
+            "fn one()\n  return 1\nend\nlet r = one() + \"s\"\n",
+            "fn brk()\n  break\nend\nlet r = 1 + brk()\n",
+            "fn cnt()\n  continue\nend\nlet r = 0\ntry\n  r = not cnt()\ncatch e\n  r = e[\"type\"]\nend\n",
+            "fn deep(n)\n  return deep(n + 1) + 1\nend\ndeep(0)\n",
+            "fn one()\n  return 1\nend\nundefined_target = one() + 1\n",
+        ];
+        for src in cases {
+            let (forced, forced_eval, _) = run_forced(src, |_| {});
+            let (sync, sync_eval) = run_sync(src);
+            match (&forced, &sync) {
+                (Ok(()), Ok(())) => {}
+                (Err(f), Err(s)) => assert_eq!(f, s, "{src}"),
+                _ => panic!("結果が一致しない: {forced:?} / {sync:?}\n{src}"),
+            }
+            assert_eq!(forced_eval.env.get("r"), sync_eval.env.get("r"), "{src}");
+            let (f, s) = (forced_eval.budget_usage(), sync_eval.budget_usage());
+            assert_eq!(f.committed.fuel, s.committed.fuel, "{src}");
+            assert_eq!(f.live_heap_bytes, s.live_heap_bytes, "{src}");
+            assert_eq!(f.peak_heap_bytes, s.peak_heap_bytes, "{src}");
+            assert!(forced_eval.frames.is_empty() && forced_eval.call_stack.is_empty());
+        }
+    }
+
+    /// 式の途中で yield した session を中断すると、式 frame と driver 上の呼び出しが畳まれる。
+    #[test]
+    fn e2a_abort_inside_expr_frame_restores_call_state() {
+        let src = "fn work()\n  let i = 0\n  while i < 5\n    i = i + 1\n  end\n  return i\nend\n\
+                   let r = work() + work()\n";
+        let program = parse_program(src);
+        let mut eval = Evaluator::new();
+        eval.force_yield_every_boundary = true;
+        let depth_before = eval.env.scope_depth();
+        eval.begin_execution(&program, src.len() as u64, true)
+            .expect("begin_execution");
+        // 2 つ目の work() の本体の途中（根の二項演算の式 frame が左辺の値を保持している）まで進める。
+        let left_held = |eval: &Evaluator| {
+            eval.frames.iter().any(|frame| {
+                matches!(&frame.kind, FrameKind::Expr(expr)
+                    if expr.path.is_empty() && expr.operands.len() == 1)
+            })
+        };
+        while !(eval.in_driver_call() && left_held(&eval)) {
+            assert!(!matches!(
+                eval.run_slice(u64::MAX),
+                SliceOutcome::Terminal(_)
+            ));
+        }
         eval.abort_session();
         assert!(eval.frames.is_empty() && eval.call_stack.is_empty());
         assert_eq!(eval.env.scope_depth(), depth_before);

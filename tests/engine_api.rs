@@ -2132,4 +2132,213 @@ print(d)
         // ので、slice 16 の pair はおよそ 200 / 16 回以上になる。
         assert!(pairs >= 200 / 16, "関数本体の中で yield している: {pairs}");
     }
+
+    // ---------------------------------------------------------------------
+    // tree-expr-continuation-e2a: 式 frame（e1 の 4 位置での call・二項・単項）
+    // ---------------------------------------------------------------------
+
+    /// TEC-AT-01（e2a 分）: 4 位置それぞれで、call の引数・callee・二項・単項・短絡に呼び出しを
+    /// 含む式（e2a の式種の中に index などの e2b の式種が入る組み合わせを含む）を全境界で yield
+    /// させても、同期実行と stdout・fuel・terminal・audit event 列が一致する。
+    #[test]
+    fn tec_at_01_e2a_expression_calls_match_sync_path() {
+        let text = "\
+fn f(x)
+  let i = 0
+  while i < 2
+    i = i + 1
+  end
+  print(x)
+  return x + i
+end
+fn g(x)
+  for v in [1, 2]
+    print(v)
+  end
+  return x * 2
+end
+fn h(a, b)
+  return a - b
+end
+fn adder(n)
+  return fn(m) n + m end
+end
+fn t(x)
+  print(\"t\")
+  return x
+end
+fn via_return(x)
+  return h(f(x), 1)
+end
+let x = 3
+let y = f(x) + g(x)
+print(y)
+y = h(f(x), g(1)) * 2
+print(y)
+f(x) + g(x)
+print(via_return(4))
+let z = adder(f(1))(g(2))
+print(z)
+let n = not t(false)
+print(n)
+let neg = -f(0)
+print(neg)
+let a1 = t(false) and t(true)
+let a2 = t(true) and t(7)
+let o1 = t(1) or t(2)
+let o2 = t(null) or t(9)
+print(a1, a2, o1, o2)
+let mixed = [f(1), 2][0] + {\"k\": g(3)}[\"k\"]
+print(mixed)
+let nested = h(h(f(1), g(1)), f(f(0)))
+print(nested)
+";
+        let yields = assert_matches_sync(text);
+        assert!(yields > 100, "式の境界でも yield している: {yields}");
+    }
+
+    /// TEC-AT-01（e2a 分）の終了経路: callee 内エラーの try 捕捉・未捕捉 terminal・callable /
+    /// arity エラー・未定義名が、同期実行とエラー種別・行・trace・fuel で一致する。
+    #[test]
+    fn tec_at_01_e2a_exit_paths_match_sync_path() {
+        let cases = [
+            "fn boom(n)\n  let i = 0\n  while i < 2\n    i = i + 1\n  end\n  return n / 0\nend\n\
+             fn one()\n  return 1\nend\n\
+             try\n  let v = one() + boom(1)\n  print(\"unreachable\")\ncatch e\n  print(e[\"type\"])\nend\n",
+            "fn inner()\n  let x = missing\nend\nfn outer(n)\n  return n + inner()\nend\nfn one()\n  return 1\nend\n\
+             print(1)\nlet r = outer(one())\n",
+            "fn one()\n  return 1\nend\nlet notfn = 3\nlet r = one() + notfn(1)\n",
+            "fn one()\n  return 1\nend\nfn two(a, b)\n  return a + b\nend\nprint(two(one()) + 1)\n",
+            "fn one()\n  return 1\nend\nfn two(a, b)\n  return a + b\nend\ntry\n  let r = two(one()) + 1\ncatch e\n  print(e[\"type\"])\nend\n",
+            "fn one()\n  return 1\nend\nlet r = one() + missing(1)\n",
+            "fn one()\n  return 1\nend\nlet r = -(one() + \"s\")\n",
+            "fn brk()\n  print(1)\n  break\nend\nlet r = 1 + brk()\n",
+        ];
+        for text in cases {
+            assert_matches_sync(text);
+        }
+    }
+
+    /// TEC-AT-02（e2a 分）: 深い式・入れ子 call・引数評価の途中・短絡評価の途中で yield しても、
+    /// resume 後の最終値と副作用列（stdout の順序）が同期実行と一致する。
+    #[test]
+    fn tec_at_02_e2a_resume_mid_expression_matches_sync_path() {
+        let text = "\
+fn say(tag, v)
+  print(tag)
+  let i = 0
+  while i < 1
+    i = i + 1
+  end
+  return v
+end
+fn sum3(a, b, c)
+  return a + b + c
+end
+let deep = say(\"a\", 1) + (say(\"b\", 2) * (say(\"c\", 3) - say(\"d\", 4))) + say(\"e\", 5)
+print(deep)
+let args = sum3(say(\"x\", 1), sum3(say(\"y\", 2), 3, say(\"z\", 4)), say(\"w\", 5))
+print(args)
+let sc = say(\"p\", true) and (say(\"q\", false) or say(\"r\", 6))
+print(sc)
+let skip = say(\"s\", false) and say(\"never\", 1)
+print(skip)
+";
+        let yields = assert_matches_sync(text);
+        assert!(yields > 50, "式の途中で yield している: {yields}");
+        let (observed, _) = run_audited(text, true);
+        assert_eq!(
+            observed.stdout,
+            "a\nb\nc\nd\ne\n4\nx\ny\nz\nw\n15\np\nq\nr\n6\ns\nfalse\n"
+        );
+    }
+
+    /// TEC-AT-04（e2a 分）: poll 経路で `f(n - 1) + 1` 形（式の途中の再帰）が、同期経路と同じ
+    /// `call_depth_limit`（同じ行・同じ trace）で止まる。
+    #[test]
+    fn tec_at_04_e2a_recursion_mid_expression_hits_same_depth_limit() {
+        let text = "fn down(n)\n  return down(n - 1) + 1\nend\nlet r = 0 + down(1000)\n";
+        assert_matches_sync(text);
+        let (forced, _) = run_audited(text, true);
+        match forced.outcome {
+            EmbeddingOutcome::RuntimeError { error, .. } => {
+                assert!(error.safe_message.contains("128"), "{error:?}");
+                assert_eq!(error.line, Some(2));
+            }
+            other => panic!("call_depth_limit を期待: {other:?}"),
+        }
+    }
+
+    /// TEC-AT-05（e2a 分）: 式の途中の yield を跨いでも submission journal が保持され、
+    /// terminal でだけ commit / rollback される（Engine::run と REPL の両方）。
+    #[test]
+    fn tec_at_05_e2a_transaction_spans_yields_mid_expression() {
+        let engine = EmbeddingEngine::builder().build().expect("build");
+        let mut ctx = EmbeddingContext::new(&engine);
+        ctx.force_yield_at_every_boundary_for_test(true);
+        let run = |ctx: &mut EmbeddingContext, text: &str| {
+            let linked = link(&engine, text);
+            engine.run(&linked, ctx, request(CapabilitySet::empty()))
+        };
+        let body = "fn work()\n  let i = 0\n  while i < 5\n    i = i + 1\n  end\n  return i\nend\n";
+
+        let ok = format!("let marker = 1\n{body}let got = work() + work()\n");
+        assert!(matches!(
+            run(&mut ctx, &ok),
+            EmbeddingOutcome::Completed { .. }
+        ));
+        assert!(matches!(
+            run(&mut ctx, "let probe = marker + got\n"),
+            EmbeddingOutcome::Completed { .. }
+        ));
+        let bad = format!("let later = 2\n{body}let n = work() + missing(work())\n");
+        assert!(matches!(
+            run(&mut ctx, &bad),
+            EmbeddingOutcome::RuntimeError { .. }
+        ));
+        assert!(matches!(
+            run(&mut ctx, "let probe = later\n"),
+            EmbeddingOutcome::RuntimeError { .. }
+        ));
+
+        // REPL 経路: 成功した submission は commit、式の途中の yield の後の未捕捉エラーは rollback。
+        let submit = |ctx: &mut EmbeddingContext, text: &str| {
+            let script = engine
+                .compile(
+                    Source::new(SourceId::new("repl").expect("source id"), text),
+                    &CompileOptions {
+                        retain_source: true,
+                    },
+                )
+                .expect("compile");
+            let budget = BudgetConfig::standard(shared_clock().as_ref()).expect("budget");
+            let link_request = LinkRequest::new(
+                ExecutionId::new(7u128.try_into().expect("nonzero")),
+                CapabilitySet::empty(),
+                budget,
+            );
+            let linked = engine.link_for_repl(&script, link_request).expect("link");
+            engine.run_for_repl(&linked, ctx, request(CapabilitySet::empty()))
+        };
+        let mut repl = EmbeddingContext::new(&engine);
+        repl.force_yield_at_every_boundary_for_test(true);
+        let ok = format!("let marker = 1\n{body}let got = -work() + work()\n");
+        assert!(matches!(
+            submit(&mut repl, &ok),
+            EmbeddingOutcome::Completed { .. }
+        ));
+        let bad = "let later = 2\nlet n = work() + (1 / (work() - 5))\n";
+        assert!(matches!(
+            submit(&mut repl, bad),
+            EmbeddingOutcome::RuntimeError { .. }
+        ));
+        assert!(matches!(
+            submit(&mut repl, "let probe = later\n"),
+            EmbeddingOutcome::RuntimeError { .. }
+        ));
+        assert!(matches!(
+            submit(&mut repl, "let probe = marker + got + work()\n"),
+            EmbeddingOutcome::Completed { .. }
+        ));
+    }
 }
