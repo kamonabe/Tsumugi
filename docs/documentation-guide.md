@@ -20,7 +20,7 @@ AI エージェント・人間のどちらも、新しい情報を書く前に�
 
 **状態（どの逸脱・未実装範囲が今残っているか）の正本はこの逸脱一覧だけである。** 表に行があることが「残っている」ことを表す。スライス小節は状態を再掲しない（上記「状態の正本は粒度ごとに 1 箇所だけ」と同じ原則）。逸脱一覧は「今の実装がどう振る舞うか」を書くので、記述だけで判断できない項目はコードやテストで事実を確かめてから書く。
 
-> **移行中:** [`execution-control.md`](execution-control.md) は逸脱一覧をまだ持たない。次に done を出す実装 PR で寄せる。
+> **移行中:** [`design.md`](design.md)・[`embedding-api.md`](embedding-api.md)・[`language-spec.md`](language-spec.md)・[`semantic-decisions.md`](semantic-decisions.md)・[`threat-model.md`](threat-model.md)・[`verification-release-operations.md`](verification-release-operations.md) は逸脱一覧をまだ持たない。各 spec の次の done 実装 PR か、[開発ループ手順書](loop-runbook.md)「整合点検」の輪番で事実を確かめたものから寄せる（逸脱一覧は事実を確かめてから書くため、まとめて一度には作らない。loop:drift #263 の D-2 で kamonabe が選択）。
 
 ## スライス小節は凍結された時点の記録
 
@@ -133,7 +133,7 @@ PR・issue とスライスは次の命名で紐付ける。
 3. `depends_on` のスライスがすべて `done` である。
 4. 小節に「想定の変更規模」が書かれており、[開発ループ手順書](loop-runbook.md)「1 回分の上限」のスライスの大きさの目安に収まっている。収まらない場合は sub-slice に分けて設計する。
 
-本ガイド導入前に完了したスライス（`done`）は、受入基準 ID が未採番でも登録してよい。
+本ガイド導入前に完了したスライス（`done`）は、受入基準 ID が未採番（`acceptance = []`）でも、設計 PR を経ずに完了したため `design_pr` が無くても登録してよい（`design_pr` は後から作れないため、`slices.toml` には書かない。loop:drift #263 の D-5 で kamonabe が選択）。
 
 ### done の条件（Definition of Done）
 
