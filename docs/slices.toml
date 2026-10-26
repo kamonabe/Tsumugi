@@ -114,12 +114,13 @@ depends_on = ["R-1a"]
 [[slice]]
 id         = "fix-host-function-id-unique"
 title      = "register_cooperative で host function ID の重複を build error にする（capability-model §11.1）"
-status     = "ready"
+status     = "done"
 parent     = "REV-015"
 spec_slice = "C12"
 spec       = { doc = "docs/capability-model.md", section = "fix-host-function-id-unique 実装スライス（cooperative 登録での host function ID 一意性検査）" }
 acceptance = ["HFID-AT-01..04"]
 design_pr  = 272
+impl_pr    = 274
 order      = 10
 
 # tree-expr-continuation（Slice 3 PR-e、元の設計 PR #242、分割は PR #250）は 1 晩・1 PR に収まらないため、issue #248 で
