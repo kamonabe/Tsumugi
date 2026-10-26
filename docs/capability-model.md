@@ -1,6 +1,6 @@
 # Tsumugi — Capability Model仕様
 
-最終更新: 2026-10-25
+最終更新: 2026-10-26
 設計ステータス: **実装仕様確定・実装進行中**（C1〜C10 実装済み。C6〔ModuleResolver／import 解決〕はPhase 2最小形としてtree経路のlink時解決を実装済み〔VM file/stdinのimportはC6-c/E9の一片としてlink層のEngine resolver gateへ統合済み——未grant + importはtreeと同じくterminal `Denied`、run層のimport展開は依然評価器内蔵`ModuleLoader`。VM backend adapter本体のconformanceはE9残。tree REPLはE7でEngine API統合済みだがimport解決は評価器内蔵`ModuleLoader`に委ねresolver gateを迂回する——従来のCWD相対import・固定エラー文字列を保全する既知の設計で、VM REPLはtree REPLと対称にalpha `ModuleLoader`を保全（gate迂回）。REPLのimport gateを塞ぐならE8b以降の課題、budget N境界はC11/Phase 3〕。詳細は [ロードマップ](roadmap.md) Phase 2 を参照）
 
 本文書の §1〜§17・§19・§20 は **到達目標の確定仕様**であり、現在の実装状態ではない。現在の実装が目標仕様からどう
@@ -813,6 +813,8 @@ AUD-049のcontract testは、BuiltinSpec全entryのtree/VM/compiler/generated do
 
 ## 18. 実装slice
 
+各スライス小節はそのスライスを実装した時点の記録であり、書き換えない。現在の逸脱・未実装範囲は冒頭の逸脱一覧を見ること。
+
 | Slice | Phase | 内容 | 完了条件 |
 |---|---:|---|---|
 | C1 | 2 | CapabilitySet/Denial/dispatcher/empty default | adapter call前deny |
@@ -830,6 +832,58 @@ AUD-049のcontract testは、BuiltinSpec全entryのtree/VM/compiler/generated do
 | C13 | 6 | canonical audit sink/event/sequence | 8 event、fail-closed、correlation |
 
 C1→C2、C3/C4/C5/C7を並行、C6はstream後、C8はBuiltinSpec衝突検査後、C9/C10を最後に行う。C11〜C13をPhase 2完了条件へ含めないが、Phase 2のpublic signatureは後続最終型と競合させない。
+
+### fix-host-function-id-unique 実装スライス（cooperative 登録での host function ID 一意性検査）
+
+§11.1 は「host function ID は registry 内で一意でなければならない」と定め、違反は build error とする。
+C12（[実行予算・協調実行仕様](execution-control.md) Slice 5）が入れた `HostFunctionRegistryBuilder::register_cooperative`
+（`src/host_function.rs`）は名前の衝突だけを検査し、ID の重複を検査しない（逸脱一覧の該当行、loop:drift #263 の D-3 (e)）。
+cooperative host function の grant 検査は descriptor の ID で行う（`resolve_cooperative_call` の
+`capabilities.contains_host_function(descriptor.id)`）ため、ID が重複すると 1 つの grant で別名の function まで
+呼べてしまう。これは §2 原則 5（HostFunction ごとに別 authority）と [マニフェスト](manifesto.md) 原則 2
+（権限はホストが明示的に付与する）に反する。本スライスはこの検査漏れを直す。
+
+- **実装範囲**:
+  1. `register_cooperative` は、名前の検査（keyword・core/context builtin・同期／cooperative の登録名との衝突）の
+     **後に**、descriptor の ID が登録済みの同期 function・cooperative function のどちらかと重複していれば
+     build error を返す。
+  2. `register` の ID 重複検査を、登録済みの同期 function に加えて登録済みの cooperative function の ID にも広げる。
+     これで登録の順序（同期が先か cooperative が先か）によらず、registry 内の ID がすべて一意になる。
+  3. error は既存の同期同士の ID 重複と同じ `ConfigError::DuplicateCapability { kind: CapabilityKind::HostFunction }`
+     とする（新しい variant を足さない。[組み込みAPI仕様](embedding-api.md) の `ConfigError` は変えない）。
+     名前と ID の両方が重複する場合は、既存の `register` と同じく名前の検査が先に効き
+     `ConfigError::DuplicateCallableName` を返す。
+  4. cooperative の ID は builder の内部だけで持つ（例: builder の private な `BTreeSet<HostFunctionId>`）。
+     `HostFunctionRegistry` の公開 API・格納構造・lookup の挙動は変えない。
+  5. `register`・`register_cooperative` の doc comment を、ID 一意性を同期・cooperative の両方で検査することに合わせて直す。
+- **範囲外（逸脱として残すもの）**:
+  - `HostFunctionRegistry::get(id)` で cooperative function を引けるようにすること（§11.1 の `get` は同期 `HostFunction` を返す型で、
+    cooperative を ID で引く API は spec に無い）。
+  - 逸脱一覧の他の行（`HostCallContext`・`HostCallError::Control`・`CapabilityCallContext` の不足フィールドなど）。
+  - §17 の Engine build 時の一括衝突検査・VM 経路（VM は cooperative を解決しない）。
+  - grant 側（`CapabilitySetBuilder::grant_host_function`）の検査は既に同 ID の二重 grant を拒否しており変えない。
+- **観測される変化**: これまで登録できていた「ID が重複する cooperative 登録」が build error になる。
+  ID が一意な登録（既存のテスト・CLI の経路はすべてこれ）の挙動は変えない。言語挙動・fuel・heap・監査の値は変えない。
+- **受入基準（fix-host-function-id-unique）**:
+  - **HFID-AT-01**（cooperative 同士）: ID が同じで名前が異なる cooperative function を 2 つ登録すると、2 つ目の
+    `register_cooperative` が `ConfigError::DuplicateCapability { kind: HostFunction }` を返す。
+    確かめ方: `src/host_function.rs` の unit test で、Ready だけを返す最小の `CooperativeHostFunction` を 2 つ登録し、`err()` の variant を照合する。
+  - **HFID-AT-02**（同期 → cooperative）: 同期 function を登録した後、同じ ID・別名の cooperative function を登録すると
+    `register_cooperative` が HFID-AT-01 と同じ error を返す。
+    確かめ方: 同じ unit test 群で、既存の `echo_fn` の後に同 ID の cooperative を登録して照合する。
+  - **HFID-AT-03**（cooperative → 同期）: cooperative function を登録した後、同じ ID・別名の同期 function を登録すると
+    `register` が HFID-AT-01 と同じ error を返す。
+    確かめ方: HFID-AT-02 の逆順の unit test。
+  - **HFID-AT-04**（優先順位と正常系）: 名前と ID の両方が重複する cooperative 登録は `ConfigError::DuplicateCallableName` を返す。
+    ID も名前も異なる同期・cooperative の混在登録は成功し、`build()` 後に両方の名前が解決できる
+    （`contains_name`・`lookup_by_name`・`lookup_cooperative`）。
+    確かめ方: unit test で、名前・ID 二重重複の error variant と、混在登録後の lookup 結果を照合する。
+  - 既存のテスト（`register_rejects_duplicate_name_and_id`、`tests/engine_api.rs`・`tests/scheduler_api.rs` の cooperative 登録）は期待値を変えずに通る。
+- **想定の変更規模**: `src/host_function.rs` だけ。本体（`#[cfg(test)]` を除く）は +20〜30 行程度
+  （builder の field と初期化、`register` の ID 検査の拡張、`register_cooperative` の ID 検査と記録、doc comment）。
+  テストは `src/host_function.rs` の `#[cfg(test)]` に +80〜120 行程度（最小の cooperative stub と HFID-AT-01〜04）。
+  触る仕組みは host function registry の builder 1 つ、受入基準は 4 項目で、[開発ループ手順書](loop-runbook.md) §11.1 に収まる。
+  done にする実装 PR で、逸脱一覧の「host function ID の registry 内一意性を cooperative 登録で検査しない」行を削除する。
 
 ## 19. 受入基準
 
