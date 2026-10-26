@@ -28,7 +28,7 @@
 //! - `CapabilityCallContext` を取る最終形の [`HostFunction::call`] シグネチャ（第11節）。C8 は
 //!   C3/C4/C5 と同じく context を取らない最小形で進める。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::capability::{CapabilityCallContext, HostFunctionId};
@@ -437,6 +437,8 @@ pub struct HostFunctionRegistryBuilder {
     by_id: BTreeMap<HostFunctionId, Arc<dyn HostFunction>>,
     by_name: BTreeMap<String, HostFunctionId>,
     by_coop_name: BTreeMap<String, Arc<dyn CooperativeHostFunction>>,
+    /// 登録済み cooperative function の ID（ID 一意性検査用。registry へは持ち越さない）。
+    coop_ids: BTreeSet<HostFunctionId>,
 }
 
 impl HostFunctionRegistryBuilder {
@@ -445,6 +447,7 @@ impl HostFunctionRegistryBuilder {
             by_id: BTreeMap::new(),
             by_name: BTreeMap::new(),
             by_coop_name: BTreeMap::new(),
+            coop_ids: BTreeSet::new(),
         }
     }
 
@@ -453,7 +456,8 @@ impl HostFunctionRegistryBuilder {
     /// descriptor の validation に加え、次を build error（第11.1節）とする。
     ///
     /// - core keyword・`print`・core/context builtin・他 host function との名前衝突。
-    /// - registry 内での ID 重複・名前重複。
+    /// - registry 内での ID 重複・名前重複（同期・cooperative の両方と排他。
+    ///   名前と ID の両方が重複する場合は名前の検査が先に効く）。
     pub fn register(mut self, function: Arc<dyn HostFunction>) -> Result<Self, ConfigError> {
         let descriptor = function.descriptor();
         descriptor.validate()?;
@@ -473,8 +477,8 @@ impl HostFunctionRegistryBuilder {
         if self.by_name.contains_key(&name) || self.by_coop_name.contains_key(&name) {
             return Err(ConfigError::DuplicateCallableName { name });
         }
-        // ID 重複。
-        if self.by_id.contains_key(&id) {
+        // ID 重複（同期・cooperative の両方と排他）。
+        if self.by_id.contains_key(&id) || self.coop_ids.contains(&id) {
             return Err(ConfigError::DuplicateCapability {
                 kind: crate::capability::CapabilityKind::HostFunction,
             });
@@ -487,7 +491,9 @@ impl HostFunctionRegistryBuilder {
 
     /// cooperative（ブロックしない）host function を1つ登録する（REV-015 Slice 5、設計 §4.4）。
     ///
-    /// 同期 [`Self::register`] と同じ名前検査（keyword / builtin / 他登録名との衝突）を行う。
+    /// 同期 [`Self::register`] と同じ名前検査（keyword / builtin / 他登録名との衝突）に加え、
+    /// descriptor の ID が登録済みの同期・cooperative function と重複すれば
+    /// `ConfigError::DuplicateCapability`（HostFunction）を返す（名前の検査が先）。
     /// cooperative 版は capability authority を同期版と同じく `HostFunction` に相乗りさせるため、
     /// descriptor の ID は `capabilities` の grant 検査に使う。VM 経路は cooperative を解決せず
     /// `Ready` 相当の同期経路のみを扱う（VM は変更しない、設計 §4.7）。
@@ -498,6 +504,7 @@ impl HostFunctionRegistryBuilder {
         let descriptor = function.descriptor();
         descriptor.validate()?;
         let name = descriptor.name.clone();
+        let id = descriptor.id;
 
         // core keyword・core/context builtin との衝突。
         if is_core_keyword(&name) {
@@ -511,6 +518,14 @@ impl HostFunctionRegistryBuilder {
             return Err(ConfigError::DuplicateCallableName { name });
         }
 
+        // ID 重複（同期・cooperative の両方と排他。grant 検査は ID で行うため）。
+        if self.by_id.contains_key(&id) || self.coop_ids.contains(&id) {
+            return Err(ConfigError::DuplicateCapability {
+                kind: crate::capability::CapabilityKind::HostFunction,
+            });
+        }
+
+        self.coop_ids.insert(id);
         self.by_coop_name.insert(name, function);
         Ok(self)
     }
@@ -763,6 +778,103 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
+    }
+
+    // --- cooperative 登録の ID 一意性（HFID-AT-01..04）---
+
+    /// Ready だけを返す最小の cooperative function。
+    struct CoopStub {
+        descriptor: HostFunctionDescriptor,
+    }
+    impl CooperativeHostFunction for CoopStub {
+        fn descriptor(&self) -> &HostFunctionDescriptor {
+            &self.descriptor
+        }
+        fn start(
+            &self,
+            _context: &mut CapabilityCallContext<'_>,
+            _arguments: &[Value],
+        ) -> HostCallPoll<Value> {
+            HostCallPoll::Ready(Ok(Value::Null))
+        }
+    }
+
+    fn coop_fn(id: u128, name: &str) -> Arc<dyn CooperativeHostFunction> {
+        Arc::new(CoopStub {
+            descriptor: descriptor(id, name, Arity::Exact(0)),
+        })
+    }
+
+    fn is_dup_host_function_id(err: &ConfigError) -> bool {
+        matches!(
+            err,
+            ConfigError::DuplicateCapability {
+                kind: crate::capability::CapabilityKind::HostFunction
+            }
+        )
+    }
+
+    /// HFID-AT-01（cooperative 同士）。
+    #[test]
+    fn hfid_at_01_cooperative_duplicate_id_rejected() {
+        let err = HostFunctionRegistry::builder()
+            .register_cooperative(coop_fn(1, "first"))
+            .unwrap()
+            .register_cooperative(coop_fn(1, "second"))
+            .err()
+            .expect("duplicate cooperative id must fail");
+        assert!(is_dup_host_function_id(&err), "{err:?}");
+    }
+
+    /// HFID-AT-02（同期 → cooperative）。
+    #[test]
+    fn hfid_at_02_sync_then_cooperative_duplicate_id_rejected() {
+        let err = HostFunctionRegistry::builder()
+            .register(echo_fn(1, "lookup", Arity::Exact(1)))
+            .unwrap()
+            .register_cooperative(coop_fn(1, "other"))
+            .err()
+            .expect("duplicate id must fail");
+        assert!(is_dup_host_function_id(&err), "{err:?}");
+    }
+
+    /// HFID-AT-03（cooperative → 同期）。
+    #[test]
+    fn hfid_at_03_cooperative_then_sync_duplicate_id_rejected() {
+        let err = HostFunctionRegistry::builder()
+            .register_cooperative(coop_fn(1, "other"))
+            .unwrap()
+            .register(echo_fn(1, "lookup", Arity::Exact(1)))
+            .err()
+            .expect("duplicate id must fail");
+        assert!(is_dup_host_function_id(&err), "{err:?}");
+    }
+
+    /// HFID-AT-04（優先順位と正常系）。
+    #[test]
+    fn hfid_at_04_name_check_precedes_id_and_mixed_registration_resolves() {
+        // 名前と ID の両方が重複する場合は名前の検査が先に効く。
+        let err = HostFunctionRegistry::builder()
+            .register(echo_fn(1, "lookup", Arity::Exact(1)))
+            .unwrap()
+            .register_cooperative(coop_fn(1, "lookup"))
+            .err()
+            .expect("duplicate name must fail");
+        assert!(matches!(err, ConfigError::DuplicateCallableName { .. }));
+
+        // ID も名前も異なる同期・cooperative の混在登録は成功し、両方の名前が解決できる。
+        let registry = HostFunctionRegistry::builder()
+            .register(echo_fn(1, "lookup", Arity::Exact(1)))
+            .unwrap()
+            .register_cooperative(coop_fn(2, "fetch"))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(registry.contains_name("lookup"));
+        assert!(registry.contains_name("fetch"));
+        assert!(registry.lookup_by_name("lookup").is_some());
+        assert!(registry.lookup_cooperative("fetch").is_some());
+        assert!(registry.lookup_by_name("fetch").is_none());
     }
 
     // --- redaction serializer（CAP-AT-22）---

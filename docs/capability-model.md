@@ -12,7 +12,7 @@
 逸脱として載せる案（Q2=A）は、返信なしのため推奨案で確定した（[開発ループ手順書](loop-runbook.md) §7.5、
 issue #263 Q2=A）。理由: spec が実装の正本であり、adapter の context 引数・`Control` は Phase 3/4 の予算・協調実行
 （[マニフェスト](manifesto.md) 原則 3・4）を受ける目標の形である。本文を実装に合わせるとその受け皿が spec から消える。載せたのは 2026-10-25 の整合点検で §3〜§11.1 を実装と照合して確かめた差であり、
-照合していない節（§12・§14.2 以降）の逸脱は、事実を確かめられたものから順に載せる。表は現時点で #263 D-3 の (a)〜(e) だけを持つ。上の設計ステータス段落にある現在の状態（§10 の範囲の REPL の resolver gate 迂回・run 層の import 展開・E9 の残りなど）と、§18「実装slice」の状態注記は、まだ表へ移していない。
+照合していない節（§12・§14.2 以降）の逸脱は、事実を確かめられたものから順に載せる。表は現時点で #263 D-3 の (a)〜(d) だけを持つ（(e) は fix-host-function-id-unique で解消した）。上の設計ステータス段落にある現在の状態（§10 の範囲の REPL の resolver gate 迂回・run 層の import 展開・E9 の残りなど）と、§18「実装slice」の状態注記は、まだ表へ移していない。
 
 ## 逸脱一覧（目標仕様に対する現在の逸脱）
 
@@ -22,7 +22,6 @@ issue #263 Q2=A）。理由: spec が実装の正本であり、adapter の cont
 | `CapabilityCallContext` に `execution_id`・`check_control`・`reserve` が無い。実装（`src/capability.rs` の `CapabilityCallContext`）が持つのは `capabilities`・`deadline`・`cancellation`・`remaining_request_bytes`・`remaining_response_bytes`・`may_yield`・`call_id` である。渡されるのは cooperative adapter（`src/host_pending.rs` の `CooperativeAdapter::start`）・cooperative host function（`src/host_function.rs` の `CooperativeHostFunction::start`）・`ModuleResolver::resolve`・`ModuleSource::read_chunk`（`src/capability.rs`）で、下の行の同期 adapter と同期 `HostFunction::call` には渡されない | §4 | C12 / exec-control Slice 5 |
 | 同期 adapter のメソッドが `&mut CapabilityCallContext` を取らない。実装（`src/capability.rs`）の `Clock::now_utc(&self)` は `Result<SystemTime, AdapterError>` でなく `SystemTime` を返し、`Input::read_line(&self)`・`Output::write_all(&self, bytes)`・`Output::flush(&self)`・`DirectoryHandle` と `FileHandle` の各メソッドも context 引数を持たない。`ReadLimit` 型は無く、`read_line` は上限引数を取らない | §6・§7・§8.3 | C3（Clock）、C4（Input/Output）、C5（DirectoryHandle/FileHandle） |
 | host function の呼び出し境界が目標と違う。実装（`src/host_function.rs`）に `HostCallContext` と `charge_external` は無く、`HostFunction::call(&self, arguments)` は context を取らない。`HostCallError` は `Host { category: String }` の 1 variant だけで（`#[non_exhaustive]`、derive は `Debug`）、`Control(ControlStop)` が無い | §11.1 | C8 |
-| host function ID の registry 内一意性を cooperative 登録で検査しない。`HostFunctionRegistryBuilder::register` は同期 function 同士の ID 重複を build error にするが、`register_cooperative`（`src/host_function.rs`）は名前の衝突だけを見て、cooperative 同士・同期との ID 重複を検査しない。`fix-host-function-id-unique`（[`slices.toml`](slices.toml)）で直す | §11.1 | C12 / exec-control Slice 5 |
 
 ## 1. 目的と規範範囲
 
