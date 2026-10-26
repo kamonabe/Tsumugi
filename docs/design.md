@@ -1,6 +1,6 @@
 # Tsumugi — 設計ドキュメント
 
-最終更新: 2026-10-20
+最終更新: 2026-10-26
 
 ## 目的と位置づけ
 
@@ -24,7 +24,7 @@ Tsumugiは、言語処理系の開発を入り口から理解するための個�
 
 これらは目標であり、現在のalpha実装に対する保証ではない。Phase 1 の最初の縦切りとして、`src/engine.rs` はツリーウォーク用の `Engine`、パース済み `CompiledScript`、状態保持用 `ExecutionContext`、`ExecutionOutcome` を crate root から公開し、CLIもこの入口を利用する。compile は構文解析までで、import は context に依存するため、execute開始時に最初のscript文を実行する前に共有`ModuleLoader`で全件を解決する。実行は caller の同一スレッドで同期的に行われるため、context は十分なスタックを持つスレッド内で生成・利用する必要がある。
 
-現行の環境変数ベースのstep・collection・filesystem・env制限はdefense-in-depthで、実行単位のdeny-by-default capabilityや総heap quotaをまだ提供していない。VM、host I/Oの注入、キャンセル、`exit()`を構造化outcomeとして返す契約も未実装である。現在地と実現順序は[ロードマップ](roadmap.md)で管理する。
+埋め込みAPI（`src/embedding.rs`。crate rootでは `EmbeddingEngine` / `EmbeddingOutcome` などとして公開）は、実行単位のdeny-by-defaultな `CapabilitySet`（`src/capability.rs`。`ExecutionRequest` の既定は全authorityを拒否する `CapabilitySet::empty`）、論理サイズによるlive heap上限（`BudgetResource::HeapBytes`、超過は `ErrorKind::HeapLimit`）を含む実行予算（`BudgetConfig`、`src/budget.rs`）、host I/Oを注入するcapability adapter（`Input` / `Output` / `Clock` / filesystem / host function）、協調キャンセル（`CancellationToken`、`ErrorKind::Cancelled`）とdeadline（`ErrorKind::DeadlineExceeded`）、`exit()` を構造化terminalとして返す `ExecutionOutcome::Exited` を実装している。従来の環境変数（`TSUMUGI_SANDBOX`・`TSUMUGI_ENV_ALLOW`・`TSUMUGI_MAX_*`）による制限は、CLIが起動時に読む互換入口（legacy profileのcapability構築と上限の上書き。[実行予算・協調実行仕様](execution-control.md)第13節）と `ModuleLoader` のimport検査に残る。VM（`Backend::VmExperimental`）は埋め込みAPIのrun経路にまだ統合されていない（[組み込みAPI仕様](embedding-api.md)のE9）。領域ごとの逸脱・未実装範囲は各領域別正本の逸脱一覧、現在地と実現順序は[ロードマップ](roadmap.md)で管理する。
 
 ## 日時変換の停止性
 
@@ -245,7 +245,7 @@ let result = filter(test, fn(item) item != "kani" end)
 - `TsumugiError` enum でパースエラー（`Parse`）とランタイムエラー（`Runtime`）を構造的に区別
 - 各バリアントに `line: usize` と `message: String` を保持
 - `Runtime` バリアントには `kind: ErrorKind` と `trace: Vec<TraceFrame>` を持ち、エラーの種別と呼び出し経路を構造的に表現する
-- `ErrorKind` enum（22バリアント）: `ZeroDivision`, `Type`, `Index`, `Name`, `StepLimit`, `StackOverflow`, `Sandbox`, `Import`, `Argument`, `IntOverflow`, `ControlFlow`, `CollectionLimit`, `StringLimit`, `SourceLimit`, `HeapLimit`, `IoLimit`, `Conversion`, `BuiltinType`, `Iteration`, `Io`, `Internal`, `Runtime`。`StringLimit` / `SourceLimit` / `HeapLimit` / `IoLimit` は包括budget（REV-015 Slice 2）で追加した予算超過の種別。`Runtime` は互換用に残すが、現行の言語コアが生成する経路は持たない
+- `ErrorKind` enum（28バリアント）: `ZeroDivision`, `Type`, `Index`, `Name`, `StepLimit`, `DeadlineExceeded`, `Cancelled`, `StackOverflow`, `Sandbox`, `Capability`, `ProcessExit`, `Import`, `Argument`, `IntOverflow`, `ControlFlow`, `CollectionLimit`, `StringLimit`, `SourceLimit`, `HeapLimit`, `IoLimit`, `Conversion`, `BuiltinType`, `Iteration`, `Io`, `Host`, `Internal`, `InternalControl`, `Runtime`。`StringLimit` / `SourceLimit` / `HeapLimit` / `IoLimit` は包括budget（REV-015 Slice 2）で追加した予算超過の種別。`DeadlineExceeded` / `Cancelled` はdeadline超過と協調キャンセル（REV-015 Slice 4）、`ProcessExit` は `exit()` の構造化terminal（REV-023）、`InternalControl` は内部制御信号の不変条件破れ（REV-015 Slice 5）を表す。この4つと予算超過の種別（`StepLimit` / `CollectionLimit` / `StringLimit` / `SourceLimit` / `HeapLimit` / `IoLimit`）はscriptのtry/catchで捕捉できない（`ErrorKind::is_uncatchable`）。`Capability` はcapabilityの拒否、`Host` はhost adapterの失敗を表し、scriptから捕捉できる。`Runtime` は互換用に残すが、現行の言語コアが生成する経路は持たない
 - `error_type()` メソッドは `kind.as_str()` を返す — try/catch で `e["type"]` として利用される
 - `Display` 実装で「N行目: メッセージ」形式の出力を生成し、trace があれば `  in 関数名() (M行目)` を内側から外側の順に付加する
 - **canonical error constructor（AUD-019）**: runtime error は operation ごとの共通 constructor から `kind` と canonical message を生成する。`src/error.rs` に `undefined_name` / `arithmetic_type` / `comparison_type` / `list_index_out_of_range` / `not_callable` / `user_arity` / `builtin_arg_type` / `callback_arity` などの constructor を集約し、tree（`eval.rs` / `builtin.rs`）・VM（`vm.rs`）・共有（`builtin_core.rs`）・`compiler.rs` / `module.rs` はすべてこれらを経由する。message には値そのものを埋め込まず、`type_name(&Value)` が返す型名（`Int` / `Str` など）だけを用いるため、tree と VM で kind / message / line が完全一致する。テンプレートの正本は [`language-spec.md`](language-spec.md) の「エラーの kind とメッセージ（正本）」、設計判断は [次期意味論・実装決定](semantic-decisions.md) 第3節
@@ -345,7 +345,7 @@ GitHub Actions (`.github/workflows/ci.yml`) が `main` への push と PR で4�
 
 ## 文法定義の置き場所
 
-形式文法は `LANG_GUIDE.md` の「Grammar (Formal)」に1つだけ置く。規範となる意味論は[`language-spec.md`](language-spec.md)（version 0.11）、実装packageは0.1.0である。構文を変更する場合は、規範仕様と`LANG_GUIDE.md`を更新する。
+形式文法は `LANG_GUIDE.md` の「Grammar (Formal)」に1つだけ置く。規範となる意味論は[`language-spec.md`](language-spec.md)（version 0.21）、実装packageは0.1.0である。構文を変更する場合は、規範仕様と`LANG_GUIDE.md`を更新する。
 
 本書はかつて「設計時の文法スナップショット（revision v0.3）」として文法を複製していたが、2つの複製が別々に古くなり、`index_assign` と `dict_literal` で互いに食い違う状態になった。複製をやめ、v0.3から現在までの構文上の変更点だけを設計履歴として残す。v0.3時点の全文はgit履歴で参照できる。
 
@@ -746,11 +746,19 @@ REPLの未捕捉エラーは、外部I/Oを含む完全なACID transactionでは
 
 - **caller所有ASTの破棄**: 公開AST APIのpreflightはCompiler/Evaluator自身の再帰走査を防ぐが、借用元がParserを使わず任意深度の再帰ASTを構築した場合、そのASTの通常Dropはcaller側のhost stackを使用する
 - **シンボリックリンクとsandbox制約**: 破壊的操作がfinal symlinkを決定論的にtargetへ置換する問題はAUD-032で修正した。ただしtargetが未作成のdangling final symlinkを通じた`write_file` / `append_file`は、fallback正規化がlink entryを許可範囲内と判定した後にOSが許可範囲外のtargetを作成し得る。またcheckと実I/Oの間のsymlink差し替えraceは防げず、許可外pathの存在情報がcanonicalize結果から観測できる場合もある（AUD-020）
-- **総ヒープメモリ制限なし**: List/Dictの要素数上限はあるが、巨大文字列、要素自身のサイズ、全コレクション合計量にはglobal quotaがなくOOMの可能性が残る
+- **総ヒープメモリは論理サイズで制限する**: 実行ごとのlive heapを `BudgetConfig::max_live_heap_bytes`（`BudgetResource::HeapBytes`）で制限し、超過は `ErrorKind::HeapLimit` になる（[実行予算・協調実行仕様](execution-control.md)第5節）。課金するのは同節の論理サイズ（`src/budget.rs` の `heap_size`。allocator・platform・Rust compilerに依存しない固定値）であり、プロセスが実際に確保するメモリ量そのものではない
 - **input() の無制限読み込み**: 改行なしの巨大入力でOOM、入力なしで無限ブロック
 
 
 ## 変更履歴
+
+### 2026-10-26: 現行実装の記述を実装に合わせる（loop:drift #263 の D-7）
+
+**問題:** 冒頭で本書を「現行実装のアーキテクチャと実装済み判断の正本」としながら、現行実装の記述の一部が実装より古かった。「目的と位置づけ」はcapability・heap上限・host I/Oの注入・キャンセル・`exit()` の構造化outcomeを未実装とし、「エラー型」は `ErrorKind` を22バリアントとして列挙し（実装は28）、「文法定義の置き場所」は言語仕様をversion 0.11とし（現行は0.21）、「未対応の既知の制約」は総ヒープメモリ制限が無いとしていた。
+
+**決定:** 本書の役割（現行実装の記録）は変えず、この4か所を `src/embedding.rs`・`src/capability.rs`・`src/budget.rs`・`src/error.rs`・`docs/language-spec.md` で確かめた現在の実装に合わせて直す。本書に逸脱一覧を作るかどうかは、[ドキュメント運用ガイド](documentation-guide.md)の移行中注記（同 issue の D-2）に従い、事実を確かめたものから寄せる。返信なしのため推奨案で確定した（loop-runbook §7.5）。
+
+**不採用案:** 本書に逸脱一覧を作り本文を目標の記述として扱い直す案は、本文の多くが設計判断の経緯と現行実装の記録で、目標と現状を分け直す量が1回の変更の大きさの目安を超える。各specの逸脱一覧の扱い（D-2）が決まるまで直さない案は、古い記述を前提に設計・実装が進むおそれを残す。
 
 ### 2026-08-28: import を実行前解決へ統一（AUD-030）
 
