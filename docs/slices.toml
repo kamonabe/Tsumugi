@@ -128,7 +128,7 @@ order      = 10
 # 残さない。「tree-expr-continuation が done」は e1〜e4 がすべて done を意味する。
 # acceptance は各スライスが担当する受入基準の ID。複数スライスにまたがる基準（TEC-AT-01 等）の
 # どの部分を満たせば完了かは、各スライスの spec 小節「受入基準（eN が満たす部分）」に書く。
-# e2b〜e4 は設計確定済みだが、DoR 3（depends_on がすべて done）を満たさないため todo に置く。
+# e3・e4 は設計確定済みだが、DoR 3（depends_on がすべて done）を満たさないため todo に置く。
 # 前段が done になった時点で状態整理 PR で todo → ready にする（F-2 と同じ運用）。
 [[slice]]
 id         = "tree-expr-continuation-e1"
@@ -147,6 +147,7 @@ order      = 11
 # e2 は 1 PR に収まらないため e2a / e2b に分割した（spec「tree-expr-continuation-e2 実装スライス」の注記）。
 # 元の id は置き換えて残さない。「e2 が done」は e2a・e2b がともに done を意味する。
 # e2a の判断待ち（式 frame の heap 課金）は、返信なしのため推奨案（課金なし）で確定した（loop-runbook §7.5）。
+# e2b は PR #262 で設計し、e2a が done になったあと設計 PR（design_pr）で e2a の実装に合わせて小節を具体化して ready にした。
 [[slice]]
 id         = "tree-expr-continuation-e2a"
 title      = "tree evaluator の式レベル continuation e2a：式 frame（FrameKind::Expr）を導入し、文の 4 位置の式に現れる call・二項・単項を段階評価して call 引数・operand 境界で yield 可能に"
@@ -163,7 +164,7 @@ order      = 12
 [[slice]]
 id         = "tree-expr-continuation-e2b"
 title      = "tree evaluator の式レベル continuation e2b：index・list / dict・f-string の段階評価と、if / while の条件・for の反復元・index 代入の式スロットを yield 可能に"
-status     = "todo"
+status     = "ready"
 parent     = "REV-015"
 spec_slice = "exec-control Slice 3"
 spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation-e2b 実装スライス（index・list / dict・f-string と、文の式スロット）" }
