@@ -1,6 +1,6 @@
 # Tsumugi 実行予算・協調実行仕様
 
-最終更新: 2026-10-25
+最終更新: 2026-10-27
 
 設計ステータス: **到達目標の確定仕様（§1〜§13）＋ 実装の現在地（下記の逸脱一覧）**
 
@@ -1920,27 +1920,65 @@ builtin・host のどれに解決されるかは静的には決まらない（us
 
 ###### tree-expr-continuation-e2b 実装スライス（index・list / dict・f-string と、文の式スロット）
 
+> **設計の更新（e2b を `ready` にした設計 PR）**: 範囲・範囲外・受入基準 ID は e2 分割の設計 PR #262 のまま変えていない。
+> e2a の実装 PR #268 で式 frame の形（`ExprFrame` が文の式スロットから子の位置の経路でノードを辿る・1 段ずつ進める・
+> `CallDest::Operand` / `ExprResult`）が決まったので、それに合わせて「保存する状態」「式スロットの指し方と入口」
+> 「受け渡し先」「受入基準の確かめ方」を書き足し、「想定の変更規模」を e2a の実績で見直した。
+
 - **範囲**:
-  - **段階評価する式種を広げる**: e2a の式 frame に index・list リテラル・dict リテラル・f-string を加える。評価順・
-    課金・エラーの位置は同期経路の `eval_expr` と同じにする。
+  - **段階評価する式種を広げる**: e2a の式 frame に index・list リテラル・dict リテラル・f-string を加える（e2a の 4 位置を
+    含む、式 frame で評価するすべての位置に効く）。対象は呼び出しを含むノードだけで、呼び出しを含まない子は従来どおり
+    `eval_expr` で 1 つの値にする（境界規則）。評価順・課金・エラーの位置は同期経路の `eval_expr` と同じにする。
     - index: object → index の順に評価し、同期経路と同じ `eval_index` で適用する。AUD-041 の参照読み
       （`識別子[副作用のない式]`）は呼び出しを含まないので式 frame を作らない（従来どおり）。
     - list: 要素を左から評価し、要素ごとに `check_collection` を行ってから `Value::new_list` で作る。
     - dict: key → key の型検査 → value → `check_collection`（新しい key のとき）の順を entry ごとに行い、
-      `Value::new_dict` で作る。
+      `Value::new_dict` で作る。重複 key は同期経路と同じく後の値で上書きする。
     - f-string: 式の部分を評価するたびに `render_display` で描画して結果へ足し（fuel と per-item byte 上限の課金は
-      その時点）、最後に `track_result` する。
+      その時点）、リテラル部分はそのまま足し、最後に `track_result` する。
+  - **式 frame に保存する状態の追加**（上の小節「continuation へ保存する式の評価状態」の具体化）: e2a の operand stack・
+    式 cursor に加え、次を式 frame に持たせる。どれも同期経路では `eval_expr` / `exec_stmt` のローカル変数が持っていたもので、
+    新しい値は作らない（heap は e2a と同じく課金しない）。
+    - dict: 作りかけの map（key の型検査と `check_collection` を済ませた entry）と、評価済みで value を待つ key。
+    - f-string: 描画済みの部分を連結した作りかけの文字列。
+    - index 代入: 先に解決した代入先 binding の cell（同期経路の `exec_stmt` がローカルに持つ `cell` と同じもの）と、
+      評価済みの index の値。
   - **文の式スロットを式 frame の対象に広げる**: e2a の 4 位置に加え、`if` の条件、`while` の条件（反復ごとの再評価を
-    含む。反復完了後の `count_step` は従来どおり条件の評価より前）、`for` の反復元、index 代入の index と値。index 代入は
-    binding の解決 → index → value の規範順序と、同期経路の代入処理・エラー写像を使う。`while` の条件と `for` の反復元の
-    評価は反復境界（`advance_frame`）でのエラーと同じく最も近い `try` へ渡す。
+    含む。反復完了後の `count_step` は従来どおり条件の評価より前）、`for` の反復元、index 代入の index と値。
+    - **式スロットの指し方**: 式 frame の根は「所有する Block・文の index・その文のどの式スロットか」で指す（e2a の
+      `stmt_value_expr` が返す値の位置に、条件・反復元・index 代入の index / value を加える）。経路で子を辿る規則は e2a と同じ。
+    - **入口**: 新しい式スロットは、式が `needs_expr_frame`（e2b の式種を加えたもの）に当たるとき根の式 frame で評価する。
+      e1 の形（それ自体 `Expr::Call` で callee と全引数が呼び出しを含まない）の式も、新しい式スロットでは e1 の直接の経路
+      （`exec_driver_call_stmt` から Call frame へ入る経路）を使わず、`needs_expr_frame` に従う。すなわち callee が user binding を
+      持つときは根の式 frame で評価し、持たないとき（builtin / 登録 host function / cooperative host function / 未定義名）は
+      従来どおり `eval_expr` で評価する（e1 の直接の経路は e1 の 4 位置だけに残す。式 frame の call も同じ前処理順序を通るので
+      観測は変わらない）。
+    - **受け渡し先**: 根の式 frame の値は、同期経路の `exec_stmt` / `advance_frame` がその値に対して行っていた処理へ届ける。
+      `if`: 真偽で分岐を選び `enter_scoped_block` の frame を積む。`while`（最初の評価）: 偽なら完了、真なら `enter_while` の
+      frame を積む。`while`（反復ごとの再評価）: `advance_frame` と同じく真なら `pending_step` を立てて次反復の本体を積み、
+      偽なら While frame を畳む。`for`: 同期経路と同じ materialize（list / dict / 文字列ごとの `check_collection`、
+      反復できない値のエラー）をして `enter_for` の frame を積む。同期経路と共有できる処理は関数に分けて共有し、
+      同期経路の順序・エラーを変えない。
+    - **index 代入**: binding の解決（未定義名のエラーは index / value の副作用より前）→ index → value の規範順序で評価し、
+      `journal_cell` → `assign_index` は同期経路と同じ関数で行う。index と value の一方だけが呼び出しを含む場合も、
+      もう一方は同じ順序の位置で `eval_expr` で評価する。
+  - `while` の条件と `for` の反復元の評価のエラーは、反復境界（`advance_frame`）でのエラーと同じく最も近い `try` へ渡す。
+    エラー行は同期経路と同じく文の行。
   - **cooperative host-call の Pending**: 文の式スロットの式 frame の中で Pending を返した場合は e2a と同じく式 frame を
-    畳んで文の評価を最初からやり直す。`while` の条件（反復境界）での Pending は現行の反復境界の扱い（`advance_frame` の
-    Pending をそのまま yield し、resume で条件を再評価する）と同じ観測にする。
-  - yield 可能点・強制 yield フック・heap・終了経路は e2a と同じ規則を新しい式種と式スロットへ当てる。
+    畳んで文の評価を最初からやり直す（index 代入は binding の解決からやり直す。cooperative host-call の Pending で文の cursor を戻し、resume でその文を
+    最初から評価し直す現行の「同じ文の再評価」と同じ観測）。
+    `while` の条件の再評価（反復境界）での Pending は現行の反復境界の扱い（`advance_frame` の Pending をそのまま yield し、
+    resume で While frame から条件を再評価する。反復完了後の `count_step` は再評価の前に済んでいるので二重に課金しない）と
+    同じ観測にする。
+  - yield 可能点・強制 yield フック・heap・終了経路は e2a と同じ規則を新しい式種と式スロットへ当てる（式 frame の 1 段の
+    間が yield 可能点。slice fuel の判定と強制 yield フックだけを行い、audit drain queue 上限と cancel / deadline の
+    checkpoint は文/反復境界だけ）。
 - **範囲外（後続）**: builtin / host / cooperative の引数に現れる呼び出し（e3）。`map` / `filter` / `each`（e4）。
-- **想定の変更規模**: `src/eval.rs` がおおむね 300 行（index・list・dict・f-string の段階評価 120、`if` / `for` の
-  入口 60、`while` の条件の再評価 60、index 代入 50）。触る仕組みは tree evaluator の driver 1 つ。受入基準は下の 4 項目。
+- **想定の変更規模**: `src/eval.rs` がおおむね 360 行（式スロットの指し方と根の入口 40、index・list・dict・f-string の
+  段階評価と保存する状態 130、`if` / `for` の受け渡し先と materialize の共有 70、`while` の最初の評価と反復ごとの再評価 70、
+  index 代入 50）。`src/ast.rs` は `expr_child` を 4 つの式種へ広げる 25 行。合わせて約 385 行で、[開発ループ手順書](loop-runbook.md)
+  「スライスの大きさの目安」の 800 行に収まる（e2a は見積もり 約 430 行に対し実績 458 行。同じ比率で上振れしても 420 行前後）。
+  触る仕組みは tree evaluator の driver 1 つ。受入基準は下の 4 項目。
 - **TEC-AT-04 / 05 を持たない理由**: 深度検査と journal の扱いは、e2a が段階評価に入れた call の前処理（`prepare_call` と
   共有する段）と driver 上の Call frame の中にあり、e2b は呼び出しの経路を新しく足さない（足すのは式種と、式 frame へ
   入る文の位置だけ）。式 frame の途中の yield が transaction 境界でないことも e2a の TEC-AT-05 で固定済みで、e2b の
@@ -1949,13 +1987,27 @@ builtin・host のどれに解決されるかは静的には決まらない（us
   - **TEC-AT-01（e2b 分）**: 強制 yield フックで、index・list / dict リテラル・f-string の中の呼び出しと、`if` / `while` の
     条件・`for` の反復元・index 代入の index と値に呼び出しを含む script が、同期経路と一致する（検査項目は
     TEC-AT-01 本文どおり）。dict key の型エラー・collection 上限・index エラーの行と trace も一致する。
+    - 確かめ方: `tests/engine_api.rs` に、式種・式スロットごとの script（例: `let y = xs[f(i)]`、`let a = [f(1), g(2)]`、
+      `let d = {k(): f(x)}`、`let s = f"{f(x)}-{g(x)}"`、`if f(x) > 0`、`while step() < 3`、`for v in f(x)`、`xs[f(i)] = g(i)`。
+      呼び出しを builtin の引数に置く形は e3 なので使わない）と
+      エラー経路（dict key が文字列でない・`max_collection_elements` 超過・範囲外 index）の script を置き、強制 yield フックありの
+      poll 経路と `can_yield = false` の `Evaluator::run` で stdout・`committed.fuel`・terminal 種別・エラー種別・行・trace・
+      非 `Yielded`/`Resumed` の audit event 列を比べる。
   - **TEC-AT-02（e2b 分）**: list / dict の要素の途中・f-string の部分の途中・`while` の条件の途中で yield させ、resume 後の
     最終値と副作用列が同期経路と一致する。
+    - 確かめ方: `tests/engine_api.rs` で、要素・部分・条件の各評価が副作用（`print`）を持つ script を強制 yield フックで
+      1 境界ずつ yield させ、resume 後の値と出力順が同期経路と一致することを見る。`src/eval.rs` の unit test で、dict の
+      作りかけの map・f-string の作りかけの文字列・index 代入の解決済み cell と index が yield を跨いで保存されることを固定する。
   - **TEC-AT-03（e2b 分）**: 既存テスト無改変で緑。同期経路と、terminal まで poll する入口の観測値が不変。
+    - 確かめ方: 既存の `tests/`・unit test を無改変で通す（`cargo test --all-features`）。加えて `src/eval.rs` の unit test で、
+      e2b の式種・式スロットを含む script の poll 経路の `live_heap` / `peak_heap` が `Evaluator::run` と一致することを見る。
   - **TEC-AT-06（e2a・e2b 分）**: e2a / e2b の式種と式スロットの中で呼んだ関数の本体にループを持つ script（例:
     `let y = f(x) + 1`、`return h(f(x), 1)`、`[f(x)]`、`while f(x) > 0`、`for v in f(x)`）を
     `PollSlice::max_fuel = 16` で実行し、1 回の poll の実行量が e1 と同じ上限以内。`Yielded`/`Resumed` が対で順序が単調。
-- **検証**: 全 sub-slice 共通の完了条件。テストは `tests/engine_api.rs`（TEC-AT-01/02/06）、式種ごとの保存状態の
+    - 確かめ方: `tests/engine_api.rs` で上の各 script を最小 slice で poll し、poll ごとの fuel 増分が「slice + 区間内の
+      callback なし bulk builtin 1 回分の単独実測 fuel」以内であることと、audit の `Yielded`/`Resumed` の対と順序を見る
+      （e1 の TEC-AT-06 のテストと同じ測り方）。
+- **検証**: 全 sub-slice 共通の完了条件。テストは `tests/engine_api.rs`（TEC-AT-01/02/06）、式種ごとの保存状態と heap の
   unit test は `src/eval.rs`。
 
 ##### tree-expr-continuation-e3 実装スライス（builtin・host function の呼び出し引数境界）
