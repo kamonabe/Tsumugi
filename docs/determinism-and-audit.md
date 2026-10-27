@@ -1910,7 +1910,7 @@ c1 は byte 計測にも redaction にも配線しないため、c1 だけでは
 
 #### fix-audit-sink-reentrancy-guard 実装スライス（sink callback 中の同じ Engine への再入検出）
 
-> 状態: **未実装**（設計のみ）。loop:drift #263 D-9（Q2=A、返信なしのため推奨案で確定）で足した `fix` スライス。§10 の「sink callback中に同じEngineの…を呼んではならない。thread-local reentrancy guardで検出し`AuditSinkError::Reentrant`にする」と §15.3 の「sink callbackのEngine再入を拒否し、deadlockしない」を満たす。判断 Q1（再入した呼び出しへ何を返すか・どの入口を対象にするか）は設計 PR で判断待ちであり、以下の実装範囲は推奨案 A で書いている。Q1 が確定したら、選んだ内容を §10 にも反映する。
+> 状態: **未実装**（設計のみ）。loop:drift #263 D-9（Q2=A、返信なしのため推奨案で確定）で足した `fix` スライス。§10 の「sink callback中に同じEngineの…を呼んではならない。thread-local reentrancy guardで検出し`AuditSinkError::Reentrant`にする」と §15.3 の「sink callbackのEngine再入を拒否し、deadlockしない」を満たす。判断 Q1（再入した呼び出しへ何を返すか・どの入口を対象にするか）は設計 PR で判断待ちであり、以下の実装範囲は推奨案 A で書いている。Q1 の選択は、下の「本文への反映」のとおり、この設計 PR のマージ前に目標の章へ書く。
 
 設計時点（main `b7ce903`）の事実:
 
@@ -1931,6 +1931,10 @@ c1 は byte 計測にも redaction にも配線しないため、c1 だけでは
   - `AuditWaker`・`AuditCompleter::complete` から呼ばれる waker の中の再入（[実行予算・協調実行仕様](execution-control.md) の waker 契約）は扱わない。
   - sink の panic の捕捉方法（Started の submit が `catch_host_unwind` の外にあること）は変えない。guard が unwind で外れることだけを保つ。
   - VM は対象外（監査 sink と VM の同時設定は build で拒否される）。
+- **本文への反映（この設計 PR のマージ前に行う）**: 再入した呼び出しが何を返すか・どの入口を対象にするかは公開 API の挙動なので、スライス小節だけに置かず目標の章に書く。判断待ち（この PR の Q1 と、レビュー指摘 2 の入れ子の扱い）が確定したら（[開発ループ手順書](loop-runbook.md) §7.3 の 4、返信が無い場合は §7.5）、同じ PR に追加の commit で次を書く。判断待ちの間は本文を変えない（未確定の選択を確定として書かないため）。
+  - (a) §10 の再入の規則: 対象の入口と、再入した呼び出しへ返す値。§10 の「start/poll/pause/resume/cancel」が scheduler の `ExecutionHandle` の操作を指すこと、facade の入口との対応、`CancellationToken::cancel` を callback から呼べるかどうか（小節の範囲外の扱いを本文に写す）。入れ子の callback でどの実行を fail-closed にするか。
+  - (b) [組み込みAPI仕様](embedding-api.md) の再入の規則（§9 の「同じcontext/handleへの再入は許さず`InternalFailure`とする」の段落）と §11 の規則 2: 選んだ選択肢で `compile`・`link` の拒否に使う値（A なら `CompileDiagnosticCode::InternalFault`・`LinkError::InternalFailure`。§11 の規則 2 は今これらを panic の写像としてだけ定義している）。B なら足す公開 variant。
+  - 選択が A 以外になった場合は、同じ commit で本小節の実装範囲と受入基準も直す。
 - **done PR で行う逸脱一覧の更新**: 逸脱一覧の「`AuditSinkError::Reentrant` は型だけで…」の行を削除し、表の下の段落から D-9 についての記述（「`AuditSinkError::Reentrant` が型だけである行（D-9）」と、D-9 の理由の文）を削除する。D-8 についての記述は残す。
 - **判断 Q1（判断待ち。推奨は A）**: §10 は「呼んではならない」「guard で検出し `AuditSinkError::Reentrant` にする」とだけ書き、再入した呼び出しそのものに何を返すか、facade のどの入口を対象にするかを決めていない。どれを選ぶかで公開 API の挙動（と、B では公開型）が決まる。
   - A（推奨）: facade の 6 入口すべてを対象にし、既存の InternalFailure 系（上記）で拒否する。公開型を増やさない。根拠: [組み込みAPI仕様](embedding-api.md)「同じcontext/handleへの再入は許さず`InternalFailure`とする」、[Capability Model仕様](capability-model.md) §11.3 の host callback の再入禁止と同じ扱いになる。§10 の列挙に compile が含まれる。外側の execution は `Reentrant` で fail-closed になり、host は `AuditFailed` で契約違反を観測できる。manifesto 原則 7（監査可能）・原則 8（小さく理解可能な中核）。
