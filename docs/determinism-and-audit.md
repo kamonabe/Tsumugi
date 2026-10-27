@@ -1,6 +1,6 @@
 # Tsumugi 決定性・実行時監査仕様
 
-最終更新: 2026-10-24
+最終更新: 2026-10-27
 
 設計ステータス: **到達目標の確定仕様（§1〜§13）＋ 実装の現在地（下記の逸脱一覧）**
 
@@ -31,6 +31,10 @@
 | `AuditField` の `original_bytes` を §9.1 の canonical subtree 長（§9.2 の encoding で測る）ではなく値の UTF-8 byte 長で代用（Path は canonical label または requested path の長さ、引数型エラーは 0）。strict CBOR スライスで揃える | §9.1 | R-1a |
 | Path の HMAC-SHA-256 の入力が canonical label の UTF-8 生 byte（`src/audit.rs::RedactionPolicy::hmac_path`）。§9.1/§9.2 の「redaction 前 subtree の canonical encoding」（label を値とする `AuditValue` の deterministic CBOR）ではないため、digest 値が目標仕様と異なる（秘匿性・決定性は保たれる）。strict CBOR スライスで揃える | §9.1/§9.2 | R-1a |
 | `AuditFrame.module_id` / `AuditError.module_id` が §7.2 の `AuditField`（Identifier/Path policy 適用済み）ではなく plain `String`（`Option<String>`）。現在は常に空文字列 / `None` で埋めており（`src/embedding.rs` の Terminal error 構築）module 情報を記録しない。§9.2 の encoding も `AuditField` ではなく text / `Option` になる | §7.2/§9.1 | A-1 |
+| 公開 `ExecutionOutcome`（`src/embedding.rs`、crate root では `EmbeddingOutcome`）は `Completed` / `Exited` / `RuntimeError` / `BudgetExceeded` / `DeadlineExceeded` / `Cancelled` / `InternalFailure` の 7 variant だけで、§7.2 の `TerminalOutcome` と 1 対 1 に対応しない。link 時の拒否と resolver の host 失敗は `Engine::link` の `Result<_, LinkError>`（`LinkError::Denied` / `LinkError::Resolve(HostError)` ほか）で返し、run 中の capability 拒否と host function の失敗は `RuntimeError`（`ErrorKind::Capability` / `ErrorKind::Host`）に含める。監査失敗は監査付き経路だけの別型 `AuditedOutcome::AuditFailed` で返す。`RecordFailure` / `ReplayMismatch` は record/replay が未実装のため無い | §7.2 | A-1（7 variant の構成は [組み込みAPI仕様](embedding-api.md) の E 系スライス由来） |
+| `AuditSinkError::Reentrant` は型だけで（`src/audit.rs`）、§10 の thread-local reentrancy guard が無い。sink callback から同じ Engine の compile/start/poll/pause/resume/cancel・host function・別の audit emit を呼んでも検出せず、`Reentrant` を生成する箇所も無い（§15.3 の「sink callbackのEngine再入を拒否し、deadlockしない」は未達）。検出を入れるのは `fix-audit-sink-reentrancy-guard` スライス | §10 | A-1 |
+
+上の表の最後の 2 行は loop:drift #263 の D-8・D-9 を受けて載せた。どちらも本文（§7.2 の 1 対 1 対応、§10 の再入検出）を実装に合わせて後退させず、逸脱として記録する案を選んだ（D-8 は issue #263 Q1=A、D-9 は Q2=A。いずれも返信なしのため推奨案で確定、[開発ループ手順書](loop-runbook.md) §7.5）。理由: spec が実装の正本であり、現在の逸脱は事実を確かめて逸脱一覧に置く（[ドキュメント運用ガイド](documentation-guide.md)「逸脱一覧の持ち方」）。D-8 の `ExecutionOutcome` は `#[non_exhaustive]` で、後続 Phase で variant を足す前提になっている。D-9 の再入検出は §15.3 の受入基準で、[マニフェスト](manifesto.md)原則 7（観測・監査可能にする）にかかわり、どのスライスも担当していなかったため、`fix` スライスを `todo` で [`slices.toml`](slices.toml) に足した。[組み込みAPI仕様](embedding-api.md) の `ExecutionOutcome`（13 variant）との差は、同 spec が逸脱一覧を作るときに載せる（ドキュメント運用ガイドの移行中注記）。
 
 ## 未実装範囲（目標仕様 §1〜§13 のうち未着手・延期中）
 
@@ -733,7 +737,7 @@ backpressure中もexecution deadlineとcancelを監視する。deadline/cancel�
 
 ```rust
 pub struct AuditBudget {
-    pub max_events: u64,                    // default 100,000、4以上
+    pub max_events: u64,                    // default 100,000、2以上
     pub max_encoded_bytes: u64,             // default 16 MiB
     pub max_pending_bytes: u64,             // default 1 MiB / execution
     pub terminal_reserve_events: u64,       // fixed 1
@@ -747,7 +751,7 @@ encoded byte数は9.2節のdeterministic CBORでencodeした実byte長とする�
 
 - StartedとTerminalもevent count・encoded bytesへ含める。Started append時にevent 1件と64 KiBをTerminal専用にreserveし、通常eventは`committed_events + requested_events <= max_events - terminal_reserve_events - active_close_reserve_events`かつ通常byte残量内の場合だけappendできる。
 - host call開始前に、`HostCallStarted`自身の通常1 event/最大60 KiBと、後続`CapabilityDecision` + `HostCallFinished`用の2 events/128 KiBをatomicにreserveする。予約できなければHostCallStartedも外部callも行わずAuditFailureにする。Decision/Finishedはclose reserveを消費し、pair完了時に未使用byteをrefundする。1 executionの未完了host callは1個だけなのでclose reserveも最大1組である。
-- `max_events < 2`、`terminal_reserve_events != 1`、`terminal_reserve_bytes < 64 KiB`、`host_call_close_reserve_events != 2`、`host_call_close_reserve_bytes < 128 KiB`はconfig errorとする。Terminalは専用event/byte reserveだけを使い、通常上限を使い切っても必ずappendできる。低いmax_events/bytesによりhost lifecycle 3 eventsを予約できないconfigは構築可能だが、host callを効果開始前のAuditFailureにする。
+- `max_events < 2`、`terminal_reserve_events != 1`、`terminal_reserve_bytes < 64 KiB`、`host_call_close_reserve_events != 2`、`host_call_close_reserve_bytes < 128 KiB`はconfig errorとする。Terminalは専用event/byte reserveだけを使い、通常上限を使い切っても必ずappendできる。低いmax_events/bytesによりhost lifecycle 3 eventsを予約できないconfigは構築可能だが、host callを効果開始前のAuditFailureにする。`max_events`の下限は、どのexecutionも必ず持つStartedとTerminalの2件である（上の`AuditBudget`定義のコメントが「4以上」としていたのを「2以上」へ直した。loop:drift #263 D-10。この節の`max_events < 2`と実装〔`AuditBudget::validate`〕を正にする案〔Q3=A〕は返信なしのため推奨案で確定、[開発ループ手順書](loop-runbook.md) §7.5）。理由: 3 events を予約できない低い`max_events`もhost callをAuditFailureにする形で扱いが決まっており、下限を4にする理由が無い。
 - 上限超過は`AuditFailure::BudgetExceeded`でfail-closedにする。
 - BudgetChargedを前節どおり集約し、監査event数をscript statement数へ単純比例させない。
 - hashing、HMAC、encodingはhost control-plane workでfuelへ課金しないが、入力sizeはsource/I/O/host budgetで既に有限でなければならない。

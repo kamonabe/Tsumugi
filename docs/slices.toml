@@ -123,6 +123,20 @@ design_pr  = 272
 impl_pr    = 274
 order      = 10
 
+# loop:drift #263 D-9（Q2=A、返信なしのため推奨案で確定）で見つかった不具合の fix。
+# determinism-and-audit §10 は sink callback 中の同じ Engine への再入を thread-local reentrancy guard で検出し
+# AuditSinkError::Reentrant にするとし、§15.3 はそれを受入基準にする。実装は Reentrant を型だけ持ち、検出が無い。
+# 逸脱一覧（determinism-and-audit.md 冒頭）の行がこのスライスを参照する。order は loop-runbook §8.1 の
+# 「不具合の報告」の既定（今ある ready・todo より前の空いている値）。未設計のため todo で置く。
+[[slice]]
+id         = "fix-audit-sink-reentrancy-guard"
+title      = "sink callback からの同じ Engine への再入を thread-local reentrancy guard で検出し AuditSinkError::Reentrant にする（§10・§15.3）"
+status     = "todo"
+parent     = "Phase 6 残"
+spec_slice = "determinism Slice 5"
+depends_on = ["A-1"]
+order      = 9
+
 # tree-expr-continuation（Slice 3 PR-e、元の設計 PR #242、分割は PR #250）は 1 晩・1 PR に収まらないため、issue #248 で
 # e1〜e4 の 4 スライスへ分割した（e2 はさらに e2a / e2b に分割）（spec「tree-expr-continuation の sub-slice 分割」）。元の id は置き換えて
 # 残さない。「tree-expr-continuation が done」は e1〜e4 がすべて done を意味する。
