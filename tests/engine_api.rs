@@ -2342,4 +2342,264 @@ print(skip)
             EmbeddingOutcome::Completed { .. }
         ));
     }
+    // ---------------------------------------------------------------------
+    // tree-expr-continuation-e2b: index・list / dict・f-string と、文の式スロット
+    // ---------------------------------------------------------------------
+
+    /// e2b のテストが使う関数群。`f` / `g` / `k` は本体にループを持つので slice の境界で yield できる。
+    const E2B_PRELUDE: &str = "\
+fn f(x)
+  let i = 0
+  while i < 2
+    i = i + 1
+  end
+  return x
+end
+fn g(x)
+  for v in [1, 2]
+    print(v)
+  end
+  return x * 2
+end
+fn k(x)
+  print(\"k\")
+  return \"key\"
+end
+fn step(n)
+  print(\"s\")
+  return n
+end
+";
+
+    /// TEC-AT-01（e2b 分）: index・list / dict リテラル・f-string の中の呼び出しと、`if` / `while` の
+    /// 条件・`for` の反復元・index 代入の index と値に呼び出しを含む script が、全境界で yield しても
+    /// 同期実行と stdout・fuel・terminal・audit event 列が一致する。
+    #[test]
+    fn tec_at_01_e2b_expression_kinds_and_slots_match_sync_path() {
+        let body = "\
+let xs = [10, 20, 30]
+let i = 1
+let y = xs[f(i)]
+print(y)
+let a = [f(1), g(2)]
+print(a)
+let d = {k(0): f(5), \"z\": g(1)}
+print(d)
+let s = f\"{f(4)}-{g(3)}-lit\"
+print(s)
+if f(1) > 0
+  print(\"if-true\")
+else
+  print(\"if-false\")
+end
+if f(0) > 0
+  print(\"no\")
+else
+  print(\"else\")
+end
+let n = 0
+while step(n) < 3
+  n = n + 1
+end
+print(n)
+for v in f(xs)
+  print(v)
+end
+for v in f(\"ab\")
+  print(v)
+end
+for v in f({\"p\": 1})
+  print(v)
+end
+xs[f(0)] = g(7)
+xs[1] = f(8)
+xs[f(2)] = 9
+print(xs)
+let dd = {\"a\": 1}
+dd[k(0)] = g(2)
+print(dd)
+let nested = [[f(1), 2], {\"q\": [g(1)]}][1][\"q\"][0]
+print(nested)
+let fs = f\"{[f(1)]}{{f(2)}}\"
+print(fs)
+let dup = {\"a\": f(1), \"a\": g(2)}
+print(dup)
+";
+        let text = format!("{E2B_PRELUDE}{body}");
+        let yields = assert_matches_sync(&text);
+        assert!(
+            yields > 150,
+            "式・式スロットの境界でも yield している: {yields}"
+        );
+    }
+
+    /// TEC-AT-01（e2b 分）のエラー経路: dict key の型エラー・collection 上限・index エラー・
+    /// 反復できない値・未定義の index 代入先が、同期実行とエラー種別・行・trace・fuel で一致する。
+    #[test]
+    fn tec_at_01_e2b_error_paths_match_sync_path() {
+        let cases = [
+            "fn n()\n  return 1\nend\nlet d = {n(): 2}\n",
+            "fn n()\n  return 1\nend\ntry\n  let d = {\"a\": 1, n(): 2}\ncatch e\n  print(e[\"type\"])\nend\n",
+            "fn n()\n  return 1\nend\nlet xs = [1, 2]\nlet y = xs[n() + 5]\n",
+            "fn n()\n  return 1\nend\nlet y = \"ab\"[n() + 5]\n",
+            "fn n()\n  return 1\nend\nlet y = 5[n()]\n",
+            "fn n()\n  return 1\nend\nfor v in n()\n  print(v)\nend\n",
+            "fn n()\n  return 1\nend\ntry\n  while n() / 0 > 1\n    print(1)\n  end\ncatch e\n  print(e[\"type\"])\nend\n",
+            "fn n()\n  return 1\nend\nundefined_target[n()] = n()\n",
+            "fn n()\n  return 1\nend\nlet xs = [1]\nxs[n() + 4] = n()\n",
+            "fn n()\n  return 1\nend\nlet xs = [1]\ntry\n  xs[0] = n() / 0\ncatch e\n  print(e[\"type\"])\nend\n",
+            "fn n()\n  return 1\nend\nlet s = f\"{n() / 0}\"\n",
+            "fn n()\n  return 1\nend\nlet i = 0\nwhile i < 3\n  i = i + 1\n  if n() / (i - 2) > 0\n    print(i)\n  end\nend\n",
+        ];
+        for text in cases {
+            assert_matches_sync(text);
+        }
+    }
+
+    /// TEC-AT-02（e2b 分）: list / dict の要素の途中・f-string の部分の途中・`while` の条件の途中で
+    /// yield しても、resume 後の最終値と副作用列（stdout の順序）が同期実行と一致する。
+    #[test]
+    fn tec_at_02_e2b_resume_mid_expression_matches_sync_path() {
+        let text = "\
+fn say(tag, v)
+  print(tag)
+  let i = 0
+  while i < 1
+    i = i + 1
+  end
+  return v
+end
+let l = [say(\"l1\", 1), say(\"l2\", 2), say(\"l3\", 3)]
+print(l)
+let d = {say(\"k1\", \"a\"): say(\"v1\", 1), say(\"k2\", \"b\"): say(\"v2\", 2)}
+print(d)
+let s = f\"<{say(\"f1\", 1)}|{say(\"f2\", 2)}>\"
+print(s)
+let xs = [0, 0]
+xs[say(\"i\", 1)] = say(\"v\", 5)
+print(xs)
+print(l[say(\"o\", 0)])
+";
+        let yields = assert_matches_sync(text);
+        assert!(yields > 50, "式の途中で yield している: {yields}");
+        // `while` の条件の途中（条件の評価ごとに副作用がある）。出力の厳密な期待値は固定せず、
+        // 同期経路との一致だけを見る。
+        let cond = "\
+fn say(tag, v)
+  print(tag)
+  let i = 0
+  while i < 1
+    i = i + 1
+  end
+  return v
+end
+let n = 0
+while say(\"c\", n) < 2
+  n = n + 1
+end
+print(n)
+";
+        assert!(assert_matches_sync(cond) > 10);
+        let (observed, _) = run_audited(text, true);
+        assert_eq!(
+            observed.stdout,
+            "l1\nl2\nl3\n[1, 2, 3]\nk1\nv1\nk2\nv2\n{\"a\": 1, \"b\": 2}\nf1\nf2\n<1|2>\ni\nv\n[0, 5]\no\n1\n"
+        );
+    }
+
+    /// TEC-AT-06（e2a・e2b 分）: 式種と式スロットの中で呼んだ関数の本体にループを持つ script を
+    /// 最小 slice（16）で実行したとき、1 poll の実行 fuel が上限以内で、Yielded / Resumed が対になり
+    /// 順序が単調。
+    #[test]
+    fn tec_at_06_e2_poll_fuel_is_bounded_in_expressions_and_slots() {
+        let engine = Engine::new();
+        let work =
+            "fn work(n)\n  let i = 0\n  while i < n\n    i = i + 1\n  end\n  return i\nend\n";
+        let scripts = [
+            "let y = work(200) + 1\n",
+            "fn h(a, b)\n  return a - b\nend\nfn via(x)\n  return h(work(x), 1)\nend\nlet r = via(200)\n",
+            "let a = [work(200)]\n",
+            "let d = {\"k\": work(200)}\n",
+            "let s = f\"{work(200)}\"\n",
+            "let xs = [1, 2]\nlet y = xs[work(200) - 200]\n",
+            "let c = 0\nif work(200) > 0\n  c = 1\nend\n",
+            "let c = 0\nwhile work(50) > c\n  c = c + 25\nend\n",
+            "for v in [work(200)]\n  let q = v\nend\n",
+            "let xs = [0]\nxs[work(200) - 200] = work(200)\n",
+        ];
+        for body in scripts {
+            let text = format!("{work}{body}");
+            let script = engine.compile(&text).expect("compile");
+            let mut ctx = ExecutionContext::new();
+            let mut handle = engine
+                .create_execution(&script, &mut ctx, ExecutionRequest::new())
+                .expect("admit");
+            let mut previous = 0;
+            let mut polls = 0;
+            loop {
+                let result = handle.poll(PollSlice { max_fuel: 16 }).expect("poll");
+                let fuel = handle.usage().committed.fuel;
+                // 式起因の超過は現行課金で 0（callback なし bulk builtin を含まない script）。
+                assert!(
+                    fuel - previous <= 16,
+                    "1 poll の実行 fuel が上限を超えた: {} > 16\n{body}",
+                    fuel - previous
+                );
+                previous = fuel;
+                polls += 1;
+                if let PollResult::Terminal { outcome, .. } = result {
+                    assert_eq!(outcome, tsumugi::ExecutionOutcome::Completed, "{body}");
+                    break;
+                }
+            }
+            assert!(
+                polls > 200 / 16,
+                "関数本体のループの途中で yield している: {polls}\n{body}"
+            );
+        }
+
+        // Yielded / Resumed が対になり poll_index が単調に増える。
+        let sink = Arc::new(InMemoryAuditSink::new());
+        let audited = EmbeddingEngine::builder()
+            .audit_sink(sink.clone() as Arc<dyn AuditSink>)
+            .audit_slice_fuel(16)
+            .build()
+            .expect("build");
+        let text = format!(
+            "{work}let a = [work(100), {{\"k\": work(100)}}]\nwhile work(20) < 0\n  print(1)\nend\n"
+        );
+        let linked = link(&audited, &text);
+        let mut ctx = EmbeddingContext::new(&audited);
+        let outcome = audited.run_audited(&linked, &mut ctx, request(CapabilitySet::empty()));
+        assert!(matches!(
+            outcome.outcome(),
+            Some(EmbeddingOutcome::Completed { .. })
+        ));
+        let mut pending: Option<u64> = None;
+        let mut last: Option<u64> = None;
+        let mut pairs = 0;
+        for envelope in sink.snapshot() {
+            match envelope.event {
+                AuditEvent::Yielded { poll_index, .. } => {
+                    assert!(pending.is_none(), "Yielded が連続した");
+                    assert!(
+                        last.is_none_or(|prev| poll_index > prev),
+                        "poll_index が単調でない"
+                    );
+                    pending = Some(poll_index);
+                    last = Some(poll_index);
+                }
+                AuditEvent::Resumed { poll_index, .. } => {
+                    assert_eq!(pending.take(), Some(poll_index), "Resumed が対にならない");
+                    pairs += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(pending.is_none());
+        assert!(
+            pairs >= 200 / 16,
+            "式の中の関数本体で yield している: {pairs}"
+        );
+    }
 }

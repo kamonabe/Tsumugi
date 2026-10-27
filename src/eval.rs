@@ -6,7 +6,7 @@ use crate::budget::{BudgetConfig, BudgetLedger, ControlStop, ExecutionPhase};
 use crate::env::Env;
 use crate::error::{TraceFrame, TsumugiError};
 use crate::limits::MAX_USER_CALL_DEPTH;
-use crate::value::{FnDef, FunctionId, NumericOrder, Value};
+use crate::value::{FnDef, FunctionId, NumericOrder, SharedValue, Value};
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -292,6 +292,8 @@ struct ExprFrame {
     owner: Block,
     /// `owner` 内の文の index。
     stmt_index: usize,
+    /// 文のどの式スロットか（[`stmt_slot_expr`]。tree-expr-continuation-e2b）。
+    slot: usize,
     /// 式スロットの根から評価中のノードまでの子の位置の経路。
     path: Vec<usize>,
     /// 文の行（同期経路の `eval_expr` と同じく、式のエラー行は文の行）。
@@ -303,6 +305,14 @@ struct ExprFrame {
     started: bool,
     /// call: callable / arity 検査を済ませたか。
     checked: bool,
+    /// dict: 処理を終えた entry の数。f-string: 次に処理する part の位置（e2b）。
+    item: usize,
+    /// dict: 作りかけの map（key の型検査と `check_collection` を済ませた entry。e2b）。
+    map: BTreeMap<String, Value>,
+    /// dict: 評価済みで value を待つ key（e2b）。
+    pending_key: Option<String>,
+    /// f-string: 描画済みの部分を連結した作りかけの文字列（e2b）。
+    text: String,
     /// 値の受け渡し先（親の式 frame の operand stack、または根なら文の受け渡し先）。
     dest: CallDest,
 }
@@ -334,6 +344,19 @@ enum CallDest {
     /// 最上位の式 frame（call ノード）をこの値で完了する（tree-expr-continuation-e2a。式の中の
     /// ユーザー関数呼び出しの戻り値）。
     ExprResult,
+    /// 以降は根の式 frame だけが持つ、文の式スロットの受け渡し先（tree-expr-continuation-e2b）。
+    /// `if` の条件: 真偽で分岐を選ぶ。
+    IfCond,
+    /// `while` の最初の条件: 偽なら完了、真なら While frame を積む。
+    WhileFirst,
+    /// `while` の反復ごとの条件の再評価（`advance_frame` の続き）。
+    WhileIter,
+    /// `for` の反復元: materialize して For frame を積む。
+    ForIter,
+    /// index 代入の index: 解決済みの代入先 cell を持ち、続けて value を評価する。
+    IndexAssignIndex { cell: SharedValue },
+    /// index 代入の value: 解決済みの代入先 cell と評価済みの index を持つ。
+    IndexAssignValue { cell: SharedValue, idx: Value },
 }
 
 /// ユーザー関数呼び出しの前処理の結果（tree-expr-continuation-e1）。
@@ -381,9 +404,22 @@ fn stmt_value_expr(stmt: &Stmt) -> Option<&Expr> {
     }
 }
 
+/// 文の式スロットを返す（tree-expr-continuation-e2b）。値の式スロットを持つ文は 0 が値、`if` / `while` は
+/// 0 が条件、`for` は 0 が反復元、index 代入は 0 が index・1 が value。
+fn stmt_slot_expr(stmt: &Stmt, slot: usize) -> Option<&Expr> {
+    match (stmt, slot) {
+        (Stmt::If { condition, .. } | Stmt::While { condition, .. }, 0) => Some(condition),
+        (Stmt::For { iter, .. }, 0) => Some(iter),
+        (Stmt::IndexAssign { index, .. }, 0) => Some(index),
+        (Stmt::IndexAssign { value, .. }, 1) => Some(value),
+        (_, 0) => stmt_value_expr(stmt),
+        _ => None,
+    }
+}
+
 /// 式 frame が指す式ノードを辿る（tree-expr-continuation-e2a）。
-fn expr_at<'a>(owner: &'a Block, stmt_index: usize, path: &[usize]) -> &'a Expr {
-    let mut node = stmt_value_expr(&owner[stmt_index]).expect("式スロットを持つ文");
+fn expr_at<'a>(owner: &'a Block, stmt_index: usize, slot: usize, path: &[usize]) -> &'a Expr {
+    let mut node = stmt_slot_expr(&owner[stmt_index], slot).expect("式スロットを持つ文");
     for &index in path {
         node = crate::ast::expr_child(node, index).expect("経路の子が存在する");
     }
@@ -2127,6 +2163,20 @@ impl Evaluator {
                 // self.frames ではなくローカル `site` に紐づくので、eval_expr（&mut self）を
                 // 呼べる。
                 let (condition, _cond_line) = site.while_parts();
+                // tree-expr-continuation-e2b: 条件が式 frame を要するなら、根の式 frame で評価し、
+                // 値は受け渡し先（`CallDest::WhileIter`）がこの続きを行う。
+                if self.can_yield_ctx && self.needs_expr_frame(condition) {
+                    let frame = self.new_expr_frame(
+                        site.owner.clone(),
+                        site.stmt_index,
+                        0,
+                        Vec::new(),
+                        line,
+                        CallDest::WhileIter,
+                    );
+                    self.frames.push(frame);
+                    return Ok(());
+                }
                 let cond = self.eval_expr(condition, line)?;
                 if cond.is_truthy() {
                     // 次反復の本体を積む前に、この While frame の pending_step を立てる。
@@ -2370,6 +2420,14 @@ impl Evaluator {
                 Ok(None)
             }
             CallDest::ExprResult => self.finish_expr_frame(value),
+            CallDest::IfCond
+            | CallDest::WhileFirst
+            | CallDest::WhileIter
+            | CallDest::ForIter
+            | CallDest::IndexAssignIndex { .. }
+            | CallDest::IndexAssignValue { .. } => {
+                unreachable!("文の式スロットの受け渡し先は finish_expr_frame が扱う")
+            }
         }
     }
 
@@ -2389,9 +2447,177 @@ impl Evaluator {
         let FrameKind::Expr(expr_frame) = frame.kind else {
             unreachable!("最上位は式 frame");
         };
-        let ExprFrame { dest, operands, .. } = *expr_frame;
+        let ExprFrame {
+            dest,
+            operands,
+            owner,
+            stmt_index,
+            line,
+            ..
+        } = *expr_frame;
         drop(operands);
-        self.deliver_call_result(dest, value)
+        match dest {
+            CallDest::IfCond
+            | CallDest::WhileFirst
+            | CallDest::WhileIter
+            | CallDest::ForIter
+            | CallDest::IndexAssignIndex { .. }
+            | CallDest::IndexAssignValue { .. } => {
+                self.deliver_slot_result(dest, &owner, stmt_index, line, value)
+            }
+            dest => self.deliver_call_result(dest, value),
+        }
+    }
+
+    /// 文の式スロットの根の式 frame の値を、同期経路の `exec_stmt` / `advance_frame` がその値に対して
+    /// 行っていた処理へ届ける（tree-expr-continuation-e2b）。frame を積む遷移は driver が積む
+    /// `StmtStep::Enter` と同じ frame を直接積む。
+    fn deliver_slot_result(
+        &mut self,
+        dest: CallDest,
+        owner: &Block,
+        stmt_index: usize,
+        line: usize,
+        value: Value,
+    ) -> Result<Option<FlowSignal>, TsumugiError> {
+        match dest {
+            CallDest::IfCond => {
+                let Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } = &owner[stmt_index]
+                else {
+                    unreachable!("IfCond は Stmt::If を指す");
+                };
+                let body = if value.is_truthy() {
+                    then_body.clone()
+                } else {
+                    else_body.clone()
+                };
+                let frame = self.enter_scoped_block(body, line)?;
+                self.frames.push(frame);
+            }
+            CallDest::WhileFirst => {
+                if value.is_truthy() {
+                    let frame = self.enter_while(owner, stmt_index, line)?;
+                    self.frames.push(frame);
+                }
+            }
+            CallDest::WhileIter => {
+                if value.is_truthy() {
+                    let Stmt::While { body, .. } = &owner[stmt_index] else {
+                        unreachable!("WhileIter は Stmt::While を指す");
+                    };
+                    if let FrameKind::While { pending_step, .. } =
+                        &mut self.frames.last_mut().expect("while frame present").kind
+                    {
+                        *pending_step = true;
+                    }
+                    self.begin_loop_iteration(body.clone(), line)?;
+                } else {
+                    self.pop_frame();
+                }
+            }
+            CallDest::ForIter => {
+                let items = self.materialize_for_items(&value, line)?;
+                if !items.is_empty() {
+                    let frame = self.enter_for(owner, stmt_index, items, value, line)?;
+                    self.frames.push(frame);
+                }
+            }
+            CallDest::IndexAssignIndex { cell } => {
+                self.index_assign_after_index(cell, value, owner, stmt_index, line)?;
+            }
+            CallDest::IndexAssignValue { cell, idx } => {
+                self.finish_index_assign(&cell, &idx, value, line)?;
+            }
+            _ => unreachable!("文の式スロットの受け渡し先だけが来る"),
+        }
+        Ok(None)
+    }
+
+    /// index 代入の index を評価し終えたあとの続き: value を評価する（式 frame が要るなら根の式 frame を
+    /// 積み、要らなければ `eval_expr` で評価して代入まで済ませる。tree-expr-continuation-e2b）。
+    fn index_assign_after_index(
+        &mut self,
+        cell: SharedValue,
+        idx: Value,
+        owner: &Block,
+        stmt_index: usize,
+        line: usize,
+    ) -> Result<(), TsumugiError> {
+        let Stmt::IndexAssign { value, .. } = &owner[stmt_index] else {
+            unreachable!("index 代入の続きは Stmt::IndexAssign を指す");
+        };
+        if self.needs_expr_frame(value) {
+            let frame = self.new_expr_frame(
+                owner.clone(),
+                stmt_index,
+                1,
+                Vec::new(),
+                line,
+                CallDest::IndexAssignValue { cell, idx },
+            );
+            self.frames.push(frame);
+            return Ok(());
+        }
+        let val = self.eval_expr(value, line)?;
+        self.finish_index_assign(&cell, &idx, val, line)
+    }
+
+    /// index 代入の書き込み（`exec_stmt` と式 frame の受け渡しで共有する）。
+    fn finish_index_assign(
+        &mut self,
+        cell: &SharedValue,
+        idx: &Value,
+        val: Value,
+        line: usize,
+    ) -> Result<(), TsumugiError> {
+        // REPL transaction のため、cellのin-place変更前に元値を記録する（AUD-024）。
+        self.env
+            .journal_cell(cell)
+            .map_err(|stop| self.control_stop_to_error(stop, line))?;
+        // 更新はcellへのin-place代入。index/valueの評価中に同じbindingが
+        // 変更されていても、その最新状態に対して書き込む。
+        let max_collection = self.budget.max_collection_elements();
+        crate::builtin_core::assign_index(
+            &mut cell.borrow_mut(),
+            idx,
+            val,
+            max_collection,
+            &mut self.budget,
+            line,
+        )?;
+        Ok(())
+    }
+
+    /// `for` の反復元を反復列に展開する（`exec_stmt` と式 frame の受け渡しで共有する）。
+    fn materialize_for_items(
+        &mut self,
+        collection: &Value,
+        line: usize,
+    ) -> Result<Vec<Value>, TsumugiError> {
+        match collection {
+            Value::List(list) => {
+                self.check_collection(list.len(), line)?;
+                // 開始時点の要素を snapshot する。ループ本体で元 binding を
+                // 変更しても make_mut が detach するため反復列は不変（AUD-047）。
+                Ok((**list).clone())
+            }
+            Value::Dict(map) => {
+                self.check_collection(map.len(), line)?;
+                Ok(map.keys().map(|k| Value::str_constant(k.clone())).collect())
+            }
+            Value::Str(s) => {
+                let size = s.chars().count();
+                self.check_collection(size, line)?;
+                Ok(s.chars()
+                    .map(|c| Value::str_constant(c.to_string()))
+                    .collect())
+            }
+            _ => Err(TsumugiError::not_iterable(line, collection)),
+        }
     }
 
     /// この式を式 frame で段階評価するか（tree-expr-continuation-e2a、yield 可能な driver だけ）。
@@ -2408,7 +2634,12 @@ impl Evaluator {
                 callee.as_ref(),
                 Expr::Ident(name) if self.env.get_cell(name).is_none()
             ),
-            Expr::BinOp { .. } | Expr::UnaryOp { .. } => true,
+            Expr::BinOp { .. }
+            | Expr::UnaryOp { .. }
+            | Expr::Index { .. }
+            | Expr::List(_)
+            | Expr::Dict(_)
+            | Expr::FStr(_) => true,
             _ => false,
         }
     }
@@ -2419,6 +2650,7 @@ impl Evaluator {
         &self,
         owner: Block,
         stmt_index: usize,
+        slot: usize,
         path: Vec<usize>,
         line: usize,
         dest: CallDest,
@@ -2429,11 +2661,16 @@ impl Evaluator {
             kind: FrameKind::Expr(Box::new(ExprFrame {
                 owner,
                 stmt_index,
+                slot,
                 path,
                 line,
                 operands: Vec::new(),
                 started: false,
                 checked: false,
+                item: 0,
+                map: BTreeMap::new(),
+                pending_key: None,
+                text: String::new(),
                 dest,
             })),
             scope_base: self.env.scope_depth(),
@@ -2447,11 +2684,12 @@ impl Evaluator {
         &mut self,
         owner: &Block,
         stmt_index: usize,
+        slot: usize,
         path: &[usize],
         index: usize,
         line: usize,
     ) -> Result<Option<FlowSignal>, TsumugiError> {
-        let node = expr_at(owner, stmt_index, path);
+        let node = expr_at(owner, stmt_index, slot, path);
         let child = crate::ast::expr_child(node, index).expect("child exists");
         if self.needs_expr_frame(child) {
             let mut child_path = path.to_vec();
@@ -2459,6 +2697,7 @@ impl Evaluator {
             let frame = self.new_expr_frame(
                 owner.clone(),
                 stmt_index,
+                slot,
                 child_path,
                 line,
                 CallDest::Operand,
@@ -2478,23 +2717,24 @@ impl Evaluator {
     /// `prepare_call` と同じ順序（`count_step` → 深度検査 → callee → callable / arity 検査 → 引数を
     /// 左から → 束縛 → call trace）で進め、本体は driver 上の Call frame で実行する。
     fn step_expr(&mut self) -> Result<Option<FlowSignal>, TsumugiError> {
-        let (owner, stmt_index, path, line) = {
+        let (owner, stmt_index, slot, path, line) = {
             let frame = self.expr_frame_mut();
             (
                 frame.owner.clone(),
                 frame.stmt_index,
+                frame.slot,
                 frame.path.clone(),
                 frame.line,
             )
         };
-        let node = expr_at(&owner, stmt_index, &path);
+        let node = expr_at(&owner, stmt_index, slot, &path);
         match node {
             Expr::Call { callee, args } => {
                 if !self.expr_frame_mut().started {
                     self.begin_user_call(line)?;
                     self.expr_frame_mut().started = true;
                     let Expr::Ident(name) = callee.as_ref() else {
-                        return self.begin_expr_child(&owner, stmt_index, &path, 0, line);
+                        return self.begin_expr_child(&owner, stmt_index, slot, &path, 0, line);
                     };
                     let value = self
                         .env
@@ -2509,7 +2749,7 @@ impl Evaluator {
                 }
                 let next = self.expr_frame_mut().operands.len();
                 if next <= args.len() {
-                    return self.begin_expr_child(&owner, stmt_index, &path, next, line);
+                    return self.begin_expr_child(&owner, stmt_index, slot, &path, next, line);
                 }
                 let mut operands = std::mem::take(&mut self.expr_frame_mut().operands);
                 let callee_value = operands.remove(0);
@@ -2533,7 +2773,7 @@ impl Evaluator {
             Expr::BinOp { op, .. } => {
                 let count = self.expr_frame_mut().operands.len();
                 match (op, count) {
-                    (_, 0) => self.begin_expr_child(&owner, stmt_index, &path, 0, line),
+                    (_, 0) => self.begin_expr_child(&owner, stmt_index, slot, &path, 0, line),
                     (BinOpKind::And | BinOpKind::Or, 1) => {
                         let truthy = self.expr_frame_mut().operands[0].is_truthy();
                         let short = match op {
@@ -2544,14 +2784,14 @@ impl Evaluator {
                             let left = self.expr_frame_mut().operands.pop().expect("left");
                             self.finish_expr_frame(left)
                         } else {
-                            self.begin_expr_child(&owner, stmt_index, &path, 1, line)
+                            self.begin_expr_child(&owner, stmt_index, slot, &path, 1, line)
                         }
                     }
                     (BinOpKind::And | BinOpKind::Or, _) => {
                         let right = self.expr_frame_mut().operands.pop().expect("right");
                         self.finish_expr_frame(right)
                     }
-                    (_, 1) => self.begin_expr_child(&owner, stmt_index, &path, 1, line),
+                    (_, 1) => self.begin_expr_child(&owner, stmt_index, slot, &path, 1, line),
                     _ => {
                         let operands = std::mem::take(&mut self.expr_frame_mut().operands);
                         let result = self.eval_binop(&operands[0], op, &operands[1], line)?;
@@ -2566,14 +2806,114 @@ impl Evaluator {
             }
             Expr::UnaryOp { op, .. } => {
                 if self.expr_frame_mut().operands.is_empty() {
-                    return self.begin_expr_child(&owner, stmt_index, &path, 0, line);
+                    return self.begin_expr_child(&owner, stmt_index, slot, &path, 0, line);
                 }
                 let operands = std::mem::take(&mut self.expr_frame_mut().operands);
                 let value = self.eval_unary(op, &operands[0], line)?;
                 drop(operands);
                 self.finish_expr_frame(value)
             }
-            _ => unreachable!("式 frame は call・二項・単項だけを段階評価する"),
+            Expr::Index { .. } => match self.expr_frame_mut().operands.len() {
+                0 => self.begin_expr_child(&owner, stmt_index, slot, &path, 0, line),
+                1 => self.begin_expr_child(&owner, stmt_index, slot, &path, 1, line),
+                _ => {
+                    let operands = std::mem::take(&mut self.expr_frame_mut().operands);
+                    let value = self.eval_index(&operands[0], &operands[1], line)?;
+                    drop(operands);
+                    self.finish_expr_frame(value)
+                }
+            },
+            Expr::List(items) => {
+                // 要素を評価するたびに、次の要素の評価（または list の生成）の前に上限を検査する。
+                let evaluated = self.expr_frame_mut().operands.len();
+                if evaluated > 0 {
+                    self.check_collection(evaluated, line)?;
+                }
+                if evaluated < items.len() {
+                    return self.begin_expr_child(&owner, stmt_index, slot, &path, evaluated, line);
+                }
+                let values = std::mem::take(&mut self.expr_frame_mut().operands);
+                // heap 課金付きで tracked backing を作る（REV-015 案A、§5.2）。
+                let value = Value::new_list(values, &mut self.budget, ExecutionPhase::Run)
+                    .map_err(|stop| self.control_stop_to_error(stop, line))?;
+                self.finish_expr_frame(value)
+            }
+            Expr::Dict(pairs) => {
+                let frame = self.expr_frame_mut();
+                let item = frame.item;
+                if frame.pending_key.is_none() {
+                    // key の評価 → key の型検査。
+                    let Some(key) = frame.operands.pop() else {
+                        return self.begin_expr_child(
+                            &owner,
+                            stmt_index,
+                            slot,
+                            &path,
+                            2 * item,
+                            line,
+                        );
+                    };
+                    match key {
+                        Value::Str(s) => frame.pending_key = Some(s.to_string()),
+                        other => return Err(TsumugiError::dict_key_type(line, &other)),
+                    }
+                    return Ok(None);
+                }
+                // value の評価 → `check_collection`（新しい key のとき）→ 挿入。
+                let Some(val) = frame.operands.pop() else {
+                    return self.begin_expr_child(
+                        &owner,
+                        stmt_index,
+                        slot,
+                        &path,
+                        2 * item + 1,
+                        line,
+                    );
+                };
+                let key = frame.pending_key.take().expect("pending key");
+                let new_len = (!frame.map.contains_key(&key)).then(|| frame.map.len() + 1);
+                if let Some(len) = new_len {
+                    self.check_collection(len, line)?;
+                }
+                let frame = self.expr_frame_mut();
+                frame.map.insert(key, val);
+                frame.item += 1;
+                if frame.item < pairs.len() {
+                    return Ok(None);
+                }
+                let map = std::mem::take(&mut frame.map);
+                let value = Value::new_dict(map, &mut self.budget, ExecutionPhase::Run)
+                    .map_err(|stop| self.control_stop_to_error(stop, line))?;
+                self.finish_expr_frame(value)
+            }
+            Expr::FStr(parts) => {
+                // 式の部分を評価するたびに描画して足す（fuel と per-item byte 上限の課金はその時点）。
+                if let Some(val) = self.expr_frame_mut().operands.pop() {
+                    let rendered = self
+                        .budget
+                        .render_display(&val, ExecutionPhase::Run)
+                        .map_err(|stop| self.control_stop_to_error(stop, line))?;
+                    self.expr_frame_mut().text.push_str(&rendered);
+                }
+                let frame = self.expr_frame_mut();
+                while let Some(FStrExprPart::Literal(literal)) = parts.get(frame.item) {
+                    frame.text.push_str(literal);
+                    frame.item += 1;
+                }
+                if frame.item >= parts.len() {
+                    let text = std::mem::take(&mut frame.text);
+                    // f-string の生成 body も dispatch を経由しないため課金する（REV-015 Slice 2）。
+                    let value = self
+                        .budget
+                        .track_result(Value::str_constant(text), ExecutionPhase::Run)
+                        .map_err(|stop| self.control_stop_to_error(stop, line))?;
+                    return self.finish_expr_frame(value);
+                }
+                let next = frame.item;
+                frame.item += 1;
+                self.begin_expr_child(&owner, stmt_index, slot, &path, next, line)
+            }
+            _ => unreachable!("式 frame は段階評価する式種だけを持つ"),
         }
     }
 
@@ -2839,21 +3179,7 @@ impl Evaluator {
                 let idx = self.eval_expr(index, *line)?;
                 let val = self.eval_expr(value, *line)?;
 
-                // REPL transaction のため、cellのin-place変更前に元値を記録する（AUD-024）。
-                self.env
-                    .journal_cell(&cell)
-                    .map_err(|stop| self.control_stop_to_error(stop, *line))?;
-                // 更新はcellへのin-place代入。index/valueの評価中に同じbindingが
-                // 変更されていても、その最新状態に対して書き込む。
-                let max_collection = self.budget.max_collection_elements();
-                crate::builtin_core::assign_index(
-                    &mut cell.borrow_mut(),
-                    &idx,
-                    val,
-                    max_collection,
-                    &mut self.budget,
-                    *line,
-                )?;
+                self.finish_index_assign(&cell, &idx, val, *line)?;
 
                 Ok(StmtStep::Val)
             }
@@ -2896,28 +3222,7 @@ impl Evaluator {
 
             Stmt::For { iter, line, .. } => {
                 let collection = self.eval_expr(iter, *line)?;
-                let items: Vec<Value> = match &collection {
-                    Value::List(list) => {
-                        self.check_collection(list.len(), *line)?;
-                        // 開始時点の要素を snapshot する。ループ本体で元 binding を
-                        // 変更しても make_mut が detach するため反復列は不変（AUD-047）。
-                        (**list).clone()
-                    }
-                    Value::Dict(map) => {
-                        self.check_collection(map.len(), *line)?;
-                        map.keys().map(|k| Value::str_constant(k.clone())).collect()
-                    }
-                    Value::Str(s) => {
-                        let size = s.chars().count();
-                        self.check_collection(size, *line)?;
-                        s.chars()
-                            .map(|c| Value::str_constant(c.to_string()))
-                            .collect()
-                    }
-                    _ => {
-                        return Err(TsumugiError::not_iterable(*line, &collection));
-                    }
-                };
+                let items = self.materialize_for_items(&collection, *line)?;
                 if items.is_empty() {
                     return Ok(StmtStep::Val);
                 }
@@ -3033,6 +3338,10 @@ impl Evaluator {
         owner: &Block,
         stmt_index: usize,
     ) -> Result<Option<StmtStep>, TsumugiError> {
+        // tree-expr-continuation-e2b: `if` / `while` の条件・`for` の反復元・index 代入の index と値。
+        if let Some(step) = self.exec_driver_slot_stmt(stmt, owner, stmt_index)? {
+            return Ok(Some(step));
+        }
         let Some(expr) = stmt_value_expr(stmt) else {
             return Ok(None);
         };
@@ -3062,6 +3371,7 @@ impl Evaluator {
             return Ok(Some(StmtStep::Enter(self.new_expr_frame(
                 owner.clone(),
                 stmt_index,
+                0,
                 Vec::new(),
                 line,
                 dest,
@@ -3092,6 +3402,63 @@ impl Evaluator {
                 heap_charge: 0,
             }))),
         }
+    }
+
+    /// 文の式スロット（`if` / `while` の条件・`for` の反復元・index 代入の index と value）の式が
+    /// 式 frame を要するとき、根の式 frame を積む（tree-expr-continuation-e2b、yield 可能な driver だけ）。
+    /// 要らなければ `None` を返し、`exec_stmt` が従来どおり `eval_expr` で評価する。
+    #[inline(never)]
+    fn exec_driver_slot_stmt(
+        &mut self,
+        stmt: &Stmt,
+        owner: &Block,
+        stmt_index: usize,
+    ) -> Result<Option<StmtStep>, TsumugiError> {
+        let (expr, dest) = match stmt {
+            Stmt::If { condition, .. } => (condition, CallDest::IfCond),
+            Stmt::While { condition, .. } => (condition, CallDest::WhileFirst),
+            Stmt::For { iter, .. } => (iter, CallDest::ForIter),
+            Stmt::IndexAssign {
+                name,
+                index,
+                value,
+                line,
+            } => {
+                if !self.needs_expr_frame(index) && !self.needs_expr_frame(value) {
+                    return Ok(None);
+                }
+                // 規範順序: target binding解決 → index → value → in-place更新（同期経路と同じ）。
+                let cell = self
+                    .env
+                    .get_cell(name)
+                    .ok_or_else(|| TsumugiError::undefined_name(*line, name))?;
+                if self.needs_expr_frame(index) {
+                    return Ok(Some(StmtStep::Enter(self.new_expr_frame(
+                        owner.clone(),
+                        stmt_index,
+                        0,
+                        Vec::new(),
+                        *line,
+                        CallDest::IndexAssignIndex { cell },
+                    ))));
+                }
+                let idx = self.eval_expr(index, *line)?;
+                self.index_assign_after_index(cell, idx, owner, stmt_index, *line)?;
+                return Ok(Some(StmtStep::Val));
+            }
+            _ => return Ok(None),
+        };
+        if !self.needs_expr_frame(expr) {
+            return Ok(None);
+        }
+        Ok(Some(StmtStep::Enter(self.new_expr_frame(
+            owner.clone(),
+            stmt_index,
+            0,
+            Vec::new(),
+            stmt.line(),
+            dest,
+        ))))
     }
 
     /// 独立スコープブロック（`if` 分岐・`try`/`catch` 本体）の frame を組み立てる。
@@ -4642,6 +5009,156 @@ mod tests {
         assert!(eval.frames.is_empty() && eval.call_stack.is_empty());
         assert_eq!(eval.env.scope_depth(), depth_before);
         assert_eq!(eval.env.get("work"), None, "transaction は rollback される");
+    }
+
+    // -------------------------------------------------------------------------
+    // tree-expr-continuation-e2b: index・list / dict・f-string と、文の式スロット
+    // -------------------------------------------------------------------------
+
+    const E2B_FN: &str =
+        "fn id(x)\n  let i = 0\n  while i < 2\n    i = i + 1\n  end\n  return x\nend\n";
+
+    /// 上限を絞った budget で強制 yield 付き poll 経路を terminal まで回す。
+    fn run_forced_limited(
+        input: &str,
+        max_collection: u64,
+    ) -> (Result<(), TsumugiError>, Evaluator, usize) {
+        let program = parse_program(input);
+        let mut eval = Evaluator::with_budget(BudgetConfig::for_legacy(1_000_000, max_collection));
+        eval.force_yield_every_boundary = true;
+        eval.begin_execution(&program, input.len() as u64, false)
+            .expect("begin_execution");
+        let mut yields = 0usize;
+        let result = loop {
+            match eval.run_slice(u64::MAX) {
+                SliceOutcome::Terminal(result) => break result,
+                _ => yields += 1,
+            }
+        };
+        (result, eval, yields)
+    }
+
+    /// TEC-AT-01（e2b 分）: `max_collection_elements` 超過（list・dict・`for` の反復元）が、同期経路と
+    /// 同じエラー・行・trace・fuel になる。
+    #[test]
+    fn e2b_collection_limit_matches_sync_path() {
+        let cases = [
+            format!("{E2B_FN}let a = [id(1), id(2), id(3)]\n"),
+            format!("{E2B_FN}let d = {{\"a\": id(1), \"b\": id(2), \"c\": id(3)}}\n"),
+            // 重複 key は上限を数えない。
+            format!(
+                "{E2B_FN}let d = {{\"a\": id(1), \"a\": id(2), \"b\": id(3)}}\nlet n = len(d)\n"
+            ),
+            format!("{E2B_FN}for v in id([1, 2, 3])\n  let x = v\nend\n"),
+            format!("{E2B_FN}for v in id(\"abc\")\n  let x = v\nend\n"),
+        ];
+        for src in cases {
+            let (forced, forced_eval, _) = run_forced_limited(&src, 2);
+            let program = parse_program(&src);
+            let mut sync_eval = Evaluator::with_budget(BudgetConfig::for_legacy(1_000_000, 2));
+            let sync = sync_eval.run(&program, src.len() as u64);
+            match (&forced, &sync) {
+                (Ok(()), Ok(())) => {}
+                (Err(f), Err(s)) => assert_eq!(f, s, "{src}"),
+                _ => panic!("結果が一致しない: {forced:?} / {sync:?}\n{src}"),
+            }
+            assert_eq!(
+                forced_eval.budget_usage().committed.fuel,
+                sync_eval.budget_usage().committed.fuel,
+                "{src}"
+            );
+            assert!(forced_eval.frames.is_empty() && forced_eval.call_stack.is_empty());
+        }
+    }
+
+    /// TEC-AT-02（e2b 分）: dict の作りかけの map・評価済みの key、f-string の作りかけの文字列、
+    /// index 代入の解決済み cell と index が、yield を跨いで式 frame / 受け渡し先に保存される。
+    /// TEC-AT-03（e2b 分）: e2b の式種・式スロットを含む script の poll 経路の `live_heap` /
+    /// `peak_heap` と fuel が `Evaluator::run` と一致する。
+    #[test]
+    fn e2b_expr_frame_preserves_partial_state_across_yields() {
+        let src = format!(
+            "{E2B_FN}let d = {{\"a\": id(1), \"b\": id(2), \"c\": id(3)}}\n\
+             let s = f\"x{{id(1)}}y{{id(2)}}z\"\n\
+             let xs = [0, 0, 0]\n\
+             xs[id(1)] = id(7)\n\
+             xs[2] = id(8)\n\
+             let l = [id(1), id(2), id(3)]\n\
+             let t = l[id(0)]\n\
+             let n = 0\n\
+             while id(n) < 2\n  n = n + 1\nend\n\
+             if id(true)\n  n = n + 10\nend\n\
+             for v in id([1, 2])\n  n = n + v\nend\n"
+        );
+        let (mut max_map, mut max_text, mut idx_cell, mut key_held, mut items) =
+            (0, 0, false, false, 0);
+        let (forced, forced_eval, yields) = run_forced(&src, |eval| {
+            for frame in &eval.frames {
+                if let FrameKind::Expr(expr) = &frame.kind {
+                    max_map = max_map.max(expr.map.len());
+                    max_text = max_text.max(expr.text.len());
+                    key_held |= expr.pending_key.is_some();
+                    items = items.max(expr.operands.len());
+                    idx_cell |= matches!(expr.dest, CallDest::IndexAssignValue { .. });
+                }
+            }
+        });
+        let (sync, sync_eval) = run_sync(&src);
+        assert!(forced.is_ok() && sync.is_ok(), "{forced:?} / {sync:?}");
+        assert!(yields > 50, "式の境界でも yield する: {yields}");
+        assert!(
+            max_map >= 2,
+            "dict の作りかけの map が保存される: {max_map}"
+        );
+        assert!(key_held, "評価済みで value を待つ key が保存される");
+        assert!(
+            max_text >= 3,
+            "f-string の作りかけの文字列が保存される: {max_text}"
+        );
+        assert!(
+            idx_cell,
+            "index 代入の cell と index が受け渡し先に保存される"
+        );
+        assert!(items >= 2, "list の評価済み要素が保存される: {items}");
+        for name in ["d", "s", "xs", "l", "t", "n"] {
+            assert_eq!(forced_eval.env.get(name), sync_eval.env.get(name), "{name}");
+        }
+        assert_eq!(forced_eval.env.get("n"), Some(Value::Int(15)));
+        let (f, s) = (forced_eval.budget_usage(), sync_eval.budget_usage());
+        assert_eq!(f.committed.fuel, s.committed.fuel);
+        assert_eq!(f.live_heap_bytes, s.live_heap_bytes);
+        assert_eq!(f.peak_heap_bytes, s.peak_heap_bytes);
+        assert!(forced_eval.frames.is_empty() && forced_eval.call_stack.is_empty());
+        assert_eq!(forced_eval.env.scope_depth(), sync_eval.env.scope_depth());
+    }
+
+    /// 文の式スロットの途中で yield した session を中断すると、式 frame と driver 上の呼び出しが
+    /// 畳まれる。
+    #[test]
+    fn e2b_abort_inside_slot_expr_frame_restores_call_state() {
+        let src = format!("{E2B_FN}let xs = [0]\nxs[id(0)] = id(1)\n");
+        let program = parse_program(&src);
+        let mut eval = Evaluator::new();
+        eval.force_yield_every_boundary = true;
+        let depth_before = eval.env.scope_depth();
+        eval.begin_execution(&program, src.len() as u64, true)
+            .expect("begin_execution");
+        let holding_cell = |eval: &Evaluator| {
+            eval.frames.iter().any(|frame| {
+                matches!(&frame.kind, FrameKind::Expr(expr)
+                    if matches!(expr.dest, CallDest::IndexAssignValue { .. }))
+            })
+        };
+        while !(eval.in_driver_call() && holding_cell(&eval)) {
+            assert!(!matches!(
+                eval.run_slice(u64::MAX),
+                SliceOutcome::Terminal(_)
+            ));
+        }
+        eval.abort_session();
+        assert!(eval.frames.is_empty() && eval.call_stack.is_empty());
+        assert_eq!(eval.env.scope_depth(), depth_before);
+        assert_eq!(eval.env.get("xs"), None, "transaction は rollback される");
     }
 
     #[test]
