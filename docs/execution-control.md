@@ -1948,8 +1948,10 @@ builtin・host のどれに解決されるかは静的には決まらない（us
     - **式スロットの指し方**: 式 frame の根は「所有する Block・文の index・その文のどの式スロットか」で指す（e2a の
       `stmt_value_expr` が返す値の位置に、条件・反復元・index 代入の index / value を加える）。経路で子を辿る規則は e2a と同じ。
     - **入口**: 新しい式スロットは、式が `needs_expr_frame`（e2b の式種を加えたもの）に当たるとき根の式 frame で評価する。
-      e1 の形（それ自体 `Expr::Call` で callee と全引数が呼び出しを含まない）の式も、新しい式スロットでは根の式 frame で
-      評価する（e1 の Call frame へ直接入る経路は e1 の 4 位置だけに残す。式 frame の call も同じ前処理順序を通るので
+      e1 の形（それ自体 `Expr::Call` で callee と全引数が呼び出しを含まない）の式も、新しい式スロットでは e1 の直接の経路
+      （`exec_driver_call_stmt` から Call frame へ入る経路）を使わず、`needs_expr_frame` に従う。すなわち callee が user binding を
+      持つときは根の式 frame で評価し、持たないとき（builtin / 登録 host function / cooperative host function / 未定義名）は
+      従来どおり `eval_expr` で評価する（e1 の直接の経路は e1 の 4 位置だけに残す。式 frame の call も同じ前処理順序を通るので
       観測は変わらない）。
     - **受け渡し先**: 根の式 frame の値は、同期経路の `exec_stmt` / `advance_frame` がその値に対して行っていた処理へ届ける。
       `if`: 真偽で分岐を選び `enter_scoped_block` の frame を積む。`while`（最初の評価）: 偽なら完了、真なら `enter_while` の
