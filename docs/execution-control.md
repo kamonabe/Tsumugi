@@ -1963,7 +1963,8 @@ builtin・host のどれに解決されるかは静的には決まらない（us
   - `while` の条件と `for` の反復元の評価のエラーは、反復境界（`advance_frame`）でのエラーと同じく最も近い `try` へ渡す。
     エラー行は同期経路と同じく文の行。
   - **cooperative host-call の Pending**: 文の式スロットの式 frame の中で Pending を返した場合は e2a と同じく式 frame を
-    畳んで文の評価を最初からやり直す（index 代入は binding の解決からやり直す。現行 §4.7「同じ文の再評価」と同じ観測）。
+    畳んで文の評価を最初からやり直す（index 代入は binding の解決からやり直す。cooperative host-call の Pending で文の cursor を戻し、resume でその文を
+    最初から評価し直す現行の「同じ文の再評価」と同じ観測）。
     `while` の条件の再評価（反復境界）での Pending は現行の反復境界の扱い（`advance_frame` の Pending をそのまま yield し、
     resume で While frame から条件を再評価する。反復完了後の `count_step` は再評価の前に済んでいるので二重に課金しない）と
     同じ観測にする。
