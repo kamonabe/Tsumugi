@@ -136,6 +136,7 @@ parent     = "Phase 6 残"
 spec_slice = "determinism Slice 5"
 spec       = { doc = "docs/determinism-and-audit.md", section = "fix-audit-sink-reentrancy-guard 実装スライス（sink callback 中の同じ Engine への再入検出）" }
 acceptance = ["RG-AT-01..05"]
+design_pr  = 281
 depends_on = ["A-1"]
 order      = 9
 
