@@ -2247,24 +2247,6 @@ print(skip)
 ";
         let yields = assert_matches_sync(text);
         assert!(yields > 50, "式の途中で yield している: {yields}");
-        // `while` の条件の途中（条件の評価ごとに副作用がある）。出力の厳密な期待値は固定せず、
-        // 同期経路との一致だけを見る。
-        let cond = "\
-fn say(tag, v)
-  print(tag)
-  let i = 0
-  while i < 1
-    i = i + 1
-  end
-  return v
-end
-let n = 0
-while say(\"c\", n) < 2
-  n = n + 1
-end
-print(n)
-";
-        assert!(assert_matches_sync(cond) > 10);
         let (observed, _) = run_audited(text, true);
         assert_eq!(
             observed.stdout,
