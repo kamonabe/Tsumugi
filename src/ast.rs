@@ -395,7 +395,7 @@ pub(crate) fn contains_call(expr: &Expr) -> bool {
 /// 式 frame が段階評価する式ノードの子を位置で返す（tree-expr-continuation-e2a）。
 ///
 /// call は 0 が callee・`i` が引数 `i - 1`、二項は 0 が左辺・1 が右辺、単項は 0 が operand。
-/// それ以外の式種・範囲外の位置は `None`。
+/// index・list・dict・f-string の位置は下の注記のとおり。それ以外の式種・範囲外の位置は `None`。
 pub(crate) fn expr_child(expr: &Expr, index: usize) -> Option<&Expr> {
     match expr {
         Expr::Call { callee, args } => match index {
@@ -408,6 +408,22 @@ pub(crate) fn expr_child(expr: &Expr, index: usize) -> Option<&Expr> {
             _ => None,
         },
         Expr::UnaryOp { expr, .. } if index == 0 => Some(expr),
+        // tree-expr-continuation-e2b: index は 0 が object・1 が index、list は要素 `i`、dict は
+        // 2i が entry i の key・2i + 1 がその value、f-string は式の部分（part の位置 `i`。
+        // リテラル部分は `None`）。
+        Expr::Index { object, index: idx } => match index {
+            0 => Some(object),
+            1 => Some(idx),
+            _ => None,
+        },
+        Expr::List(items) => items.get(index),
+        Expr::Dict(pairs) => pairs
+            .get(index / 2)
+            .map(|(key, value)| if index.is_multiple_of(2) { key } else { value }),
+        Expr::FStr(parts) => match parts.get(index) {
+            Some(FStrExprPart::Expr(child)) => Some(child),
+            _ => None,
+        },
         _ => None,
     }
 }
