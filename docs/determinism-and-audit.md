@@ -1908,6 +1908,42 @@ c1 は byte 計測にも redaction にも配線しないため、c1 だけでは
   - **SC-AT-20**: 同じ入力では縮退結果と envelope 列が 100 回一致する（§15.1）。
 - **想定の変更規模**: `src/audit.rs`・`src/eval.rs`（または event を積む箇所）・`src/embedding.rs` で約 100〜180 行。仕組みは縮退 1 つ。
 
+#### fix-audit-sink-reentrancy-guard 実装スライス（sink callback 中の同じ Engine への再入検出）
+
+> 状態: **未実装**（設計のみ）。loop:drift #263 D-9（Q2=A、返信なしのため推奨案で確定）で足した `fix` スライス。§10 の「sink callback中に同じEngineの…を呼んではならない。thread-local reentrancy guardで検出し`AuditSinkError::Reentrant`にする」と §15.3 の「sink callbackのEngine再入を拒否し、deadlockしない」を満たす。判断 Q1（再入した呼び出しへ何を返すか・どの入口を対象にするか）は設計 PR で判断待ちであり、以下の実装範囲は推奨案 A で書いている。Q1 が確定したら、選んだ内容を §10 にも反映する。
+
+設計時点（main `b7ce903`）の事実:
+
+- `AuditSinkError::Reentrant` は型だけで、生成する箇所が無い（`src/audit.rs` の `AuditSinkError`）。
+- facade の `Engine`（`src/embedding.rs`）は `Send + Sync`（同ファイルのコンパイル時アサーション）で、`Send + Sync` の部品（`Arc<dyn AuditSink>`・`Arc<HostFunctionRegistry>`）だけを持ち、内部に lock を持たない。sink は `EngineBuilder::audit_sink` で渡すため、sink が `Arc<Engine>` を後から受け取れば、callback の中から同じ Engine の入口を呼べる。
+- sink の `submit` を呼ぶのは次の 3 か所で、どれも run を呼んだ thread の上で同期に呼ぶ: `run_audited_inner` の Started の submit と、Started 失敗時の Terminal の submit、`AuditDelivery::deliver`（host-call triple・`Yielded`/`Resumed`・`BudgetCharged`・Terminal の配送と、backpressure 中の同じ batch の再送）。
+- facade の公開入口は `compile`・`link`・`link_for_repl`・`run`・`run_for_repl`・`run_audited` の 6 つである。§10 が挙げる start/poll/pause/resume/cancel は scheduler の `ExecutionHandle`（`src/engine.rs`）の操作で、scheduler の `Engine` は sink を持たない（逸脱一覧の B-1 の行）。facade では start と poll は run 系 3 入口の中にあり、pause/resume の入口は無い。cancel は `CancellationToken`（`Send + Sync` の flag）で、Engine の入口ではない。host function と別の audit emit は、run 系の入口を通らなければ呼べない。
+
+- **実装範囲**:
+  - `src/audit.rs` に thread-local の guard を置く。中身は「この thread で今 sink callback の中にいる Engine の `EngineId` の列」と「その callback の中で再入が試みられたか」の印である。sink の `submit` を呼ぶ 3 か所を、guard に入って `submit` を呼び、出るときに印を確かめる 1 つの helper に通す。guard から出る処理は RAII（`Drop`）で行い、sink が panic して unwind した場合も列から外れるようにする。別の Engine の sink callback が入れ子になった場合も、入った順に積み、出るときに自分の分だけを外す。
+  - facade の 6 入口は、最初に「この thread で、この Engine（`self.id`）の sink callback の中か」を確かめる。中であれば、何も実行せずに拒否し、guard の印を立てる。拒否の返し方（Q1 = A）: `run`・`run_for_repl` は `ExecutionOutcome::InternalFailure`、`run_audited` は `AuditedOutcome::Outcome(InternalFailure)`、`compile` は `CompileDiagnosticCode::InternalFault` の診断 1 件の `CompileErrors`、`link`・`link_for_repl` は `LinkError::InternalFailure`。この検査は poison・running の検査より前に行い、渡された context の `running`・`poisoned`・binding を変えない（同じ context への再入を拒否する既存の検査と同じく、拒否で context を poison しない）。
+  - `submit` から戻ったとき印が立っていれば、sink が返した値（`Ack` でも）を捨てて `AuditSubmit::Failed(AuditSinkError::Reentrant)` として扱う。以降は既存の `Failed` と同じ経路を通る: Started なら script work を行わず `Terminal(AuditFailure)` を emergency slot へ append して `AuditFailed { failure: AuditFailure::Sink }`、実行途中・Terminal の配送なら `AuditFailure::Sink` で fail-closed（§10.1）。`AuditFailure` に variant は足さない（`AuditSinkError` の他の variant と同じく `Sink` に畳む）。
+  - `AuditSinkError::Reentrant` の doc comment から「A-1 では検出配線なし」を外す。
+- **範囲外**:
+  - 別の thread からの呼び出しは thread-local guard の対象外であり、検出しない（§10 の「thread-local reentrancy guard」どおり）。sink が別 thread で同じ Engine を使っても、facade の `Engine` は lock を持たないため deadlock はしない。
+  - scheduler の `Engine`（`src/engine.rs`）と `ExecutionHandle` は sink を持たないため対象外。sink を持つ scheduler 経路は E10 統合のスライスで扱う。
+  - `CancellationToken::cancel` は止めない（別 thread からの cancel を受けるための flag で、execution-control の契約どおり callback からも呼べる）。
+  - `AuditWaker`・`AuditCompleter::complete` から呼ばれる waker の中の再入（[実行予算・協調実行仕様](execution-control.md) の waker 契約）は扱わない。
+  - sink の panic の捕捉方法（Started の submit が `catch_host_unwind` の外にあること）は変えない。guard が unwind で外れることだけを保つ。
+  - VM は対象外（監査 sink と VM の同時設定は build で拒否される）。
+- **done PR で行う逸脱一覧の更新**: 逸脱一覧の「`AuditSinkError::Reentrant` は型だけで…」の行を削除し、表の下の段落から D-9 についての記述（「`AuditSinkError::Reentrant` が型だけである行（D-9）」と、D-9 の理由の文）を削除する。D-8 についての記述は残す。
+- **判断 Q1（判断待ち。推奨は A）**: §10 は「呼んではならない」「guard で検出し `AuditSinkError::Reentrant` にする」とだけ書き、再入した呼び出しそのものに何を返すか、facade のどの入口を対象にするかを決めていない。どれを選ぶかで公開 API の挙動（と、B では公開型）が決まる。
+  - A（推奨）: facade の 6 入口すべてを対象にし、既存の InternalFailure 系（上記）で拒否する。公開型を増やさない。根拠: [組み込みAPI仕様](embedding-api.md)「同じcontext/handleへの再入は許さず`InternalFailure`とする」、[Capability Model仕様](capability-model.md) §11.3 の host callback の再入禁止と同じ扱いになる。§10 の列挙に compile が含まれる。外側の execution は `Reentrant` で fail-closed になり、host は `AuditFailed` で契約違反を観測できる。manifesto 原則 7（監査可能）・原則 8（小さく理解可能な中核）。
+  - B: A と同じ入口を対象にし、拒否を表す新しい公開 variant（`ContextError`／`LinkError`／`CompileDiagnosticCode` に `Reentrant` 相当）を足す。再入した呼び出しの側でも理由を区別できるが、公開 API が 3 つ増え、外側の `AuditFailed` と情報が重なる。
+  - C: run 系の 3 入口だけを対象にし、`compile`・`link`・`link_for_repl` は許す（audit を emit せず、execution の状態を持たないため）。変更は小さいが、§10 の列挙（compile）を直す必要がある。
+- **受入基準**:
+  - **RG-AT-01（Started の submit 中の再入）**: sink の callback から同じ Engine の `run_audited` を新しい context で呼ぶと、その呼び出しは `AuditedOutcome::Outcome(InternalFailure)` を返し、script を 1 文も実行しない（stdout 出力・host call が 0 件、渡した context は poison されない）。外側の実行は `AuditFailed { failure: AuditFailure::Sink }` になり、sink が受け取る envelope 列は Started と `Terminal(AuditFailure)` だけである。確かめ方: `tests/audit_reentrancy.rs` で、`OnceLock<Arc<Engine>>` を持つ記録用 sink を使う。
+  - **RG-AT-02（全入口と全配送点）**: callback の中から `compile`・`link`・`link_for_repl`・`run`・`run_for_repl`・`run_audited` を呼ぶと、それぞれ上記の型で拒否される。再入が host-call triple・`Yielded`/`Resumed`・`BudgetCharged`・Terminal の配送で起きた場合も、sink が `Ack` を返していても外側は `AuditFailure::Sink` で fail-closed になる。確かめ方: 入口ごと・「何回目の submit で再入するか」ごとの table-driven test。
+  - **RG-AT-03（別の Engine は許す）**: callback の中から別の Engine（sink なし・sink あり）を呼ぶと通常どおり実行され、外側の実行も成功する（envelope 列は再入しない場合と一致する）。確かめ方: 2 つの Engine を作る統合テスト。
+  - **RG-AT-04（guard の後始末）**: 再入で fail-closed になった実行・sink が `Failed` を返した実行・sink が panic した実行の後で、同じ thread から同じ Engine の `compile`・`run_audited` を（callback の外で）呼ぶと通常どおり成功する。2 つの Engine の callback が入れ子になった場合も、内側を出たあと外側の Engine への再入は引き続き拒否され、外側を出たあとは許される。確かめ方: 統合テストと `src/audit.rs` の guard の unit test。
+  - **RG-AT-05（deadlock しない・非破壊）**: RG-AT-01〜04 の各テストを別 thread で回し、上限時間（例: 10 秒）以内に戻ることを `recv_timeout` で確かめる。既存の `tests/audit_*.rs` は無改変で緑。sink なしの経路と、再入しない sink ありの経路は観測結果（envelope 列・`committed_bytes`・yield 位置・出力 byte・exit code）が変わらない。
+- **想定の変更規模**: `src/audit.rs` に約 50〜70 行（thread-local の guard・RAII・入口用の判定関数・doc comment）、`src/embedding.rs` に約 50〜80 行（submit 3 か所を helper へ通す・6 入口の先頭の検査と拒否の値）。合わせて約 100〜150 行。テストは新しい `tests/audit_reentrancy.rs`（約 250〜350 行）と `src/audit.rs` の unit test。触る仕組みは監査の sink 配送の境界 1 つ、受入基準は 5 項目。
+
 ### Slice 6: VM conformance
 
 - Charge opcode、StableError、FunctionId、host boundary、transaction、audit semantic eventをtreeと一致させる
