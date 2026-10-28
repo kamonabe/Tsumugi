@@ -1,7 +1,32 @@
 # Tsumugi — 組み込みAPI仕様
 
-最終更新: 2026-10-20
+最終更新: 2026-10-28
 設計ステータス: **実装仕様確定・実装進行中**（E1〜E6・E7〔tree REPL の Engine API 統合を含む〕・E8a・E11 実装済み。E9〔VM 経路統合、Phase 5〕のうち **VM file/stdin の import・resolver 統合（link 層 capability gate）は実装済み**で、残りの adapter/conformance（VM の charge parity・StableError・FunctionId・transaction 等）と experimental flag 除去は未実装＝**E9 は未完了**。E8b の capability profile/options 配線（`--profile safe|legacy` と全 capability option、safe/legacy の frozen `CapabilitySet` 構築・注入）は C9/C10/E7/E11 で統合済み、migration warning は §14.4 の N-1 スキップ採択により正式に descope 済み（不実装）、EMB-AT-10/11 は profile 経由 subprocess test で固定済み（下記実装 slice 表・第16節 Phase 2 の受入 ID ↔ test 対応を参照）＝**E8b 完了**。E10 は未実装。詳細は [ロードマップ](roadmap.md) Phase 1/2 を参照）
+
+本文書の §1〜§13・§15 は **到達目標の確定仕様**であり、現在の実装状態ではない。現在の実装が目標仕様からどう
+逸脱しているかは、下の **逸脱一覧** が唯一の正本である（[ドキュメント運用ガイド](documentation-guide.md)
+「逸脱一覧の持ち方」）。表は現在の逸脱だけを持ち、解消した行は削除する。実装スライスの進捗の正本は
+[`slices.toml`](slices.toml)。
+
+逸脱一覧は loop:drift #282 の D-11〜D-13 を受けて新設した。本文（目標）を実装に合わせて後退させず、実装との差を
+逸脱として載せる案を選んだ。`ExecutionOutcome` の variant の数（D-11）は loop:drift #263 の D-8 の Q1=A と D-2 の Q1=A の
+適用、`StartError` の variant の数（D-12）は #282 の Q1=A、`ExecutionOutcome` の field の形（D-13）は #282 の Q2=A で、
+いずれも返信なしのため推奨案で確定した（[開発ループ手順書](loop-runbook.md) §7.5）。理由: spec が実装の正本であり、
+現在の逸脱は事実を確かめて逸脱一覧に置く（ドキュメント運用ガイド「逸脱一覧の持ち方」）。§8 の `ExecutionOutcome` は
+`#[non_exhaustive]` で後続 Phase に variant を足す前提であり、`Completed.value` は top-level 返値を足しても variant を
+変えないための受け皿である。§9 の `StartError` の開始前の mismatch・poison・内部失敗の channel は §10 規則1・§11 規則2 が
+前提にしている。本文を実装に合わせると、これらの受け皿が spec から消える。載せたのは 2026-10-28 の整合点検で
+§3〜§12 の公開型を実装と照合して確かめた差のうち、上の 3 項目だけである。照合していない節（§13 以降）の逸脱と、
+上の設計ステータス段落・§14「実装slice」表にある現在の状態（E9・E10 の残りなど）は、まだ表へ移していない。
+監査 builder の差（`audit_sink` が任意である点など）は [決定性・実行時監査仕様](determinism-and-audit.md) の逸脱一覧にある。
+
+## 逸脱一覧（目標仕様に対する現在の逸脱）
+
+| 逸脱内容 | 対象の節(§) | 発生スライス |
+|---|---|---|
+| 公開 `ExecutionOutcome`（`src/embedding.rs` の `ExecutionOutcome`、crate root では `EmbeddingOutcome`）は `Completed` / `Exited` / `RuntimeError` / `BudgetExceeded` / `DeadlineExceeded` / `Cancelled` / `InternalFailure` の 7 variant だけで、目標の 13 variant のうち `Denied` / `LinkError` / `HostError` / `AuditFailure` / `RecordFailure` / `ReplayMismatch` が無い。link 時の拒否と resolver の host 失敗は `Engine::link` の `Result<_, LinkError>`（`LinkError::Denied` / `LinkError::Resolve(HostError)` ほか）で返し、監査失敗は監査付き経路だけの別型 `AuditedOutcome::AuditFailed` で返す。`RecordFailure` / `ReplayMismatch` は record/replay が未実装のため無い（同じ差を [決定性・実行時監査仕様](determinism-and-audit.md) の逸脱一覧が §7.2 の `TerminalOutcome` との対応として持つ） | §8 | E1・E5・E7・E11 |
+| `ExecutionOutcome` の field の形が目標と違う。目標の `Completed { value: Value, usage }` に対し、実装（`src/embedding.rs` の `ExecutionOutcome::Completed`）は `Completed { usage }` で `value` が無い。目標の `BudgetExceeded { failure: BudgetExceeded, usage }` に対し、実装は `BudgetExceeded { error: ExecutionError, usage }` で、超過した resource は `ExecutionError::code` の `ErrorKind` で表す（構造化の `BudgetExceeded` 型は `src/budget.rs` にあるが outcome には載せない）。目標の `DeadlineExceeded { deadline: MonotonicInstant, usage }` に対し、実装は `DeadlineExceeded { usage }` で `deadline` が無い | §8 | E5（`Completed`）、E11（`BudgetExceeded`・`DeadlineExceeded`） |
+| `StartError`（`src/scheduler.rs` の `StartError`、`src/lib.rs` で crate root に公開）は `Backpressure { active, queued, limit }` / `Config(ConfigError)` / `ConcurrentRunRequiresPolling` の 3 variant だけで、目標の `EngineMismatch` / `RevisionMismatch` / `ContextBusy` / `ContextPoisoned` / `InvalidRequest` / `AuditUnavailable` / `InternalFailure` が無く、目標に無い `Config(ConfigError)` を持つ。`ConcurrentRunRequiresPolling` は variant だけで、検出は配線していない | §9 | exec-control Slice 5 |
 
 ## 1. 目的と規範範囲
 
