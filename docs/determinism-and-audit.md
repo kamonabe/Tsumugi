@@ -1,6 +1,6 @@
 # Tsumugi 決定性・実行時監査仕様
 
-最終更新: 2026-10-27
+最終更新: 2026-10-28
 
 設計ステータス: **到達目標の確定仕様（§1〜§13）＋ 実装の現在地（下記の逸脱一覧）**
 
@@ -32,9 +32,8 @@
 | Path の HMAC-SHA-256 の入力が canonical label の UTF-8 生 byte（`src/audit.rs::RedactionPolicy::hmac_path`）。§9.1/§9.2 の「redaction 前 subtree の canonical encoding」（label を値とする `AuditValue` の deterministic CBOR）ではないため、digest 値が目標仕様と異なる（秘匿性・決定性は保たれる）。strict CBOR スライスで揃える | §9.1/§9.2 | R-1a |
 | `AuditFrame.module_id` / `AuditError.module_id` が §7.2 の `AuditField`（Identifier/Path policy 適用済み）ではなく plain `String`（`Option<String>`）。現在は常に空文字列 / `None` で埋めており（`src/embedding.rs` の Terminal error 構築）module 情報を記録しない。§9.2 の encoding も `AuditField` ではなく text / `Option` になる | §7.2/§9.1 | A-1 |
 | 公開 `ExecutionOutcome`（`src/embedding.rs`、crate root では `EmbeddingOutcome`）は `Completed` / `Exited` / `RuntimeError` / `BudgetExceeded` / `DeadlineExceeded` / `Cancelled` / `InternalFailure` の 7 variant だけで、§7.2 の `TerminalOutcome` と 1 対 1 に対応しない。link 時の拒否と resolver の host 失敗は `Engine::link` の `Result<_, LinkError>`（`LinkError::Denied` / `LinkError::Resolve(HostError)` ほか）で返し、run 中の capability 拒否と host function の失敗は `RuntimeError`（`ErrorKind::Capability` / `ErrorKind::Host`）に含める。監査失敗は監査付き経路だけの別型 `AuditedOutcome::AuditFailed` で返す。`RecordFailure` / `ReplayMismatch` は record/replay が未実装のため無い | §7.2 | A-1（7 variant の構成は [組み込みAPI仕様](embedding-api.md) の E 系スライス由来） |
-| `AuditSinkError::Reentrant` は型だけで（`src/audit.rs`）、§10 の thread-local reentrancy guard が無い。sink callback から同じ Engine の compile/start/poll/pause/resume/cancel・host function・別の audit emit を呼んでも検出せず、`Reentrant` を生成する箇所も無い（§15.3 の「sink callbackのEngine再入を拒否し、deadlockしない」は未達）。検出を入れるのは `fix-audit-sink-reentrancy-guard` スライス | §10 | A-1 |
 
-上の表の `ExecutionOutcome` が 7 variant だけである行（D-8）と、`AuditSinkError::Reentrant` が型だけである行（D-9）は、loop:drift #263 を受けて載せた。どちらも本文（§7.2 の 1 対 1 対応、§10 の再入検出）を実装に合わせて後退させず、逸脱として記録する案を選んだ（D-8 は issue #263 Q1=A、D-9 は Q2=A。いずれも返信なしのため推奨案で確定、[開発ループ手順書](loop-runbook.md) §7.5）。理由: spec が実装の正本であり、現在の逸脱は事実を確かめて逸脱一覧に置く（[ドキュメント運用ガイド](documentation-guide.md)「逸脱一覧の持ち方」）。D-8 の `ExecutionOutcome` は `#[non_exhaustive]` で、後続 Phase で variant を足す前提になっている。D-9 の再入検出は §15.3 の受入基準で、[マニフェスト](manifesto.md)原則 7（観測・監査可能にする）にかかわり、どのスライスも担当していなかったため、`fix` スライスを `todo` で [`slices.toml`](slices.toml) に足した。[組み込みAPI仕様](embedding-api.md) の `ExecutionOutcome`（13 variant）との差は、同 spec が逸脱一覧を作るときに載せる（ドキュメント運用ガイドの移行中注記）。
+上の表の `ExecutionOutcome` が 7 variant だけである行（D-8）は、loop:drift #263 を受けて載せた。本文（§7.2 の 1 対 1 対応）を実装に合わせて後退させず、逸脱として記録する案を選んだ（issue #263 Q1=A。返信なしのため推奨案で確定、[開発ループ手順書](loop-runbook.md) §7.5）。理由: spec が実装の正本であり、現在の逸脱は事実を確かめて逸脱一覧に置く（[ドキュメント運用ガイド](documentation-guide.md)「逸脱一覧の持ち方」）。D-8 の `ExecutionOutcome` は `#[non_exhaustive]` で、後続 Phase で variant を足す前提になっている。[組み込みAPI仕様](embedding-api.md) の `ExecutionOutcome`（13 variant）との差は、同 spec が逸脱一覧を作るときに載せる（ドキュメント運用ガイドの移行中注記）。
 
 ## 未実装範囲（目標仕様 §1〜§13 のうち未着手・延期中）
 
@@ -48,6 +47,7 @@
 | record/replay での redaction 再適用（record 済み redacted payload を盲目コピーせず現行 policy を適用） | §12 | record/replay スライスへ延期 |
 | VM の audit triple 対応（監査 wiring） | §2.1 | Slice 6（VM conformance）へ延期 |
 | engine 全体の audit drain queue byte 上限（16 MiB）。per-execution 上限（`max_pending_bytes`）は B-2 で実装済み | §10.2 | 複数 execution 共有の queue 会計と wake 経路が scheduler（E10 統合）と不可分なため延期 |
+| sink callback 中の再入検出は facade の 6 入口（`compile` / `link` / `link_for_repl` / `run` / `run_for_repl` / `run_audited`）だけが対象。scheduler の `ExecutionHandle` の操作（§10 の start/poll/pause/resume）と、`AuditWaker` / `AuditCompleter::complete` から呼ばれる waker の中の再入、別 thread からの呼び出しは検出しない（scheduler の `Engine` は sink を持たない） | §10 | sink を持つ scheduler 経路は E10 統合のスライスで扱う |
 
 ## 1. 位置づけ
 

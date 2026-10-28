@@ -570,7 +570,7 @@ fn rg_at_04_nested_callbacks_fail_only_the_reentered_engine() {
                 }
             })
         };
-        let target_b = build_target(&slot_b, sink_b.clone(), "rg04-b");
+        build_target(&slot_b, sink_b.clone(), "rg04-b");
 
         // Engine A の sink: Started の submit で B を実行し、戻ったあともう一度 A へ再入する。
         let sink_a = {
