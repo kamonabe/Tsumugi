@@ -146,8 +146,8 @@ order      = 9
 # 残さない。「tree-expr-continuation が done」は e1〜e4 がすべて done を意味する。
 # acceptance は各スライスが担当する受入基準の ID。複数スライスにまたがる基準（TEC-AT-01 等）の
 # どの部分を満たせば完了かは、各スライスの spec 小節「受入基準（eN が満たす部分）」に書く。
-# e3・e4 は設計確定済みだが、DoR 3（depends_on がすべて done）を満たさないため todo に置く。
-# 前段が done になった時点で状態整理 PR で todo → ready にする（F-2 と同じ運用）。
+# e4 は設計確定済みだが、DoR 3（depends_on がすべて done）を満たさないため todo に置く。
+# 前段が done になった時点で設計 PR で todo → ready にする（e2b・e3 と同じ運用）。
 [[slice]]
 id         = "tree-expr-continuation-e1"
 title      = "tree evaluator の式レベル continuation e1：文レベルのユーザー関数呼び出しを driver 上で実行し関数本体の文/反復境界で slice yield（強制 yield フック）"
@@ -166,6 +166,8 @@ order      = 11
 # 元の id は置き換えて残さない。「e2 が done」は e2a・e2b がともに done を意味する。
 # e2a の判断待ち（式 frame の heap 課金）は、返信なしのため推奨案（課金なし）で確定した（loop-runbook §7.5）。
 # e2b は PR #262 で設計し、e2a が done になったあと設計 PR（design_pr）で e2a の実装に合わせて小節を具体化して ready にした。
+# e3 は分割の PR #250 で設計し、e2b が done になったあと設計 PR（design_pr）で e2a・e2b の実装に合わせて小節を具体化して
+# ready にした。そのとき受入基準に TEC-AT-06（e3 分）を加えた。
 [[slice]]
 id         = "tree-expr-continuation-e2a"
 title      = "tree evaluator の式レベル continuation e2a：式 frame（FrameKind::Expr）を導入し、文の 4 位置の式に現れる call・二項・単項を段階評価して call 引数・operand 境界で yield 可能に"
@@ -195,13 +197,13 @@ order      = 13
 [[slice]]
 id         = "tree-expr-continuation-e3"
 title      = "tree evaluator の式レベル continuation e3：builtin・host function の呼び出しで呼び出しを含む引数の境界を yield 可能に"
-status     = "todo"
+status     = "ready"
 parent     = "REV-015"
 spec_slice = "exec-control Slice 3"
 spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation-e3 実装スライス（builtin・host function の呼び出し引数境界）" }
-acceptance = ["TEC-AT-01..03"]
+acceptance = ["TEC-AT-01..03", "TEC-AT-06"]
 depends_on = ["tree-expr-continuation-e2b"]
-design_pr  = 250
+design_pr  = 287
 order      = 15
 
 [[slice]]

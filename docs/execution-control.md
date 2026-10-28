@@ -1,6 +1,6 @@
 # Tsumugi 実行予算・協調実行仕様
 
-最終更新: 2026-10-27
+最終更新: 2026-10-28
 
 設計ステータス: **到達目標の確定仕様（§1〜§13）＋ 実装の現在地（下記の逸脱一覧）**
 
@@ -2011,30 +2011,120 @@ builtin・host のどれに解決されるかは静的には決まらない（us
 
 ##### tree-expr-continuation-e3 実装スライス（builtin・host function の呼び出し引数境界）
 
+> **設計の更新（e3 を `ready` にした設計 PR）**: 範囲と範囲外は分割の設計 PR #250 のまま変えていない。
+> e2a / e2b の実装 PR #268・#280 で式 frame の形が決まった（`ExprFrame` が文の式スロットから子の位置の経路でノードを辿る、
+> 1 段ずつ進める、`CallDest::Operand` / `ExprResult`）。それに合わせて次を書き足した: 対象の呼び出しの決め方、callee の解決、
+> builtin ごとの引数の扱い、保存する状態、cooperative host-call の Pending と resume、受入基準の確かめ方、「想定の変更規模」。
+> 受入基準に TEC-AT-06（e3 分）を加えた（下記「TEC-AT-06 を加えた理由」）。
+
 - **範囲**:
-  - poll 経路で、callee が builtin（`map` / `filter` / `each` を除く）・登録 host function・cooperative host
-    function に解決され、引数が呼び出しを含む call を、e2 の式 frame で引数を段階評価してから dispatch する。
-    引数は従来どおり左から右へ評価し、`count_step`・host call 課金（`charge_host_call_request`）・capability /
-    arity 検査・audit の host-call triple の順序と位置を同期経路と一致させる。
-  - 引数の AST を直接読む builtin（`push` / `pop` の対象識別子、`len(識別子)` の最適化、
-    `validate_context_builtin_call` の「第 1 引数が識別子か」判定）は、AST を読む部分の意味を変えない。
-    呼び出しを含む引数だけを式 frame で評価し、それ以外の引数の扱いは同期経路と同じにする。
-  - cooperative host function は、引数評価後の `start` 呼び出しと Pending 時の扱い（`may_yield` は
-    トップレベルだけ＝e1）を同期経路の規約どおりに保つ。
-  - yield 可能点: これらの call の引数境界（e2 の call 引数境界と同じ）。強制 yield フックをここへ広げる。
-  - builtin 本体の実行（bulk work を含む）は yield しない（§4.2 の超過、chunk 境界 yield は
+  - **対象の呼び出し**: poll 経路（`can_yield_ctx`）で式 frame を使う位置（e2a の 4 位置・e2b の式スロットと、それらの部分式）に
+    現れる call のうち、次をすべて満たすもの。e2a の `needs_expr_frame` はこれらの call を「callee が user binding を持たない
+    識別子」として式 frame の対象から外していた。e3 はこれらを対象に加える。
+    - callee が識別子で、その時点で user binding を持たない。
+    - その名前が、同期経路の `prepare_call` と同じ優先順（builtin → cooperative host function → 登録 host function）で、
+      **引数を評価する builtin**（`map` / `filter` / `each` を除く。下記「builtin ごとの引数の扱い」）・cooperative host function・
+      登録 host function のどれかに解決される。
+    - 引数のどれかが呼び出しを含む（「呼び出しを含む式」の定義どおり、静的に判定する）。
+  - **引数を評価しない呼び出しは対象にしない**: `input` / `args` / `now`（引数 0 個）と `pop`（第 1 引数が識別子）は、引数が
+    呼び出しを含むと、同期経路では引数を評価する前に arity / 代入先のエラーになる。callee が未定義名の call も、引数を評価する
+    前に未定義名のエラーになる。これらは引数の境界を持たないので、式 frame を作らず従来どおり `eval_expr` で評価する
+    （観測は変わらない）。`map` / `filter` / `each` も従来どおり `eval_expr` で call 全体を評価する（e4）。
+  - **callee の解決は 1 回だけ**: call の式 frame の最初の段で、同期経路の `prepare_call` と同じ判定（`env.get_cell(name)` が
+    無いこと、builtin 名・cooperative 登録名・host 登録名の順）で解決先を決め、式 frame に保存する。以降の段は保存した解決先に
+    従い、判定し直さない（同期経路も call の開始時に 1 回だけ判定する）。callee の識別子（子 0）は値として評価しない。
+  - **builtin ごとの引数の扱い**: 同期経路の `eval_builtin` / `builtin_io` / `builtin_collection` と同じ順序・同じ検査・同じ
+    課金にする。評価済みの引数から結果を作る部分は、同期経路と共有する関数に分ける（同期経路の順序・エラーを変えない）。
+    - **共通**: 最初の段で `validate_context_builtin_call`（arity と、`push` / `pop` の第 1 引数が識別子か）を行う。引数の評価より前。
+      builtin は同期経路と同じく `count_step` を行わず、call trace も積まない。
+    - **PureCore builtin**（`builtin_registry::is_pure_core_builtin`）: 引数を左から 1 つずつ評価する。揃ったら同期経路と同じく、
+      filesystem host-call の request 課金（`charge_host_call_request`）→ dispatch（`to_str` / `join` / `sort` の budgeted 版、
+      `dispatch_fs` と host-call triple の push、それ以外は `builtin_core::dispatch`）→ response 課金 → `track_result` を行う。
+      `len(識別子)` の最適化（AUD-041）は引数が呼び出しを含まないので対象にならない（従来どおり）。
+    - **`print`**: 引数を 1 つ評価するたびに `render_display` で描画し、描画済みの部分に足す（fuel と per-item byte 上限の課金は
+      その時点。描画が失敗したら後の引数は評価しない。同期経路と同じ）。揃ったら `charge_output` → `resolve_print`。
+    - **`env` / `exit`**: arity 検査（`env` は `check_arity_count`、`exit` は `validate_context_builtin_call`）の後に引数を評価し、
+      `env` は型検査 → `resolve_env` → `track_result`、`exit` は型検査 → `resolve_exit` → `record_exit` を行う。
+    - **`push`**: `validate_context_builtin_call` の後、第 2 引数の評価より前に代入先 binding の cell を解決する（未定義名のエラーは
+      第 2 引数の副作用より前）。第 2 引数を評価したら、型検査 → `check_collection` → `journal_cell` → `budget_list_push` を行う。
+  - **登録 host function**: 最初の段で `count_step` を行い、引数を左から評価する。揃ったら `resolve_host_call`（grant・arity 検査・
+    host error の写像）→ `track_result` を行う（同期経路の `prepare_call` の host 分岐と共有する関数に分ける）。
+  - **cooperative host function**: 最初の段で、resume 中の格納結果（`resumed_host_call`）があれば、`count_step` と引数の評価より前に
+    それを取り出して式結果へ写す（同期経路の `eval_cooperative_call` と同じ。この call 自身の引数は評価し直さない）。無ければ
+    `count_step` → 引数を左から評価 → `resolve_cooperative_call` → call_id の採番 → `start` を行う（評価済みの引数から `start` 以降を
+    行う部分は同期経路と共有する関数に分ける）。`may_yield` は e1 と同じく `can_yield_ctx && !in_driver_call()`。
+    - Ready はそのまま式結果へ写す（`finish_cooperative_result`）。
+    - Pending は e2a と同じく、トップレベル（driver 上の Call frame の外）なら文の式 frame をすべて畳んで文の cursor を戻して yield する。
+      resume では文全体を最初から評価し直す。文の他の部分の呼び出しは再び実行され、この call には上の格納結果が届く（現行の
+      「同じ文の再評価」と同じ観測）。関数本体の中なら `may_yield = false` の規約違反（catch 不能 `InternalControl`）のまま。
+  - **式 frame に保存する状態の追加**（上の小節「continuation へ保存する式の評価状態」の具体化）: e2a の operand stack（評価済みの
+    引数）・式 cursor に加え、次を式 frame に持たせる。どれも同期経路では `prepare_call` / `eval_builtin` 系のローカル変数が持って
+    いたもので、新しい値は作らない（heap は e2a と同じく課金しない）。
+    - callee の解決先（builtin 名・cooperative host function・登録 host function のどれか）。
+    - `print`: 描画済みの部分（同期経路のローカル `parts`）。
+    - `push`: 解決済みの代入先 cell。
+  - **yield 可能点**: これらの call の引数の境界（引数 i の評価後・引数 i+1 の評価前、全引数の評価後・dispatch の前）。e2a と同じく
+    式 frame の 1 段の間であり、slice fuel の判定と強制 yield フックだけを行う。audit drain queue 上限と cancel / deadline の
+    checkpoint は文/反復境界だけ。強制 yield フックは式 frame の段の間でそのまま効く（前進の条件も e2a の `expr_progress`）。
+  - **builtin・host function の本体は 1 段で完了まで実行し、yield しない**（bulk work を含む。§4.2 の超過で、chunk 境界 yield は
     `fuel-bulk-chunk-yield`）。
-- **範囲外（後続 sub-slice）**: `map` / `filter` / `each`（e4）。
+  - **終了経路**: 引数の評価の途中や dispatch で起きたエラーは、e2a と同じく `handle_error` が式 frame を畳んで最も近い `try` へ渡す。
+    エラー行・trace は同期経路と同じ。`exit` の `ProcessExit` と予算超過は従来どおり catch 不能 terminal として伝播する。
+- **範囲外（後続 sub-slice）**: `map` / `filter` / `each`（e4）。その引数や callback の中の呼び出しは、e3 の時点では従来どおり
+  `eval_expr` の中で `can_yield = false` のまま完了まで実行し、§4.2 の超過として扱う。
+- **逸脱一覧の更新（e3 の実装 PR で行う）**: 「未実装範囲」の e3 の行を削除する。`map` / `filter` / `each` の引数に現れる呼び出しが
+  まだ yield できないことを、e4 の行に書き足す。
+- **想定の変更規模**: おおむね 650 行（[開発ループ手順書](loop-runbook.md)「スライスの大きさの目安」の 1000 行に収まる）。
+  関数へ移して字下げが変わる行は、§14.5 の数え方で追加と削除の両方に数えた。
+  - `src/eval.rs` 約 290 行: `needs_expr_frame` と解決先の判定 30、`ExprFrame` の追加の状態 15、`step_expr` の call の段の
+    builtin / host / cooperative 分岐（最初の段の検査、引数の段階評価、`print` の描画、適用）150、cooperative の resume 格納結果と
+    `start` 以降の共有 45、登録 host function の適用の共有 50。
+  - `src/builtin.rs` 約 350 行: PureCore の適用（約 120 行）を共有する関数へ移す 250、`print` / `env` / `exit` / `push` の適用を
+    共有する関数に分ける 100。
+  - e2b は見積もり約 385 行に対し、実績は `#[cfg(test)]` を除いて 491 行だった（PR #280）。同じ比率で上振れしても約 830 行で
+    1000 行に収まる。実装中に 1000 行を超えそうなら、cooperative host function を後続の sub-slice へ回してよい（そのときは実装 PR を止めて、
+    本小節を割る設計 PR を先に出す）。
+  - 触る仕組みは tree evaluator の call の評価 1 つ。`src/builtin.rs` は `impl Evaluator` の builtin dispatch で、builtin の挙動は
+    変えず、引数の評価と適用の境目を分けるだけである。受入基準は下の 4 項目。
+- **TEC-AT-04 / 05 を持たない理由**: 深度検査と journal の扱いは、e2a が段階評価に入れたユーザー関数の call の前処理と driver 上の
+  Call frame の中にある。e3 は builtin・host function の call の引数を段階評価するだけで、ユーザー関数を呼ぶ経路を新しく足さない
+  （引数の中のユーザー関数呼び出しは e2a の経路を通る）。builtin・host function は同期経路でも深度を数えない。`push` の
+  `journal_cell` は同期経路と同じ関数で行い、式 frame の途中の yield が transaction 境界でないことは e2a の TEC-AT-05 で固定済み。
+- **TEC-AT-06 を加えた理由**: e3 で引数の境界を yield 可能にする目的は、builtin・host function の引数の中で呼んだ関数の本体が
+  ループを持っても 1 回の poll の実行量を有界にすること（§4.2、上の小節「yield 要件」）である。e2 で TEC-AT-06（e2a・e2b 分）を
+  置いたのと同じく、e3 の位置でもこれを e3 の done の時点で固定する。
 - **受入基準（e3 が満たす部分）**:
-  - **TEC-AT-01（e3 分）**: 強制 yield フックで、builtin・host function・cooperative host function の引数に
-    ユーザー関数呼び出しを含む script（`print(f(x))`、`push(xs, f(x))`、登録 host function の引数に呼び出し）
-    を跨いで yield/resume した結果が同期経路と一致する。host-call triple を含む audit event 列（非
-    `Yielded`/`Resumed`）も一致する。
-  - **TEC-AT-02（e3 分）**: builtin の引数評価の途中で yield させ、部分評価済みの引数が保存されて resume 後に
-    同期経路と同じ値・副作用列になる。
-  - **TEC-AT-03（e3 分）**: 既存テスト無改変で緑（host function・cooperative・audit 系のテストを含む）。
-- **検証**: 全 sub-slice 共通の完了条件。テストは `tests/engine_api.rs`（TEC-AT-01/02）と、host function・
-  cooperative の組み合わせが要る場合は既存の配置（`tests/scheduler_api.rs` 等）に新規テストとして追加する。
+  - **TEC-AT-01（e3 分）**: 強制 yield フックで、builtin・登録 host function・cooperative host function の引数に呼び出しを含む
+    script を跨いで yield/resume した結果が、同期経路と一致する（検査項目は TEC-AT-01 本文どおり。host-call triple を含む
+    非 `Yielded`/`Resumed` の audit event 列を含む）。引数の検査・型・arity・未定義名・描画上限のエラーの種別・行・trace も一致する。
+    - 確かめ方: `tests/engine_api.rs` に、builtin ごとの script（例: `print(f(1), g(2))`、`let n = len(f(x))`、`push(xs, f(x))`、
+      `let s = to_str(f(x)) + join(g(), ",")`、`let v = env(k())`、`if len(f(x)) > 0`、`print(len(f(x)) + 1)`、filesystem builtin の
+      引数に呼び出し〔未 grant でも deny の host-call triple が積まれる〕）とエラー経路（`push` の代入先が未定義名〔第 2 引数の
+      副作用が出ない〕・`push` の代入先が list でない・PureCore builtin の arity 違反〔`len(f(), g())`〕・`env` の型違反）の script を
+      置き、e1 以来の比べ方（強制 yield ありの poll 経路と `can_yield = false` の `Evaluator::run`、監査付きと sink 無しの
+      `Engine::run`）で stdout・`committed.fuel`・terminal 種別・エラー種別・行・trace・非 `Yielded`/`Resumed` の audit event 列を
+      比べる。登録 host function と cooperative host function（Ready を返す adapter）の引数に呼び出しを置く script は、同じ registry と
+      grant を `Evaluator::set_host_registry` で渡した `Evaluator::run` と比べる（既存の `host_fn_id` / `coop_ctx` の helper を使う）。
+  - **TEC-AT-02（e3 分）**: builtin・host function の引数の評価の途中で yield させ、評価済みの引数・`print` の描画済みの部分・`push` の
+    解決済みの cell・callee の解決先が保存され、resume 後に同期経路と同じ値・副作用列になる。cooperative host function が Pending を
+    返した場合は、resume で文を評価し直しても、この call の引数の呼び出しは 1 回だけ実行される。
+    - 確かめ方: `tests/engine_api.rs` で、各引数の評価が副作用（`print`）を持つ script（例: `print(a(), b(), c())`、
+      `push(xs, f(x))`、登録 host function の 3 引数）を強制 yield フックで 1 境界ずつ yield させ、resume 後の値と出力順が同期経路と
+      一致することを見る。cooperative の Pending は `tests/scheduler_api.rs` に、`let x = fetch(one())` と `print(g(), fetch(one()))` の
+      Pending → complete → resume を置き、`one()` の副作用が 1 回・`g()` の副作用が文の評価し直しの分だけ出ること（現行の観測。
+      e2a の `cooperative_pending_inside_expression_frame_yields_and_resumes` と同じ規則）と、関数本体の中で同じ形が `InternalControl`
+      になることを見る。`src/eval.rs` の unit test で、評価済みの引数・描画済みの部分・cell・解決先が yield を跨いで保存されることを固定する。
+  - **TEC-AT-03（e3 分）**: 既存テスト無改変で緑（host function・cooperative・audit・filesystem 系のテストと
+    `may_yield_false_requires_ready_else_internal_terminal`・B2-AT-09 を含む）。同期経路と、terminal まで poll する入口の観測値が不変。
+    - 確かめ方: 既存の `tests/`・unit test を無改変で通す（`cargo test --all-features`）。加えて `src/eval.rs` の unit test で、e3 の
+      call を含む script の poll 経路の `live_heap` / `peak_heap` が `Evaluator::run` と一致することを見る。
+  - **TEC-AT-06（e3 分）**: builtin・登録 host function の引数の中で呼んだ関数の本体にループを持つ script（例: `print(f(x))`、
+    `let n = len(f(x))`、`h(f(x))`）を `PollSlice::max_fuel = 16` で実行し、1 回の poll の実行量が e1 と同じ上限以内。
+    `Yielded`/`Resumed` が対で順序が単調。
+    - 確かめ方: `tests/engine_api.rs` で上の各 script を最小 slice で poll し、poll ごとの fuel 増分が「slice + 区間内の callback なし
+      bulk builtin 1 回分の単独実測 fuel」以内であることと、audit の `Yielded`/`Resumed` の対と順序を見る（e1 の TEC-AT-06 と同じ測り方）。
+- **検証**: 全 sub-slice 共通の完了条件。テストは `tests/engine_api.rs`（TEC-AT-01/02/06）、`tests/scheduler_api.rs`（cooperative の
+  Pending と resume）、式 frame の保存状態と heap の unit test は `src/eval.rs`。
 
 ##### tree-expr-continuation-e4 実装スライス（`map` / `filter` / `each` の段階実行）
 
