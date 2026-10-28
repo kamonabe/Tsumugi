@@ -131,12 +131,13 @@ order      = 10
 [[slice]]
 id         = "fix-audit-sink-reentrancy-guard"
 title      = "sink callback からの同じ Engine への再入を thread-local reentrancy guard で検出し AuditSinkError::Reentrant にする（§10・§15.3）"
-status     = "ready"
+status     = "done"
 parent     = "Phase 6 残"
 spec_slice = "determinism Slice 5"
 spec       = { doc = "docs/determinism-and-audit.md", section = "fix-audit-sink-reentrancy-guard 実装スライス（sink callback 中の同じ Engine への再入検出）" }
 acceptance = ["RG-AT-01..05"]
 design_pr  = 281
+impl_pr    = 286
 depends_on = ["A-1"]
 order      = 9
 
