@@ -465,7 +465,7 @@ pub enum StartError {
 | `CancellationToken` | yes | yes | yes | 任意threadからcancel可 |
 | `ExecutionWaker` | yes | yes | yes | 別threadはwakeだけ可能 |
 
-`ExecutionContext`の`!Send + !Sync`はstable契約である。Phase 2同期adapterはcaller thread上で有限時間に`Ready`相当の結果を返す。Phase 4 cooperative adapterだけが`Pending` ticketを返し、別threadはresult格納とwakeだけを行う。同期callbackを暗黙worker threadへ移さない。同じcontext/handleへの再入は許さず`InternalFailure`とする。
+`ExecutionContext`の`!Send + !Sync`はstable契約である。Phase 2同期adapterはcaller thread上で有限時間に`Ready`相当の結果を返す。Phase 4 cooperative adapterだけが`Pending` ticketを返し、別threadはresult格納とwakeだけを行う。同期callbackを暗黙worker threadへ移さない。同じcontext/handleへの再入は許さず`InternalFailure`とする。audit sink callbackの中から同じ`Engine`の入口を呼ぶ再入も許さない。`run`は`ExecutionOutcome::InternalFailure`、`compile`は`CompileDiagnosticCode::InternalFault`の診断1件の`CompileErrors`、`link`は`LinkError::InternalFailure`で、何も実行せずに拒否する。この拒否は実行を始める前に返すもので、渡されたcontextを変えずpoisonもしない（第10節規則4のpoisonは実行したexecutionのterminalに対するもので、この拒否には適用しない）。対象の入口の全体（REPL用の内部入口と監査付き入口を含む）、外側のexecutionの扱い、入れ子のcallbackは[決定性・実行時監査仕様](determinism-and-audit.md)第10節を正本とする。
 
 ## 10. 境界、状態遷移、transaction
 
@@ -491,7 +491,7 @@ pub enum StartError {
 ## 11. Host panic、abort、exit
 
 1. lexer/parser/linker/backend/host functionのunwind panicを各host boundaryで`catch_unwind(AssertUnwindSafe(...))`する。
-2. compile panicは`CompileDiagnosticCode::InternalFault`、link/start panicはそれぞれ`LinkError::InternalFailure` / `StartError::InternalFailure`、handle作成後のrun/poll panicはterminal `ExecutionOutcome::InternalFailure`とし、random nonzero fault IDを付ける。
+2. compile panicは`CompileDiagnosticCode::InternalFault`、link/start panicはそれぞれ`LinkError::InternalFailure` / `StartError::InternalFailure`、handle作成後のrun/poll panicはterminal `ExecutionOutcome::InternalFailure`とし、random nonzero fault IDを付ける。panic以外では、audit sink callbackからの同じEngineへの再入の拒否（第9節）にも`CompileDiagnosticCode::InternalFault` / `LinkError::InternalFailure` / `ExecutionOutcome::InternalFailure`を使う。
 3. panic payload/native backtraceはpublic errorへ含めず、host-only diagnostic hookがある場合だけ渡す。
 4. `panic=abort`、OOM、stack overflow abort、FFI UB、callback内process exit/abortは捕捉不能。[脅威モデル](threat-model.md)どおり別process隔離が最終防御である。
 5. 公式host function/adapterはpanic、abort、process exitを行ってはならない。

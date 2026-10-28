@@ -127,13 +127,16 @@ order      = 10
 # determinism-and-audit §10 は sink callback 中の同じ Engine への再入を thread-local reentrancy guard で検出し
 # AuditSinkError::Reentrant にするとし、§15.3 はそれを受入基準にする。実装は Reentrant を型だけ持ち、検出が無い。
 # 逸脱一覧（determinism-and-audit.md 冒頭）の行がこのスライスを参照する。order は loop-runbook §8.1 の
-# 「不具合の報告」の既定（今ある ready・todo より前の空いている値）。未設計のため todo で置く。
+# 「不具合の報告」の既定（今ある ready・todo より前の空いている値）。設計 PR で spec 小節を書き ready にした。
 [[slice]]
 id         = "fix-audit-sink-reentrancy-guard"
 title      = "sink callback からの同じ Engine への再入を thread-local reentrancy guard で検出し AuditSinkError::Reentrant にする（§10・§15.3）"
-status     = "todo"
+status     = "ready"
 parent     = "Phase 6 残"
 spec_slice = "determinism Slice 5"
+spec       = { doc = "docs/determinism-and-audit.md", section = "fix-audit-sink-reentrancy-guard 実装スライス（sink callback 中の同じ Engine への再入検出）" }
+acceptance = ["RG-AT-01..05"]
+design_pr  = 281
 depends_on = ["A-1"]
 order      = 9
 
