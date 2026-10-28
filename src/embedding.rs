@@ -1043,6 +1043,19 @@ impl Engine {
         source: Source<'_>,
         options: &CompileOptions,
     ) -> Result<CompiledScript, CompileErrors> {
+        // sink callback の中からの同じ Engine への再入は、何も実行せずに拒否する（§10）。
+        if crate::audit::reject_sink_callback_reentry(self.id) {
+            return Err(CompileErrors {
+                diagnostics: vec![CompileDiagnostic {
+                    code: CompileDiagnosticCode::InternalFault,
+                    line: None,
+                    column: None,
+                    safe_message: String::from(
+                        "sink callback の中から同じ Engine は呼べません（再入は許可されません）",
+                    ),
+                }],
+            });
+        }
         // lexer / parser / backend の unwind panic を host boundary で捕捉する（第11節 規則1）。
         // compile 中の panic は `CompileDiagnosticCode::InternalFault` へ写す（規則2）。panic
         // payload / native backtrace は公開診断へ含めない（規則3）。E7 以降 `&Engine` は
@@ -1108,6 +1121,10 @@ impl Engine {
         script: &CompiledScript,
         request: LinkRequest,
     ) -> Result<LinkedScript, LinkError> {
+        // sink callback の中からの同じ Engine への再入は、何も実行せずに拒否する（§10）。
+        if crate::audit::reject_sink_callback_reentry(self.id) {
+            return Err(sink_reentry_link_error());
+        }
         // linker の unwind panic を host boundary で捕捉する（第11節 規則1）。link 中の panic は
         // `LinkError::InternalFailure` へ写す（規則2）。payload / backtrace は含めない（規則3）。
         // E7 で `Engine` が `Arc<dyn HostFunction>` を保持したため `&Engine` は自動 `UnwindSafe`
@@ -1155,6 +1172,9 @@ impl Engine {
         script: &CompiledScript,
         request: LinkRequest,
     ) -> Result<LinkedScript, LinkError> {
+        if crate::audit::reject_sink_callback_reentry(self.id) {
+            return Err(sink_reentry_link_error());
+        }
         catch_host_unwind(AssertUnwindSafe(|| {
             self.link_for_repl_inner(script, request)
         }))
@@ -1965,6 +1985,12 @@ impl Engine {
         context: &mut ExecutionContext,
         request: ExecutionRequest,
     ) -> ExecutionOutcome {
+        // sink callback の中からの同じ Engine への再入は、context に触れず拒否する（§10）。
+        if crate::audit::reject_sink_callback_reentry(self.id) {
+            return internal_failure(
+                "sink callback の中から同じ Engine は呼べません（再入は許可されません）",
+            );
+        }
         // poison 済み context は実行しない（第10節 規則4）。frame は clean のままで、poison は
         // 解除しない。この経路は poison を「新たに」設定しない（既に true）。
         if context.poisoned {
@@ -2040,6 +2066,11 @@ impl Engine {
         context: &mut ExecutionContext,
         request: ExecutionRequest,
     ) -> ExecutionOutcome {
+        if crate::audit::reject_sink_callback_reentry(self.id) {
+            return internal_failure(
+                "sink callback の中から同じ Engine は呼べません（再入は許可されません）",
+            );
+        }
         if context.poisoned {
             return internal_failure("poison 済みの実行コンテキストは再利用できません");
         }
@@ -2079,6 +2110,11 @@ impl Engine {
         context: &mut ExecutionContext,
         request: ExecutionRequest,
     ) -> AuditedOutcome {
+        if crate::audit::reject_sink_callback_reentry(self.id) {
+            return AuditedOutcome::Outcome(Box::new(internal_failure(
+                "sink callback の中から同じ Engine は呼べません（再入は許可されません）",
+            )));
+        }
         if context.poisoned {
             return AuditedOutcome::Outcome(Box::new(internal_failure(
                 "poison 済みの実行コンテキストは再利用できません",
@@ -2296,7 +2332,12 @@ impl Engine {
         // 別 execution の ack / gap / 未送信 sequence の ack は protocol 違反として fail-closed。
         let started_batch: Arc<[AuditEnvelope]> =
             Arc::from(vec![make_envelope(started_seq, started_event)]);
-        let started_ok = match sink.submit(started_batch, AuditWaker::noop()) {
+        let started_ok = match crate::audit::submit_guarded(
+            self.id,
+            &*sink,
+            started_batch,
+            AuditWaker::noop(),
+        ) {
             AuditSubmit::Ack(ack) => {
                 ack.execution_id == execution_id && ack.through_sequence == started_seq
             }
@@ -2321,7 +2362,8 @@ impl Engine {
                 Ok(seq) => {
                     let batch: Arc<[AuditEnvelope]> =
                         Arc::from(vec![make_envelope(seq, terminal_event)]);
-                    let _ = sink.submit(batch, AuditWaker::noop());
+                    let _ =
+                        crate::audit::submit_guarded(self.id, &*sink, batch, AuditWaker::noop());
                     AuditFailure::Sink
                 }
                 Err(failure) => failure,
@@ -2343,6 +2385,7 @@ impl Engine {
         let collect_poll_trace = poll_trace.is_some();
         let mut delivery = AuditDelivery {
             sink: Arc::clone(&sink),
+            engine_id: self.id,
             execution_id,
             schema_version: 1,
             source_hash,
@@ -2962,6 +3005,8 @@ const AUDIT_BACKPRESSURE_MAX_RESENDS: u64 = 1_000_000;
 /// 「再送も同一 byte 列」）。
 struct AuditDelivery {
     sink: Arc<dyn crate::audit::AuditSink>,
+    /// 再入 guard（§10）に渡す、この配送を行う Engine の ID。
+    engine_id: EngineId,
     execution_id: ExecutionId,
     schema_version: u16,
     source_hash: [u8; 32],
@@ -3032,7 +3077,12 @@ impl AuditDelivery {
         use crate::audit::{AuditFailure, AuditSubmit, AuditWaker};
 
         let waker = AuditWaker::noop();
-        match self.sink.submit(Arc::clone(batch), waker.clone()) {
+        match crate::audit::submit_guarded(
+            self.engine_id,
+            &*self.sink,
+            Arc::clone(batch),
+            waker.clone(),
+        ) {
             AuditSubmit::Ack(ack) => {
                 if self.ack_ok(&ack, through_seq) {
                     Ok(())
@@ -3079,7 +3129,12 @@ impl AuditDelivery {
                     }
                     // 5) 同一 Arc batch を再送する（§10「再送も同一 byte 列」）。scripted/同期 sink は
                     //    この resend で Pending を減らし、尽きたら Ack を返す。
-                    match self.sink.submit(Arc::clone(batch), waker.clone()) {
+                    match crate::audit::submit_guarded(
+                        self.engine_id,
+                        &*self.sink,
+                        Arc::clone(batch),
+                        waker.clone(),
+                    ) {
                         AuditSubmit::Ack(ack) if self.ack_ok(&ack, through_seq) => {
                             context.evaluator.record_backpressure_resume();
                             return Ok(());
@@ -3224,6 +3279,15 @@ fn internal_failure(safe_message: impl Into<String>) -> ExecutionOutcome {
         fault_id: next_fault_id(),
         safe_message: safe_message.into(),
         usage: BudgetUsage::default(),
+    }
+}
+
+/// sink callback 中の再入を拒否する `link` / `link_for_repl` の値（§10）。
+fn sink_reentry_link_error() -> LinkError {
+    let fault_id = next_fault_id();
+    LinkError::InternalFailure {
+        fault_id,
+        safe_message: internal_fault_message(fault_id),
     }
 }
 

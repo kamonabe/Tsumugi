@@ -23,13 +23,14 @@
 //!   [`estimate_encoded_bytes`] の naive 推定で、後で §9.2 encoder へ差し替え可能に隔離する。
 //! - record/replay（§6）、VM 変更、§1.1 の sink 必須ポリシー（opt-in のまま）。
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::budget::{BudgetConfig, BudgetResource, BudgetUsage};
-use crate::embedding::{Backend, ExecutionId, ExecutionOutcome};
+use crate::embedding::{Backend, EngineId, ExecutionId, ExecutionOutcome};
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * 1024;
@@ -1577,7 +1578,7 @@ pub enum AuditSinkError {
     Permanent,
     /// protocol 違反（gap / 別 execution / 未送信 sequence の ack 等）。
     Protocol,
-    /// sink callback 中の再入（§10、A-1 では検出配線なし）。
+    /// sink callback 中の同じ Engine への再入（§10）。thread-local guard が検出する。
     Reentrant,
 }
 
@@ -1802,6 +1803,101 @@ pub fn new_audit_ticket() -> (AuditTicket, AuditCompleter) {
 pub trait AuditSink: Send + Sync {
     /// batch（1 execution 内の順序付き envelope 列）を submit する（§10）。
     fn submit(&self, batch: Arc<[AuditEnvelope]>, waker: AuditWaker) -> AuditSubmit;
+}
+
+// =============================================================================
+// §10 sink callback 中の同じ Engine への再入検出（thread-local reentrancy guard）
+// =============================================================================
+
+/// 「いまこの thread で sink callback の中にいる Engine」の 1 要素（§10）。
+struct SinkCallbackEntry {
+    engine: EngineId,
+    /// この Engine への再入が試みられたか。入れ子の callback でも、再入された Engine の要素
+    /// だけに立てる（thread で 1 つにはしない）。
+    reentered: bool,
+}
+
+thread_local! {
+    /// この thread で sink callback に入っている Engine の列（入った順）。
+    static SINK_CALLBACK_STACK: RefCell<Vec<SinkCallbackEntry>> = const { RefCell::new(Vec::new()) };
+}
+
+/// sink callback に入っている間だけ列に要素を積む RAII guard。
+///
+/// `Drop` で自分の要素を外すので、sink が panic して unwind した場合も列から外れる。
+struct SinkCallbackGuard {
+    finished: bool,
+}
+
+impl SinkCallbackGuard {
+    fn enter(engine: EngineId) -> Self {
+        SINK_CALLBACK_STACK.with(|stack| {
+            stack.borrow_mut().push(SinkCallbackEntry {
+                engine,
+                reentered: false,
+            });
+        });
+        Self { finished: false }
+    }
+
+    /// 自分の要素を外し、再入が試みられたかを返す。
+    fn finish(mut self) -> bool {
+        self.finished = true;
+        SINK_CALLBACK_STACK.with(|stack| {
+            stack
+                .borrow_mut()
+                .pop()
+                .is_some_and(|entry| entry.reentered)
+        })
+    }
+}
+
+impl Drop for SinkCallbackGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            SINK_CALLBACK_STACK.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+/// この thread が `engine` の sink callback の中にいるなら、その要素に再入の印を立てて
+/// `true` を返す（§10）。入れ子の下の要素も対象で、列の先頭だけを見ない。
+///
+/// facade の公開入口は、最初にこれを呼び、`true` なら何も実行せずに拒否する。
+pub(crate) fn reject_sink_callback_reentry(engine: EngineId) -> bool {
+    SINK_CALLBACK_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        match stack.iter_mut().find(|entry| entry.engine == engine) {
+            Some(entry) => {
+                entry.reentered = true;
+                true
+            }
+            None => false,
+        }
+    })
+}
+
+/// `sink.submit` を再入 guard の中で呼ぶ（§10）。
+///
+/// callback から戻ったとき `engine` への再入が試みられていれば、sink が返した値（`Ack` でも）
+/// を捨てて `AuditSubmit::Failed(AuditSinkError::Reentrant)` にする。
+pub(crate) fn submit_guarded(
+    engine: EngineId,
+    sink: &dyn AuditSink,
+    batch: Arc<[AuditEnvelope]>,
+    waker: AuditWaker,
+) -> AuditSubmit {
+    let guard = SinkCallbackGuard::enter(engine);
+    let result = sink.submit(batch, waker);
+    if guard.finish() {
+        if let AuditSubmit::Pending(ticket) = result {
+            ticket.cancel();
+        }
+        return AuditSubmit::Failed(AuditSinkError::Reentrant);
+    }
+    result
 }
 
 /// 常に `Ack` を返す同期 in-process sink（§10）。A-1 の最小実装。
@@ -3955,6 +4051,139 @@ mod tests {
         assert_eq!(estimate_event_bytes(&started), 128);
         assert_eq!(estimate_event_bytes(&decision), 128);
         assert_eq!(estimate_event_bytes(&finished), 128);
+    }
+
+    // --- §10 sink callback 再入 guard（fix-audit-sink-reentrancy-guard、RG-AT-04）---
+
+    fn test_engine_id() -> EngineId {
+        crate::embedding::Engine::builder()
+            .build()
+            .expect("build")
+            .id()
+    }
+
+    fn stack_len() -> usize {
+        SINK_CALLBACK_STACK.with(|stack| stack.borrow().len())
+    }
+
+    #[test]
+    fn reentry_outside_callback_is_not_rejected() {
+        let a = test_engine_id();
+        assert!(!reject_sink_callback_reentry(a));
+        assert_eq!(stack_len(), 0);
+    }
+
+    #[test]
+    fn reentry_mark_is_per_engine_entry_including_lower_entries() {
+        let a = test_engine_id();
+        let b = test_engine_id();
+        let c = test_engine_id();
+        let guard_a = SinkCallbackGuard::enter(a);
+        let guard_b = SinkCallbackGuard::enter(b);
+        // 列の先頭（b）ではなく、下の要素（a）への再入も検出し、a の印だけを立てる。
+        assert!(reject_sink_callback_reentry(a));
+        // 列にいない Engine は拒否しない。
+        assert!(!reject_sink_callback_reentry(c));
+        assert!(!guard_b.finish(), "b には再入していない");
+        // b を出たあとも a の callback の中では a への再入は拒否される。
+        assert!(reject_sink_callback_reentry(a));
+        assert!(guard_a.finish(), "a には再入した");
+        assert_eq!(stack_len(), 0);
+        assert!(!reject_sink_callback_reentry(a), "出たあとは許される");
+    }
+
+    #[test]
+    fn guard_is_removed_on_unwind() {
+        let a = test_engine_id();
+        let unwound = std::panic::catch_unwind(|| {
+            let _guard = SinkCallbackGuard::enter(a);
+            assert!(reject_sink_callback_reentry(a));
+            panic!("injected panic (test only)");
+        });
+        assert!(unwound.is_err());
+        assert_eq!(stack_len(), 0);
+        assert!(!reject_sink_callback_reentry(a));
+    }
+
+    #[test]
+    fn nested_guards_are_removed_in_order_on_unwind() {
+        let a = test_engine_id();
+        let b = test_engine_id();
+        let unwound = std::panic::catch_unwind(|| {
+            let _guard_a = SinkCallbackGuard::enter(a);
+            let _guard_b = SinkCallbackGuard::enter(b);
+            panic!("injected panic (test only)");
+        });
+        assert!(unwound.is_err());
+        assert_eq!(stack_len(), 0);
+    }
+
+    struct ReenteringSink {
+        engine: EngineId,
+        reenter: bool,
+    }
+
+    impl AuditSink for ReenteringSink {
+        fn submit(&self, batch: Arc<[AuditEnvelope]>, _waker: AuditWaker) -> AuditSubmit {
+            if self.reenter {
+                assert!(reject_sink_callback_reentry(self.engine));
+            }
+            let last = batch.last().expect("non-empty");
+            AuditSubmit::Ack(AuditAck {
+                execution_id: last.execution_id,
+                through_sequence: last.sequence,
+            })
+        }
+    }
+
+    fn one_envelope_batch() -> Arc<[AuditEnvelope]> {
+        Arc::from(vec![AuditEnvelope {
+            schema_version: 1,
+            execution_id: exec_id(1),
+            source_hash: [0; 32],
+            language_revision: "0.21".to_string(),
+            sequence: 0,
+            timestamp: HostTimestamp {
+                unix_nanoseconds: 0,
+            },
+            event: AuditEvent::Terminal {
+                outcome: TerminalOutcome::Completed,
+                error: None,
+                usage: BudgetUsage::default(),
+                import_graph_hash: None,
+                context_committed: true,
+                host_effects_may_remain: false,
+            },
+        }])
+    }
+
+    #[test]
+    fn submit_guarded_turns_ack_into_reentrant_failure_only_when_reentered() {
+        let engine = test_engine_id();
+        let reentering = ReenteringSink {
+            engine,
+            reenter: true,
+        };
+        assert_eq!(
+            submit_guarded(
+                engine,
+                &reentering,
+                one_envelope_batch(),
+                AuditWaker::noop()
+            ),
+            AuditSubmit::Failed(AuditSinkError::Reentrant)
+        );
+        assert_eq!(stack_len(), 0);
+
+        let calm = ReenteringSink {
+            engine,
+            reenter: false,
+        };
+        assert!(matches!(
+            submit_guarded(engine, &calm, one_envelope_batch(), AuditWaker::noop()),
+            AuditSubmit::Ack(_)
+        ));
+        assert_eq!(stack_len(), 0);
     }
 }
 
