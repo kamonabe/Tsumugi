@@ -47,7 +47,7 @@
 | record/replay での redaction 再適用（record 済み redacted payload を盲目コピーせず現行 policy を適用） | §12 | record/replay スライスへ延期 |
 | VM の audit triple 対応（監査 wiring） | §2.1 | Slice 6（VM conformance）へ延期 |
 | engine 全体の audit drain queue byte 上限（16 MiB）。per-execution 上限（`max_pending_bytes`）は B-2 で実装済み | §10.2 | 複数 execution 共有の queue 会計と wake 経路が scheduler（E10 統合）と不可分なため延期 |
-| sink callback 中の再入検出は facade の 6 入口（`compile` / `link` / `link_for_repl` / `run` / `run_for_repl` / `run_audited`）だけが対象。scheduler の `ExecutionHandle` の操作（§10 の start/poll/pause/resume）と、`AuditWaker` / `AuditCompleter::complete` から呼ばれる waker の中の再入、別 thread からの呼び出しは検出しない（scheduler の `Engine` は sink を持たない） | §10 | sink を持つ scheduler 経路は E10 統合のスライスで扱う |
+| sink callback 中の再入検出は facade の 6 入口（`compile` / `link` / `link_for_repl` / `run` / `run_for_repl` / `run_audited`）だけが対象。scheduler の `ExecutionHandle` の操作（§10 の start/poll/pause/resume）の再入検出と、拒否に返す値は未実装（scheduler の `Engine` は sink を持たない） | §10 | sink を持つ scheduler 経路は E10 統合のスライスで扱う |
 
 ## 1. 位置づけ
 

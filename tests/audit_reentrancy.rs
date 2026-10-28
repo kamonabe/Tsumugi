@@ -27,6 +27,10 @@ use tsumugi::{
 // -----------------------------------------------------------------------------
 
 /// host-call triple・BudgetCharged・Terminal の配送点をすべて通る script。
+/// 反復があり、小さい slice fuel で `Yielded` / `Resumed` を配送する script。
+const LOOP_SCRIPT: &str =
+    "let total = 0\nlet i = 0\nwhile i < 30\n    total = total + i\n    i = i + 1\nend\n";
+
 const SCRIPT: &str =
     "write_file(\"@data/out.txt\", \"hello\")\nlet c = read_file(\"@data/out.txt\")\n";
 
@@ -164,13 +168,23 @@ type Slot = Arc<OnceLock<Arc<Target>>>;
 
 /// `sink` を持つ Engine を作って slot に入れる。
 fn build_target(slot: &Slot, sink: Arc<dyn AuditSink>, tag: &str) -> Arc<Target> {
-    let engine = Arc::new(
-        EmbeddingEngine::builder()
-            .audit_sink(sink)
-            .build()
-            .expect("build"),
-    );
-    let compiled = compile(&engine, SCRIPT);
+    build_target_with(slot, sink, tag, SCRIPT, None)
+}
+
+/// script と `audit_slice_fuel` を指定して作る（`Yielded` / `Resumed` の配送点を通すため）。
+fn build_target_with(
+    slot: &Slot,
+    sink: Arc<dyn AuditSink>,
+    tag: &str,
+    script: &'static str,
+    slice_fuel: Option<u64>,
+) -> Arc<Target> {
+    let mut builder = EmbeddingEngine::builder().audit_sink(sink);
+    if let Some(fuel) = slice_fuel {
+        builder = builder.audit_slice_fuel(fuel);
+    }
+    let engine = Arc::new(builder.build().expect("build"));
+    let compiled = compile(&engine, script);
     let linked = engine.link(&compiled, link_request()).expect("link");
     let target = Arc::new(Target {
         engine,
@@ -405,6 +419,129 @@ fn rg_at_02_every_delivery_point_fails_closed_even_when_sink_acks() {
     });
 }
 
+#[test]
+fn rg_at_02_yielded_and_resumed_deliveries_fail_closed() {
+    within_timeout(|| {
+        // 基準の実行で、Yielded / Resumed が配送される submit の回を数える。
+        let slot: Slot = Arc::new(OnceLock::new());
+        let sink = FnSink::new(|_| {});
+        let target = build_target_with(&slot, sink.clone(), "rg02y-base", LOOP_SCRIPT, Some(16));
+        assert!(
+            matches!(
+                run_outer(&target, 7).outcome(),
+                Some(EmbeddingOutcome::Completed { .. })
+            ),
+            "基準の実行は Completed"
+        );
+        let log = sink.log();
+        let yield_resume_batches: Vec<usize> = log
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                matches!(
+                    e.event,
+                    AuditEvent::Yielded { .. } | AuditEvent::Resumed { .. }
+                )
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            !yield_resume_batches.is_empty(),
+            "Yielded / Resumed が配送されない script では意味がない"
+        );
+        let total_submits = sink.submits();
+
+        for reenter_at in 1..=total_submits {
+            let slot: Slot = Arc::new(OnceLock::new());
+            let probe_failures: Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
+            let sink = {
+                let slot = Arc::clone(&slot);
+                let probe_failures = Arc::clone(&probe_failures);
+                FnSink::new(move |n| {
+                    if n == reenter_at {
+                        *probe_failures.lock().expect("probe") =
+                            Some(probe_all_entries(slot.get().expect("target")));
+                    }
+                })
+            };
+            let target = build_target_with(&slot, sink.clone(), "rg02y", LOOP_SCRIPT, Some(16));
+            let outcome = run_outer(&target, 70 + reenter_at as u128);
+            let failures = probe_failures
+                .lock()
+                .expect("probe")
+                .take()
+                .unwrap_or_else(|| panic!("{reenter_at} 回目の submit で callback が呼ばれた"));
+            assert!(failures.is_empty(), "{reenter_at} 回目: {failures:?}");
+            assert!(
+                is_audit_failed_sink(&outcome),
+                "{reenter_at} 回目: {outcome:?}"
+            );
+        }
+    });
+}
+
+/// `Pending` を返す sink。`pend_at` 回目の submit で `Pending` を返し、`reenter_on` 回目の
+/// submit で再入する。`reenter_on == pend_at` なら、再入した submit が `Pending` を返す。
+/// それ以外の submit は `Ack` を返す（`Pending` の次の submit は backpressure の再送）。
+struct PendingSink {
+    slot: Slot,
+    count: AtomicUsize,
+    pend_at: usize,
+    reenter_on: usize,
+    probe_failures: Mutex<Option<Vec<String>>>,
+}
+
+impl AuditSink for PendingSink {
+    fn submit(&self, batch: Arc<[AuditEnvelope]>, _waker: AuditWaker) -> AuditSubmit {
+        let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == self.reenter_on {
+            *self.probe_failures.lock().expect("probe") =
+                Some(probe_all_entries(self.slot.get().expect("target")));
+        }
+        if n == self.pend_at {
+            return AuditSubmit::Pending(tsumugi::AuditTicket::new());
+        }
+        let last = batch.last().expect("non-empty batch");
+        AuditSubmit::Ack(AuditAck {
+            execution_id: last.execution_id,
+            through_sequence: last.sequence,
+        })
+    }
+}
+
+#[test]
+fn rg_at_02_backpressure_resend_and_pending_return_fail_closed() {
+    within_timeout(|| {
+        // (pend_at, reenter_on): 再送の submit で再入する／再入した submit が Pending を返す。
+        for (pend_at, reenter_on) in [(2, 3), (3, 4), (2, 2), (3, 3)] {
+            let slot: Slot = Arc::new(OnceLock::new());
+            let sink = Arc::new(PendingSink {
+                slot: Arc::clone(&slot),
+                count: AtomicUsize::new(0),
+                pend_at,
+                reenter_on,
+                probe_failures: Mutex::new(None),
+            });
+            let target = build_target(&slot, sink.clone(), "rg02p");
+            let outcome = run_outer(&target, 80 + pend_at as u128);
+            let failures = sink
+                .probe_failures
+                .lock()
+                .expect("probe")
+                .take()
+                .unwrap_or_else(|| panic!("({pend_at},{reenter_on}): callback が呼ばれた"));
+            assert!(
+                failures.is_empty(),
+                "({pend_at},{reenter_on}): {failures:?}"
+            );
+            assert!(
+                is_audit_failed_sink(&outcome),
+                "({pend_at},{reenter_on}): {outcome:?}"
+            );
+        }
+    });
+}
+
 // -----------------------------------------------------------------------------
 // RG-AT-03: 別の Engine は許す
 // -----------------------------------------------------------------------------
@@ -479,7 +616,8 @@ fn rg_at_03_calling_another_engine_from_callback_is_allowed() {
 // RG-AT-04: guard の後始末と入れ子
 // -----------------------------------------------------------------------------
 
-/// callback の外から、同じ Engine の compile と run_audited が通常どおり成功する。
+/// callback の外から、同じ Engine の compile が通常どおり成功する（guard が残っていない）。
+/// run_audited は各ケースが sink の挙動に合わせて確かめる。
 fn assert_engine_usable_outside_callback(target: &Target) {
     let engine = &*target.engine;
     engine
@@ -530,6 +668,10 @@ fn rg_at_04_guard_is_released_after_reentry_failed_sink_and_panic() {
             let target = build_target(&slot, Arc::new(FailingSink), "rg04-failed");
             assert!(is_audit_failed_sink(&run_outer(&target, 43)));
             assert_engine_usable_outside_callback(&target);
+            // sink が常に失敗するので Completed にはならないが、guard が残っていれば
+            // run_audited が `Outcome(InternalFailure)` で拒否される。そうではなく
+            // 通常どおり sink まで届いて `AuditFailed { Sink }` になる。
+            assert!(is_audit_failed_sink(&run_outer(&target, 45)));
         }
 
         // 3. sink が panic した実行の後（unwind で guard が外れる）。
@@ -544,6 +686,12 @@ fn rg_at_04_guard_is_released_after_reentry_failed_sink_and_panic() {
             let unwound = catch_unwind(AssertUnwindSafe(|| run_outer(&target, 44)));
             assert!(unwound.is_err(), "sink の panic は run_audited を貫通する");
             assert_engine_usable_outside_callback(&target);
+            // panic は 1 回目の submit だけなので、続く run_audited は通常どおり Completed になる。
+            let outcome = run_outer(&target, 46);
+            assert!(
+                matches!(outcome.outcome(), Some(EmbeddingOutcome::Completed { .. })),
+                "{outcome:?}"
+            );
         }
     });
 }
