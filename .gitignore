@@ -6,3 +6,4 @@
 reports/
 # AI エージェント向けローカル作業ルール（コミット対象外）
 /AGENTS.md
+__pycache__/

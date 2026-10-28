@@ -41,6 +41,15 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  loop-scripts:
+    name: Loop scripts (python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Unit tests for .claude/skills
+        run: python3 -m unittest discover -s .claude/skills/loop-check/scripts -v
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
