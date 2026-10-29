@@ -146,8 +146,8 @@ order      = 9
 # 残さない。「tree-expr-continuation が done」は e1〜e4 がすべて done を意味する。
 # acceptance は各スライスが担当する受入基準の ID。複数スライスにまたがる基準（TEC-AT-01 等）の
 # どの部分を満たせば完了かは、各スライスの spec 小節「受入基準（eN が満たす部分）」に書く。
-# e4 は設計確定済みだが、DoR 3（depends_on がすべて done）を満たさないため todo に置く。
-# 前段が done になった時点で設計 PR で todo → ready にする（e2b・e3 と同じ運用）。
+# e1〜e3 は done。e4 は設計確定済みで depends_on もすべて done になったが、e3 の実装で小節の前提が
+# 変わっていないかを確かめる設計の更新を設計 PR で行ってから todo → ready にする（e2b・e3 と同じ運用）。
 [[slice]]
 id         = "tree-expr-continuation-e1"
 title      = "tree evaluator の式レベル continuation e1：文レベルのユーザー関数呼び出しを driver 上で実行し関数本体の文/反復境界で slice yield（強制 yield フック）"
@@ -197,13 +197,14 @@ order      = 13
 [[slice]]
 id         = "tree-expr-continuation-e3"
 title      = "tree evaluator の式レベル continuation e3：builtin・host function の呼び出しで呼び出しを含む引数の境界を yield 可能に"
-status     = "ready"
+status     = "done"
 parent     = "REV-015"
 spec_slice = "exec-control Slice 3"
 spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation-e3 実装スライス（builtin・host function の呼び出し引数境界）" }
 acceptance = ["TEC-AT-01..03", "TEC-AT-06"]
 depends_on = ["tree-expr-continuation-e2b"]
 design_pr  = 287
+impl_pr    = 296
 order      = 15
 
 [[slice]]

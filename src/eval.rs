@@ -282,6 +282,16 @@ enum FrameKind {
     Expr(Box<ExprFrame>),
 }
 
+/// 式 frame が評価中のノードの位置（文の式スロットからの経路。tree-expr-continuation-e3 で
+/// 段の関数へ引き渡すためにまとめた）。
+struct ExprAt<'a> {
+    owner: &'a Block,
+    stmt_index: usize,
+    slot: usize,
+    path: &'a [usize],
+    line: usize,
+}
+
 /// 式 frame の状態（tree-expr-continuation-e2a、execution-control §14「continuation へ保存する
 /// 式の評価状態」）。
 ///
@@ -313,8 +323,26 @@ struct ExprFrame {
     pending_key: Option<String>,
     /// f-string: 描画済みの部分を連結した作りかけの文字列（e2b）。
     text: String,
+    /// call: callee が builtin・host function に解決された場合の解決先（e3。最初の段で 1 回だけ決める）。
+    target: Option<CallTarget>,
+    /// `print`: 描画済みの引数（同期経路のローカル `parts`。e3）。
+    parts: Vec<String>,
+    /// `push`: 解決済みの代入先 cell（e3）。
+    cell: Option<SharedValue>,
     /// 値の受け渡し先（親の式 frame の operand stack、または根なら文の受け渡し先）。
     dest: CallDest,
+}
+
+/// 式 frame の call の callee が解決された先（tree-expr-continuation-e3）。同期経路の `prepare_call` と
+/// 同じ優先順（builtin → cooperative host function → 登録 host function）で決める。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallTarget {
+    /// 引数を評価する builtin（`print` / `exit` / `env` / `push` と PureCore builtin）。
+    Builtin,
+    /// cooperative host function。
+    Cooperative,
+    /// 登録 host function。
+    Host,
 }
 
 /// driver 上で実行している文レベルのユーザー関数呼び出しの状態（tree-expr-continuation-e1）。
@@ -2623,17 +2651,24 @@ impl Evaluator {
     /// この式を式 frame で段階評価するか（tree-expr-continuation-e2a、yield 可能な driver だけ）。
     ///
     /// 呼び出しを含む call・二項・単項に限る。callee が識別子でその時点で user binding を持たない
-    /// call（builtin / cooperative host / 登録 host function / 未定義名）と、e2a で段階評価しない式種は
-    /// 従来どおり `eval_expr` で 1 つの値として評価する。
+    /// call は、引数に呼び出しを含み、かつ `resolve_call_target` が引数を評価する builtin・
+    /// cooperative host function・登録 host function に解決するときだけ式 frame にする（e3）。
+    /// 引数に呼び出しが無い call、`input` / `args` / `now` / `pop` / `map` / `filter` / `each`・
+    /// 未定義名、e2a・e3 で段階評価しない式種は従来どおり `eval_expr` で 1 つの値として評価する。
     fn needs_expr_frame(&self, expr: &Expr) -> bool {
         if !crate::ast::contains_call(expr) {
             return false;
         }
         match expr {
-            Expr::Call { callee, .. } => !matches!(
-                callee.as_ref(),
-                Expr::Ident(name) if self.env.get_cell(name).is_none()
-            ),
+            // callee が識別子でその時点で user binding を持たない call は、引数に呼び出しを含み、かつ
+            // 引数を評価する builtin・host function に解決されるときだけ式 frame にする（e3）。
+            Expr::Call { callee, args } => match callee.as_ref() {
+                Expr::Ident(name) if self.env.get_cell(name).is_none() => {
+                    args.iter().any(crate::ast::contains_call)
+                        && self.resolve_call_target(name).is_some()
+                }
+                _ => true,
+            },
             Expr::BinOp { .. }
             | Expr::UnaryOp { .. }
             | Expr::Index { .. }
@@ -2641,6 +2676,26 @@ impl Evaluator {
             | Expr::Dict(_)
             | Expr::FStr(_) => true,
             _ => false,
+        }
+    }
+
+    /// 識別子 callee（user binding なし）の解決先（tree-expr-continuation-e3）。同期経路の `prepare_call`
+    /// と同じ優先順。引数を評価しない builtin（`input` / `args` / `now` / `pop`）と `map` / `filter` /
+    /// `each` は式 frame の対象にしない（`None`）。
+    fn resolve_call_target(&self, name: &str) -> Option<CallTarget> {
+        match name {
+            "print" | "exit" | "env" | "push" => return Some(CallTarget::Builtin),
+            "input" | "args" | "now" | "pop" | "map" | "filter" | "each" => return None,
+            _ => {}
+        }
+        if crate::builtin_registry::is_pure_core_builtin(name) {
+            Some(CallTarget::Builtin)
+        } else if self.host_registry.contains_cooperative_name(name) {
+            Some(CallTarget::Cooperative)
+        } else if self.host_registry.contains_name(name) {
+            Some(CallTarget::Host)
+        } else {
+            None
         }
     }
 
@@ -2671,6 +2726,9 @@ impl Evaluator {
                 map: BTreeMap::new(),
                 pending_key: None,
                 text: String::new(),
+                target: None,
+                parts: Vec::new(),
+                cell: None,
                 dest,
             })),
             scope_base: self.env.scope_depth(),
@@ -2730,6 +2788,26 @@ impl Evaluator {
         let node = expr_at(&owner, stmt_index, slot, &path);
         match node {
             Expr::Call { callee, args } => {
+                if !self.expr_frame_mut().started
+                    && let Expr::Ident(name) = callee.as_ref()
+                    && self.env.get_cell(name).is_none()
+                    && let Some(target) = self.resolve_call_target(name)
+                {
+                    // callee の解決は 1 回だけ。以降の段は保存した解決先に従う（e3）。
+                    self.expr_frame_mut().target = Some(target);
+                }
+                if let (Some(target), Expr::Ident(name)) =
+                    (self.expr_frame_mut().target, callee.as_ref())
+                {
+                    let at = ExprAt {
+                        owner: &owner,
+                        stmt_index,
+                        slot,
+                        path: &path,
+                        line,
+                    };
+                    return self.step_target_call(target, name, args, &at);
+                }
                 if !self.expr_frame_mut().started {
                     self.begin_user_call(line)?;
                     self.expr_frame_mut().started = true;
@@ -2915,6 +2993,98 @@ impl Evaluator {
             }
             _ => unreachable!("式 frame は段階評価する式種だけを持つ"),
         }
+    }
+
+    /// builtin・host function に解決された call の式 frame を 1 段進める（tree-expr-continuation-e3）。
+    ///
+    /// 最初の段で同期経路と同じ前処理（arity 検査・`push` の代入先解決・`count_step`・cooperative の
+    /// 格納結果の消費）を行い、引数を左から 1 つずつ評価する。揃ったら同期経路と共有する適用関数
+    /// （`apply_*`）で結果を作る。引数の境界が yield 可能点になり、builtin・host function の本体は
+    /// 1 段で完了まで実行する。
+    #[inline(never)]
+    fn step_target_call(
+        &mut self,
+        target: CallTarget,
+        name: &str,
+        args: &[Expr],
+        at: &ExprAt<'_>,
+    ) -> Result<Option<FlowSignal>, TsumugiError> {
+        let line = at.line;
+        let is_builtin = target == CallTarget::Builtin;
+        if !self.expr_frame_mut().started {
+            self.expr_frame_mut().started = true;
+            match target {
+                CallTarget::Builtin => {
+                    crate::builtin_core::validate_context_builtin_call(
+                        name,
+                        args.len(),
+                        matches!(args.first(), Some(Expr::Ident(_))),
+                        line,
+                    )?;
+                    if name == "env" {
+                        crate::builtin_core::check_arity_count(name, args.len(), 1, line)?;
+                    } else if name == "push" {
+                        let cell = self.push_target_cell(&args[0], line)?;
+                        self.expr_frame_mut().cell = Some(cell);
+                    }
+                }
+                CallTarget::Host => self.count_step(line)?,
+                CallTarget::Cooperative => {
+                    // resume 中の格納結果は count_step と引数の評価より前に消費する（同期経路と同じ）。
+                    if let Some((_call_id, result)) = self.resumed_host_call.take() {
+                        let value = self.finish_cooperative_result(name, result, line)?;
+                        return self.finish_expr_frame(value);
+                    }
+                    self.count_step(line)?;
+                }
+            }
+        }
+        // `print`: 直前に評価した引数を描画して足す（fuel と per-item byte 上限の課金はその時点）。
+        if is_builtin
+            && name == "print"
+            && let Some(val) = self.expr_frame_mut().operands.pop()
+        {
+            let rendered = self.render_print_part(&val, line)?;
+            drop(val);
+            self.expr_frame_mut().parts.push(rendered);
+        }
+        let frame = self.expr_frame_mut();
+        // `push` の第 1 引数は代入先（値として評価しない）。
+        let skip = usize::from(is_builtin && name == "push");
+        let next = frame.operands.len() + frame.parts.len() + skip;
+        if next < args.len() {
+            return self.begin_expr_child(
+                at.owner,
+                at.stmt_index,
+                at.slot,
+                at.path,
+                next + 1,
+                line,
+            );
+        }
+        let mut operands = std::mem::take(&mut frame.operands);
+        let value = match target {
+            CallTarget::Host => self.apply_host_call(name, &operands, line)?,
+            CallTarget::Cooperative => self.start_cooperative_call(name, operands, line)?,
+            CallTarget::Builtin => match name {
+                "print" => {
+                    let parts = std::mem::take(&mut self.expr_frame_mut().parts);
+                    self.apply_print(&parts, line)?
+                }
+                "env" => self.apply_env(operands.pop().expect("env key"), line)?,
+                "exit" => self.apply_exit(operands.pop(), line)?,
+                "push" => {
+                    let cell = self.expr_frame_mut().cell.take().expect("push target");
+                    self.apply_push(&cell, operands.pop().expect("push value"), line)?
+                }
+                _ => self
+                    .apply_pure_core_builtin(name, operands, line)?
+                    .ok_or_else(|| {
+                        TsumugiError::internal_control(line, "unknown PureCore builtin")
+                    })?,
+            },
+        };
+        self.finish_expr_frame(value)
     }
 
     /// 最上位の式 frame を 1 段進め、その結果で driver を遷移させる（tree-expr-continuation-e2a、
@@ -4058,25 +4228,9 @@ impl Evaluator {
             for arg in args {
                 arg_values.push(self.eval_expr(arg, line)?);
             }
-            // registry と capability を分けて借用するため、registry の Arc を clone してから
-            // consult する（`self` の他 field と借用が競合しないようにする）。
-            let registry = std::sync::Arc::clone(&self.host_registry);
-            let value = crate::host_function::resolve_host_call(
-                &registry,
-                &self.capabilities,
-                name,
-                &arg_values,
-                line,
-            )?
-            // contains_name が true のため resolve_host_call は必ず Some（None は未登録名のみ）。
-            .unwrap_or(Value::Null);
-            // host function が生成した untracked な値を tracked 化しつつ heap 課金する
-            // （builtin dispatch 境界と同じ扱い）。
-            let tracked = self
-                .budget
-                .track_result(value, ExecutionPhase::Run)
-                .map_err(|stop| self.control_stop_to_error(stop, line))?;
-            return Ok(CallPrep::Done(tracked));
+            return self
+                .apply_host_call(name, &arg_values, line)
+                .map(CallPrep::Done);
         }
 
         // ユーザー定義関数の呼び出し: ステップカウント + 深度チェック
@@ -4106,6 +4260,33 @@ impl Evaluator {
             saved_scopes,
             callee: func_value,
         })
+    }
+
+    /// 評価済みの引数で登録 host function を呼ぶ（grant・arity 検査・host error の写像 →
+    /// `track_result`）。同期経路と式 frame で共有する（tree-expr-continuation-e3）。
+    fn apply_host_call(
+        &mut self,
+        name: &str,
+        arg_values: &[Value],
+        line: usize,
+    ) -> Result<Value, TsumugiError> {
+        // registry と capability を分けて借用するため、registry の Arc を clone してから
+        // consult する（`self` の他 field と借用が競合しないようにする）。
+        let registry = std::sync::Arc::clone(&self.host_registry);
+        let value = crate::host_function::resolve_host_call(
+            &registry,
+            &self.capabilities,
+            name,
+            arg_values,
+            line,
+        )?
+        // contains_name が true のため resolve_host_call は必ず Some（None は未登録名のみ）。
+        .unwrap_or(Value::Null);
+        // host function が生成した untracked な値を tracked 化しつつ heap 課金する
+        // （builtin dispatch 境界と同じ扱い）。
+        self.budget
+            .track_result(value, ExecutionPhase::Run)
+            .map_err(|stop| self.control_stop_to_error(stop, line))
     }
 
     /// ユーザー関数呼び出しの入口: `count_step` → 深度検査（同期経路と式 frame で共有する段、
@@ -4219,7 +4400,17 @@ impl Evaluator {
         for arg in args {
             arg_values.push(self.eval_expr(arg, line)?);
         }
+        self.start_cooperative_call(name, arg_values, line)
+    }
 
+    /// 評価済みの引数で cooperative host function を `start` する（同期経路と式 frame で共有、
+    /// tree-expr-continuation-e3）。`resumed_host_call` の消費と `count_step`・引数の評価は呼び出し側。
+    fn start_cooperative_call(
+        &mut self,
+        name: &str,
+        arg_values: Vec<Value>,
+        line: usize,
+    ) -> Result<Value, TsumugiError> {
         // capability / arity を検査して adapter を取り出す（registry の Arc を clone して借用衝突を
         // 避ける）。grant 不足は capability error、arity 不一致は argument error（どちらも catch 可能）。
         let registry = std::sync::Arc::clone(&self.host_registry);
@@ -5132,6 +5323,185 @@ mod tests {
         assert_eq!(forced_eval.env.scope_depth(), sync_eval.env.scope_depth());
     }
 
+    /// TEC-AT-02（e3 分）: builtin の呼び出しの式 frame が、callee の解決先・評価済みの引数・`print` の
+    /// 描画済みの部分・`push` の解決済み cell を yield を跨いで保存し、resume 後の値・fuel・heap が
+    /// 同期経路と一致する。
+    /// TEC-AT-03（e3 分）: e3 の call を含む script の poll 経路の `live_heap` / `peak_heap` が
+    /// `Evaluator::run` と一致する。
+    #[test]
+    fn e3_builtin_call_frame_preserves_partial_state_across_yields() {
+        let src = format!(
+            "{E2B_FN}let xs = []\n\
+             print(id(1), id(\"two\"), id([3]))\n\
+             push(xs, id(5))\n\
+             push(xs, id(6) + id(7))\n\
+             let n = len(id(xs)) + len(id(\"abc\"))\n\
+             let s = join(id([1, 2]), id(\"-\")) + to_str(id(4))\n\
+             let r = sort(id([3, 1, 2]))\n"
+        );
+        let (mut builtin_frames, mut max_parts, mut push_cell, mut max_operands) = (0, 0, false, 0);
+        let program = parse_program(&src);
+        let mut forced_eval = Evaluator::new();
+        forced_eval.set_capabilities(ambient_test_capabilities());
+        forced_eval.force_yield_every_boundary = true;
+        forced_eval
+            .begin_execution(&program, src.len() as u64, false)
+            .expect("begin_execution");
+        let mut yields = 0usize;
+        let forced = loop {
+            match forced_eval.run_slice(u64::MAX) {
+                SliceOutcome::Terminal(result) => break result,
+                _ => {
+                    yields += 1;
+                    for frame in &forced_eval.frames {
+                        if let FrameKind::Expr(expr) = &frame.kind {
+                            builtin_frames += usize::from(expr.target == Some(CallTarget::Builtin));
+                            max_parts = max_parts.max(expr.parts.len());
+                            push_cell |= expr.cell.is_some();
+                            if expr.target.is_some() {
+                                max_operands = max_operands.max(expr.operands.len());
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let mut sync_eval = Evaluator::new();
+        sync_eval.set_capabilities(ambient_test_capabilities());
+        let sync = sync_eval.run(&program, src.len() as u64);
+        assert!(forced.is_ok() && sync.is_ok(), "{forced:?} / {sync:?}");
+        assert!(yields > 30, "引数の境界でも yield する: {yields}");
+        assert!(builtin_frames > 0, "builtin の式 frame で yield している");
+        assert!(
+            max_parts >= 2,
+            "print の描画済みの部分が保存される: {max_parts}"
+        );
+        assert!(push_cell, "push の解決済みの cell が保存される");
+        assert!(max_operands >= 1, "評価済みの引数が保存される");
+        for name in ["xs", "n", "s", "r"] {
+            assert_eq!(forced_eval.env.get(name), sync_eval.env.get(name), "{name}");
+        }
+        assert_eq!(forced_eval.env.get("n"), Some(Value::Int(5)));
+        let (f, s) = (forced_eval.budget_usage(), sync_eval.budget_usage());
+        assert_eq!(f.committed.fuel, s.committed.fuel);
+        assert_eq!(f.live_heap_bytes, s.live_heap_bytes);
+        assert_eq!(f.peak_heap_bytes, s.peak_heap_bytes);
+        assert!(forced_eval.frames.is_empty() && forced_eval.call_stack.is_empty());
+        assert_eq!(forced_eval.env.scope_depth(), sync_eval.env.scope_depth());
+    }
+
+    /// TEC-AT-01（e3 分）の描画上限: `print` の引数の描画が per-item byte 上限（`max_single_string_bytes`）
+    /// に掛かったとき、同期経路と同じエラー・行・trace・fuel になり、後続の引数は評価されない
+    /// （式 frame では描画が引数を評価した次の段で行われるが、次の引数の評価より前）。
+    #[test]
+    fn e3_print_render_limit_matches_sync_path() {
+        let src = "let n = 0\n\
+                   fn bump(x)\n  n = n + 1\n  let i = 0\n  while i < 1\n    i = i + 1\n  end\n  return x\nend\n\
+                   print(bump(1), bump([1000, 2000, 3000]), bump(2))\n";
+        let program = parse_program(src);
+        let config = || {
+            let mut config = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+            config.max_single_string_bytes = 12;
+            config
+        };
+        let mut forced = Evaluator::with_budget(config());
+        forced.set_capabilities(ambient_test_capabilities());
+        forced.force_yield_every_boundary = true;
+        forced
+            .begin_execution(&program, src.len() as u64, false)
+            .expect("begin_execution");
+        let forced_result = loop {
+            if let SliceOutcome::Terminal(result) = forced.run_slice(u64::MAX) {
+                break result;
+            }
+        };
+        let mut sync = Evaluator::with_budget(config());
+        sync.set_capabilities(ambient_test_capabilities());
+        let sync_result = sync.run(&program, src.len() as u64);
+        assert!(sync_result.is_err(), "描画上限で止まる: {sync_result:?}");
+        assert_eq!(forced_result, sync_result);
+        // 3 つ目の引数 `bump(2)` は評価されない（bump は 2 回だけ）。
+        assert_eq!(forced.env.get("n"), Some(Value::Int(2)));
+        assert_eq!(forced.env.get("n"), sync.env.get("n"));
+        assert_eq!(
+            forced.budget_usage().committed.fuel,
+            sync.budget_usage().committed.fuel
+        );
+        assert!(forced.frames.is_empty() && forced.call_stack.is_empty());
+    }
+
+    /// TEC-AT-01（e3 分）の `exit` / `env` の grant した経路: 引数に呼び出しを含む `exit` / `env` が、
+    /// 強制 yield の poll 経路と `Evaluator::run` で結果・fuel・heap・`take_pending_exit` まで一致する。
+    /// `exit` の `ProcessExit` は try で catch されず、後続の文は実行されない。
+    #[test]
+    fn e3_exit_and_env_arguments_match_sync_path() {
+        let prelude =
+            "fn id(x)\n  let i = 0\n  while i < 2\n    i = i + 1\n  end\n  return x\nend\n";
+        let cases = [
+            "let a = 1\nexit(id(3))\nlet a = 2\n",
+            "let a = 1\ntry\n  exit(id(4))\ncatch e\n  a = 99\nend\na = 2\n",
+            "let v = env(id(\"PATH\"))\nlet a = 1\n",
+            "let v = [env(id(\"TSUMUGI_E3_UNSET_KEY\")), id(2)]\nlet a = 1\n",
+        ];
+        for body in cases {
+            let src = format!("{prelude}{body}");
+            let program = parse_program(&src);
+            let mut forced = Evaluator::new();
+            forced.set_capabilities(ambient_test_capabilities());
+            forced.force_yield_every_boundary = true;
+            forced
+                .begin_execution(&program, src.len() as u64, false)
+                .expect("begin_execution");
+            let forced_result = loop {
+                if let SliceOutcome::Terminal(result) = forced.run_slice(u64::MAX) {
+                    break result;
+                }
+            };
+            let mut sync = Evaluator::new();
+            sync.set_capabilities(ambient_test_capabilities());
+            let sync_result = sync.run(&program, src.len() as u64);
+            assert_eq!(forced_result, sync_result, "{body}");
+            for name in ["a", "v"] {
+                assert_eq!(forced.env.get(name), sync.env.get(name), "{body} / {name}");
+            }
+            assert_eq!(
+                forced.budget_usage().committed.fuel,
+                sync.budget_usage().committed.fuel,
+                "{body}"
+            );
+            let (f, s) = (forced.budget_usage(), sync.budget_usage());
+            assert_eq!(f.live_heap_bytes, s.live_heap_bytes, "{body}");
+            assert_eq!(f.peak_heap_bytes, s.peak_heap_bytes, "{body}");
+            let (forced_exit, sync_exit) = (forced.take_pending_exit(), sync.take_pending_exit());
+            assert_eq!(forced_exit, sync_exit, "{body}");
+            if body.contains("exit(") {
+                assert!(forced_exit.is_some(), "exit が記録される: {body}");
+                assert_eq!(forced.env.get("a"), Some(Value::Int(1)), "{body}");
+            } else {
+                assert!(forced_result.is_ok(), "{body}: {forced_result:?}");
+                assert_eq!(forced.env.get("a"), Some(Value::Int(1)), "{body}");
+            }
+        }
+    }
+
+    /// 引数を評価しない builtin（`input` / `args` / `now` / `pop`）と `map` / `filter` / `each`、
+    /// 未定義名は式 frame の対象にならない（従来どおり `eval_expr` で評価する）。
+    #[test]
+    fn e3_calls_without_argument_boundary_are_not_framed() {
+        let eval = Evaluator::new();
+        for name in [
+            "input", "args", "now", "pop", "map", "filter", "each", "nope",
+        ] {
+            assert!(eval.resolve_call_target(name).is_none(), "{name}");
+        }
+        for name in ["print", "exit", "env", "push", "len", "sort", "read_file"] {
+            assert!(
+                eval.resolve_call_target(name) == Some(CallTarget::Builtin),
+                "{name}"
+            );
+        }
+    }
+
     /// 文の式スロットの途中で yield した session を中断すると、式 frame と driver 上の呼び出しが
     /// 畳まれる。
     #[test]
@@ -6001,6 +6371,164 @@ mod tests {
             let (registry, _calls) = registry_with(7, Arity::Exact(1), false);
             let err = run_with("nonexistent(1)\n", registry, granted(7)).expect_err("unknown name");
             assert_eq!(err.error_type(), "name");
+        }
+
+        /// cooperative host function（Ready を返す）。引数を記録して `Int(99)` を返す。
+        struct ReadyCoop {
+            descriptor: HostFunctionDescriptor,
+            calls: CallSink,
+        }
+        impl crate::host_function::CooperativeHostFunction for ReadyCoop {
+            fn descriptor(&self) -> &HostFunctionDescriptor {
+                &self.descriptor
+            }
+            fn start(
+                &self,
+                _context: &mut crate::capability::CapabilityCallContext<'_>,
+                arguments: &[Value],
+            ) -> crate::host_pending::HostCallPoll<Value> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(arguments.iter().map(|v| v.to_string()).collect());
+                crate::host_pending::HostCallPoll::Ready(Ok(Value::Int(99)))
+            }
+        }
+
+        /// 登録 host function `lookup`（id 7）と cooperative host function `fetch`（id 8）、
+        /// 両方を grant した capability と、それぞれの呼び出し記録を作る。
+        fn registry_with_both() -> (Arc<HostFunctionRegistry>, CapabilitySet, CallSink, CallSink) {
+            let lookup_calls: CallSink = Arc::new(Mutex::new(Vec::new()));
+            let fetch_calls: CallSink = Arc::new(Mutex::new(Vec::new()));
+            let registry = HostFunctionRegistry::builder()
+                .register(Arc::new(Recorder {
+                    descriptor: descriptor(7, "lookup", Arity::Exact(2)),
+                    calls: Arc::clone(&lookup_calls),
+                    fail: false,
+                }))
+                .unwrap()
+                .register_cooperative(Arc::new(ReadyCoop {
+                    descriptor: descriptor(8, "fetch", Arity::Exact(1)),
+                    calls: Arc::clone(&fetch_calls),
+                }))
+                .unwrap()
+                .build()
+                .unwrap();
+            let caps = CapabilitySet::builder()
+                .grant_host_function(hid(7))
+                .unwrap()
+                .grant_host_function(hid(8))
+                .unwrap()
+                .build();
+            (Arc::new(registry), caps, lookup_calls, fetch_calls)
+        }
+
+        /// TEC-AT-01 / 02 / 03（e3 分）: 登録 host function と cooperative host function（Ready）の引数に
+        /// 呼び出しを含む script を全境界で yield させても、値・呼び出しの引数列・fuel・heap が
+        /// 同期経路と一致し、host function の解決先が式 frame に保存される。
+        #[test]
+        fn e3_host_function_arguments_match_sync_path() {
+            let src = "fn id(x)\n  let i = 0\n  while i < 2\n    i = i + 1\n  end\n  return x\nend\n\
+                       let a = lookup(id(1), id(2))\n\
+                       let b = fetch(id(3))\n\
+                       let c = lookup(id(4), fetch(id(5))) + fetch(lookup(id(6), id(7)))\n\
+                       let d = [fetch(id(8)), id(9)]\n";
+            let (reg_f, caps_f, lookup_f, fetch_f) = registry_with_both();
+            let mut targets = (false, false);
+            let program = parse_program(src);
+            let mut forced = Evaluator::new();
+            forced.set_host_registry(reg_f);
+            forced.set_capabilities(caps_f);
+            forced.force_yield_every_boundary = true;
+            forced
+                .begin_execution(&program, src.len() as u64, false)
+                .expect("begin");
+            let mut yields = 0;
+            let result = loop {
+                match forced.run_slice(u64::MAX) {
+                    SliceOutcome::Terminal(result) => break result,
+                    _ => {
+                        yields += 1;
+                        for frame in &forced.frames {
+                            if let FrameKind::Expr(expr) = &frame.kind {
+                                targets.0 |= expr.target == Some(CallTarget::Host);
+                                targets.1 |= expr.target == Some(CallTarget::Cooperative);
+                            }
+                        }
+                    }
+                }
+            };
+            let (reg_s, caps_s, lookup_s, fetch_s) = registry_with_both();
+            let mut sync = Evaluator::new();
+            sync.set_host_registry(reg_s);
+            sync.set_capabilities(caps_s);
+            let sync_result = sync.run(&program, src.len() as u64);
+            assert!(result.is_ok() && sync_result.is_ok(), "{result:?}");
+            assert!(yields > 20, "{yields}");
+            assert!(targets.0 && targets.1, "解決先が式 frame に保存される");
+            for name in ["a", "b", "c", "d"] {
+                assert_eq!(forced.env.get(name), sync.env.get(name), "{name}");
+            }
+            assert_eq!(*lookup_f.lock().unwrap(), *lookup_s.lock().unwrap());
+            assert_eq!(*fetch_f.lock().unwrap(), *fetch_s.lock().unwrap());
+            assert_eq!(lookup_f.lock().unwrap().len(), 3);
+            assert_eq!(fetch_f.lock().unwrap().len(), 4);
+            let (f, s) = (forced.budget_usage(), sync.budget_usage());
+            assert_eq!(f.committed.fuel, s.committed.fuel);
+            assert_eq!(f.committed.host_calls, s.committed.host_calls);
+            assert_eq!(f.live_heap_bytes, s.live_heap_bytes);
+            assert_eq!(f.peak_heap_bytes, s.peak_heap_bytes);
+            assert!(forced.frames.is_empty() && forced.call_stack.is_empty());
+        }
+
+        /// host function の引数の評価中のエラーと、grant 不足・arity 違反は、同期経路と同じエラー・
+        /// 行・fuel になり、host function は呼ばれない。
+        #[test]
+        fn e3_host_function_error_paths_match_sync_path() {
+            let prelude = "fn id(x)\n  return x\nend\n";
+            // (script, grant するか)。grant しない case は capability error で host function は呼ばれない。
+            let cases = [
+                ("let a = lookup(id(1), id(2) / 0)\n", true),
+                ("let a = lookup(id(1))\n", true),
+                ("let a = fetch(id(1), id(2))\n", true),
+                (
+                    "try\n  let a = fetch(id(1), id(2))\ncatch e\n  let t = e[\"type\"]\nend\n",
+                    true,
+                ),
+                ("let a = lookup(id(1), id(2))\n", false),
+                ("let a = fetch(id(1))\n", false),
+            ];
+            for (body, granted) in cases {
+                let src = format!("{prelude}{body}");
+                let program = parse_program(&src);
+                let run = |forced: bool| {
+                    let (registry, caps, lookup, fetch) = registry_with_both();
+                    let mut eval = Evaluator::new();
+                    eval.set_host_registry(registry);
+                    eval.set_capabilities(if granted {
+                        caps
+                    } else {
+                        CapabilitySet::empty()
+                    });
+                    eval.force_yield_every_boundary = forced;
+                    eval.begin_execution(&program, src.len() as u64, false)
+                        .expect("begin");
+                    let result = loop {
+                        if let SliceOutcome::Terminal(result) = eval.run_slice(u64::MAX) {
+                            break result;
+                        }
+                    };
+                    let calls = (lookup.lock().unwrap().len(), fetch.lock().unwrap().len());
+                    (result, eval.budget_usage().committed.fuel, calls)
+                };
+                let (forced, sync) = (run(true), run(false));
+                assert_eq!(forced, sync, "{src}");
+                if !granted {
+                    let err = forced.0.expect_err("grant なしは capability error");
+                    assert_eq!(err.error_type(), "capability", "{src}");
+                    assert_eq!(forced.2, (0, 0), "{src}");
+                }
+            }
         }
 
         #[test]
