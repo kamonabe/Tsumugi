@@ -5388,6 +5388,46 @@ mod tests {
         assert_eq!(forced_eval.env.scope_depth(), sync_eval.env.scope_depth());
     }
 
+    /// TEC-AT-01（e3 分）の描画上限: `print` の引数の描画が per-item byte 上限（`max_single_string_bytes`）
+    /// に掛かったとき、同期経路と同じエラー・行・trace・fuel になり、後続の引数は評価されない
+    /// （式 frame では描画が引数を評価した次の段で行われるが、次の引数の評価より前）。
+    #[test]
+    fn e3_print_render_limit_matches_sync_path() {
+        let src = "let n = 0\n\
+                   fn bump(x)\n  n = n + 1\n  let i = 0\n  while i < 1\n    i = i + 1\n  end\n  return x\nend\n\
+                   print(bump(1), bump([1000, 2000, 3000]), bump(2))\n";
+        let program = parse_program(src);
+        let config = || {
+            let mut config = BudgetConfig::for_legacy(1_000_000, 1_000_000);
+            config.max_single_string_bytes = 12;
+            config
+        };
+        let mut forced = Evaluator::with_budget(config());
+        forced.set_capabilities(ambient_test_capabilities());
+        forced.force_yield_every_boundary = true;
+        forced
+            .begin_execution(&program, src.len() as u64, false)
+            .expect("begin_execution");
+        let forced_result = loop {
+            if let SliceOutcome::Terminal(result) = forced.run_slice(u64::MAX) {
+                break result;
+            }
+        };
+        let mut sync = Evaluator::with_budget(config());
+        sync.set_capabilities(ambient_test_capabilities());
+        let sync_result = sync.run(&program, src.len() as u64);
+        assert!(sync_result.is_err(), "描画上限で止まる: {sync_result:?}");
+        assert_eq!(forced_result, sync_result);
+        // 3 つ目の引数 `bump(2)` は評価されない（bump は 2 回だけ）。
+        assert_eq!(forced.env.get("n"), Some(Value::Int(2)));
+        assert_eq!(forced.env.get("n"), sync.env.get("n"));
+        assert_eq!(
+            forced.budget_usage().committed.fuel,
+            sync.budget_usage().committed.fuel
+        );
+        assert!(forced.frames.is_empty() && forced.call_stack.is_empty());
+    }
+
     /// 引数を評価しない builtin（`input` / `args` / `now` / `pop`）と `map` / `filter` / `each`、
     /// 未定義名は式 frame の対象にならない（従来どおり `eval_expr` で評価する）。
     #[test]
@@ -6390,20 +6430,30 @@ mod tests {
         #[test]
         fn e3_host_function_error_paths_match_sync_path() {
             let prelude = "fn id(x)\n  return x\nend\n";
+            // (script, grant するか)。grant しない case は capability error で host function は呼ばれない。
             let cases = [
-                "let a = lookup(id(1), id(2) / 0)\n",
-                "let a = lookup(id(1))\n",
-                "let a = fetch(id(1), id(2))\n",
-                "try\n  let a = fetch(id(1), id(2))\ncatch e\n  let t = e[\"type\"]\nend\n",
+                ("let a = lookup(id(1), id(2) / 0)\n", true),
+                ("let a = lookup(id(1))\n", true),
+                ("let a = fetch(id(1), id(2))\n", true),
+                (
+                    "try\n  let a = fetch(id(1), id(2))\ncatch e\n  let t = e[\"type\"]\nend\n",
+                    true,
+                ),
+                ("let a = lookup(id(1), id(2))\n", false),
+                ("let a = fetch(id(1))\n", false),
             ];
-            for body in cases {
+            for (body, granted) in cases {
                 let src = format!("{prelude}{body}");
                 let program = parse_program(&src);
                 let run = |forced: bool| {
                     let (registry, caps, lookup, fetch) = registry_with_both();
                     let mut eval = Evaluator::new();
                     eval.set_host_registry(registry);
-                    eval.set_capabilities(caps);
+                    eval.set_capabilities(if granted {
+                        caps
+                    } else {
+                        CapabilitySet::empty()
+                    });
                     eval.force_yield_every_boundary = forced;
                     eval.begin_execution(&program, src.len() as u64, false)
                         .expect("begin");
@@ -6415,7 +6465,13 @@ mod tests {
                     let calls = (lookup.lock().unwrap().len(), fetch.lock().unwrap().len());
                     (result, eval.budget_usage().committed.fuel, calls)
                 };
-                assert_eq!(run(true), run(false), "{src}");
+                let (forced, sync) = (run(true), run(false));
+                assert_eq!(forced, sync, "{src}");
+                if !granted {
+                    let err = forced.0.expect_err("grant なしは capability error");
+                    assert_eq!(err.error_type(), "capability", "{src}");
+                    assert_eq!(forced.2, (0, 0), "{src}");
+                }
             }
         }
 

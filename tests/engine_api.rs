@@ -2680,7 +2680,7 @@ print(t)
         assert!(observed.stdout.ends_with("[4, 4]\n"), "{}", observed.stdout);
     }
 
-    /// TEC-AT-01（e3 分）のエラー経路: 引数の検査・型・arity・未定義名・描画上限のエラーの種別・行・
+    /// TEC-AT-01（e3 分）のエラー経路: 引数の検査・型・arity・未定義名のエラー（描画上限は `src/eval.rs` の `e3_print_render_limit_matches_sync_path`）の種別・行・
     /// trace・fuel が同期実行と一致する（`push` の代入先が未定義名なら第 2 引数の副作用が出ない）。
     #[test]
     fn tec_at_01_e3_error_paths_match_sync_path() {
