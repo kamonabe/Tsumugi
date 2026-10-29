@@ -2600,7 +2600,7 @@ issue #290 から作ったスライス（不具合の修正、`slices.toml` の 
   - 言語仕様への統合: [言語仕様](language-spec.md)の「実行安全性」に「値のネスト深度制限」の小節を足し（「コールフレーム深度制限」と同じ形: 上限・超過時・対象・設定変更）、ランタイムエラーの表に `overflow` の行を足し、章冒頭の要約文に値の深度を足す。[次期意味論・実装決定](semantic-decisions.md) §21 は統合済みと記す（§21.7）。`language_revision` で分岐せず、言語仕様のバージョン（0.21）と `LanguageRevision` は変えない（§21.6）。
   - [脅威モデル](threat-model.md) TM-007 の緩和策に値のネスト深度の検査を足し、TM-AT-07 に値の深度 256 / 257 の試験を足す。closure の capture の連鎖（下記の範囲外）を TM-007 の残存リスクに書く。
 - **範囲外:**
-  - closure の capture の連鎖（`f = fn() g() end` で前の関数値を capture し続ける）による stack 枯渇。関数値の深度は 0 と数える（§21.3）ため本スライスでは防げない。issue #290 の設計の際に確かめた事実として、20 万段の連鎖の破棄で tree-walk 版が abort する（exit 134）。直し方は `fix-closure-capture-chain-stack`（`todo`）の設計で決める。
+  - closure の capture の連鎖（`f = fn() g() end` で前の関数値を capture し続ける）による stack 枯渇。関数値の深度は 0 と数える（§21.3）ため本スライスでは防げない。issue #290 の設計の際に確かめた事実として、20 万段の連鎖の破棄で tree-walk 版・VM 版とも abort する（exit 134）。直し方は `fix-closure-capture-chain-stack`（`todo`）の設計で決める。
   - host function の戻り値や host から渡された値そのものの深度の検査（§21.3。スクリプトが List / Dict に入れるときは検査する）。
   - 深度の計算への fuel・heap の課金（§21.3。課金しない）。
   - `contains` の予算漏れ（同じ issue の別スライス `fix-contains-budgeted-equality`）。
@@ -2608,7 +2608,7 @@ issue #290 から作ったスライス（不具合の修正、`slices.toml` の 
 - **受入基準:**
   - **VND-AT-01（境界と catch）:** 深度 256 の List / Dict を List / Dict リテラル・`push`・index 代入・`map` の結果のそれぞれで作れ、深度 257 になる同じ操作が `overflow`・`値のネストが深すぎます (上限: 256)` で拒否される。`try` / `catch` で捕捉でき、`push` / index 代入の対象は変わらない。tree-walk 版と VM 版で kind・message・line が一致する。確かめ方: 経路ごとに 256 / 257 を作る script を両 backend で実行し、結果・catch した error の type / message / line・対象の `len` を比べる統合テスト。
   - **VND-AT-02（abort しない）:** issue #290 の再現 1（List を 20 万回入れ子にする）と Dict 版が、abort せず `overflow` の診断を出して exit 1 で終わる。確かめ方: debug ビルドの CLI を subprocess で起動し、exit code が 1 で stderr にメッセージがあることを確かめるテスト（両 backend）。
-  - **VND-AT-03（深度は正確）:** 深度 256 の要素を index 代入・`pop` で取り除いた List / Dict は、再び入れ子にでき（深度 257 にならない）、深度の読み直しを要する index 代入を要素数ぶん繰り返しても完了する。確かめ方: 取り除いた後に `[x]` を作れることを確かめるテストと、深い要素を並べた List の全要素をスカラーへ index 代入するループが既定の budget で終わることを確かめるテスト（両 backend）。
+  - **VND-AT-03（深度は正確）:** 深度 256 の要素を index 代入・`pop` で取り除いた List / Dict は、再び入れ子にでき（深度 257 にならない）、深度の読み直しを要する index 代入を要素数ぶん繰り返しても完了する。確かめ方: 取り除いた後に `[x]` を作れることを確かめるテストと、深い要素を並べた List（例: 要素数 10 万）の全要素をスカラーへ index 代入するループが、壁時計の上限（例: 10 秒）以内に終わることを確かめるテスト（両 backend）。深度の読み直しは課金しない（§21.3）ため、fuel では要素数の 2 乗の実装を検出できず、壁時計で確かめる。
   - **VND-AT-04（上限の値で stack が足りる）:** 深度 256 の値を、call depth 128 の再帰の内側で表示（`print`・`to_str`）・比較（`==`）・`sort`・破棄しても abort しない（CLI の 8 MiB の実行スレッド、debug ビルド）。確かめ方: CLI を subprocess で起動して exit 0 で終わることを確かめるテスト（両 backend）。
   - **VND-AT-05（上限内の観測は不変）:** 深度 256 以下の値だけを使う既存のテスト（`tests/`・unit test）が期待値の変更なしで通り、fuel・`live_heap` / `peak_heap` の値が変わらない（深度の計算は課金しない）。確かめ方: 既存のテスト一式と、代表 script の usage を変更前の値で固定するテスト。
 

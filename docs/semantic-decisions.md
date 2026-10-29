@@ -2314,6 +2314,8 @@ Tsumugi の時刻は内部表現も出力基準も UTC 固定である。`now()`
 
 ## 21. 値のネスト深度上限（issue #290）
 
+設計ステータス: **設計確定・未実装**
+
 ### 21.1 背景・課題
 
 値（List / Dict）の入れ子の深さに上限がない。ループで `x = [x]` を繰り返せば値はいくらでも深くでき、値の破棄（`Tracked` の Drop）・比較・表示（`Display`・`render_into`）・全順序（`TotalOrder::compare_budgeted`）のように値を Rust の再帰でたどる処理が host stack を使い切り、プロセスが abort する（issue #290 の再現: 20 万段の List で `fatal runtime error: stack overflow`、exit 134。Dict でも同じ）。構文・AST（256）・call（128）・import（128）の深度上限は host stack を消費する前にエラー化するが、値の深さはどれにも当たらない（[脅威モデル](threat-model.md) TM-007 の緩和策は AST・call・import の深度検査だけ）。マニフェスト原則 1（ホストの安定性を最優先する）・原則 6（ホストプロセスが panic・abort しない）に反する。
