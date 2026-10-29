@@ -20,7 +20,7 @@ AI エージェント・人間のどちらも、新しい情報を書く前に�
 
 **状態（どの逸脱・未実装範囲が今残っているか）の正本はこの逸脱一覧だけである。** 表に行があることが「残っている」ことを表す。スライス小節は状態を再掲しない（上記「状態の正本は粒度ごとに 1 箇所だけ」と同じ原則）。逸脱一覧は「今の実装がどう振る舞うか」を書くので、記述だけで判断できない項目はコードやテストで事実を確かめてから書く。
 
-> **移行中:** [`design.md`](design.md)・[`embedding-api.md`](embedding-api.md)・[`language-spec.md`](language-spec.md)・[`semantic-decisions.md`](semantic-decisions.md)・[`threat-model.md`](threat-model.md)・[`verification-release-operations.md`](verification-release-operations.md) は逸脱一覧をまだ持たない。各 spec の次の done 実装 PR か、[開発ループ手順書](loop-runbook.md)「整合点検」の輪番で事実を確かめたものから寄せる（逸脱一覧は事実を確かめてから書くため、まとめて一度には作らない。loop:drift #263 の D-2 で kamonabe が選択）。
+> **移行中:** [`design.md`](design.md)・[`language-spec.md`](language-spec.md)・[`semantic-decisions.md`](semantic-decisions.md)・[`threat-model.md`](threat-model.md)・[`verification-release-operations.md`](verification-release-operations.md) は逸脱一覧をまだ持たない。各 spec の次の done 実装 PR か、[開発ループ手順書](loop-runbook.md)「整合点検」の輪番で事実を確かめたものから寄せる（逸脱一覧は事実を確かめてから書くため、まとめて一度には作らない。loop:drift #263 の D-2 で kamonabe が選択）。
 
 ## スライス小節は凍結された時点の記録
 
