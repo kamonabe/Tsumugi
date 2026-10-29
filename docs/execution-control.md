@@ -1,6 +1,6 @@
 # Tsumugi 実行予算・協調実行仕様
 
-最終更新: 2026-10-28
+最終更新: 2026-10-29
 
 設計ステータス: **到達目標の確定仕様（§1〜§13）＋ 実装の現在地（下記の逸脱一覧）**
 
@@ -13,11 +13,28 @@
 「逸脱一覧の持ち方」）。2 表は tree-expr-continuation-e1 の実装 PR で新設した。それ以前に完了したスライスの
 逸脱・未実装範囲は、事実を確かめられたものから順に載せる。
 
+逸脱一覧の `ExecutionRequest`（§3）の行は loop:drift #288 の D-15、handle API（§9.1）の 4 行は D-16 を受けて載せた。
+どちらも本文（目標の §3・§9.1）を実装に合わせて後退させず、実装との差を逸脱として載せる案を選んだ（D-15 は #288 の
+Q1=A、D-16 は Q2=A。いずれも返信なしのため推奨案で確定した、[開発ループ手順書](loop-runbook.md) §7.5）。理由: spec が
+実装の正本であり、現在の逸脱は事実を確かめて逸脱一覧に置く（ドキュメント運用ガイド「逸脱一覧の持ち方」。#263 の D-8、
+#282 の D-12・D-13 と同じ扱い）。§3 の `execution_id` を必須にする目標は、host 供給の実行 ID を全 execution の監査
+envelope に置く [決定性・実行時監査仕様](determinism-and-audit.md) §7.1 が前提にしており、§3 を実装の `new(budget, clock)`
+に合わせると弱まる。deadline を効かせる clock の持ち方は §3 が「注入した `MonotonicClock`」として別に定めており、目標側を
+変えずに残せる。§9.1 の handle API と facade（`src/embedding.rs`）の統合は [組み込みAPI仕様](embedding-api.md) の E10
+の範囲で、目標を先に後退させると統合の受け皿が消え、budget・capability を持たない handle が §3・§4.2・§12 と矛盾する。
+handle 経路を §3 の `ExecutionRequest` と組み込みAPI仕様 §8 の `ExecutionOutcome` へ寄せる `fix` スライスは、この判断では
+足していない（#288 の Q2 の選択肢 C を選ばなかった。公開 API の breaking 変更で、E10 との順序を決める必要があるため）。
+
 ## 逸脱一覧（目標仕様 §1〜§13 に対する現在の逸脱）
 
 | 逸脱内容 | 対象の節(§) | 発生スライス |
 |---|---|---|
 | tree evaluator の slice fuel の使用量は `count_step`（文・反復・呼び出しの fuel）だけを数え、builtin が台帳へ直接課金する per-element fuel（`sort` の走査・比較課金など）を数えない。total fuel は正しいが、1 回の poll で実行する fuel が「slice + 区間内の bulk builtin 1 回分」を超えうる（bulk builtin を含む文が 1 slice に複数回あると、その回数ぶん超える） | §4.2 | Slice 3 PR-d |
+| `ExecutionRequest`（`src/embedding.rs` の `ExecutionRequest`、crate root では `EmbeddingRequest`）の field は private で、目標に無い `clock: Arc<dyn MonotonicClock>`（`budget.deadline` を効かせる clock）を持つ。`execution_id` は `Option<ExecutionId>` で、`with_execution_id` で設定し、監査 sink を設定した engine で実行するときだけ必須（未設定なら script work 前に fail-closed、sink 無しなら無視）。`arguments` は `Arc<[String]>` でなく `Vec<String>`。constructor は目標の `new(execution_id, capabilities, budget)` でなく `new(budget, clock) -> Result<Self, ConfigError>` で、capability は `with_capabilities`（既定は `CapabilitySet::empty`）、引数は `with_arguments(Vec<String>)`（目標は `arguments(impl Into<Arc<[String]>>)`）で設定する。`cancellation` builder は目標どおり | §3 | REV-015 最終形移行 Slice 1・Slice 2、Phase 6 A-1（`execution_id`） |
+| scheduler（`src/engine.rs`、crate root の `Engine`）の handle 経路の `ExecutionRequest`（`src/engine.rs` の `ExecutionRequest`、crate root では `ExecutionRequest`）は field を持たない骨格（`new()` / `Default` だけ）で、§3 の `ExecutionRequest` と別型である。budget は context 内の評価器が持つ `BudgetConfig` を使い、capability・cancellation token・実行 ID を request で渡せない | §3/§9.1 | Slice 3 PR-a |
+| `Engine::create_execution`（`src/engine.rs`）に `link_options: LinkOptions` 引数が無い（`LinkOptions` 型も無い）。`Engine::start` は `&LinkedScript` でなく `&CompiledScript`（`src/engine.rs` の `CompiledScript`）を取り、Link を初回 poll で行う。`create_execution` との違いは開始 phase（Created / Linked）だけである | §9.1 | Slice 3 PR-a |
+| `PollSlice.max_fuel`（`src/engine.rs`）は `NonZeroU64`（16 以上）でなく `u64` で、0 や 16 未満を型で排除しない（field は `pub` で、構築時の検査を通らない）。既定 10,000 は目標どおり | §9.1 | Slice 3 PR-a |
+| `PollResult::Terminal` の `outcome` は [組み込みAPI仕様](embedding-api.md) §8 の `ExecutionOutcome` でなく、`src/engine.rs` の別の `ExecutionOutcome`（crate root では `ExecutionOutcome`）で、variant は `Completed` / `RuntimeError` / `LinkError` / `Cancelled` / `DeadlineExceeded` の 5 つだけである（予算超過は `RuntimeError` に含まれ、`Denied` / `Exited` / `HostError` / `BudgetExceeded` などが無い。variant は `usage` を持たず、最終 usage は `PollResult::Terminal.usage` で観測する）。scheduler の `Engine` が監査 sink を持たない点は [決定性・実行時監査仕様](determinism-and-audit.md) の逸脱一覧に B-1 としてある | §9.1 | Slice 3 PR-a |
 
 ## 未実装範囲（目標仕様 §1〜§13 のうち未着手・延期中）
 

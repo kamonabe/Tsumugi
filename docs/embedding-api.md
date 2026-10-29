@@ -1,6 +1,6 @@
 # Tsumugi — 組み込みAPI仕様
 
-最終更新: 2026-10-28
+最終更新: 2026-10-29
 設計ステータス: **実装仕様確定・実装進行中**（E1〜E6・E7〔tree REPL の Engine API 統合を含む〕・E8a・E11 実装済み。E9〔VM 経路統合、Phase 5〕のうち **VM file/stdin の import・resolver 統合（link 層 capability gate）は実装済み**で、残りの adapter/conformance（VM の charge parity・StableError・FunctionId・transaction 等）と experimental flag 除去は未実装＝**E9 は未完了**。E8b の capability profile/options 配線（`--profile safe|legacy` と全 capability option、safe/legacy の frozen `CapabilitySet` 構築・注入）は C9/C10/E7/E11 で統合済み、migration warning は §14.4 の N-1 スキップ採択により正式に descope 済み（不実装）、EMB-AT-10/11 は profile 経由 subprocess test で固定済み（下記実装 slice 表・第16節 Phase 2 の受入 ID ↔ test 対応を参照）＝**E8b 完了**。E10 は未実装。詳細は [ロードマップ](roadmap.md) Phase 1/2 を参照）
 
 本文書の §1〜§13・§15 は **到達目標の確定仕様**であり、現在の実装状態ではない。現在の実装が目標仕様からどう
@@ -19,6 +19,8 @@
 §3〜§12 の公開型を実装と照合して確かめた差のうち、上の 3 項目だけである。照合していない節（§13 以降）の逸脱と、
 上の設計ステータス段落・§14「実装slice」表にある現在の状態（E9・E10 の残りなど）は、まだ表へ移していない。
 監査 builder の差（`audit_sink` が任意である点など）は [決定性・実行時監査仕様](determinism-and-audit.md) の逸脱一覧にある。
+§6 が正本を [実行予算・協調実行仕様](execution-control.md) §3 に置く `ExecutionRequest` の差（loop:drift #288 の D-15）と、
+同仕様 §9.1 の handle API の差（D-16）は、同仕様の逸脱一覧にある。
 
 ## 逸脱一覧（目標仕様に対する現在の逸脱）
 
