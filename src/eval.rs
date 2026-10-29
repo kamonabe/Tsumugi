@@ -2651,8 +2651,10 @@ impl Evaluator {
     /// この式を式 frame で段階評価するか（tree-expr-continuation-e2a、yield 可能な driver だけ）。
     ///
     /// 呼び出しを含む call・二項・単項に限る。callee が識別子でその時点で user binding を持たない
-    /// call（builtin / cooperative host / 登録 host function / 未定義名）と、e2a で段階評価しない式種は
-    /// 従来どおり `eval_expr` で 1 つの値として評価する。
+    /// call は、引数に呼び出しを含み、かつ `resolve_call_target` が引数を評価する builtin・
+    /// cooperative host function・登録 host function に解決するときだけ式 frame にする（e3）。
+    /// 引数に呼び出しが無い call、`input` / `args` / `now` / `pop` / `map` / `filter` / `each`・
+    /// 未定義名、e2a・e3 で段階評価しない式種は従来どおり `eval_expr` で 1 つの値として評価する。
     fn needs_expr_frame(&self, expr: &Expr) -> bool {
         if !crate::ast::contains_call(expr) {
             return false;
@@ -5426,6 +5428,60 @@ mod tests {
             sync.budget_usage().committed.fuel
         );
         assert!(forced.frames.is_empty() && forced.call_stack.is_empty());
+    }
+
+    /// TEC-AT-01（e3 分）の `exit` / `env` の grant した経路: 引数に呼び出しを含む `exit` / `env` が、
+    /// 強制 yield の poll 経路と `Evaluator::run` で結果・fuel・heap・`take_pending_exit` まで一致する。
+    /// `exit` の `ProcessExit` は try で catch されず、後続の文は実行されない。
+    #[test]
+    fn e3_exit_and_env_arguments_match_sync_path() {
+        let prelude =
+            "fn id(x)\n  let i = 0\n  while i < 2\n    i = i + 1\n  end\n  return x\nend\n";
+        let cases = [
+            "let a = 1\nexit(id(3))\nlet a = 2\n",
+            "let a = 1\ntry\n  exit(id(4))\ncatch e\n  a = 99\nend\na = 2\n",
+            "let v = env(id(\"PATH\"))\nlet a = 1\n",
+            "let v = [env(id(\"TSUMUGI_E3_UNSET_KEY\")), id(2)]\nlet a = 1\n",
+        ];
+        for body in cases {
+            let src = format!("{prelude}{body}");
+            let program = parse_program(&src);
+            let mut forced = Evaluator::new();
+            forced.set_capabilities(ambient_test_capabilities());
+            forced.force_yield_every_boundary = true;
+            forced
+                .begin_execution(&program, src.len() as u64, false)
+                .expect("begin_execution");
+            let forced_result = loop {
+                if let SliceOutcome::Terminal(result) = forced.run_slice(u64::MAX) {
+                    break result;
+                }
+            };
+            let mut sync = Evaluator::new();
+            sync.set_capabilities(ambient_test_capabilities());
+            let sync_result = sync.run(&program, src.len() as u64);
+            assert_eq!(forced_result, sync_result, "{body}");
+            for name in ["a", "v"] {
+                assert_eq!(forced.env.get(name), sync.env.get(name), "{body} / {name}");
+            }
+            assert_eq!(
+                forced.budget_usage().committed.fuel,
+                sync.budget_usage().committed.fuel,
+                "{body}"
+            );
+            let (f, s) = (forced.budget_usage(), sync.budget_usage());
+            assert_eq!(f.live_heap_bytes, s.live_heap_bytes, "{body}");
+            assert_eq!(f.peak_heap_bytes, s.peak_heap_bytes, "{body}");
+            let (forced_exit, sync_exit) = (forced.take_pending_exit(), sync.take_pending_exit());
+            assert_eq!(forced_exit, sync_exit, "{body}");
+            if body.contains("exit(") {
+                assert!(forced_exit.is_some(), "exit が記録される: {body}");
+                assert_eq!(forced.env.get("a"), Some(Value::Int(1)), "{body}");
+            } else {
+                assert!(forced_result.is_ok(), "{body}: {forced_result:?}");
+                assert_eq!(forced.env.get("a"), Some(Value::Int(1)), "{body}");
+            }
+        }
     }
 
     /// 引数を評価しない builtin（`input` / `args` / `now` / `pop`）と `map` / `filter` / `each`、
