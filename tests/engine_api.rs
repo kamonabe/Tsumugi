@@ -2758,11 +2758,53 @@ print(s)
             "let s = join([\"a\"], to_str(work(200)))\n",
             "let n = len(range(0, work(10))) + work(200)\n",
             "try\n  let v = env(to_str(work(200)))\ncatch e\n  let t = e\nend\n",
+            // TEC-AT-06 本文の例: `print(f(x))` と登録 host function `h(f(x))`。
+            "print(work(200))\n",
+            "let v = h(work(200))\n",
         ];
+
+        /// 引数 1 個を取り `Int(1)` を返す登録 host function `h`（id 1）。
+        struct HostH(tsumugi::HostFunctionDescriptor);
+        impl tsumugi::HostFunction for HostH {
+            fn descriptor(&self) -> &tsumugi::HostFunctionDescriptor {
+                &self.0
+            }
+            fn call(
+                &self,
+                _arguments: &[tsumugi::Value],
+            ) -> Result<tsumugi::Value, tsumugi::HostCallError> {
+                Ok(tsumugi::Value::Int(1))
+            }
+        }
+        let host_id = tsumugi::HostFunctionId::new(std::num::NonZeroU128::new(1).expect("id"));
+        let registry = Arc::new(
+            tsumugi::HostFunctionRegistry::builder()
+                .register(Arc::new(HostH(tsumugi::HostFunctionDescriptor {
+                    id: host_id,
+                    name: "h".to_string(),
+                    arity: tsumugi::HostArity::Exact(1),
+                    cost: tsumugi::HostCost::default(),
+                    argument_audit: Vec::new(),
+                    result_audit: tsumugi::AuditValuePolicy::Omit,
+                    may_block: false,
+                })))
+                .expect("register")
+                .build()
+                .expect("build"),
+        );
         for body in scripts {
             let text = format!("{work}{body}");
             let script = engine.compile(&text).expect("compile");
             let mut ctx = ExecutionContext::new();
+            let (_, buffer) = stdout_caps();
+            let caps = tsumugi::CapabilitySet::builder()
+                .stdout(Arc::new(Capture(Arc::clone(&buffer))))
+                .expect("stdout grant")
+                .grant_host_function(host_id)
+                .expect("grant")
+                .build();
+            ctx.set_host_registry(Arc::clone(&registry));
+            ctx.set_capabilities(caps);
             let mut handle = engine
                 .create_execution(&script, &mut ctx, ExecutionRequest::new())
                 .expect("admit");

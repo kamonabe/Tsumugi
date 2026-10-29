@@ -905,6 +905,12 @@ fn cooperative_pending_with_call_argument_evaluates_argument_once() {
              fn g()\n  g_n = g_n + 1\n  return 2\nend\n\
              let t = [g(), fetch(one())]\n\
              let ok = [0][one_n - 1] + [0][g_n - 2] + [0][t[1] - 41]\n",
+        // builtin の式 frame（評価済みの第 2 引数 `g() - 2` を持つ）の下で Pending になる形。
+        "let one_n = 0\nlet g_n = 0\n\
+         fn one()\n  one_n = one_n + 1\n  return 1\nend\n\
+         fn g()\n  g_n = g_n + 1\n  return 2\nend\n\
+         let s = slice([1, 2, 3], g() - 2, fetch(one()) - 40)\n\
+         let ok = [0][one_n - 1] + [0][g_n - 2] + [0][len(s) - 1]\n",
     ];
     for text in cases {
         let engine = Engine::with_limits(limits(1, 0));
