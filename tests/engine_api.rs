@@ -2602,4 +2602,234 @@ print(n)
             "式の中の関数本体で yield している: {pairs}"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // tree-expr-continuation-e3: builtin・host function の呼び出し引数境界
+    // ---------------------------------------------------------------------
+
+    /// TEC-AT-01（e3 分）: builtin の引数に呼び出しを含む script（`print` / PureCore builtin / `push` /
+    /// `env` / `exit` / filesystem builtin、式の途中や条件・user binding による builtin の shadow）を
+    /// 全境界で yield させても、同期実行と stdout・fuel・terminal・audit event 列
+    /// （filesystem の host-call triple を含む）が一致する。
+    #[test]
+    fn tec_at_01_e3_builtin_arguments_match_sync_path() {
+        let body = "\
+fn trim(x)
+  return \"shadow\"
+end
+let xs = [3, 1, 2]
+print(f(1), g(2), f(3))
+print(f(\"a\"))
+let n = len(f(xs))
+print(n)
+push(xs, f(9))
+print(xs)
+let s = to_str(f(1)) + join(f([1, 2]), \",\")
+print(s)
+let w = upper(f(\"abc\"))
+print(w)
+if len(f(xs)) > 0
+  print(\"nonempty\")
+end
+print(len(f(xs)) + 1)
+print(sort(f([3, 1, 2])), range(0, f(3)), keys(f({\"a\": 1})))
+print(trim(f(\" a \")))
+try
+  let v = env(k(0))
+  print(v)
+catch e
+  print(e[\"type\"])
+end
+try
+  let v = env(f(1))
+catch e
+  print(e[\"type\"])
+end
+try
+  let r = read_file(f(\"/nonexistent/tsumugi\"))
+catch e
+  print(e[\"type\"])
+end
+try
+  write_file(f(\"/nonexistent/tsumugi\"), g(\"x\"))
+catch e
+  print(e[\"type\"])
+end
+try
+  exit(f(0))
+catch e
+  print(e[\"type\"])
+end
+let t = [len(f(xs)), g(2)]
+print(t)
+";
+        let text = format!("{E2B_PRELUDE}{body}");
+        let yields = assert_matches_sync(&text);
+        assert!(
+            yields > 100,
+            "builtin の引数の境界でも yield している: {yields}"
+        );
+        // script が最後まで走っている（途中のエラー終了で検査が空振りしていない）。
+        let (observed, _) = run_audited(&text, true);
+        assert!(
+            matches!(observed.outcome, EmbeddingOutcome::Completed { .. }),
+            "{:?}\n{}",
+            observed.outcome,
+            observed.stdout
+        );
+        assert!(observed.stdout.ends_with("[4, 4]\n"), "{}", observed.stdout);
+    }
+
+    /// TEC-AT-01（e3 分）のエラー経路: 引数の検査・型・arity・未定義名・描画上限のエラーの種別・行・
+    /// trace・fuel が同期実行と一致する（`push` の代入先が未定義名なら第 2 引数の副作用が出ない）。
+    #[test]
+    fn tec_at_01_e3_error_paths_match_sync_path() {
+        let cases = [
+            "push(missing, g(1))\n",
+            "let n = 1\npush(n, g(1))\n",
+            "let xs = [1]\ntry\n  push(xs, g(1), 3)\ncatch e\n  print(e[\"type\"])\nend\n",
+            "push(g(1), 2)\n",
+            "len(f(1), g(2))\n",
+            "try\n  len(f(1), g(2))\ncatch e\n  print(e[\"type\"])\nend\n",
+            "env(f(1), g(2))\n",
+            "try\n  let v = env(f(1))\ncatch e\n  print(e[\"type\"])\nend\n",
+            "print(g(1), f(1) / 0)\n",
+            "try\n  print(g(1), f(1) / 0)\ncatch e\n  print(e[\"type\"])\nend\n",
+            "exit(f(\"x\"))\n",
+            "exit(f(1), g(2))\n",
+            "nope(f(1))\n",
+            "let r = nope(g(1)) + 1\n",
+            "pop(f([1]))\n",
+            "input(f(1))\n",
+            "map(f([1]), f(2))\n",
+            "let xs = [1]\nprint(f(xs)[f(5)])\n",
+            "let s = upper(f(1))\n",
+            "let xs = [1, 2, 3]\ntry\n  push(xs, f(1))\ncatch e\n  print(e[\"type\"])\nend\nprint(xs)\n",
+        ];
+        for body in cases {
+            let text = format!("{E2B_PRELUDE}{body}");
+            assert_matches_sync(&text);
+        }
+    }
+
+    /// TEC-AT-02（e3 分）: 引数の評価が副作用を持つ builtin の呼び出しを 1 境界ずつ yield させても、
+    /// 評価済みの引数・`print` の描画済みの部分・`push` の解決済みの cell が保存され、出力順が
+    /// 同期実行と一致する。
+    #[test]
+    fn tec_at_02_e3_resume_mid_arguments_matches_sync_path() {
+        let text = "\
+fn say(tag, v)
+  print(tag)
+  let i = 0
+  while i < 1
+    i = i + 1
+  end
+  return v
+end
+print(say(\"a\", 1), say(\"b\", 2), say(\"c\", 3))
+let xs = []
+push(xs, say(\"p\", 5))
+print(xs)
+let n = len(say(\"l\", [1, 2])) + say(\"r\", 1)
+print(n)
+let s = join(say(\"j1\", [1, 2]), say(\"j2\", \"-\"))
+print(s)
+";
+        let yields = assert_matches_sync(text);
+        assert!(yields > 30, "引数の途中で yield している: {yields}");
+        let (observed, _) = run_audited(text, true);
+        assert_eq!(
+            observed.stdout,
+            "a\nb\nc\n1 2 3\np\n[5]\nl\nr\n3\nj1\nj2\n1-2\n"
+        );
+    }
+
+    /// TEC-AT-06（e3 分）: builtin の引数の中で呼んだ関数の本体にループを持つ script を最小 slice（16）で
+    /// 実行したとき、1 poll の実行 fuel が上限以内で、Yielded / Resumed が対になり順序が単調。
+    #[test]
+    fn tec_at_06_e3_poll_fuel_is_bounded_in_builtin_arguments() {
+        let engine = Engine::new();
+        let work =
+            "fn work(n)\n  let i = 0\n  while i < n\n    i = i + 1\n  end\n  return i\nend\n";
+        let scripts = [
+            "let n = to_str(work(200))\n",
+            "let n = len([work(200)])\n",
+            "let xs = [1]\npush(xs, work(200))\n",
+            "let s = join([\"a\"], to_str(work(200)))\n",
+            "let n = len(range(0, work(10))) + work(200)\n",
+            "try\n  let v = env(to_str(work(200)))\ncatch e\n  let t = e\nend\n",
+        ];
+        for body in scripts {
+            let text = format!("{work}{body}");
+            let script = engine.compile(&text).expect("compile");
+            let mut ctx = ExecutionContext::new();
+            let mut handle = engine
+                .create_execution(&script, &mut ctx, ExecutionRequest::new())
+                .expect("admit");
+            let mut previous = 0;
+            let mut polls = 0;
+            loop {
+                let result = handle.poll(PollSlice { max_fuel: 16 }).expect("poll");
+                let fuel = handle.usage().committed.fuel;
+                assert!(
+                    fuel - previous <= 16,
+                    "1 poll の実行 fuel が上限を超えた: {} > 16\n{body}",
+                    fuel - previous
+                );
+                previous = fuel;
+                polls += 1;
+                if let PollResult::Terminal { outcome, .. } = result {
+                    assert_eq!(outcome, tsumugi::ExecutionOutcome::Completed, "{body}");
+                    break;
+                }
+            }
+            assert!(
+                polls > 200 / 16,
+                "関数本体のループの途中で yield している: {polls}\n{body}"
+            );
+        }
+
+        let sink = Arc::new(InMemoryAuditSink::new());
+        let audited = EmbeddingEngine::builder()
+            .audit_sink(sink.clone() as Arc<dyn AuditSink>)
+            .audit_slice_fuel(16)
+            .build()
+            .expect("build");
+        let text = format!(
+            "{work}let n = len([work(100)]) + len(range(0, work(20)))\nlet xs = []\npush(xs, work(100))\n"
+        );
+        let linked = link(&audited, &text);
+        let mut ctx = EmbeddingContext::new(&audited);
+        let outcome = audited.run_audited(&linked, &mut ctx, request(CapabilitySet::empty()));
+        assert!(matches!(
+            outcome.outcome(),
+            Some(EmbeddingOutcome::Completed { .. })
+        ));
+        let mut pending: Option<u64> = None;
+        let mut last: Option<u64> = None;
+        let mut pairs = 0;
+        for envelope in sink.snapshot() {
+            match envelope.event {
+                AuditEvent::Yielded { poll_index, .. } => {
+                    assert!(pending.is_none(), "Yielded が連続した");
+                    assert!(
+                        last.is_none_or(|prev| poll_index > prev),
+                        "poll_index が単調でない"
+                    );
+                    pending = Some(poll_index);
+                    last = Some(poll_index);
+                }
+                AuditEvent::Resumed { poll_index, .. } => {
+                    assert_eq!(pending.take(), Some(poll_index), "Resumed が対にならない");
+                    pairs += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(pending.is_none());
+        assert!(
+            pairs >= 200 / 16,
+            "builtin の引数の中の関数本体で yield している: {pairs}"
+        );
+    }
 }

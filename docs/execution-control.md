@@ -40,8 +40,7 @@ handle 経路を §3 の `ExecutionRequest` と組み込みAPI仕様 §8 の `Ex
 
 | 未実装範囲 | 対象の節(§) | 備考 |
 |---|---|---|
-| builtin・登録 host function・cooperative host function の引数に現れる呼び出しの引数境界での slice yield（その呼び出しは Rust 再帰で完了まで実行する。callee が識別子でその時点で user binding を持たない call は、式 frame の中でも call 全体を従来の `eval_call` で評価する） | §4.2/§9.3 | tree-expr-continuation-e3 |
-| `map` / `filter` / `each` の要素境界と callback 本体の文/反復境界での slice yield（callback 本体は `can_yield = false` で完了まで実行する） | §4.2/§9.3 | tree-expr-continuation-e4 |
+| `map` / `filter` / `each` の要素境界と callback 本体の文/反復境界での slice yield（callback 本体は `can_yield = false` で完了まで実行する）。`map` / `filter` / `each` の引数に現れる呼び出しも、call 全体を従来の `eval_expr` で評価するため引数の境界で yield できない | §4.2/§9.3 | tree-expr-continuation-e4 |
 | 関数本体・callback 本体の中での cooperative host-call の Pending yield と audit drain queue 上限の yield。どちらもトップレベル（driver 上の呼び出しの外）の文/反復境界だけで判定し、関数本体の中で Pending を返す adapter は `may_yield = false` の規約違反（catch 不能 `InternalControl`）になる | §4.2/§6.2 | §14「tree-expr-continuation 実装スライス」の逸脱（audit drain queue は [決定性・実行時監査仕様](determinism-and-audit.md) の逸脱一覧にも B-2 として記載） |
 | callback なし bulk builtin（`sort` / `join` / 文字列繰り返し / 大 collection コピー等）の chunk 境界での slice yield。現状は bulk builtin 1 回分を §4.2 の超過として扱い、chunk 前の確認は deadline / cancel だけ | §4.1/§4.2 | fuel-bulk-chunk-yield |
 | VM の式レベル continuation（VM の slice yield と continuation parity） | §9.3 | Slice 6（VM が experimental の間） |

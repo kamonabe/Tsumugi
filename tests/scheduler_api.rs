@@ -325,6 +325,22 @@ impl FakeCooperativeAdapter {
     }
 }
 
+impl FakeCooperativeAdapter {
+    /// 引数 1 個を取る `pending`（tree-expr-continuation-e3 の引数に呼び出しを置くテスト用）。
+    fn pending_unary(id: u128, name: &str) -> Arc<Self> {
+        let mut descriptor = coop_descriptor(id, name);
+        descriptor.arity = tsumugi::HostArity::Exact(1);
+        Arc::new(Self {
+            descriptor,
+            ready_int: Mutex::new(None),
+            response_byte_stop: Mutex::new(false),
+            last_may_yield: Arc::new(Mutex::new(None)),
+            offloads: Arc::new(AtomicUsize::new(0)),
+            next_id: AtomicUsize::new(1),
+        })
+    }
+}
+
 impl CooperativeHostFunction for FakeCooperativeAdapter {
     fn descriptor(&self) -> &HostFunctionDescriptor {
         &self.descriptor
@@ -871,4 +887,84 @@ fn may_yield_false_requires_ready_else_internal_terminal() {
         );
         assert_eq!(*adapter.last_may_yield.lock().unwrap(), Some(true));
     }
+}
+
+/// tree-expr-continuation-e3（TEC-AT-02 e3 分）: cooperative host function の引数に呼び出しを置いた
+/// call が Pending になっても、resume の文の評価し直しで、この call の引数の呼び出しは 1 回だけ
+/// 実行される（格納結果が届くので引数を評価し直さない）。同じ文の他の部分の呼び出しは評価し直しの
+/// 分だけ実行される（現行の「同じ文の再評価」と同じ観測）。関数本体の中で同じ形は InternalControl。
+#[test]
+fn cooperative_pending_with_call_argument_evaluates_argument_once() {
+    let cases = [
+        // 末尾の `ok` が one() の実行回数・g() の実行回数・格納結果を検査する。
+        "fn one()\n  one_n = one_n + 1\n  return 1\nend\nlet one_n = 0\n\
+         let x = fetch(one())\n\
+         let ok = [0][one_n - 1] + [0][x - 41]\n",
+        "let one_n = 0\nlet g_n = 0\n\
+             fn one()\n  one_n = one_n + 1\n  return 1\nend\n\
+             fn g()\n  g_n = g_n + 1\n  return 2\nend\n\
+             let t = [g(), fetch(one())]\n\
+             let ok = [0][one_n - 1] + [0][g_n - 2] + [0][t[1] - 41]\n",
+    ];
+    for text in cases {
+        let engine = Engine::with_limits(limits(1, 0));
+        let adapter = FakeCooperativeAdapter::pending_unary(1, "fetch");
+        let (registry, caps) = coop_setup(1, "fetch", adapter.clone());
+        let script = engine.compile(text).unwrap();
+        let mut ctx = coop_context(registry, caps);
+        let mut handle = engine
+            .create_execution(&script, &mut ctx, ExecutionRequest::new())
+            .expect("active");
+        loop {
+            match handle.poll(PollSlice::default()).unwrap() {
+                PollResult::Yielded {
+                    reason: YieldReason::HostCallPending { .. },
+                    ..
+                } => break,
+                PollResult::Yielded { .. } => continue,
+                other => panic!("HostCallPending を期待: {other:?}\n{text}"),
+            }
+        }
+        assert_eq!(*adapter.last_may_yield.lock().unwrap(), Some(true));
+        let completer = take_stashed_completer().expect("completer");
+        completer.complete(Ok(Value::Int(41)));
+        let outcome = loop {
+            match handle.poll(PollSlice::default()).unwrap() {
+                PollResult::Terminal { outcome, .. } => break outcome,
+                PollResult::Yielded { .. } => continue,
+                PollResult::Paused { .. } => panic!("pause は要求していない"),
+            }
+        };
+        // 末尾の `ok` の式が、one() = 1 回・g() = 2 回・格納結果 41 を検査する（外れると index エラー）。
+        assert_eq!(outcome, ExecutionOutcome::Completed, "{text}");
+    }
+
+    // 関数本体の中の同じ形は may_yield = false の規約違反（catch 不能 InternalControl）。
+    let engine = Engine::with_limits(limits(1, 0));
+    let adapter = FakeCooperativeAdapter::pending_unary(2, "fetch");
+    let (registry, caps) = coop_setup(2, "fetch", adapter.clone());
+    let script = engine
+        .compile(
+            "fn one()\n  return 1\nend\nfn f()\n  let x = fetch(one())\nend\n\
+             try\n  f()\ncatch e\n  let y = 1\nend\n",
+        )
+        .unwrap();
+    let mut ctx = coop_context(registry, caps);
+    let mut handle = engine
+        .create_execution(&script, &mut ctx, ExecutionRequest::new())
+        .expect("active");
+    let outcome = loop {
+        match handle.poll(PollSlice::default()).unwrap() {
+            PollResult::Terminal { outcome, .. } => break outcome,
+            PollResult::Yielded { .. } => continue,
+            PollResult::Paused { .. } => unreachable!(),
+        }
+    };
+    match outcome {
+        ExecutionOutcome::RuntimeError { error } => {
+            assert_eq!(error.error_type(), "internal_control");
+        }
+        other => panic!("RuntimeError(internal_control) を期待したが {other:?}"),
+    }
+    assert_eq!(*adapter.last_may_yield.lock().unwrap(), Some(false));
 }
