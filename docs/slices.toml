@@ -197,13 +197,14 @@ order      = 13
 [[slice]]
 id         = "tree-expr-continuation-e3"
 title      = "tree evaluator の式レベル continuation e3：builtin・host function の呼び出しで呼び出しを含む引数の境界を yield 可能に"
-status     = "ready"
+status     = "done"
 parent     = "REV-015"
 spec_slice = "exec-control Slice 3"
 spec       = { doc = "docs/execution-control.md", section = "tree-expr-continuation-e3 実装スライス（builtin・host function の呼び出し引数境界）" }
 acceptance = ["TEC-AT-01..03", "TEC-AT-06"]
 depends_on = ["tree-expr-continuation-e2b"]
 design_pr  = 287
+impl_pr    = 296
 order      = 15
 
 [[slice]]
