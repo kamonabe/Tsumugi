@@ -670,7 +670,7 @@ import はプログラムの実行を始める前にすべて解決する。読�
 ### パス解決
 
 - ファイル・標準入力から実行するスクリプトの import は、ホストが許可した import root の下で解決する。CLI では `--allow-import-root NAME=PATH` で root を許可する（[Capability Model仕様](capability-model.md) §14.1。safe profile だけで指定でき、複数指定できる）
-- import root が 1 つも許可されていないのに import があると、実行開始前の link 時に拒否する。拒否は catch できず、1 文も実行せずに診断 `import がありますが module resolver が許可されていません。…` を標準エラーへ出して終了コード 1 で終わる。ツリーウォーク版と `--vm` 版で同じである
+- import root が 1 つも許可されていないのに import があると、実行開始前の link 時に拒否する。拒否は catch できず、1 文も実行せずに診断 `エラー: import がありますが module resolver が許可されていません。…` を標準エラーへ出して終了コード 1 で終わる。ツリーウォーク版と `--vm` 版で同じである
 - `@NAME/...` による root の選択と、unqualified path（`@` で始まらないパス）を root `default` へ割り当てる扱いは [Capability Model仕様](capability-model.md) §14.1 に従う
 - ネストした import（A が B を import し、B が C を import する）にも対応
 - 現在の実装は、実行時の読み込みを import 元スクリプトのディレクトリ基準で行い、link 時の確認と経路が分かれている（上の「現在の既知非適合」、issue #291）
@@ -849,7 +849,7 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 外部状態に触れる組み込み関数は、ホストが許可したときだけ動く（冒頭の「外部操作の権限」、[Capability Model仕様](capability-model.md)）。
 
 - `print` は標準出力、`env` は環境変数、`now` は時刻、`input` はスクリプトの標準入力、`exit` はプロセス終了の許可を要する。許可が無ければ catch 可能な `capability` エラー（`host function の実行が許可されていません: {name}`）になる
-- ファイルシステム関数（`read_file` / `read_lines` / `write_file` / `append_file` / `path_exists` / `is_file` / `is_dir` / `mkdir` / `remove` / `remove_dir` / `remove_tree` / `rename` / `list_dir` / `file_size`）は、対象パスを含む root と操作の許可を要する。許可が無ければ catch 可能な `sandbox` エラー（`ファイルシステム操作が許可されていません`）になる。safe profile のパスは `@NAME/...` か、root `default` に対する相対パスで書き、絶対パス・`.`・`..` を含むパスは catch 可能な `argument` エラーになる（[Capability Model仕様](capability-model.md) §8.2・§14.1）
+- ファイルシステム関数（`read_file` / `read_lines` / `write_file` / `append_file` / `path_exists` / `is_file` / `is_dir` / `mkdir` / `remove` / `remove_dir` / `remove_tree` / `rename` / `list_dir` / `file_size`）は、対象パスを含む root と操作の許可を要する。許可が無ければ catch 可能な `sandbox` エラー（`ファイルシステム操作が許可されていません`）になる。safe profile のパスは `@NAME/...` か、root `default` に対する相対パスで書く。ファイルシステムの root が 1 つも許可されていなければ、パスの形式にかかわらず `sandbox` エラーになる。root が許可されているとき、絶対パス・`.`・`..` を含むパスは catch 可能な `argument` エラーになる（[Capability Model仕様](capability-model.md) §8.2・§14.1）
 - 許可された操作の失敗（存在しないファイルの読み込み、親ディレクトリの無い場所への書き込み、既存ディレクトリへの `mkdir` など）は、`null` や `false` を返さず catch 可能な `host` エラー（`host function の実行に失敗しました: {name} (filesystem)`）になる。legacy profile でも同じである
 - 下の表の説明は、必要な許可があるときの挙動である
 
