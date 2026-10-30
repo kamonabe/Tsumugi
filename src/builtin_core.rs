@@ -394,10 +394,11 @@ pub fn builtin_slice(args: &[Value], line: usize) -> Result<Value, TsumugiError>
     }
 }
 
-pub fn builtin_contains(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
-    check_arity("contains", args, 2, line)?;
+/// `contains` の Str・Dict 分岐（値の比較を含まないので budget 不要）。List は
+/// [`builtin_contains_budgeted`] が処理する（`Vec::contains` の再帰比較は fuel を課金せず、
+/// 共有 DAG で指数時間になるため使わない。issue #290）。
+fn contains_non_list(args: &[Value], line: usize) -> Result<Value, TsumugiError> {
     match &args[0] {
-        Value::List(v) => Ok(Value::Bool(v.contains(&args[1]))),
         Value::Str(s) => {
             if let Value::Str(sub) = &args[1] {
                 Ok(Value::Bool(s.contains(sub.as_str())))
@@ -420,6 +421,32 @@ pub fn builtin_contains(args: &[Value], line: usize) -> Result<Value, TsumugiErr
             other,
         )),
     }
+}
+
+/// `contains` の budget-aware 版（issue #290、`fix-contains-budgeted-equality`）。
+///
+/// 第 1 引数が List のとき、先頭から順に各要素と第 2 引数を `==` と同じ
+/// [`crate::budget::BudgetLedger::values_equal`] で比べ、等しい要素が見つかった時点で `true` を返す。
+/// fuel 超過は `==` と同じく catch できない terminal になる。Str・Dict の挙動は
+/// `contains_non_list` と同じ（値の比較を含まないので課金しない）。
+pub fn builtin_contains_budgeted(
+    args: &[Value],
+    budget: &mut crate::budget::BudgetLedger,
+    line: usize,
+) -> Result<Value, TsumugiError> {
+    check_arity("contains", args, 2, line)?;
+    let Value::List(list) = &args[0] else {
+        return contains_non_list(args, line);
+    };
+    for item in list.iter() {
+        let equal = budget
+            .values_equal(item, &args[1], crate::budget::ExecutionPhase::Run)
+            .map_err(|stop| crate::budget::control_stop_to_error(stop, 0, line))?;
+        if equal {
+            return Ok(Value::Bool(true));
+        }
+    }
+    Ok(Value::Bool(false))
 }
 
 /// `sort` の budget-aware 版（REV-001 / REV-017）。
@@ -2076,12 +2103,11 @@ pub fn dispatch(
         "has_key" => builtin_has_key(args, line)?,
         "type" => builtin_type(args, line)?,
         "slice" => builtin_slice(args, line)?,
-        "contains" => builtin_contains(args, line)?,
         "reverse" => builtin_reverse(args, line)?,
         "range" => builtin_range(args, max_collection, line)?,
         "split" => builtin_split(args, max_collection, line)?,
-        // sort / join / to_str は REV-001 で budget-aware 版（builtin_sort_budgeted /
-        // builtin_join_budgeted / builtin_to_str_budgeted）へ移し、tree/VM の dispatch
+        // sort / join / to_str / contains は budget-aware 版（builtin_sort_budgeted /
+        // builtin_join_budgeted / builtin_to_str_budgeted / builtin_contains_budgeted）へ移し、tree/VM の dispatch
         // 境界が intercept する。ここへは到達しない（budget を持てない dispatch では
         // 共有 DAG の指数時間／出力を有限化できない）。
         "trim" => builtin_trim(args, line)?,
