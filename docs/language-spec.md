@@ -27,7 +27,7 @@
 
 両engine共通の仕様違反（[Capability Model仕様](capability-model.md) の目標との差）:
 
-- ファイル・標準入力から実行するスクリプトの import は、link 時に resolver が import root の下で確かめたファイルと、実行時に読むファイルが別の経路で決まる。実行時は評価器内蔵の module loader が import 元スクリプトのディレクトリを基準に読み直すため、確かめたものと別のファイルが実行されることがあり、入れ子の import は import root で検査されない（issue #291 で修正予定）
+- ファイル・標準入力から実行するスクリプトの import は、link 時に resolver が import root の下で確かめたファイルと、実行時に読むファイルが別の経路で決まる。実行時は評価器内蔵の module loader が import 元スクリプトのディレクトリを基準に読み直すため、確かめたものと別のファイルが実行されることがあり、入れ子の import は import root で検査されない。逆に、import root の下にあっても、import 元スクリプトのディレクトリから同じ相対パスで見つからないモジュールは読めず、`import` エラー（`import に失敗しました: モジュールを読み込めません: {path}`）で 1 文も実行せずに終了コード 1 で終わる（issue #291 で修正予定）
 - import の実行時の読み込み（ファイル・標準入力・REPL）は、profile にかかわらず `TSUMUGI_SANDBOX` を読み、許可範囲外のパスをサンドボックス違反にする。目標は「safe profile では `TSUMUGI_SANDBOX` を読まない」である（同 §14.3・§14.4）。上の項目と同じく、実行時の import が module loader を経由していることによる
 
 本書の文法どおり、複数行lambdaの終端`end`は必須である。
@@ -673,7 +673,7 @@ import はプログラムの実行を始める前にすべて解決する。読�
 - import root が 1 つも許可されていないのに import があると、実行開始前の link 時に拒否する。拒否は catch できず、1 文も実行せずに診断 `エラー: import がありますが module resolver が許可されていません。…` を標準エラーへ出して終了コード 1 で終わる。ツリーウォーク版と `--vm` 版で同じである
 - `@NAME/...` による root の選択と、unqualified path（`@` で始まらないパス）を root `default` へ割り当てる扱いは [Capability Model仕様](capability-model.md) §14.1 に従う
 - ネストした import（A が B を import し、B が C を import する）にも対応
-- 現在の実装は、実行時の読み込みを import 元スクリプトのディレクトリ基準で行い、link 時の確認と経路が分かれている（上の「現在の既知非適合」、issue #291）
+- 現在の実装は、実行時の読み込みを import 元スクリプトのディレクトリ基準で行い、link 時の確認と経路が分かれている。このため import root の下にだけ置いたモジュールは読めずに失敗する（上の「現在の既知非適合」、issue #291）
 
 ### 循環 import
 
