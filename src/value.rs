@@ -68,9 +68,10 @@ pub struct Tracked<T> {
 
 /// backing の中身が持つ子要素の深度の要約を求める（[`Tracked`] の生成時に使う）。
 ///
-/// 返す組は（子の深度の最大, その深度を持つ子の数）。List / Dict 以外
-/// （String・変数 cell・関数 header）は子を持たないので `(0, 0)`。
-pub trait ChildDepth {
+/// 返す組は（子の深度の最大, その深度を持つ子の数）。List / Dict の backing だけが
+/// 実装する。crate 内部の trait で、公開の生成関数（`Tracked::new` など）の境界には
+/// 使わない（公開 API を増やさない、PR #301 判断 Q1=B）。
+pub(crate) trait ChildDepth {
     /// 子要素の保存済み深度を 1 段だけ読んで要約する（再帰しない）。
     fn child_depth_summary(&self) -> (u32, u32);
 }
@@ -103,25 +104,7 @@ impl ChildDepth for BTreeMap<String, Value> {
     }
 }
 
-impl ChildDepth for String {
-    fn child_depth_summary(&self) -> (u32, u32) {
-        (0, 0)
-    }
-}
-
-impl ChildDepth for () {
-    fn child_depth_summary(&self) -> (u32, u32) {
-        (0, 0)
-    }
-}
-
-impl ChildDepth for RefCell<Value> {
-    fn child_depth_summary(&self) -> (u32, u32) {
-        (0, 0)
-    }
-}
-
-impl<T: ChildDepth> Tracked<T> {
+impl<T> Tracked<T> {
     /// backing を台帳へ課金してから包む（§5.2）。`logical_bytes` は §5.1 の論理サイズ。
     ///
     /// `charge` が上限超過・overflow なら `ControlStop` を返し、`Tracked` は作られない
@@ -135,14 +118,13 @@ impl<T: ChildDepth> Tracked<T> {
         // charge を先に行い、成功した場合だけ id を発番して包む。
         budget.charge_heap(logical_bytes, phase)?;
         let id = budget.allocate_heap_id()?;
-        let (child_max, child_max_count) = data.child_depth_summary();
         Ok(Rc::new(Self {
             data,
             id,
             bytes: logical_bytes,
             ledger: budget.heap_handle(),
-            child_max,
-            child_max_count,
+            child_max: 0,
+            child_max_count: 0,
         }))
     }
 
@@ -155,14 +137,13 @@ impl<T: ChildDepth> Tracked<T> {
     /// 台帳で課金した実 backing へ複製・差し替える（§5.2 COW）。定数自体は live heap を
     /// 増減させない。
     pub fn constant(data: T) -> Rc<Self> {
-        let (child_max, child_max_count) = data.child_depth_summary();
         Rc::new(Self {
             data,
             id: AllocationId(0),
             bytes: 0,
             ledger: HeapLedgerWeak::new(),
-            child_max,
-            child_max_count,
+            child_max: 0,
+            child_max_count: 0,
         })
     }
 
@@ -186,14 +167,13 @@ impl<T: ChildDepth> Tracked<T> {
     ) -> Result<Rc<Self>, ControlStop> {
         let Some(strong) = ledger.upgrade() else {
             // 台帳なし: untracked で包む（課金・release とも no-op）。
-            let (child_max, child_max_count) = data.child_depth_summary();
             return Ok(Rc::new(Self {
                 data,
                 id: AllocationId(0),
                 bytes: 0,
                 ledger: HeapLedgerWeak::new(),
-                child_max,
-                child_max_count,
+                child_max: 0,
+                child_max_count: 0,
             }));
         };
         let id = {
@@ -201,14 +181,13 @@ impl<T: ChildDepth> Tracked<T> {
             l.charge(logical_bytes, phase)?;
             l.allocate_id()?
         };
-        let (child_max, child_max_count) = data.child_depth_summary();
         Ok(Rc::new(Self {
             data,
             id,
             bytes: logical_bytes,
             ledger: ledger.clone(),
-            child_max,
-            child_max_count,
+            child_max: 0,
+            child_max_count: 0,
         }))
     }
 
@@ -223,10 +202,34 @@ impl<T: ChildDepth> Tracked<T> {
     }
 }
 
-impl<T: ChildDepth> Tracked<T> {
+impl<T> Tracked<T> {
+    /// 生成直後の backing に、子要素の深度の要約を書き込む（List / Dict 専用）。
+    ///
+    /// 公開の生成関数（`new` / `constant`）は要約を 0 で初期化するので、crate 内で
+    /// List / Dict の backing を作る経路（`Value::new_list` / `new_dict`・COW の detach・
+    /// builtin の untracked な結果）はここを通す。生成直後の `Rc` は一意所有なので必ず書ける。
+    pub(crate) fn summarized(mut rc: Rc<Self>) -> Rc<Self>
+    where
+        T: ChildDepth,
+    {
+        if let Some(tracked) = Rc::get_mut(&mut rc) {
+            let (m, c) = tracked.data.child_depth_summary();
+            tracked.child_max = m;
+            tracked.child_max_count = c;
+        }
+        rc
+    }
+
+    /// 深度の要約つきの untracked backing（[`Tracked::constant`] + [`Tracked::summarized`]）。
+    pub(crate) fn constant_with_depth(data: T) -> Rc<Self>
+    where
+        T: ChildDepth,
+    {
+        Self::summarized(Self::constant(data))
+    }
+
     /// この backing（List / Dict）の深度（semantic-decisions §21.3。空は 1）。
-    /// List / Dict 以外の backing では意味を持たない。
-    pub fn depth(&self) -> u32 {
+    pub(crate) fn depth(&self) -> u32 {
         self.child_max.saturating_add(1)
     }
 
@@ -248,7 +251,10 @@ impl<T: ChildDepth> Tracked<T> {
     }
 
     /// 最大深度の子がいなくなっていたら、全要素の保存済み深度を読み直す（再帰しない）。
-    fn settle_child_depth(&mut self) {
+    fn settle_child_depth(&mut self)
+    where
+        T: ChildDepth,
+    {
         if self.child_max_count == 0 {
             let (m, c) = self.data.child_depth_summary();
             self.child_max = m;
@@ -870,7 +876,7 @@ impl std::fmt::Debug for Value {
 impl Value {
     /// この値の深度（semantic-decisions §21.3）。スカラー・関数値・エラー値は 0、
     /// List / Dict は backing が持つ保存済みの深度（空は 1）。値を再帰でたどらない。
-    pub fn depth(&self) -> u32 {
+    pub(crate) fn depth(&self) -> u32 {
         match self {
             Value::List(l) => l.depth(),
             Value::Dict(d) => d.depth(),
@@ -878,9 +884,30 @@ impl Value {
         }
     }
 
-    /// この値を List / Dict の要素にすると深度の上限（`MAX_VALUE_DEPTH`）を超えるか。
-    fn exceeds_as_element(&self) -> bool {
-        self.depth() as usize >= MAX_VALUE_DEPTH
+    /// この値を List / Dict の要素にすると深度の上限（`MAX_VALUE_DEPTH`）を超えるなら、
+    /// catch できる `overflow` を返す（semantic-decisions §21.3）。
+    ///
+    /// 検査は tree / VM の呼び出し側で、値の生成・変更の primitive（`new_list` /
+    /// `new_dict` / `list_push_tracked` / `index_set_tracked`）を呼ぶ前に行う。primitive の
+    /// 失敗は catch 不能 terminal の `ControlStop` だけなので、深度超過はそこへ混ぜない
+    /// （execution-control §7、PR #301 判断 Q1=B）。呼ぶ前に検査するので、拒否したとき
+    /// COW の detach・課金は起きず、対象は変わらない。
+    pub(crate) fn check_element_depth(
+        &self,
+        line: usize,
+    ) -> Result<(), crate::error::TsumugiError> {
+        if self.depth() as usize >= MAX_VALUE_DEPTH {
+            return Err(crate::error::TsumugiError::value_depth_limit(line));
+        }
+        Ok(())
+    }
+
+    /// 複数の要素について [`Value::check_element_depth`] を行う。
+    pub(crate) fn check_elements_depth<'a>(
+        mut items: impl Iterator<Item = &'a Value>,
+        line: usize,
+    ) -> Result<(), crate::error::TsumugiError> {
+        items.try_for_each(|v| v.check_element_depth(line))
     }
 
     /// `Vec<Value>` から heap 課金済みの `Value::List` を作る（REV-015 案A、§5.2）。
@@ -894,22 +921,10 @@ impl Value {
         budget: &mut crate::budget::BudgetLedger,
         phase: ExecutionPhase,
     ) -> Result<Value, ControlStop> {
-        // 深度が上限を超える List は、課金の前に拒否する（semantic-decisions §21.3）。
-        if items.iter().any(Value::exceeds_as_element) {
-            return Err(ControlStop::ValueDepthExceeded);
-        }
-        Value::new_list_unchecked(items, budget, phase)
-    }
-
-    /// 深度を検査しない [`Value::new_list`]。`track_result` が builtin / host function の
-    /// 結果（既に作られた値。host の戻り値の深度は検査しない、§21.3）を tracked 化するときだけ使う。
-    pub(crate) fn new_list_unchecked(
-        items: Vec<Value>,
-        budget: &mut crate::budget::BudgetLedger,
-        phase: ExecutionPhase,
-    ) -> Result<Value, ControlStop> {
         let bytes = heap_size::list_body(items.len() as u64);
-        Ok(Value::List(Tracked::new(items, bytes, budget, phase)?))
+        Ok(Value::List(Tracked::summarized(Tracked::new(
+            items, bytes, budget, phase,
+        )?)))
     }
 
     /// `String` から heap 課金済みの `Value::Str` を作る（REV-015 PR-b、§5.2）。
@@ -1017,25 +1032,14 @@ impl Value {
         budget: &mut crate::budget::BudgetLedger,
         phase: ExecutionPhase,
     ) -> Result<Value, ControlStop> {
-        // 深度が上限を超える Dict は、課金の前に拒否する（semantic-decisions §21.3）。
-        if map.values().any(Value::exceeds_as_element) {
-            return Err(ControlStop::ValueDepthExceeded);
-        }
-        Value::new_dict_unchecked(map, budget, phase)
-    }
-
-    /// 深度を検査しない [`Value::new_dict`]（[`Value::new_list_unchecked`] と同じ用途）。
-    pub(crate) fn new_dict_unchecked(
-        map: BTreeMap<String, Value>,
-        budget: &mut crate::budget::BudgetLedger,
-        phase: ExecutionPhase,
-    ) -> Result<Value, ControlStop> {
         let key_bytes_total: u64 = map
             .keys()
             .map(|k| k.len() as u64)
             .fold(0u64, u64::saturating_add);
         let bytes = heap_size::dict_body(map.len() as u64, key_bytes_total);
-        Ok(Value::Dict(Tracked::new(map, bytes, budget, phase)?))
+        Ok(Value::Dict(Tracked::summarized(Tracked::new(
+            map, bytes, budget, phase,
+        )?)))
     }
 
     /// `Value::List` の backing を書き込み用に detach し、`&mut Vec<Value>` を得る
@@ -1065,7 +1069,7 @@ impl Value {
         // 共有中または未 tracked。複製して新しい tracked backing を作る（§5.2 COW）。
         let cloned: Vec<Value> = (**list).clone();
         let bytes = heap_size::list_body(cloned.len() as u64);
-        let fresh = Tracked::new(cloned, bytes, budget, phase)?;
+        let fresh = Tracked::summarized(Tracked::new(cloned, bytes, budget, phase)?);
         *list = fresh;
         let tracked = Rc::get_mut(list).expect("新規 Rc は一意所有");
         Ok(&mut tracked.data)
@@ -1088,7 +1092,7 @@ impl Value {
             .map(|k| k.len() as u64)
             .fold(0u64, u64::saturating_add);
         let bytes = heap_size::dict_body(cloned.len() as u64, key_bytes_total);
-        let fresh = Tracked::new(cloned, bytes, budget, phase)?;
+        let fresh = Tracked::summarized(Tracked::new(cloned, bytes, budget, phase)?);
         *dict = fresh;
         let tracked = Rc::get_mut(dict).expect("新規 Rc は一意所有");
         Ok(&mut tracked.data)
@@ -1156,10 +1160,7 @@ impl Value {
         phase: ExecutionPhase,
     ) -> Result<(), ControlStop> {
         if let Value::List(list) = self {
-            // 深度の検査は COW detach・課金より前（拒否したら対象を変更しない、§21.3）。
-            if item.exceeds_as_element() {
-                return Err(ControlStop::ValueDepthExceeded);
-            }
+            // 深度の上限の検査は呼び出し側（`Value::check_element_depth`）。ここは要約の更新だけ。
             let item_depth = item.depth();
             Value::detach_list(list, budget, phase)?;
             let old_bytes = list.bytes;
@@ -1211,10 +1212,7 @@ impl Value {
     ) -> Result<(), ControlStop> {
         match (self, target) {
             (Value::List(list), IndexTarget::ListIndex(idx)) => {
-                // 深度の検査は COW detach・課金より前（拒否したら対象を変更しない、§21.3）。
-                if value.exceeds_as_element() {
-                    return Err(ControlStop::ValueDepthExceeded);
-                }
+                // 深度の上限の検査は呼び出し側（`Value::check_element_depth`）。
                 let new_depth = value.depth();
                 Value::detach_list(list, budget, phase)?;
                 let old_bytes = list.bytes;
@@ -1230,9 +1228,6 @@ impl Value {
                 Value::retrack_list(list, old_bytes, budget, phase)?;
             }
             (Value::Dict(dict), IndexTarget::DictKey(key)) => {
-                if value.exceeds_as_element() {
-                    return Err(ControlStop::ValueDepthExceeded);
-                }
                 let new_depth = value.depth();
                 Value::detach_dict(dict, budget, phase)?;
                 let old_bytes = dict.bytes;

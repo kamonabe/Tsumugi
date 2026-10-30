@@ -1072,6 +1072,7 @@ impl Evaluator {
         value: Value,
         line: usize,
     ) -> Result<(), TsumugiError> {
+        value.check_element_depth(line)?;
         let mut target = cell.borrow_mut();
         target
             .list_push_tracked(value, &mut self.budget, ExecutionPhase::Run)
@@ -2911,6 +2912,7 @@ impl Evaluator {
                     return self.begin_expr_child(&owner, stmt_index, slot, &path, evaluated, line);
                 }
                 let values = std::mem::take(&mut self.expr_frame_mut().operands);
+                Value::check_elements_depth(values.iter(), line)?;
                 // heap 課金付きで tracked backing を作る（REV-015 案A、§5.2）。
                 let value = Value::new_list(values, &mut self.budget, ExecutionPhase::Run)
                     .map_err(|stop| self.control_stop_to_error(stop, line))?;
@@ -2960,6 +2962,7 @@ impl Evaluator {
                     return Ok(None);
                 }
                 let map = std::mem::take(&mut frame.map);
+                Value::check_elements_depth(map.values(), line)?;
                 let value = Value::new_dict(map, &mut self.budget, ExecutionPhase::Run)
                     .map_err(|stop| self.control_stop_to_error(stop, line))?;
                 self.finish_expr_frame(value)
@@ -3771,6 +3774,7 @@ impl Evaluator {
                     self.check_collection(values.len().saturating_add(1), line)?;
                     values.push(value);
                 }
+                Value::check_elements_depth(values.iter(), line)?;
                 // heap 課金付きで tracked backing を作る（REV-015 案A、§5.2）。
                 Value::new_list(values, &mut self.budget, ExecutionPhase::Run)
                     .map_err(|stop| self.control_stop_to_error(stop, line))
@@ -3791,6 +3795,7 @@ impl Evaluator {
                     }
                     map.insert(key, val);
                 }
+                Value::check_elements_depth(map.values(), line)?;
                 Value::new_dict(map, &mut self.budget, ExecutionPhase::Run)
                     .map_err(|stop| self.control_stop_to_error(stop, line))
             }

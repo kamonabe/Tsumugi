@@ -2612,6 +2612,7 @@ issue #290 から作ったスライス（不具合の修正、`slices.toml` の 
   - **VND-AT-03（深度は正確）:** 深度 256 の要素を index 代入・`pop` で取り除いた List / Dict は、再び入れ子にでき（深度 257 にならない）、深度の読み直しを要する index 代入を要素数ぶん繰り返しても完了する。確かめ方: 取り除いた後に `[x]` を作れることを確かめるテストと、深い要素を並べた List（例: 要素数 10 万）の全要素をスカラーへ index 代入するループが、壁時計の上限（例: 10 秒）以内に終わることを確かめるテスト（両 backend）。深度の読み直しは課金しない（§21.3）ため、fuel では要素数の 2 乗の実装を検出できず、壁時計で確かめる。
   - **VND-AT-04（上限の値で stack が足りる）:** 深度 256 の値を、call depth 128 の再帰の内側で表示（`print`・`to_str`）・比較（`==`）・`sort`・破棄しても abort しない（CLI の 8 MiB の実行スレッド、debug ビルド）。確かめ方: CLI を subprocess で起動して exit 0 で終わることを確かめるテスト（両 backend）。
   - **VND-AT-05（上限内の観測は不変）:** 深度 256 以下の値だけを使う既存のテスト（`tests/`・unit test）が期待値の変更なしで通り、fuel・`live_heap` / `peak_heap` の値が変わらない（深度の計算は課金しない）。確かめ方: 既存のテスト一式と、代表 script の usage を変更前の値で固定するテスト。
+- **実装での判断（実装 PR #301 のレビュー C1、判断待ち Q1）:** 深度超過のエラーは公開型 `ControlStop` に variant を足して運ばない。`ControlStop` は変えず（§7 の「どの variant も script から捕捉できない terminal」を保つ）、tree-walk 版・VM 版の呼び出し側が値の生成・変更の primitive（`Value::new_list` / `new_dict` / `list_push_tracked` / `index_set_tracked`）を呼ぶ前に crate 内部の検査（`Value::check_element_depth`）で深度を確かめ、超過なら catch できる `overflow` を直接返す。深度の要約と検査の関数（`ChildDepth`・`depth` など）は `pub(crate)` にし、公開の生成関数（`Tracked::new` / `constant` / `new_via_handle`）に trait 境界を足さない。理由: 公開 API を増やさず（[マニフェスト](manifesto.md)原則 8、§21.6 が公開 API を増やさない理由と同じ）、停止理由の型の意味を一つに保つ（原則 5）。返信なしのため推奨案で確定（Q1=B、[開発ループ手順書](loop-runbook.md) §7.5）。
 
 ## 15. 境界受入テスト
 

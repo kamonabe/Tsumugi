@@ -221,6 +221,8 @@ pub fn assign_index(
         }
         other => return Err(TsumugiError::index_assign_unsupported(line, other)),
     };
+    // 値のネスト深度の上限（semantic-decisions §21.3）。primitive を呼ぶ前に検査する。
+    value.check_element_depth(line)?;
     target
         .index_set_tracked(
             normalized,
@@ -239,14 +241,12 @@ pub fn builtin_push(
     check_arity("push", args, 2, line)?;
     if let Value::List(v) = &args[0] {
         check_collection_size(v.len().saturating_add(1), max_collection, line)?;
-        if args[1].depth() as usize >= crate::limits::MAX_VALUE_DEPTH {
-            return Err(TsumugiError::value_depth_limit(line));
-        }
+        args[1].check_element_depth(line)?;
         // COW: backing を複製して 1 要素追加し、untracked で包む。heap 課金は
         // 呼び出し側の `track_result` で行う（REV-015 案A）。
         let mut data: Vec<Value> = (**v).clone();
         data.push(args[1].clone());
-        Ok(Value::List(Tracked::constant(data)))
+        Ok(Value::List(Tracked::constant_with_depth(data)))
     } else {
         Err(TsumugiError::builtin_arg_type(
             line, "push", 1, "List", &args[0],
@@ -279,7 +279,7 @@ pub fn builtin_pop_update(args: &[Value], line: usize) -> Result<Value, TsumugiE
         // 呼び出し側の `track_result` で行う（REV-015 案A）。
         let mut data: Vec<Value> = (**v).clone();
         data.pop();
-        Ok(Value::List(Tracked::constant(data)))
+        Ok(Value::List(Tracked::constant_with_depth(data)))
     } else {
         Ok(args[0].clone())
     }

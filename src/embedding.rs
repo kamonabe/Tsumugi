@@ -1653,7 +1653,7 @@ fn adapter_error_to_link_error(error: crate::capability::AdapterError) -> LinkEr
             ControlStop::Cancelled => LinkError::Cancelled,
             ControlStop::DeadlineExceeded { .. } => LinkError::DeadlineExceeded,
             ControlStop::BudgetExceeded(exceeded) => LinkError::BudgetExceeded(exceeded),
-            ControlStop::InternalFailure(_) | ControlStop::ValueDepthExceeded => {
+            ControlStop::InternalFailure(_) => {
                 LinkError::Resolve(host_error("internal_resolver_fault"))
             }
         },

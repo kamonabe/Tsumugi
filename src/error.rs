@@ -696,7 +696,7 @@ impl TsumugiError {
     }
 
     /// 値のネスト深度上限（semantic-decisions §21.3）。catch できる `overflow`。
-    pub fn value_depth_limit(line: usize) -> Self {
+    pub(crate) fn value_depth_limit(line: usize) -> Self {
         Self::runtime_with_message_id(
             line,
             ErrorKind::StackOverflow,
