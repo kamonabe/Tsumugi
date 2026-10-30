@@ -128,7 +128,7 @@ parent     = "REV-001"
 spec       = { doc = "docs/execution-control.md", section = "fix-value-nesting-depth-limit 実装スライス（値のネスト深度上限）" }
 acceptance = ["VND-AT-01..05"]
 design_pr  = 297
-impl_pr    = 0
+impl_pr    = 301
 
 [[slice]]
 id         = "fix-closure-capture-chain-stack"
