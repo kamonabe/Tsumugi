@@ -141,7 +141,7 @@ Phase 0〜2の受入完了時、次を保証する。
 | TM-004 | canonicalize、metadata、import error差で許可外pathの存在をoracle化する | capability/grant/rootの拒否をresolver/OS操作前に同一のsanitized denialとして生成し、script操作ではcanonical error、link/control-planeでは`Denied`へ写像する。許可外pathをcanonicalizeしない | 許可済みroot内の存在情報は操作仕様上観測可能 | 2 | TM-AT-04 |
 | TM-005 | loop、callback、host call連打でCPUを占有する | fuel hookを全評価・callback経路へ置き、host call costを事前課金 | Phase 2時点のstepは包括的でない。hard CPU limitはOS責任 | 3/OS | TM-AT-05 |
 | TM-006 | 巨大文字列、総collection、input/host resultでOOMまたはallocator abortを起こす | 入出力・host resultのbyte上限、将来の総heap budget、上限超過前の拒否 | Rust allocation failureは同一process回復不能の場合がある | 3/OS | TM-AT-06 |
-| TM-007 | 深いAST/call/importまたはnative callbackでstackを枯渇させる | 既存AST/call/import深度検査、tree実行thread要件、host callbackの再入禁止 | OS stack overflowはabortし得る。別processが最終防御 | 0/1/OS | TM-AT-07 |
+| TM-007 | 深いAST/call/import/値またはnative callbackでstackを枯渇させる | 既存AST/call/import深度検査、List/Dictの値のネスト深度検査（上限256、値を作る時点で拒否）、tree実行thread要件、host callbackの再入禁止 | OS stack overflowはabortし得る。closureのcaptureの連鎖（関数値の深度は0と数える）の破棄はstackを枯渇させ得る（`fix-closure-capture-chain-stack`で別に扱う）。host functionの戻り値の値の深度は検査しない。別processが最終防御 | 0/1/OS | TM-AT-07 |
 | TM-008 | `input()`、filesystem、resolver、host function、外部serviceが無期限blockする | Phase 3でcallbackへdeadline/cancellationを渡し、adapterに有限timeoutを要求する | 同期v1は実行中syscallをpreemptできない | 3/OS | TM-AT-08 |
 | TM-009 | env、file、stdin、host resultのsecretをstdout、error、traceへ漏らす | 必要値だけsnapshot/grant、output別capability、errorにsecret値を含めない | scriptへ正当に渡したsecretの意図的出力は情報フロー制御対象外 | 2 | TM-AT-09 |
 | TM-010 | audit eventへsource、path、引数、result、secret、PIIが漏れる | Phase 2でredaction metadataと既定`Omit`を固定し、Phase 6でsink前redactionする | hostがsafe messageへsecretを入れる誤設定 | 2/6 | TM-AT-10 |
@@ -166,7 +166,7 @@ Phase 0〜2の受入完了時、次を保証する。
 
 - 本文書のactor、asset、trust boundary、保証/非保証、責任分界、全脅威IDがrelease documentationから参照できる。
 - 各TM-IDにAttack、Mitigation、Residual risk、Phase、受入IDが1件以上あり、孤立IDがない。
-- **TM-AT-07:** 既存のAST深度256/257、import深度128/129、call depth試験がhost abortではなく構造化errorになることを確認する。境界差は[AUD-017](roadmap.md)で追跡する。
+- **TM-AT-07:** 既存のAST深度256/257、import深度128/129、call depth試験に加え、値のネスト深度256/257（List・Dictのリテラル、`push`、index代入、`map`の結果。`tests/value_nesting_depth_limit.rs` の VND-AT-01・VND-AT-02）が、host abortではなく構造化errorになることを確認する。境界差は[AUD-017](roadmap.md)で追跡する。
 - **TM-AT-12（host部分）:** dependency lock、review、OS隔離がTsumugi保証外のhost責任として明記される。
 
 ### Phase 1

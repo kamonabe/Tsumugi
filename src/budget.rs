@@ -595,6 +595,10 @@ pub enum ControlStop {
     /// 内部不変条件の破れ（§5.2）。現状は `AllocationId` 発行の overflow だけを
     /// 表す。budget 超過と同じく catch 不能 terminal であり、0 へ wrap しない。
     InternalFailure(InternalFailure),
+    /// 値のネスト深度が上限（`MAX_VALUE_DEPTH`）を超える List / Dict を作ろうとした
+    /// （semantic-decisions §21）。他の variant と違い **catch できる** `overflow` エラーに
+    /// 写る（[`control_stop_to_error`]）。budget 超過ではないので課金・usage には現れない。
+    ValueDepthExceeded,
 }
 
 /// 内部不変条件の破れ（§5.2 / §7.1）。catch 不能 terminal として扱う。
@@ -2094,7 +2098,7 @@ impl BudgetLedger {
                 for item in data {
                     tracked_items.push(self.track_result(item, phase)?);
                 }
-                Value::new_list(tracked_items, self, phase)
+                Value::new_list_unchecked(tracked_items, self, phase)
             }
             Value::Dict(dict) => {
                 if dict.alloc_id().0 != 0 {
@@ -2106,7 +2110,7 @@ impl BudgetLedger {
                 for (k, item) in data {
                     tracked_map.insert(k, self.track_result(item, phase)?);
                 }
-                Value::new_dict(tracked_map, self, phase)
+                Value::new_dict_unchecked(tracked_map, self, phase)
             }
             // scalar / Fn / VmFn / Error は collection backing を持たない。
             // Fn/VmFn/Error の内部 String は既存 body の写像で本 PR の対象外。
@@ -2473,6 +2477,7 @@ pub fn control_stop_to_error(
         },
         ControlStop::DeadlineExceeded { .. } => TsumugiError::deadline_exceeded(line),
         ControlStop::Cancelled => TsumugiError::cancelled(line),
+        ControlStop::ValueDepthExceeded => TsumugiError::value_depth_limit(line),
         ControlStop::InternalFailure(InternalFailure::AllocationIdExhausted) => {
             TsumugiError::internal(line, "AllocationId を割り当てできません")
         }

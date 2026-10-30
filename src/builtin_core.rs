@@ -239,6 +239,9 @@ pub fn builtin_push(
     check_arity("push", args, 2, line)?;
     if let Value::List(v) = &args[0] {
         check_collection_size(v.len().saturating_add(1), max_collection, line)?;
+        if args[1].depth() as usize >= crate::limits::MAX_VALUE_DEPTH {
+            return Err(TsumugiError::value_depth_limit(line));
+        }
         // COW: backing を複製して 1 要素追加し、untracked で包む。heap 課金は
         // 呼び出し側の `track_result` で行う（REV-015 案A）。
         let mut data: Vec<Value> = (**v).clone();

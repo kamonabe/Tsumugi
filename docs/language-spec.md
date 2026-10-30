@@ -823,6 +823,7 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 | 空Listへの`pop` | `builtin_type` | `pop は空の List には使用できません` |
 | コレクション上限 | `collection_limit` | `コレクション要素数が上限を超えました: {requested} (上限: {limit})` |
 | user関数depth上限 | `overflow` | `スタックオーバーフロー: 再帰が深すぎます (上限: 128)` |
+| 値のネスト深度上限 | `overflow` | `値のネストが深すぎます (上限: 256)` |
 | loop外の`break` / `continue` | `control_flow` | `break はループの中でのみ使用できます` / `continue は…` |
 | ステップ上限 | `limit` | `ステップ上限に達しました (上限: {limit})` |
 | 整数演算overflow | `int_overflow` | `整数オーバーフロー: {operation}` |
@@ -954,7 +955,7 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 
 外部操作の権限は冒頭の「外部操作の権限」と[Capability Model仕様](capability-model.md)に従う。以下は誤操作や過剰な資源消費を抑えるためのdefense-in-depth機構であり、敵対的なスクリプトを隔離するセキュリティ境界ではない。非信頼コードを実行する場合は、非rootプロセス、権限制限されたコンテナ、read-only filesystem、CPU・メモリ・実行時間上限などOS側の分離を併用する。
 
-構文とASTは深度256、非循環import chainはroot scriptを除いて128に制限し、parser・compiler・evaluatorがhost stackを消費する前にエラー化する。ステップ予算はloop反復と関数・callback呼び出しを中心に数え、構文解析、コンパイル、直線的な大量コード、文字列サイズ、重いbuiltin、I/O待ち、プロセス全体の総heap量は包括的に制限しない。filesystem制御にもsymlinkのTOCTOU制約がある。
+構文とASTは深度256、非循環import chainはroot scriptを除いて128に制限し、parser・compiler・evaluatorがhost stackを消費する前にエラー化する。実行中に作るListとDictの入れ子の深さも256に制限し、値の破棄・比較・表示がhost stackを使い切る前に、値を作る時点で拒否する。ステップ予算はloop反復と関数・callback呼び出しを中心に数え、構文解析、コンパイル、直線的な大量コード、文字列サイズ、重いbuiltin、I/O待ち、プロセス全体の総heap量は包括的に制限しない。filesystem制御にもsymlinkのTOCTOU制約がある。
 
 ### ステップ予算
 
@@ -1011,6 +1012,18 @@ CLI の既定（safe profile）では、`env()` が読めるのは `--allow-env 
 - 超過時: 「スタックオーバーフロー: 再帰が深すぎます (上限: 128)」ランタイムエラー
 - 対象: 通常呼び出しと`map` / `filter` / `each`のcallback。builtinとcore組み込み関数自体は数えない
 - 設定変更: 不可（コンパイル時定数 `MAX_USER_CALL_DEPTH`）
+
+### 値のネスト深度制限
+
+ListとDictの入れ子の深さを256に制限する。深さが際限なく増えた値は、破棄・比較・表示でhost stackを使い切ってプロセスを落とすため、値を作る時点で止めてcatchできるランタイムエラーにする。
+
+- 深度: スカラー・関数値・エラー値は0。Listは「1 + 要素の深度の最大」、Dictは「1 + 値の深度の最大」（keyは数えない）。空のList・Dictは1。index代入・`pop`で深い要素を取り除いた後は、残った内容で決まる
+- 上限: 256。深度256の値は作れ、深度が257以上になる値を作る操作をその値を作る前に拒否する。AST深度と同じ値なので、リテラルとして書ける入れ子はすべて値として作れる
+- 超過時: 「値のネストが深すぎます (上限: 256)」`overflow`ランタイムエラー。`try` / `catch`で捕捉できる。`push`・index代入で拒否したとき、対象のList・Dictは変わらない。lineはその操作を含む式・文の行
+- 対象: List・Dictリテラル、`push`、index代入（Listの要素・Dictの値）、`map`の結果。要素の並べ替え・一部の取り出し・入れ物の入れ替えだけの組み込み関数（`filter`・`slice`・`reverse`・`sort`・`values`など）は入力より深い値を作らないため超過しない。hostが返す値そのものの深度は検査しないが、スクリプトがそれをList・Dictに入れるときは同じ規則で検査する
+- 課金: 深度の計算と検査はfuel・heapに課金しない
+- ツリーウォーク版・VM版で同じ境界・同じメッセージ・同じlineになる
+- 設定変更: 不可（コンパイル時定数 `MAX_VALUE_DEPTH`）。言語仕様のバージョン（0.21）は変えず、すべてのrevisionに適用する
 
 ### 構文・AST深度制限
 
