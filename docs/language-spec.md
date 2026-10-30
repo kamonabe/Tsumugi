@@ -2,11 +2,22 @@
 
 バージョン: 0.21
 
-最終更新: 2026-10-20
+最終更新: 2026-10-30
 
 この番号は言語仕様のrevisionであり、Cargo package / REPLの実装バージョン `0.1.0` とは独立して管理する。
 
 本書をTsumugiの**現行実装から観測できる規範仕様**とし、デフォルトのツリーウォーク版と`--vm`版は同じ観測可能な挙動を満たすものとする。次期revisionについて設計確定済みだが未実装の決定は[次期意味論・実装決定](semantic-decisions.md)を正本とし、その受入基準とpaired testが完了するまで本書へ先行反映しない。実装差は言語機能ではなく非適合として扱い、詳細と修正状況は[`roadmap.md`](roadmap.md)の監査バックログで管理する。
+
+### 外部操作の権限（capability）
+
+環境変数・時刻・標準入出力・ファイルシステム・プロセス終了・import に触れる操作は、ホストが実行単位で明示的に許可（grant）したときだけ動く。許可が無ければ外部状態に触れる前に拒否する（[マニフェスト](manifesto.md) 原則 2）。権限の型・許可の粒度・拒否の扱いは [Capability Model仕様](capability-model.md) を正本とし、本書には再掲しない。
+
+- CLI の既定は safe profile である（[Capability Model仕様](capability-model.md) §14.2・§14.4）。safe profile が既定で許可するのは標準出力（`print`）とスクリプト引数（`args()`）だけで、それ以外は `--allow-env KEY`・`--allow-clock`・`--allow-script-stdin`・`--allow-exit`・`--fs-root NAME=PATH` と `--fs-op NAME=OP[,OP...]`・`--allow-import-root NAME=PATH` で個別に許可する（同 §14.1）。`--deny-stdout` は標準出力の許可を外す
+- `--profile legacy` は互換用で、環境変数（`TSUMUGI_` で始まるものを除く）・時刻・標準入出力・プロセス終了と、`TSUMUGI_SANDBOX` に従うファイルシステムを許可する（同 §14.3）。legacy profile は import root を許可しないため、ファイル・標準入力から実行するスクリプトの import は拒否される
+- REPL も同じ profile と option で動く。ただし REPL の import は import root を要しない（「モジュール / import」の「制約」）
+- 許可の無い操作は、スクリプト実行中なら catch 可能な `capability`（ファイルシステム操作は `sandbox`）エラーになる。import の拒否だけは実行開始前の link 時に起き、catch できない（「モジュール / import」の「パス解決」）
+
+本節と、組み込み関数表・「実行安全性」の権限に関する記述は、loop:drift #298 の D-17・D-18 を受けて CLI の既定（safe profile）に合わせて直した。実装は変えず、本書を [Capability Model仕様](capability-model.md) §14 と実装に合わせる案（Q1=A・Q2=A）は、返信なしのため推奨案で確定した（[開発ループ手順書](loop-runbook.md) §7.5、issue #298）。理由: Capability Model仕様が採択した safe 既定はマニフェスト原則 2「権限はホストが明示的に付与する」に沿い、実装もそれに一致している。本書だけが CLI が ambient に権限を持つ前提で書かれていた。これは既に実装されている CLI の既定を記述し直したもので、`LanguageRevision` で分岐する言語挙動の変更ではないため、仕様 revision は 0.21 のまま変えない。
 
 ### 現在の既知非適合
 
@@ -14,7 +25,10 @@
 
 両engine差: 現在なし。
 
-両engine共通の仕様違反: 現在なし。
+両engine共通の仕様違反（[Capability Model仕様](capability-model.md) の目標との差）:
+
+- ファイル・標準入力から実行するスクリプトの import は、link 時に resolver が import root の下で確かめたファイルと、実行時に読むファイルが別の経路で決まる。実行時は評価器内蔵の module loader が import 元スクリプトのディレクトリを基準に読み直すため、確かめたものと別のファイルが実行されることがあり、入れ子の import は import root で検査されない（issue #291 で修正予定）
+- import の実行時の読み込み（ファイル・標準入力・REPL）は、profile にかかわらず `TSUMUGI_SANDBOX` を読み、許可範囲外のパスをサンドボックス違反にする。目標は「safe profile では `TSUMUGI_SANDBOX` を読まない」である（同 §14.3・§14.4）。上の項目と同じく、実行時の import が module loader を経由していることによる
 
 本書の文法どおり、複数行lambdaの終端`end`は必須である。
 
@@ -655,8 +669,11 @@ import はプログラムの実行を始める前にすべて解決する。読�
 
 ### パス解決
 
-- パスは現在実行中のスクリプトからの相対パスで解決される
+- ファイル・標準入力から実行するスクリプトの import は、ホストが許可した import root の下で解決する。CLI では `--allow-import-root NAME=PATH` で root を許可する（[Capability Model仕様](capability-model.md) §14.1。safe profile だけで指定でき、複数指定できる）
+- import root が 1 つも許可されていないのに import があると、実行開始前の link 時に拒否する。拒否は catch できず、1 文も実行せずに診断 `import がありますが module resolver が許可されていません。…` を標準エラーへ出して終了コード 1 で終わる。ツリーウォーク版と `--vm` 版で同じである
+- `@NAME/...` による root の選択と、unqualified path（`@` で始まらないパス）を root `default` へ割り当てる扱いは [Capability Model仕様](capability-model.md) §14.1 に従う
 - ネストした import（A が B を import し、B が C を import する）にも対応
+- 現在の実装は、実行時の読み込みを import 元スクリプトのディレクトリ基準で行い、link 時の確認と経路が分かれている（上の「現在の既知非適合」、issue #291）
 
 ### 循環 import
 
@@ -669,8 +686,8 @@ import はプログラムの実行を始める前にすべて解決する。読�
 - import はプログラムのトップレベルでのみ使用できる。関数・条件分岐・ループ・`try` / `catch`・複数行ラムダのブロック内に記述すると、パスの読み込み前にパースエラー `import はトップレベルでのみ使用できます` になる
 - root scriptを数えず、現在処理中のimport chainは最大128ファイル。異なるファイルへの129段目のimportは`import 失敗: ネストが深すぎます (上限: 128)`という`import`ランタイムエラーになる。既訪問パスは深度検査前にスキップされるため、循環importの従来挙動は変わらない
 - import されたファイル内の `let` 宣言・`fn` 定義がすべて現在のスコープに展開される（名前空間は分離されない）
-- REPL での import は現在の作業ディレクトリからの相対パスで解決される
-- `TSUMUGI_SANDBOX` が設定されている場合、import 先パスも許可範囲内でなければサンドボックス違反エラーになる
+- REPL での import は import root を要さず、現在の作業ディレクトリからの相対パスで解決される
+- import の実行時の読み込み（ファイル・標準入力・REPL）は、profile にかかわらず、`TSUMUGI_SANDBOX` が設定されていれば import 先パスが許可範囲内でなければサンドボックス違反エラーになる（上の「現在の既知非適合」）
 
 ## エラー処理（try / catch）
 
@@ -775,7 +792,7 @@ end
 
 `zero_division`, `type`, `index`, `name`, `limit`, `overflow`, `sandbox`, `import`, `argument`, `int_overflow`, `control_flow`, `collection_limit`, `string_limit`, `source_limit`, `heap_limit`, `io_limit`, `conversion`, `builtin_type`, `iteration`, `io`, `capability`, `host`, `internal`, `runtime`
 
-このうち `capability` / `host` は、host function や capability が配線された実行（埋め込み実行など）でのみ観測される。単体のスクリプト実行では生成経路を持たない。これらを catch 可能種別として扱う契約は[組み込みAPI仕様](embedding-api.md) 8.1 に従う。
+このうち `capability` / `sandbox` は、ホストが許可していない外部操作を試みたときに起きる（冒頭の「外部操作の権限」）。CLI の既定（safe profile）では、`env` / `now` / `input` / `exit` を許可なしで呼ぶと `capability`、ファイルシステム操作を許可なしで行うと `sandbox` になる。`host` は、許可された外部操作が失敗したとき（許可した root の中の存在しないファイルを `read_file` で読んだときなど）に起きる。これらを catch 可能種別として扱う契約は[組み込みAPI仕様](embedding-api.md) 8.1 と [Capability Model仕様](capability-model.md) §4・§8.5 に従う。
 
 このうち `string_limit` / `source_limit` / `heap_limit` / `io_limit` は包括budget（REV-015 Slice 2）で追加した予算超過の種別である。既定の上限では通常のスクリプトから観測されず、対応するメッセージテンプレートは budget 実装の確定に伴って変わり得るため、下の正本表には載せていない（実装状態は[ロードマップ](roadmap.md)の REV-015 を参照）。
 
@@ -821,12 +838,20 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 
 - パースエラー（構文エラー）— プログラムの実行前に発生するため
 - import 先ファイルの構文エラー — `import` はトップレベル限定のため `try` の内側に置けない
+- import root が許可されていない import — 実行開始前の link 時に拒否するため（「モジュール / import」の「パス解決」）
 
 ### 出力の失敗
 
 `print` は標準出力への書き込みに失敗した場合、`io` 種別のランタイムエラーになる。パイプの読み取り側が先に終了した場合（`tsumugi script.tsg | head -1` など）もこれに該当し、捕捉しなければ診断を表示して終了コード1で終わる。CLI自身のREPLプロンプトやバナーの出力に失敗した場合は、スクリプトのエラーではなくCLIの診断として報告する。
 
 ## 組み込み関数
+
+外部状態に触れる組み込み関数は、ホストが許可したときだけ動く（冒頭の「外部操作の権限」、[Capability Model仕様](capability-model.md)）。
+
+- `print` は標準出力、`env` は環境変数、`now` は時刻、`input` はスクリプトの標準入力、`exit` はプロセス終了の許可を要する。許可が無ければ catch 可能な `capability` エラー（`host function の実行が許可されていません: {name}`）になる
+- ファイルシステム関数（`read_file` / `read_lines` / `write_file` / `append_file` / `path_exists` / `is_file` / `is_dir` / `mkdir` / `remove` / `remove_dir` / `remove_tree` / `rename` / `list_dir` / `file_size`）は、対象パスを含む root と操作の許可を要する。許可が無ければ catch 可能な `sandbox` エラー（`ファイルシステム操作が許可されていません`）になる。safe profile のパスは `@NAME/...` か、root `default` に対する相対パスで書き、絶対パス・`.`・`..` を含むパスは catch 可能な `argument` エラーになる（[Capability Model仕様](capability-model.md) §8.2・§14.1）
+- 許可された操作の失敗（存在しないファイルの読み込み、親ディレクトリの無い場所への書き込み、既存ディレクトリへの `mkdir` など）は、`null` や `false` を返さず catch 可能な `host` エラー（`host function の実行に失敗しました: {name} (filesystem)`）になる。legacy profile でも同じである
+- 下の表の説明は、必要な許可があるときの挙動である
 
 | 関数 | 説明 |
 |---|---|
@@ -843,11 +868,11 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 | `to_int(val)` | 値を整数に変換（Int/Float/Bool/文字列対応）。Floatは0方向へ切り捨て、`NaN` / `±Infinity` / 丸め後に i64 範囲 `[-2^63, 2^63)` 外となる値は `conversion` エラー。文字列は整数リテラルとして解釈できる場合だけ成功し、`"3.5"` や前後に空白を含む `" 42"` は `conversion` エラー |
 | `to_str(val)` | 値を文字列に変換 |
 | `range(start, end)` | start から end の手前までの整数リストを生成 |
-| `read_file(path)` | ファイル全体を文字列で返す。失敗時は null |
-| `read_lines(path)` | ファイルを行ごとに読んでリストで返す。失敗時は null |
-| `write_file(path, content)` | ファイルに書き込み（上書き）。成功で true、失敗で false |
-| `append_file(path, content)` | ファイルに追記。成功で true、失敗で false |
-| `env(name)` | 環境変数を取得。未設定なら null。`TSUMUGI_ENV_ALLOW` 設定時は許可リスト外のキーも null |
+| `read_file(path)` | ファイル全体を文字列で返す |
+| `read_lines(path)` | ファイルを行ごとに読んでリストで返す |
+| `write_file(path, content)` | ファイルに書き込み（上書き）。成功で true |
+| `append_file(path, content)` | ファイルに追記。成功で true |
+| `env(name)` | 環境変数を取得。未設定なら null。safe profile では `--allow-env` で許可したキー以外も null（`--allow-env` が 1 つも無ければ `capability` エラー）。legacy profile では `TSUMUGI_ENV_ALLOW` 設定時に許可リスト外のキーも null |
 | `args()` | スクリプト引数を文字列リストで返す。process argv ではなく実行 context の snapshot を返し、CLIはSCRIPT（またはstdin `-`）より後ろのtokenを順序どおり渡す。埋め込み host は `ExecutionContext::set_script_args` で実行単位に注入する。引数がなければ空リスト（AUD-018） |
 | `input()` | 標準入力から1行読み取る。EOF なら null |
 | `now()` | 現在のUNIXタイムスタンプ（秒）を整数で返す |
@@ -859,8 +884,8 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 | `remove_dir(path)` | **空ディレクトリのみ**を削除する。非空ディレクトリは削除しない（再帰削除は `remove_tree`）。成功で true（revision 0.20 で再帰削除から変更、REV-021） |
 | `remove_tree(path)` | ディレクトリを中身ごと**再帰削除**する。final symlinkはlink自体だけを削除し、targetをたどらない。成功で true（revision 0.20 で追加、REV-021） |
 | `rename(from, to)` | ファイル/ディレクトリを移動・リネーム。from/toのfinal symlinkはtargetでなくdirectory entry自体として扱う。成功で true |
-| `list_dir(path)` | ディレクトリ内のエントリ名をリストで返す。失敗で null。名前（Str）は `sort` と同じ全順序 `TotalOrder` で整列する（Str 帯のコードポイント順。revision 0.21 で整列キーを全順序へ一本化、REV-017。実効順序はコードポイント順で従来と同一） |
-| `file_size(path)` | ファイルサイズ（バイト）を整数で返す。失敗で null。サイズが i64 で表現できない（`i64::MAX` 超）場合は wrap・負値を返さず `int_overflow` エラー |
+| `list_dir(path)` | ディレクトリ内のエントリ名をリストで返す。名前（Str）は `sort` と同じ全順序 `TotalOrder` で整列する（Str 帯のコードポイント順。revision 0.21 で整列キーを全順序へ一本化、REV-017。実効順序はコードポイント順で従来と同一） |
+| `file_size(path)` | ファイルサイズ（バイト）を整数で返す。サイズが i64 で表現できない（`i64::MAX` 超）場合は wrap・負値を返さず `int_overflow` エラー |
 | `trim(str)` | 前後の空白を除去 |
 | `starts_with(str, prefix)` | 接頭辞チェック |
 | `ends_with(str, suffix)` | 接尾辞チェック |
@@ -927,7 +952,7 @@ runtime error は operation ごとの共通 constructor から `kind`・メッ�
 
 ## 実行安全性
 
-以下は誤操作や過剰な資源消費を抑えるためのdefense-in-depth機構であり、敵対的なスクリプトを隔離するセキュリティ境界ではない。非信頼コードを実行する場合は、非rootプロセス、権限制限されたコンテナ、read-only filesystem、CPU・メモリ・実行時間上限などOS側の分離を併用する。
+外部操作の権限は冒頭の「外部操作の権限」と[Capability Model仕様](capability-model.md)に従う。以下は誤操作や過剰な資源消費を抑えるためのdefense-in-depth機構であり、敵対的なスクリプトを隔離するセキュリティ境界ではない。非信頼コードを実行する場合は、非rootプロセス、権限制限されたコンテナ、read-only filesystem、CPU・メモリ・実行時間上限などOS側の分離を併用する。
 
 構文とASTは深度256、非循環import chainはroot scriptを除いて128に制限し、parser・compiler・evaluatorがhost stackを消費する前にエラー化する。ステップ予算はloop反復と関数・callback呼び出しを中心に数え、構文解析、コンパイル、直線的な大量コード、文字列サイズ、重いbuiltin、I/O待ち、プロセス全体の総heap量は包括的に制限しない。filesystem制御にもsymlinkのTOCTOU制約がある。
 
@@ -953,7 +978,9 @@ CLI では環境変数 `TSUMUGI_MAX_COLLECTION_SIZE` で、List/Dictの要素数
 
 ### ファイルI/Oサンドボックス
 
-環境変数 `TSUMUGI_SANDBOX` でファイル操作（read_file, write_file, append_file, import 等）の対象パスを制限する。
+CLI の既定（safe profile）では、ファイル操作の範囲は `--fs-root` / `--fs-op` で許可した root と操作に限られ、許可が無ければ全て拒否する（[Capability Model仕様](capability-model.md) §14.1・§14.2）。ファイル操作に関して `TSUMUGI_SANDBOX` を読むのは `--profile legacy` のときだけである（同 §14.3）。ただし import の実行時の読み込みは、現在 profile にかかわらず `TSUMUGI_SANDBOX` を読む（冒頭の「現在の既知非適合」）。
+
+`--profile legacy` では、環境変数 `TSUMUGI_SANDBOX` でファイル操作（read_file, write_file, append_file 等）の対象パスを制限する。
 
 - カンマ区切りで複数パスを許可可能
 - 許可パスのプレフィックスに合致しないアクセスはサンドボックス違反エラー
@@ -961,18 +988,20 @@ CLI では環境変数 `TSUMUGI_MAX_COLLECTION_SIZE` で、List/Dictの要素数
 - `remove` / `remove_dir` / `remove_tree` / `rename`は中間symlinkを解決したうえでfinal directory entryを認可対象とし、final symlinkのtargetは操作しない
 - targetが未作成のdangling final symlinkを通じた`write_file` / `append_file`は、targetの場所を認可できない既知の制約がある（AUD-020）
 - 検査と実I/Oの間のsymlink差し替えraceまでは防止しない
-- 未設定時は制限なし（全パス許可）
-- 例: `TSUMUGI_SANDBOX=/home/user/scripts,/tmp`
+- 未設定時は制限なし（全パス許可）。このとき起動時に標準エラーへ警告を1件出す
+- 例: `TSUMUGI_SANDBOX=/home/user/scripts,/tmp tsumugi --profile legacy script.tsg`
 
 ### 環境変数アクセス制御
 
-環境変数 `TSUMUGI_ENV_ALLOW` で `env()` 関数が読み取れるキーを制限する。
+CLI の既定（safe profile）では、`env()` が読めるのは `--allow-env KEY` で許可したキーだけで、`TSUMUGI_ENV_ALLOW` は読まない（[Capability Model仕様](capability-model.md) §14.1・§14.2）。
+
+`--profile legacy` では、環境変数 `TSUMUGI_ENV_ALLOW` で `env()` 関数が読み取れるキーを制限する。
 
 - カンマ区切りでキー名を列挙
 - 末尾 `*` でプレフィックスマッチ（例: `TSUMUGI_*`）
 - 許可リスト外のキーは `null` を返す（エラーにはならない）
-- 未設定時は制限なし（全キー読み取り可能）
-- 例: `TSUMUGI_ENV_ALLOW="HOME,PATH,TSUMUGI_*"`
+- 未設定時は制限なし（`TSUMUGI_` で始まるもの以外の全キー読み取り可能）。このとき起動時に標準エラーへ警告を1件出す
+- 例: `TSUMUGI_ENV_ALLOW="HOME,PATH" tsumugi --profile legacy script.tsg`
 
 ### コールフレーム深度制限
 
