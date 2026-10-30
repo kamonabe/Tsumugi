@@ -1,6 +1,6 @@
 # Tsumugi 実行予算・協調実行仕様
 
-最終更新: 2026-10-29
+最終更新: 2026-10-30
 
 設計ステータス: **到達目標の確定仕様（§1〜§13）＋ 実装の現在地（下記の逸脱一覧）**
 
@@ -2564,6 +2564,53 @@ F-2 は既定 `total_fuel` の見直しと、課金表の版である `fuel_acco
   更に分割してよいが、`fuel_accounting_revision` の bump と既定 `total_fuel` の更新は**同一 PR で
   行う**（会計版と既定値を別 PR に割ると、中間状態で「新課金なのに旧既定上限」で代表 script が落ちる
   不整合が main に出るため）。分割する場合は `slices.toml` を更新し、本小節を割る。
+
+### fix-contains-budgeted-equality 実装スライス（`contains` の等価判定を予算付き比較へ）
+
+issue #290 から作ったスライス（不具合の修正、`slices.toml` の `fix-contains-budgeted-equality`）。issue の仕分けで「受け入れ」とし、判断は要らないとした部分である（[言語仕様](language-spec.md)「等価比較」の「この規則は`contains`のように等価判定を使う組み込み関数でも共有する」で直し方が決まる）。
+
+- **現状の不具合:** `contains(list, x)` は `src/builtin_core.rs` の `builtin_contains` で `Vec::contains`（`Value` の `PartialEq`）を使う。`PartialEq` は List / Dict を Rust の再帰でたどり、fuel を課金せず、共有された入れ子（DAG）を枝刈りしない。このため `a = [a, a]` を 60 回繰り返した値どうしの比較が指数時間になり、fuel・deadline・cancel のどれでも止まらない（issue #290 の再現 2。CLI の 30 秒の deadline も効かない）。`==` / `!=` は REV-001 で予算付きの `BudgetLedger::values_equal`（`src/budget.rs`、worklist で走査し List / Dict のペアごとに fuel 1 を課金、比較済みペアを枝刈り）へ移っており、`contains` だけが取り残されている。
+- **実装範囲:**
+  - `contains` の第 1 引数が List のとき、各要素と第 2 引数の等価判定を `values_equal` で行う。`sort` / `join` / `to_str` と同じく、budget を持たない `builtin_core::dispatch` へ入れず、tree（`src/builtin.rs`）と VM（`src/vm.rs`）の dispatch 境界で先に intercept する budget 付きの関数（例: `builtin_contains_budgeted`）にする。tree の式 frame 経路（tree-expr-continuation-e3）を含め、PureCore builtin を呼ぶすべての経路が同じ関数を通る。
+  - 要素を先頭から順に比較し、等しい要素が見つかった時点で `true` を返す（残りの要素は比較しない）。
+  - fuel 超過は `==` と同じく catch できない terminal（`BudgetExceeded(Fuel)`）になる。
+  - `builtin_core::dispatch` の `"contains"` の List 分岐は使われなくなるので、`sort` などと同じく到達しない旨のコメントにするか、List 分岐を budget 付きの関数へ寄せる（Str・Dict 分岐の挙動は変えない）。
+- **範囲外:**
+  - 第 1 引数が Str（部分文字列）・Dict（key の有無）のときの挙動と課金。値の比較を含まないので変えない。
+  - 要素を走査する per-element 課金（§4.1 の「collection elementを走査」）。F-2・`fuel-bulk-charge` の範囲で、本スライスは `==` と同じ `values_equal` の課金だけを加える。
+  - 値のネスト深度の上限（同じ issue の別スライス `fix-value-nesting-depth-limit`）。
+- **課金の変化:** List / Dict を要素に持つ List への `contains` は、`==` と同じく比較した List / Dict のペアごとに fuel を使うようになる。スカラーだけの List への `contains` の fuel は変わらない（`values_equal` はスカラーの比較に課金しない）。これは §4.1 の課金表に charge point を足す変更ではなく、`==` / `!=` がすでに使う比較の課金を、[言語仕様](language-spec.md)が等価判定を共有すると定める `contains` にも適用する修正なので、`fuel_accounting_revision`（§3.1。実装は F-2 で入る）の版は変えない。
+- **想定の変更規模:** `src/` は 40〜80 行程度（`src/builtin_core.rs` に budget 付きの関数 20〜40 行、`src/builtin.rs` と `src/vm.rs` の intercept に各 5〜10 行、dispatch の List 分岐の整理）。テストは `tests/` に 100〜200 行。触る仕組みは「builtin の dispatch 境界での budget 付き intercept」1 つ。受入基準は 4 項目。§11.1（[開発ループ手順書](loop-runbook.md)）に収まる。
+- **受入基準:**
+  - **CBE-AT-01（`==` と同じ結果）:** `contains([a], b)` が、Int と Float の跨ぎ（`1` と `1.0`）、NaN、入れ子の List / Dict（`[1]` と `[1.0]`）、関数値の同一性、エラー値、型違いの組で `a == b` と同じ真偽を返す。tree-walk 版と VM 版で同じ。確かめ方: 組の表を回し、`contains([a], b)` と `a == b` の出力を比べる統合テスト（両 backend）。
+  - **CBE-AT-02（共有 DAG で有限時間）:** issue #290 の再現 2（`a = [a, a]`・`b = [b, b]` を 60 回）の `contains([a], b)` が既定の budget で有限時間に `true` を返す。確かめ方: CLI を subprocess で起動し、壁時計の上限（例: 10 秒）以内に `true` を出して exit 0 で終わることを確かめるテスト（両 backend）。
+  - **CBE-AT-03（fuel 超過は terminal）:** 比較が fuel を使い切る `contains`（共有しない大きな入れ子どうしの比較）が、`==` と同じ catch できない `BudgetExceeded(Fuel)` で止まり、`try` / `catch` で捕捉されない。確かめ方: 小さい `total_fuel` を設定した実行で、`try` の内側の `contains` が terminal で終わり catch 節が走らないことを確かめるテスト。
+  - **CBE-AT-04（課金が `==` と一致）:** List / Dict を要素に持つ `contains([x], y)` の fuel 消費の増分が、同じ `x` と `y` の `x == y` の比較の増分と一致し、スカラーだけの List への `contains` の fuel 消費は変更前と同じである。確かめ方: 同じ入力で `contains` と `==` の usage の fuel を比べるテストと、スカラーの List で変更前の値を固定するテスト。
+
+### fix-value-nesting-depth-limit 実装スライス（値のネスト深度上限）
+
+issue #290 から作ったスライス（不具合の修正、`slices.toml` の `fix-value-nesting-depth-limit`）。目標の規範は[次期意味論・実装決定](semantic-decisions.md) §21（値のネスト深度上限）で、issue #290 の判断待ち Q1 で返信なしのため推奨案（A: 値を作る時点で深度を検査し、超過は catch できるエラーにする）で確定した（[開発ループ手順書](loop-runbook.md) §7.5）。
+
+- **現状の不具合:** List / Dict の入れ子の深さに上限がなく、`x = [x]` を 20 万回繰り返した値の破棄（`src/value.rs` の `Tracked` の Drop）で host stack があふれ、プロセスが abort する（issue #290 の再現 1。tree-walk 版・VM 版とも exit 134。Dict の `d = {"a": d}` でも同じ）。比較の `TotalOrder::compare_budgeted`・`Display`・`render_into` も値を Rust の再帰でたどる。
+- **実装範囲:**
+  - [次期意味論・実装決定](semantic-decisions.md) §21.3 の規範のとおり、List / Dict の深度を持ち、深度が 257 以上になる値を作る操作を、値を作る前に `overflow`（`値のネストが深すぎます (上限: 256)`）で拒否する。対象の経路は §21.3 の「対象」のとおり（List / Dict リテラル、`push`、index 代入、`map` の結果）。tree-walk 版（`src/eval.rs`・`src/builtin.rs`）と VM 版（`src/vm.rs` の `ListPush` / `DictInsert` / `ListPushBinding` など）の両方。
+  - 深度は値を再帰でたどらずに求める。List / Dict の backing（`src/value.rs` の `Tracked`）に深度を持たせ、作るときは要素の保存済み深度の最大 + 1 を求める（要素ごとに O(1)）。`push` は「既存の深度」と「入れる値の深度 + 1」の大きい方にする。index 代入・`pop` で深度が下がりうる場合も、§21.3 のとおり正確な深度を保つ（要素の保存済み深度を読み直す。値を再帰でたどらない）。index 代入を繰り返すループが要素数の 2 乗の時間にならないよう、読み直しは必要なときに限る（例: 最大深度の要素の数を持ち、0 になったときだけ読み直す）。具体的な持ち方は実装に任せる。
+  - 上限はコンパイル時定数 `MAX_VALUE_DEPTH = 256`（`src/limits.rs`。`MAX_AST_DEPTH`・`MAX_USER_CALL_DEPTH` と同じ置き場所）。
+  - 拒否したときは対象の List / Dict を変更しない（COW の detach・課金の前に検査する）。
+  - 言語仕様への統合: [言語仕様](language-spec.md)の「実行安全性」に「値のネスト深度制限」の小節を足し（「コールフレーム深度制限」と同じ形: 上限・超過時・対象・設定変更）、ランタイムエラーの表に `overflow` の行を足し、章冒頭の要約文に値の深度を足す。[次期意味論・実装決定](semantic-decisions.md) §21 は統合済みと記す（§21.7）。`language_revision` で分岐せず、言語仕様のバージョン（0.21）と `LanguageRevision` は変えない（§21.6。設計 PR #297 の判断待ち Q1=A、返信なしのため推奨案で確定、[開発ループ手順書](loop-runbook.md) §7.5）。
+  - [脅威モデル](threat-model.md) TM-007 の緩和策に値のネスト深度の検査を足し、TM-AT-07 に値の深度 256 / 257 の試験を足す。closure の capture の連鎖（下記の範囲外）を TM-007 の残存リスクに書く。
+- **範囲外:**
+  - closure の capture の連鎖（`f = fn() g() end` で前の関数値を capture し続ける）による stack 枯渇。関数値の深度は 0 と数える（§21.3）ため本スライスでは防げない。issue #290 の設計の際に確かめた事実として、20 万段の連鎖の破棄で tree-walk 版・VM 版とも abort する（exit 134）。直し方は `fix-closure-capture-chain-stack`（`todo`）の設計で決める。
+  - host function の戻り値や host から渡された値そのものの深度の検査（§21.3。スクリプトが List / Dict に入れるときは検査する）。
+  - 深度の計算への fuel・heap の課金（§21.3。課金しない）。
+  - `contains` の予算漏れ（同じ issue の別スライス `fix-contains-budgeted-equality`）。
+- **想定の変更規模:** `src/` は 300〜450 行程度（`src/value.rs` の backing の深度と生成・`push`・index 代入・`pop` の更新 150〜200 行、エラーの生成 10〜20 行、`src/eval.rs`・`src/builtin.rs` の検査の配線 50〜80 行、`src/vm.rs` の opcode の配線 50〜80 行、上限定数 5 行）。テストは `tests/` に 200〜350 行。docs は言語仕様・脅威モデル・本書の逸脱一覧。触る仕組みは「値の表現（List / Dict の backing）」1 つ。受入基準は 5 項目。§11.1（[開発ループ手順書](loop-runbook.md)）に収まる。
+- **受入基準:**
+  - **VND-AT-01（境界と catch）:** 深度 256 の List / Dict を List / Dict リテラル・`push`・index 代入・`map` の結果のそれぞれで作れ、深度 257 になる同じ操作が `overflow`・`値のネストが深すぎます (上限: 256)` で拒否される。`try` / `catch` で捕捉でき、`push` / index 代入の対象は変わらない。tree-walk 版と VM 版で kind・message・line が一致する。確かめ方: 経路ごとに 256 / 257 を作る script を両 backend で実行し、結果・catch した error の type / message / line・対象の `len` を比べる統合テスト。
+  - **VND-AT-02（abort しない）:** issue #290 の再現 1（List を 20 万回入れ子にする）と Dict 版が、abort せず `overflow` の診断を出して exit 1 で終わる。確かめ方: debug ビルドの CLI を subprocess で起動し、exit code が 1 で stderr にメッセージがあることを確かめるテスト（両 backend）。
+  - **VND-AT-03（深度は正確）:** 深度 256 の要素を index 代入・`pop` で取り除いた List / Dict は、再び入れ子にでき（深度 257 にならない）、深度の読み直しを要する index 代入を要素数ぶん繰り返しても完了する。確かめ方: 取り除いた後に `[x]` を作れることを確かめるテストと、深い要素を並べた List（例: 要素数 10 万）の全要素をスカラーへ index 代入するループが、壁時計の上限（例: 10 秒）以内に終わることを確かめるテスト（両 backend）。深度の読み直しは課金しない（§21.3）ため、fuel では要素数の 2 乗の実装を検出できず、壁時計で確かめる。
+  - **VND-AT-04（上限の値で stack が足りる）:** 深度 256 の値を、call depth 128 の再帰の内側で表示（`print`・`to_str`）・比較（`==`）・`sort`・破棄しても abort しない（CLI の 8 MiB の実行スレッド、debug ビルド）。確かめ方: CLI を subprocess で起動して exit 0 で終わることを確かめるテスト（両 backend）。
+  - **VND-AT-05（上限内の観測は不変）:** 深度 256 以下の値だけを使う既存のテスト（`tests/`・unit test）が期待値の変更なしで通り、fuel・`live_heap` / `peak_heap` の値が変わらない（深度の計算は課金しない）。確かめ方: 既存のテスト一式と、代表 script の usage を変更前の値で固定するテスト。
 
 ## 15. 境界受入テスト
 

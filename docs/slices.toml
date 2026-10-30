@@ -105,6 +105,38 @@ depends_on = ["R-1a"]
 # 未着手（roadmap.md「現在地」「Phase 6 残」から分解。order は暫定）
 # ════════════════════════════════════════════════════════════════
 
+# issue #290（kamonabe、「優先」）から作った不具合の fix 2 本と、その設計で見つかった関連の 1 本。
+# order は loop-runbook §8.1 の「優先」の既定（今ある ready・todo のすべてより前の空いている値）。
+# parent は共有 DAG の比較・表示を有限化する REV-001（値を再帰でたどる処理の有限化として同じ項目に置いた）。
+# contains は言語仕様「等価比較」の共有規則で直し方が決まる。値の深度は issue の判断待ち Q1（返信なしのため推奨案 A で
+# 確定）を semantic-decisions §21 に書いた。closure の capture の連鎖は §21 の範囲外で、直し方を決めていないため todo。
+[[slice]]
+id         = "fix-contains-budgeted-equality"
+title      = "contains の等価判定を == と同じ予算付きの values_equal にする（言語仕様「等価比較」、issue #290）"
+status     = "ready"
+parent     = "REV-001"
+spec       = { doc = "docs/execution-control.md", section = "fix-contains-budgeted-equality 実装スライス（`contains` の等価判定を予算付き比較へ）" }
+acceptance = ["CBE-AT-01..04"]
+design_pr  = 297
+order      = 7
+
+[[slice]]
+id         = "fix-value-nesting-depth-limit"
+title      = "List / Dict の入れ子の深さを 256 に制限し、超過を catch できる overflow エラーにする（semantic-decisions §21、issue #290）"
+status     = "ready"
+parent     = "REV-001"
+spec       = { doc = "docs/execution-control.md", section = "fix-value-nesting-depth-limit 実装スライス（値のネスト深度上限）" }
+acceptance = ["VND-AT-01..05"]
+design_pr  = 297
+order      = 8
+
+[[slice]]
+id         = "fix-closure-capture-chain-stack"
+title      = "closure の capture の連鎖の破棄による stack 枯渇を防ぐ（TM-007、semantic-decisions §21.3 の範囲外）"
+status     = "todo"
+parent     = "REV-001"
+order      = 14
+
 # loop:drift #263 D-3 (e)（Q2=A、返信なしのため推奨案で確定）で見つかった不具合の fix。
 # capability-model §11.1「host function ID は registry 内で一意」に対し、register_cooperative が
 # 名前の衝突だけを見て ID の重複（cooperative 同士・同期 function との間）を検査しない。
