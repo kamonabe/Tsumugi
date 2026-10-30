@@ -270,7 +270,7 @@ print("replaced:" + to_str(len(g)))
 /// 深度の読み直しを要しても要素数の 2 乗にならず壁時計の上限以内に終わる。
 #[test]
 fn vnd_at_03_reassign_loop_is_not_quadratic() {
-    let n = 20_000;
+    let n = 100_000;
     let source = format!(
         "{}let xs = []\nlet k = 0\nwhile k < {n}\n  push(xs, e255)\n  k = k + 1\nend\nk = 0\nwhile k < {n}\n  xs[k] = 0\n  k = k + 1\nend\nlet ok = [xs]\nprint(len(ok))\n",
         nest("e255", "list", 255)
