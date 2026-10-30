@@ -190,6 +190,12 @@ impl Evaluator {
                 &mut self.budget,
                 line,
             )?)
+        } else if name == "contains" {
+            Some(crate::builtin_core::builtin_contains_budgeted(
+                &evaluated,
+                &mut self.budget,
+                line,
+            )?)
         } else if name == "sort" {
             Some(crate::builtin_core::builtin_sort_budgeted(
                 &evaluated,

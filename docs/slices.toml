@@ -113,12 +113,12 @@ depends_on = ["R-1a"]
 [[slice]]
 id         = "fix-contains-budgeted-equality"
 title      = "contains の等価判定を == と同じ予算付きの values_equal にする（言語仕様「等価比較」、issue #290）"
-status     = "ready"
+status     = "done"
 parent     = "REV-001"
 spec       = { doc = "docs/execution-control.md", section = "fix-contains-budgeted-equality 実装スライス（`contains` の等価判定を予算付き比較へ）" }
 acceptance = ["CBE-AT-01..04"]
 design_pr  = 297
-order      = 7
+impl_pr    = 300
 
 [[slice]]
 id         = "fix-value-nesting-depth-limit"
