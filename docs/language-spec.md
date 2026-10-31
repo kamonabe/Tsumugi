@@ -2,7 +2,7 @@
 
 バージョン: 0.21
 
-最終更新: 2026-10-30
+最終更新: 2026-10-31
 
 この番号は言語仕様のrevisionであり、Cargo package / REPLの実装バージョン `0.1.0` とは独立して管理する。
 
@@ -29,6 +29,7 @@
 
 - ファイル・標準入力から実行するスクリプトの import は、link 時に resolver が import root の下で確かめたファイルと、実行時に読むファイルが別の経路で決まる。実行時は評価器内蔵の module loader が import 元スクリプトのディレクトリを基準に読み直すため、確かめたものと別のファイルが実行されることがあり、入れ子の import は import root で検査されない。逆に、import root の下にあっても、import 元スクリプトのディレクトリから同じ相対パスで見つからないモジュールは読めず、`import` エラー（`import に失敗しました: モジュールを読み込めません: {path}`）で 1 文も実行せずに終了コード 1 で終わる（issue #291 で修正予定）
 - import の実行時の読み込み（ファイル・標準入力・REPL）は、profile にかかわらず `TSUMUGI_SANDBOX` を読み、許可範囲外のパスをサンドボックス違反にする。目標は「safe profile では `TSUMUGI_SANDBOX` を読まない」である（同 §14.3・§14.4）。上の項目と同じく、実行時の import が module loader を経由していることによる
+- `--profile legacy` で `TSUMUGI_SANDBOX` の値が区切り文字（カンマ）と空白だけ（`,`・` , ` など）のとき、CLI は未設定と同じに扱い、ファイルシステム全体を警告なしで許可する。目標は「許可するパスが 0 個の設定として、ファイル操作をすべてサンドボックス違反エラーにし、警告を 1 件出す」である（「ファイルI/Oサンドボックス」、同 §14.3。issue #291 で修正予定）
 
 本書の文法どおり、複数行lambdaの終端`end`は必須である。
 
@@ -673,7 +674,8 @@ import はプログラムの実行を始める前にすべて解決する。読�
 - import root が 1 つも許可されていないのに import があると、実行開始前の link 時に拒否する。拒否は catch できず、1 文も実行せずに診断 `エラー: import がありますが module resolver が許可されていません。…` を標準エラーへ出して終了コード 1 で終わる。ツリーウォーク版と `--vm` 版で同じである
 - `@NAME/...` による root の選択と、unqualified path（`@` で始まらないパス）を root `default` へ割り当てる扱いは [Capability Model仕様](capability-model.md) §14.1 に従う
 - ネストした import（A が B を import し、B が C を import する）にも対応
-- 現在の実装は、実行時の読み込みを import 元スクリプトのディレクトリ基準で行い、link 時の確認と経路が分かれている。このため import root の下にだけ置いたモジュールは読めずに失敗する（上の「現在の既知非適合」、issue #291）
+- import 先のファイルの中の import も、そのファイルのディレクトリではなく import root を基準に解決する。`import "b.tsg"` は、どのファイルに書いても root `default` の直下の `b.tsg` を指す。`..` と絶対パスは使えず、link 時に拒否する
+- 実行するのは、link 時に import root の下で確かめたファイルの内容そのものである。実行時にファイルを読み直さないので、link の後でファイルを書き換えても、実行される内容は変わらない（[Capability Model仕様](capability-model.md) §10）。現在の実装との差は上の「現在の既知非適合」にある
 
 ### 循環 import
 
@@ -687,7 +689,7 @@ import はプログラムの実行を始める前にすべて解決する。読�
 - root scriptを数えず、現在処理中のimport chainは最大128ファイル。異なるファイルへの129段目のimportは`import 失敗: ネストが深すぎます (上限: 128)`という`import`ランタイムエラーになる。既訪問パスは深度検査前にスキップされるため、循環importの従来挙動は変わらない
 - import されたファイル内の `let` 宣言・`fn` 定義がすべて現在のスコープに展開される（名前空間は分離されない）
 - REPL での import は import root を要さず、現在の作業ディレクトリからの相対パスで解決される
-- import の実行時の読み込み（ファイル・標準入力・REPL）は、profile にかかわらず、`TSUMUGI_SANDBOX` が設定されていれば import 先パスが許可範囲内でなければサンドボックス違反エラーになる（上の「現在の既知非適合」）
+- ファイル・標準入力から実行するスクリプトの import は `TSUMUGI_SANDBOX` を読まない（import の許可は import root だけで決まる）。safe profile の REPL の import も `TSUMUGI_SANDBOX` を読まないのが目標である（[Capability Model仕様](capability-model.md) §14.3・§14.4）。現在の実装との差は上の「現在の既知非適合」にある
 
 ## エラー処理（try / catch）
 
@@ -979,7 +981,7 @@ CLI では環境変数 `TSUMUGI_MAX_COLLECTION_SIZE` で、List/Dictの要素数
 
 ### ファイルI/Oサンドボックス
 
-CLI の既定（safe profile）では、ファイル操作の範囲は `--fs-root` / `--fs-op` で許可した root と操作に限られ、許可が無ければ全て拒否する（[Capability Model仕様](capability-model.md) §14.1・§14.2）。ファイル操作に関して `TSUMUGI_SANDBOX` を読むのは `--profile legacy` のときだけである（同 §14.3）。ただし import の実行時の読み込みは、現在 profile にかかわらず `TSUMUGI_SANDBOX` を読む（冒頭の「現在の既知非適合」）。
+CLI の既定（safe profile）では、ファイル操作の範囲は `--fs-root` / `--fs-op` で許可した root と操作に限られ、許可が無ければ全て拒否する（[Capability Model仕様](capability-model.md) §14.1・§14.2）。ファイル操作に関して `TSUMUGI_SANDBOX` を読むのは `--profile legacy` のときだけである（同 §14.3）。import の許可は import root だけで決まり、ファイル・標準入力から実行するスクリプトの import は `TSUMUGI_SANDBOX` を読まない（「モジュール / import」の「制約」）。現在の実装との差は冒頭の「現在の既知非適合」にある。
 
 `--profile legacy` では、環境変数 `TSUMUGI_SANDBOX` でファイル操作（read_file, write_file, append_file 等）の対象パスを制限する。
 
@@ -989,7 +991,8 @@ CLI の既定（safe profile）では、ファイル操作の範囲は `--fs-roo
 - `remove` / `remove_dir` / `remove_tree` / `rename`は中間symlinkを解決したうえでfinal directory entryを認可対象とし、final symlinkのtargetは操作しない
 - targetが未作成のdangling final symlinkを通じた`write_file` / `append_file`は、targetの場所を認可できない既知の制約がある（AUD-020）
 - 検査と実I/Oの間のsymlink差し替えraceまでは防止しない
-- 未設定時は制限なし（全パス許可）。このとき起動時に標準エラーへ警告を1件出す
+- 未設定時は制限なし（全パス許可）。このとき起動時に標準エラーへ警告を1件出す。値が空文字列のときも未設定と同じ
+- 値が区切り文字（カンマ）と空白だけ（`,`・` , ` など）のときは、許可するパスが 0 個の設定として扱い、ファイル操作をすべてサンドボックス違反エラーにする。このとき起動時に標準エラーへ警告を1件出す（[Capability Model仕様](capability-model.md) §14.3）
 - 例: `TSUMUGI_SANDBOX=/home/user/scripts,/tmp tsumugi --profile legacy script.tsg`
 
 ### 環境変数アクセス制御

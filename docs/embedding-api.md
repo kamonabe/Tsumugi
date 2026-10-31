@@ -1,6 +1,6 @@
 # Tsumugi — 組み込みAPI仕様
 
-最終更新: 2026-10-29
+最終更新: 2026-10-31
 設計ステータス: **実装仕様確定・実装進行中**（E1〜E6・E7〔tree REPL の Engine API 統合を含む〕・E8a・E11 実装済み。E9〔VM 経路統合、Phase 5〕のうち **VM file/stdin の import・resolver 統合（link 層 capability gate）は実装済み**で、残りの adapter/conformance（VM の charge parity・StableError・FunctionId・transaction 等）と experimental flag 除去は未実装＝**E9 は未完了**。E8b の capability profile/options 配線（`--profile safe|legacy` と全 capability option、safe/legacy の frozen `CapabilitySet` 構築・注入）は C9/C10/E7/E11 で統合済み、migration warning は §14.4 の N-1 スキップ採択により正式に descope 済み（不実装）、EMB-AT-10/11 は profile 経由 subprocess test で固定済み（下記実装 slice 表・第16節 Phase 2 の受入 ID ↔ test 対応を参照）＝**E8b 完了**。E10 は未実装。詳細は [ロードマップ](roadmap.md) Phase 1/2 を参照）
 
 本文書の §1〜§13・§15 は **到達目標の確定仕様**であり、現在の実装状態ではない。現在の実装が目標仕様からどう
@@ -314,7 +314,7 @@ impl Engine {
 
 `ModuleId::new`は1..=1024 UTF-8 bytes、NULなしを受理する。resolverはcredential、query secret、絶対local pathをIDへ含めてはならない。
 
-`link`はEngine ID、language revision、backendの順に検証し、不一致なら対応する`LinkError`を返してresolverを呼ばない。Phase 2では全importを実行前にresolver capabilityで解決し、**循環・深度・module単体compile・hash**を検証する。static cross-module callable symbol/arityの検証はPhase 2のlink検証に含めず、export/symbolモデルが入る後続Phase（exportモデル導入スライス）へ移す。未解決のcross-module symbolはlinkで静的に落とさず、run時に`RuntimeError`（name error等）へ落ちる。resolver capabilityなしでimportがあればresolver call 0で terminal `Denied`とする。`cancellation`は`with_cancellation`で注入し、link開始前のcancelはresolver call 0で`Cancelled`。run中のdynamic importは禁止する。import 0件でも空graphを持つ。`FeatureUnavailable`はPhase 2最終形でも列挙に残すが、import解決がEngine APIへ配線された後はimportを理由に返されない（到達しない保持variant）。
+`link`はEngine ID、language revision、backendの順に検証し、不一致なら対応する`LinkError`を返してresolverを呼ばない。Phase 2では全importを実行前にresolver capabilityで解決し、**循環・深度・module単体compile・hash**を検証する。static cross-module callable symbol/arityの検証はPhase 2のlink検証に含めず、export/symbolモデルが入る後続Phase（exportモデル導入スライス）へ移す。未解決のcross-module symbolはlinkで静的に落とさず、run時に`RuntimeError`（name error等）へ落ちる。resolver capabilityなしでimportがあればresolver call 0で terminal `Denied`とする。`cancellation`は`with_cancellation`で注入し、link開始前のcancelはresolver call 0で`Cancelled`。run中のdynamic importは禁止する。`LinkedScript`はlinkがresolverから読んだmodule sourceを内部に保持し、runはそのsourceからimportを展開する。runはresolver・filesystemからmoduleを読み直さない（[Capability Model仕様](capability-model.md) §10。保持は内部であり、本節の公開型のfieldは増やさない）。同じ`ExecutionContext`で、すでに展開したmoduleと同じ`ModuleId`・違う`source_hash`のmoduleを含む`LinkedScript`をrunすると、runの`Link`フェーズで1文も実行せずに失敗する（後勝ちにしない。同§10）。import 0件でも空graphを持つ。`FeatureUnavailable`はPhase 2最終形でも列挙に残すが、import解決がEngine APIへ配線された後はimportを理由に返されない（到達しない保持variant）。
 
 `LinkRequest`はresolverへ渡すoperation ID、capability、[実行予算・協調実行仕様](execution-control.md)の有限`BudgetConfig`、cancellationを所有する。deadlineは`BudgetConfig.deadline`を使い、source/module/import count・bytesを同文書の`BudgetUsage`へ課金する。Phase 1/2のmeter実装を内部縦切りにしても、無制限limitや独立optional deadlineをpublic APIへ置かない。`create_execution`からlinkする場合も同じrequest budget/controlを共有し、別の計数系を作らない。
 

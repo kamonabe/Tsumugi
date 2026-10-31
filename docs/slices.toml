@@ -105,6 +105,30 @@ depends_on = ["R-1a"]
 # 未着手（roadmap.md「現在地」「Phase 6 残」から分解。order は暫定）
 # ════════════════════════════════════════════════════════════════
 
+# issue #291（kamonabe）から作った不具合の fix 2 本。仕分けの判断待ち Q1=A・Q2=A（返信なしのため推奨案で確定）を
+# capability-model §10・§14.3 に書いた。order は loop-runbook §8.1 の「不具合の報告」の既定（今ある ready・todo より前の
+# 空いている値）。parent は sandbox の TOCTOU・check/use の分離を path-handle で受入試験化する AUD-020（owning spec に
+# capability-model を含む）。2 本は触る仕組みが別（run 層の import 展開と、legacy profile の filesystem 構築）なので分けた。
+[[slice]]
+id         = "fix-import-run-from-link-graph"
+title      = "file/stdin の run 層の import を link が resolver で確かめた source から展開し、ModuleLoader の読み直しを無くす（capability-model §10、issue #291）"
+status     = "ready"
+parent     = "AUD-020"
+spec       = { doc = "docs/capability-model.md", section = "fix-import-run-from-link-graph 実装スライス（run 層の import を link で確かめた graph から展開）" }
+acceptance = ["ILG-AT-01..05"]
+design_pr  = 303
+order      = 6
+
+[[slice]]
+id         = "fix-legacy-sandbox-empty-list"
+title      = "legacy profile の区切り文字だけの TSUMUGI_SANDBOX を空の許可リスト（filesystem grant 無し）にし警告を出す（capability-model §14.3、issue #291）"
+status     = "ready"
+parent     = "AUD-020"
+spec       = { doc = "docs/capability-model.md", section = "fix-legacy-sandbox-empty-list 実装スライス（区切り文字だけの `TSUMUGI_SANDBOX` を空の許可リストにする）" }
+acceptance = ["LSE-AT-01..03"]
+design_pr  = 303
+order      = 7
+
 # issue #290（kamonabe、「優先」）から作った不具合の fix 2 本と、その設計で見つかった関連の 1 本。
 # order は loop-runbook §8.1 の「優先」の既定（今ある ready・todo のすべてより前の空いている値）。
 # parent は共有 DAG の比較・表示を有限化する REV-001（値を再帰でたどる処理の有限化として同じ項目に置いた）。
