@@ -695,6 +695,19 @@ impl TsumugiError {
         )
     }
 
+    /// 値のネスト深度上限（semantic-decisions §21.3）。catch できる `overflow`。
+    pub(crate) fn value_depth_limit(line: usize) -> Self {
+        Self::runtime_with_message_id(
+            line,
+            ErrorKind::StackOverflow,
+            crate::stable_error::message_id::OVERFLOW_VALUE_DEPTH,
+            format!(
+                "値のネストが深すぎます (上限: {})",
+                crate::limits::MAX_VALUE_DEPTH
+            ),
+        )
+    }
+
     /// step/fuel 上限
     pub fn step_limit(line: usize, limit: u64) -> Self {
         Self::runtime_with_kind(

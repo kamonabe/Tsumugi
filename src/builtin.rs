@@ -554,6 +554,7 @@ impl Evaluator {
                     self.check_collection(result.len().saturating_add(1), line)?;
                     result.push(val);
                 }
+                Value::check_elements_depth(result.iter(), line)?;
                 let listed = Value::new_list(result, &mut self.budget, ExecutionPhase::Run)
                     .map_err(|stop| self.control_stop_to_error(stop, line))?;
                 Ok(Some(listed))

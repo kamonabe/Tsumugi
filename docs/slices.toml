@@ -123,12 +123,12 @@ impl_pr    = 300
 [[slice]]
 id         = "fix-value-nesting-depth-limit"
 title      = "List / Dict の入れ子の深さを 256 に制限し、超過を catch できる overflow エラーにする（semantic-decisions §21、issue #290）"
-status     = "ready"
+status     = "done"
 parent     = "REV-001"
 spec       = { doc = "docs/execution-control.md", section = "fix-value-nesting-depth-limit 実装スライス（値のネスト深度上限）" }
 acceptance = ["VND-AT-01..05"]
 design_pr  = 297
-order      = 8
+impl_pr    = 301
 
 [[slice]]
 id         = "fix-closure-capture-chain-stack"

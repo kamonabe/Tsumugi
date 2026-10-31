@@ -1626,6 +1626,7 @@ impl Vm {
                 self.check_collection(candidate, line)?;
                 // stack 上のリテラル backing へ tracked push する（delta 課金、REV-015 案A）。
                 // budget と stack の同時可変借用を避けるため、slot を一旦取り出して戻す。
+                value.check_element_depth(line)?;
                 let idx = self.stack.len().saturating_sub(1);
                 let mut collection = std::mem::replace(&mut self.stack[idx], Value::Null);
                 let result =
@@ -1663,6 +1664,7 @@ impl Vm {
                     self.check_collection(candidate, line)?;
                 }
                 // stack 上のリテラル backing へ tracked insert する（delta 課金）。
+                value.check_element_depth(line)?;
                 let idx = self.stack.len().saturating_sub(1);
                 let mut collection = std::mem::replace(&mut self.stack[idx], Value::Null);
                 let result = collection.index_set_tracked(
@@ -2045,6 +2047,7 @@ impl Vm {
                     };
                     self.check_collection(v.len().saturating_add(1), line)?;
                 }
+                value.check_element_depth(line)?;
                 self.checkpoint_cell(&cell);
                 cell.borrow_mut()
                     .list_push_tracked(value, &mut self.budget, ExecutionPhase::Run)
@@ -2069,6 +2072,7 @@ impl Vm {
                 // self.stack と self.budget を同時可変借用できないため、slot を一旦
                 // 取り出して in-place push し、書き戻す。slot を take するので backing の
                 // Rc は一意所有のまま（strong_count 1）で、tree と同じ in-place 経路を通る。
+                value.check_element_depth(line)?;
                 let mut slot = std::mem::replace(&mut self.stack[stack_index], Value::Null);
                 let result = slot.list_push_tracked(value, &mut self.budget, ExecutionPhase::Run);
                 self.stack[stack_index] = slot;
@@ -2259,6 +2263,7 @@ impl Vm {
                         self.check_collection(result.len().saturating_add(1), line)?;
                         result.push(value);
                     }
+                    Value::check_elements_depth(result.iter(), line)?;
                     Value::new_list(result, &mut self.budget, ExecutionPhase::Run)
                         .map_err(|stop| Self::control_stop_to_error(&self.budget, stop, line))
                 } else {
