@@ -12,7 +12,7 @@
 逸脱として載せる案（Q2=A）は、返信なしのため推奨案で確定した（[開発ループ手順書](loop-runbook.md) §7.5、
 issue #263 Q2=A）。理由: spec が実装の正本であり、adapter の context 引数・`Control` は Phase 3/4 の予算・協調実行
 （[マニフェスト](manifesto.md) 原則 3・4）を受ける目標の形である。本文を実装に合わせるとその受け皿が spec から消える。載せたのは 2026-10-25 の整合点検で §3〜§11.1 を実装と照合して確かめた差であり、
-照合していない節（§12・§14.2 以降）の逸脱は、事実を確かめられたものから順に載せる。表は現時点で #263 D-3 の (a)〜(d) と、issue #291 の設計で事実を確かめた 3 行（file/stdin の run 層の import 展開、scheduler の handle 経路の import、区切り文字だけの `TSUMUGI_SANDBOX`）を持つ（(e) は fix-host-function-id-unique で解消した）。上の設計ステータス段落にある現在の状態（§10 の範囲の REPL の resolver gate 迂回・run 層の import 展開・E9 の残りなど）と、§18「実装slice」の状態注記は、まだ表へ移していない。
+照合していない節（§12・§14.2 以降）の逸脱は、事実を確かめられたものから順に載せる。表は現時点で #263 D-3 の (a)〜(d) と、issue #291 の設計で事実を確かめた 3 行（file/stdin の run 層の import 展開、scheduler の handle 経路の import、区切り文字だけの `TSUMUGI_SANDBOX`）を持つ（(e) は fix-host-function-id-unique で解消した）。上の設計ステータス段落にある現在の状態のうち、§10 の範囲の REPL の resolver gate 迂回、REPL と scheduler の handle 経路の import 展開、E9 の残りなど（file/stdin の run 層の import 展開を除く）と、§18「実装slice」の状態注記は、まだ表へ移していない。
 
 ## 逸脱一覧（目標仕様に対する現在の逸脱）
 
@@ -949,11 +949,15 @@ source だけを実行する」の段落）で確定している。本スライ�
   4. VM file/stdin（`src/main.rs` の `execute_vm_with_path`）は `engine.link` の結果を捨てずに持ち、2 の関数で展開した
      program を `Compiler` に渡す。`ModuleLoader` をこの経路から外す。binary（別 crate）から 2 の関数と保持 source を
      使うための入口は、`link_for_repl` と同じく `#[doc(hidden)]` の CLI 内部 shim とし、外部 embedder 向けの公開契約を増やさない。
-  5. 課金（`Evaluator::charge_link`・`Vm::charge_link`）は、展開で新しく展開した module ごとに、保持 source の byte 長で
+  5. 課金は、展開で新しく展開した module ごとに、保持 source の byte 長で
      `charge_source`・`charge_import` を行い、imported module record を 96 + `ModuleId` の UTF-8 byte 長で heap に課金する
      （[実行予算・協調実行仕様](execution-control.md) §5.1・§5.3）。tree は record token を展開済みの集合と同じ寿命で持ち、
      実行が完了しなかったときに展開済みの集合から外す（`ModuleLoader::forget` と同じ巻き戻し）。VM は main.rs の
-     実行の寿命で持つ。REPL の `ModuleLoader` 経路の課金（canonical path の byte 長）は変えない。
+     実行の寿命で持つ。課金の入口は、tree（`Evaluator::charge_link`）・VM（`Vm::charge_link`）とも `ModuleId` と保持 source を受け取る版を
+     別に足す。`&[LoadedModule]` を受け取る既存の `charge_link` は、`ModuleLoader` 経路（tree の `run_repl_submission`・`Evaluator::run`・
+     `run_phased` と scheduler の handle 経路の `begin_execution`、`src/main.rs` の VM REPL）と、既存テスト（`tests/differential.rs` の
+     `Vm::charge_link` 呼び出し）のために入力も挙動も変えずに残す。
+     REPL の `ModuleLoader` 経路の課金（canonical path の byte 長）は変えない。
   6. doc comment を新しい経路に合わせて直す（`src/sandbox.rs` 冒頭の「run 層の実 import 展開は依然 ModuleLoader」、
      `src/module.rs` 冒頭、`Engine::link_for_repl` の「`Engine::run` は `import_graph` を参照せず」、`main.rs` の
      「gate 通過の確認だけに使い、LinkedScript は破棄する」、`ExecutionContext::set_script_path`）。`set_script_path` は
@@ -1016,11 +1020,15 @@ source だけを実行する」の段落）で確定している。本スライ�
     96 + `ModuleId` の byte 長になる。`TSUMUGI_MAX_IMPORT_COUNT=0` などの N+1 拒否は 1 文も実行せずに起きる（既存の
     `import_count_limit_gates_file_execution` ほかが期待値を変えずに通る）。tree と VM で source/import の値が一致する。
     確かめ方: `src/embedding.rs` の unit test で `BudgetUsage` の各値を期待値と照合し、heap は record 1 件分の差を
-    `ModuleId` の長さの違う 2 つの graph で比べる。tree/VM の一致は `tests/differential.rs` の既存 `cap_at_17_source_count_charge_parity` で確かめる。
+    `ModuleId` の長さの違う 2 つの graph で比べる。tree/VM の一致は、新しい 2 経路を通す in-process テストを `tests/differential.rs` に足して確かめる。tree 側は `Engine::link` → `Engine::run`、
+    VM 側は同じ `LinkedScript` から実装範囲 4 の `#[doc(hidden)]` 入口で展開した program を `Compiler` に渡し、実装範囲 5 の `ModuleId` 版の入口で課金して
+    `Vm::run` する（main.rs の `execute_vm_with_path` と同じ組み立て）。両者の `BudgetUsage` の `source_count`・`source_bytes`・`import_count`・`import_bytes` を照合する。
+    既存の `cap_at_17_source_count_charge_parity` は `ModuleLoader` 経路（`set_base_dir`・`ModuleLoader::link`・`Vm::charge_link(&[LoadedModule])`）を
+    直接動かすテストで新しい経路を通らないため、`ModuleLoader` 経路（REPL などで残る）の回帰として期待値を変えずに通ることだけを確かめる。
 - **想定の変更規模**: 本体（`#[cfg(test)]` を除く `src/`）は +250〜450 行・−50〜100 行程度。内訳の目安は
   `src/module.rs`（graph からの展開関数と正規化の共有、+100〜150）、`src/embedding.rs`（保持 source、run 経路の差し替え、
   doc(hidden) の入口、doc comment、+60〜120）、`src/eval.rs`（`begin_execution` の読み込み元の切り替え、`ModuleId → source_hash` の
-  展開済み集合・hash 食い違いの error・record token、+60〜110）、`src/vm.rs`（`charge_link` の入力を `ModuleId` 版に、+10〜30）、`src/main.rs`
+  展開済み集合・hash 食い違いの error・record token、+60〜110）、`src/vm.rs`（`ModuleId` 版の課金入口を足す。既存の `charge_link` は残す。+10〜30）、`src/main.rs`
   （VM 経路、+15〜30・−15）、`src/sandbox.rs`（doc comment）、`src/stable_error.rs`（message_id 1 つ、+1〜3）。テストは unit / subprocess を合わせて +300〜450 行程度。
   触る仕組みは run 層の import 展開 1 つ（tree と VM の両入口を同じ関数で揃える）、受入基準は 5 項目で、
   [開発ループ手順書](loop-runbook.md) §11.1 に収まる。
@@ -1074,7 +1082,8 @@ security warning なしで許可する（逸脱一覧の該当行）。同じ値
   （0 個の判定、警告の定数、`build_legacy_sandbox_fs` の分岐の削除、テストで値を注入できる内部関数への切り出し）。
   テストは `tests/cli_legacy_profile.rs` と `src/cli_capability.rs` の `#[cfg(test)]` に +80〜140 行程度。触る仕組みは legacy profile の
   filesystem 構築 1 つ、受入基準は 3 項目で、[開発ループ手順書](loop-runbook.md) §11.1 に収まる。
-  done にする実装 PR で、逸脱一覧の「legacy profile で `TSUMUGI_SANDBOX` が区切り文字と空白だけの値のとき」の行を削除する。
+  done にする実装 PR で、逸脱一覧の「legacy profile で `TSUMUGI_SANDBOX` が区切り文字と空白だけの値のとき」の行を削除し、
+  [言語仕様](language-spec.md)「現在の既知非適合」の区切り文字と空白だけの `TSUMUGI_SANDBOX` の項目を削除する。
 
 ## 19. 受入基準
 
