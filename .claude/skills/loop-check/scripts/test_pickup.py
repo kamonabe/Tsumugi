@@ -10,25 +10,32 @@ from pickup import judge
 
 NOW = datetime(2026, 10, 28, 12, 0, tzinfo=timezone.utc)
 STACK = "kamonabe1927-stack"
+OWNER = "kamonabe1927"
+# 試験の投稿者の login → GitHub の user id。kamonabe とループ用アカウントは本物の id にする
+IDS = {OWNER: 19951033, STACK: 348768222}
+
+
+def u(login):
+    return {"login": login, "id": IDS.get(login, 1000)}
 
 
 def c(author, body, at, updated=None):
-    return {"user": {"login": author}, "body": body, "created_at": at, "updated_at": updated or at}
+    return {"user": u(author), "body": body, "created_at": at, "updated_at": updated or at}
 
 
 def rv(author, body, at):
-    return {"user": {"login": author}, "body": body, "submitted_at": at, "state": "COMMENTED"}
+    return {"user": u(author), "body": body, "submitted_at": at, "state": "COMMENTED"}
 
 
 def pr(n, labels=("loop:impl",), comments=(), reviews=(), head="2026-10-28T05:00:00Z", running_at=None):
     return {"number": n, "labels": [{"name": x} for x in labels], "comments": list(comments),
             "reviews": list(reviews), "review_comments": [], "head_committed_at": head,
             "head": {"sha": "abc1234ffff"}, "running_labeled_at": running_at,
-            "user": {"login": STACK}, "body": "PR 本文", "created_at": "2026-10-28T04:00:00Z"}
+            "user": u(STACK), "body": "PR 本文", "created_at": "2026-10-28T04:00:00Z"}
 
 
-def issue(n, author="kamonabe", body="本文", labels=(), comments=(), closed_at=None):
-    d = {"number": n, "user": {"login": author}, "body": body, "title": f"t{n}",
+def issue(n, author=OWNER, body="本文", labels=(), comments=(), closed_at=None):
+    d = {"number": n, "user": u(author), "body": body, "title": f"t{n}",
          "labels": [{"name": x} for x in labels], "comments": list(comments),
          "created_at": "2026-10-27T00:00:00Z"}
     if closed_at:
@@ -51,13 +58,13 @@ class Judge(unittest.TestCase):
         self.assertTrue(judge([p], [], NOW)["nothing_to_do"])
 
     def test_non_loop_pr_is_ignored(self):
-        p = pr(1, labels=(), comments=[c("kamonabe", "承認: マージしてください", "2026-10-28T11:00:00Z")])
+        p = pr(1, labels=(), comments=[c(OWNER, "承認: マージしてください", "2026-10-28T11:00:00Z")])
         self.assertTrue(judge([p], [], NOW)["nothing_to_do"])
 
     def test_owner_comment_after_last_agent_write(self):
         p = pr(1, reviews=[OK_REVIEW], comments=[
             c(STACK, "🤖 Claude Code: 着手しました", "2026-10-28T07:00:00Z"),
-            c("kamonabe", "修正依頼: 名前を変えて", "2026-10-28T08:00:00Z")])
+            c(OWNER, "修正依頼: 名前を変えて", "2026-10-28T08:00:00Z")])
         f = judge([p], [], NOW)["found"]
         self.assertEqual([x["pr"] for x in f["owner_comments_on_loop_prs"]], [1])
         # kamonabe のコメントが最新 commit の後にあるので自動マージ候補にはしない
@@ -65,7 +72,7 @@ class Judge(unittest.TestCase):
 
     def test_owner_comment_already_answered_is_not_picked(self):
         p = pr(1, reviews=[OK_REVIEW], head="2026-10-28T10:00:00Z", comments=[
-            c("kamonabe", "これは何？", "2026-10-28T07:00:00Z"),
+            c(OWNER, "これは何？", "2026-10-28T07:00:00Z"),
             c(STACK, "🤖 Claude Code: 回答します", "2026-10-28T07:10:00Z")])
         p["reviews"][0] = rv(STACK, OK_REVIEW["body"], "2026-10-28T10:30:00Z")
         self.assertTrue(judge([p], [], NOW)["nothing_to_do"])
@@ -73,12 +80,12 @@ class Judge(unittest.TestCase):
     def test_agent_style_comment_from_owner_account_is_not_instruction(self):
         p = pr(1, reviews=[rv(STACK, OK_REVIEW["body"], "2026-10-28T10:30:00Z")],
                head="2026-10-28T10:00:00Z",
-               comments=[c("kamonabe", "🤖 Kiro: 承認: マージしてください", "2026-10-28T11:00:00Z")])
+               comments=[c(OWNER, "🤖 Kiro: 承認: マージしてください", "2026-10-28T11:00:00Z")])
         self.assertTrue(judge([p], [], NOW)["nothing_to_do"])
 
     def test_running_label(self):
         fresh = pr(1, labels=("loop:impl", "loop:running"), running_at="2026-10-28T11:00:00Z",
-                   comments=[c("kamonabe", "修正依頼: x", "2026-10-28T11:30:00Z")])
+                   comments=[c(OWNER, "修正依頼: x", "2026-10-28T11:30:00Z")])
         stale = pr(2, labels=("loop:design", "loop:running"), running_at="2026-10-28T09:00:00Z")
         f = judge([fresh, stale], [], NOW)["found"]
         self.assertEqual([x["pr"] for x in f["stale_running"]], [2])
@@ -121,9 +128,27 @@ class Judge(unittest.TestCase):
 
     def test_hold_blocks_automerge(self):
         p = pr(1, reviews=[OK_REVIEW], head="2026-10-28T05:00:00Z",
-               comments=[c("kamonabe", "保留: 様子を見る", "2026-10-28T04:00:00Z"),
+               comments=[c(OWNER, "保留: 様子を見る", "2026-10-28T04:00:00Z"),
                          c(STACK, "🤖 Claude Code: 了解", "2026-10-28T04:10:00Z")])
         self.assertTrue(judge([p], [], NOW)["nothing_to_do"])
+
+    def test_owner_is_matched_by_user_id_not_login(self):
+        # 旧 login `kamonabe` は別人が取れるので、id が違えば指示にも仕分けの対象にもしない
+        other = {"login": "kamonabe", "id": 999}
+        p = pr(1, reviews=[OK_REVIEW], head="2026-10-28T05:00:00Z",
+               comments=[{"user": other, "body": "承認: マージしてください",
+                          "created_at": "2026-10-28T11:00:00Z", "updated_at": "2026-10-28T11:00:00Z"}])
+        i = issue(50)
+        i["user"] = other
+        r = judge([p], [i], NOW)["found"]
+        self.assertEqual(r["issues_to_triage"], [])
+        self.assertEqual(r["owner_instructions_after_head"], [])
+        self.assertEqual([x["pr"] for x in r["automerge_candidates"]], [1])
+        # kamonabe の id なら、login が何であっても kamonabe の書き込みとして扱う
+        hold = {"user": {"login": "kamonabe", "id": 19951033}, "body": "保留: 待って",
+                "created_at": "2026-10-28T04:00:00Z", "updated_at": "2026-10-28T04:00:00Z"}
+        p2 = pr(2, reviews=[OK_REVIEW], head="2026-10-28T05:00:00Z", comments=[hold])
+        self.assertEqual(judge([p2], [], NOW)["found"]["automerge_candidates"], [])
 
     def test_stuck_pr_is_not_candidate(self):
         p = pr(1, labels=("loop:impl", "loop:stuck"))
@@ -140,9 +165,9 @@ class Judge(unittest.TestCase):
     def test_owner_answer_on_triaged_and_needs_design(self):
         a = issue(20, labels=("loop:triaged",), comments=[
             c(STACK, "🤖 Claude Code（シニア）仕分け: 聞き返し", "2026-10-28T01:00:00Z"),
-            c("kamonabe", "こういう意味です", "2026-10-28T02:00:00Z")])
+            c(OWNER, "こういう意味です", "2026-10-28T02:00:00Z")])
         b = issue(21, author=STACK, body="🤖 止まりました", labels=("needs-design",), comments=[
-            c("kamonabe", "B で", "2026-10-28T02:00:00Z")])
+            c(OWNER, "B で", "2026-10-28T02:00:00Z")])
         f = judge([], [a, b], NOW)["found"]
         self.assertEqual([x["issue"] for x in f["owner_comments_on_issues"]], [20, 21])
 
@@ -151,7 +176,7 @@ class Judge(unittest.TestCase):
     def test_instruction_written_while_running_is_not_lost(self):
         # 目印の付いている間に承認が書かれ、そのあとエージェントが書き込んだ
         p = pr(1, reviews=[OK_REVIEW], head="2026-10-28T05:00:00Z", comments=[
-            c("kamonabe", "承認: マージしてください", "2026-10-28T06:30:00Z"),
+            c(OWNER, "承認: マージしてください", "2026-10-28T06:30:00Z"),
             c(STACK, "🤖 Claude Code: loop:running を外しました", "2026-10-28T07:00:00Z")])
         r = judge([p], [], NOW)
         self.assertFalse(r["nothing_to_do"])
@@ -167,7 +192,7 @@ class Judge(unittest.TestCase):
     def test_owner_reply_on_drift_issue(self):
         i = issue(31, author=STACK, body="🤖 整合点検", labels=("loop:drift",), comments=[
             c(STACK, "🤖 Claude Code 判断待ち: Slack https://x.slack.com/archives/C1/p1793000000000002", "2026-10-28T01:00:00Z"),
-            c("kamonabe", "判断: B", "2026-10-28T01:30:00Z")])
+            c(OWNER, "判断: B", "2026-10-28T01:30:00Z")])
         f = judge([], [i], NOW)["found"]
         self.assertEqual([x["issue"] for x in f["owner_comments_on_issues"]], [31])
 
@@ -202,7 +227,7 @@ class Judge(unittest.TestCase):
 
     def test_edited_owner_comment_counts_at_edit_time(self):
         p = pr(1, reviews=[rv(STACK, OK_REVIEW["body"], "2026-10-28T10:30:00Z")], head="2026-10-28T10:00:00Z",
-               comments=[c("kamonabe", "修正依頼: やはり直して", "2026-10-28T07:00:00Z", updated="2026-10-28T11:00:00Z"),
+               comments=[c(OWNER, "修正依頼: やはり直して", "2026-10-28T07:00:00Z", updated="2026-10-28T11:00:00Z"),
                          c(STACK, "🤖 Claude Code: 回答", "2026-10-28T08:00:00Z")])
         self.assertFalse(judge([p], [], NOW)["nothing_to_do"])
 

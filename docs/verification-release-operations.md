@@ -102,7 +102,7 @@ rust-version = "1.97"
 
 - Git tag: `v<semver>`、例`v0.2.0`、`v0.2.0-rc.1`。
 - GitHub Release title: `Tsumugi v<semver>`。
-- OCI tag: `ghcr.io/kamonabe/tsumugi:<semver>`。先頭の`v`を付けない。
+- OCI tag: `ghcr.io/kamonabe1927/tsumugi:<semver>`。先頭の`v`を付けない。
 - `latest`、branch名、日付だけのtagを配布・manifest・runbookで使用しない。
 - tag、GitHub Release asset、OCI manifestはimmutableとし、同じversionへ異なるbytesを再公開しない。
 - tagのversion、`Cargo.toml`のversion、artifact名、OCI label `org.opencontainers.image.version`は完全一致させる。
@@ -409,7 +409,7 @@ cargo install --locked --path .
 cargo install --locked --path . --force
 
 # 公開済みrelease tagからinstall
-cargo install --locked --git https://github.com/kamonabe/tsumugi.git --tag v<semver> tsumugi
+cargo install --locked --git https://github.com/kamonabe1927/tsumugi.git --tag v<semver> tsumugi
 ```
 
 - install先はCargo既定の`$CARGO_HOME/bin`、未設定時は`~/.cargo/bin`とする。
@@ -544,7 +544,7 @@ OCI imageはTsumugi CLIを再現可能に実行する配布形式であり、dae
 ### 9.3 build・tag・platform
 
 ```text
-ghcr.io/kamonabe/tsumugi:<semver>
+ghcr.io/kamonabe1927/tsumugi:<semver>
 platforms = linux/amd64,linux/arm64
 ```
 
@@ -578,7 +578,7 @@ publish前に次を必須とする。
 - container smokeが両architectureで成功済み。
 - manifest PRで`<semver>`を実在する完全なSemVerへ、`<index-digest>`を署名検証済みOCI indexの64桁SHA-256へ置換し、placeholder、`latest`、存在しないtag/digestが0件。
 
-manifest作成時のimage fieldは`ghcr.io/kamonabe/tsumugi:<semver>@sha256:<index-digest>`とし、**完全なSemVer tagとindex digestの両方**を固定する。例えば公開済みversionが`0.2.0`なら、tag `ghcr.io/kamonabe/tsumugi:0.2.0`が解決した検証済みindex digestを同じfieldへ付記する。以下の規範template中の2つのplaceholderは設計上の置換位置であり、そのままcommitしてはならない。
+manifest作成時のimage fieldは`ghcr.io/kamonabe1927/tsumugi:<semver>@sha256:<index-digest>`とし、**完全なSemVer tagとindex digestの両方**を固定する。例えば公開済みversionが`0.2.0`なら、tag `ghcr.io/kamonabe1927/tsumugi:0.2.0`が解決した検証済みindex digestを同じfieldへ付記する。以下の規範template中の2つのplaceholderは設計上の置換位置であり、そのままcommitしてはならない。
 
 ### 10.2 HelmとMitori CronJob規約を流用しない理由
 
@@ -640,7 +640,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: tsumugi
-          image: ghcr.io/kamonabe/tsumugi:<semver>@sha256:<index-digest>
+          image: ghcr.io/kamonabe1927/tsumugi:<semver>@sha256:<index-digest>
           imagePullPolicy: IfNotPresent
           command:
             - /usr/local/bin/tsumugi
@@ -881,7 +881,7 @@ release gateの100%は統計的availabilityではなく、1件でも欠ければ
 
 ```bash
 cargo install --locked --force \
-  --git https://github.com/kamonabe/tsumugi.git \
+  --git https://github.com/kamonabe1927/tsumugi.git \
   --tag v<previous-semver> \
   tsumugi
 ```
