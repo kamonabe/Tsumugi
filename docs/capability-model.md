@@ -566,7 +566,7 @@ ModuleIdは同じlogical moduleへ同じIDを返す。同ID/異hashのlink error
 **runはlinkが読んだsourceだけを実行する。** `LinkedScript`は、linkがresolverから読みUTF-8検証とmodule単体compileを通した各moduleのsourceを、`ModuleId`ごとに内部で保持する（公開型`ImportGraph`/`ImportNode`のfieldは増やさない）。runはroot sourceと同じく保持したmodule sourceを実行スレッド上で再parseし（[組み込みAPI仕様](embedding-api.md) §4.1 案A）、`import`文をその内容で展開する。run層はfilesystem・CWD・importerのディレクトリからmoduleを読み直さず、resolverも呼ばない（EMB-AT-05）。linkで確かめたmoduleと実行するmoduleを1経路にすることで、確認と使用の間の差し替え（TOCTOU、[脅威モデル](threat-model.md) TM-003）が入り込む余地を無くす（[マニフェスト](manifesto.md) 原則2「権限はホストが明示的に付与する」、原則8「小さく理解可能な中核を保つ」）。
 
 - module内の`import`もroot sourceの`import`と同じ規則でlink層が正規化しresolverへ渡す。specifierはimporterのディレクトリを基準にしない。unqualified pathはmount `default`のroot、`@NAME/...`はmount `NAME`のrootを基準にし、`..`・絶対pathはmalformed specifierとして`LinkError::Resolve`（code `invalid_import_specifier`）で拒否する（§14.1、§8.2の`FilesystemTarget`）。
-- 展開の規則は[言語仕様](language-spec.md)「モジュール / import」に従う。`import`文の位置にmoduleのtop-level文を置き、同じ`ModuleId`は1つの`ExecutionContext`の中で（contextの再利用をまたいでも）1回だけ展開する。展開済みかどうかは`ModuleId`ごとに展開したsourceのhash（[組み込みAPI仕様](embedding-api.md) §5.1の`ImportNode.source_hash`）と組で覚えて判定する。同じ`ModuleId`で同じhashなら展開しない。同じ`ModuleId`でhashが違うsourceを展開しようとしたら（例: rootの違うresolverでlinkした2つの`LinkedScript`を同じcontextで順にrunした2回目）、後勝ちにも黙ったskipにもせず、runの`Link`フェーズで1文も実行せずに失敗にする（outcomeと診断は§18のfix-import-run-from-link-graph小節）。同ID/異hashを後勝ちにしない上の規則を、runをまたぐ場合にも当てはめたものである。実行が完了しなかったexecutionが新しく展開したmoduleは未展開に戻し、次のexecutionで再び展開できる。
+- 展開の規則は[言語仕様](language-spec.md)「モジュール / import」に従う。`import`文の位置にmoduleのtop-level文を置き、同じ`ModuleId`は1つの`ExecutionContext`の中で（contextの再利用をまたいでも）1回だけ展開する。展開済みかどうかは`ModuleId`ごとに展開したsourceのhash（[組み込みAPI仕様](embedding-api.md) §5.1の`ImportNode.source_hash`）と組で覚えて判定する。同じ`ModuleId`で同じhashなら展開しない。同じ`ModuleId`でhashが違うsourceを展開しようとしたら（例: rootの違うresolverでlinkした2つの`LinkedScript`を同じcontextで順にrunした2回目）、後勝ちにも黙ったskipにもせず、runの`Link`フェーズで1文も実行せずに失敗にする（outcomeと診断は§18のfix-import-run-from-link-graph小節）。hashの照合は`LinkedScript`のgraphの全moduleに及ぶ。展開済みで展開しないmoduleについても、その中の`import`を照合のためだけにたどり（展開も課金もしない）、子孫の食い違い（例: 同じ内容の`a.tsg`の下にある`b.tsg`だけが違う）も同じ失敗にする（[組み込みAPI仕様](embedding-api.md) §5「違う`source_hash`のmoduleを含む`LinkedScript`」）。同ID/異hashを後勝ちにしない上の規則を、runをまたぐ場合にも当てはめたものである。実行が完了しなかったexecutionが新しく展開したmoduleは未展開に戻し、次のexecutionで再び展開できる。
 - source・importの本数とbytes、imported module recordのheapは[実行予算・協調実行仕様](execution-control.md) §5.1・§5.3のとおり`ModuleId`単位で課金する（module recordは96 + `ModuleId`のUTF-8 byte長）。課金はこれまでどおりrunの`Link`フェーズ（最初の文を実行する前）で行う。
 - 展開中のどの`import`（rootにあるものもmoduleの中にあるものも）でも、specifierの正規化に失敗するか、`ModuleId`が`LinkedScript`の保持sourceに無いのは、linkを経ていない`LinkedScript`（例: `link_for_repl`の空graph）をrunへ渡した内部契約違反であり、scriptから見えるimport errorにせず`InternalFailure`にする。
 - REPLのimportは本段落の対象外で、評価器内蔵`ModuleLoader`が解決する既知の設計のまま（冒頭の設計ステータス段落、[組み込みAPI仕様](embedding-api.md) §12）。
@@ -924,7 +924,11 @@ source だけを実行する」の段落）で確定している。本スライ�
      キー、その module の `source_hash`（`ImportNode.source_hash` と同じ値）を値にする対応（例: `BTreeMap<ModuleId, SourceHash>`）とし、
      `ExecutionContext` の評価器が持つ（context の再利用をまたいで保持し、`clear_user_state` で捨てる）。
      同じ `ModuleId` で同じ hash なら skip する。同じ `ModuleId` で hash が違うときは、展開を止めて run の `Link` フェーズで失敗にする
-     （§10、PR #303 の Q2=A。返信なしのため推奨案で確定）。この失敗は次のとおりにする。
+     （§10、PR #303 の Q2=A。返信なしのため推奨案で確定）。hash の照合は `LinkedScript` の graph の全 module に及ぶ（embedding-api §5 の
+     「違う `source_hash` の module を含む `LinkedScript`」）。同じ hash で skip する module についても、その保持 source の中の `import` を
+     照合のためだけに同じ関数でたどり、子孫の `ModuleId` と hash を展開済みの集合と照合する（展開も課金もしない）。展開と巻き戻しは
+     execution 単位で揃うので、展開済みの module の子孫はすべて展開済みの集合にある。たどる順は展開と同じ（source 順の深さ優先）で、
+     1 回の run の中で同じ `ModuleId` は 1 回だけたどり、最初に見つけた食い違いで止める。この失敗は次のとおりにする。
      - outcome は `ExecutionOutcome::RuntimeError`（`ErrorKind::Import`、kind `import`）。今 run の `Link` フェーズで起きる import の失敗
        （`ModuleLoader` の読込不能・構文不正・深度）と同じく `terminal_from_run_error` を通す。1 文も実行していないので catch の対象にならない。
        [組み込みAPI仕様](embedding-api.md) §8 の目標の `ExecutionOutcome::LinkError` が無いのは同仕様の逸脱一覧の既存の行のとおりで、
@@ -1005,7 +1009,9 @@ source だけを実行する」の段落）で確定している。本スライ�
     (e) 同じ `ExecutionContext` で、`@default/a.tsg` を import する root を、内容の違う `a.tsg` を返す 2 つの resolver でそれぞれ link し、
     順に run すると、2 回目は `RuntimeError`（`ExecutionError` の `code` が `ErrorKind::Import`、`safe_message` が実装範囲 2 の文言、`line` が `import` 文の行）で終わり、
     root と module のどの文も実行しない（2 回目の `a.tsg` の top-level の `print` が出ない）。そのあと 1 回目と同じ graph を同じ context で
-    run すると `Completed` になる（context は poison しない）。
+    run すると `Completed` になる（context は poison しない）。推移の場合も同じで、`a.tsg` が `import "b.tsg"` を持ち、2 つの resolver が
+    同じ内容の `a.tsg` と内容の違う `b.tsg` を返すとき、2 回目は同じ `RuntimeError`（`safe_message` の `<ModuleId>` が `@default/b.tsg`、
+    `line` が `a.tsg` の中の `import "b.tsg"` の行）で終わり、どの文も実行しない。
     確かめ方: (a)(b)(c) は `tests/cli_safe_profile.rs` の subprocess test（tree / `--vm`）で stdout を照合する。(d)(e) は
     `src/embedding.rs` の unit test で、module の top-level の `print`（capture した stdout）の回数と、(e) は outcome の variant・
     `ExecutionError` の `code`・`safe_message`・`line` を照合する。message_id は `src/stable_error.rs` の
