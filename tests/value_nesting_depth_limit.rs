@@ -188,6 +188,37 @@ fn vnd_at_01_boundary_and_catch_in_both_engines() {
     }
 }
 
+/// VND-AT-01（リテラルの検査位置、PR #301 判断 Q1=A）: List / Dict リテラルは要素・値を入れるたびに
+/// 深度を検査する。深度 256 の `e` を含むリテラルは、後ろの要素の評価（副作用）の前に拒否され、
+/// 後ろで上書きされる key の値でも拒否される。tree-walk 版と VM 版で結果が一致する。
+#[test]
+fn vnd_at_01_literal_checks_each_element_in_both_engines() {
+    for kind in ["list", "dict"] {
+        let wrap = if kind == "list" {
+            "[e255]"
+        } else {
+            "{\"k\": e255}"
+        };
+        let source = format!(
+            "{}let e = {wrap}\n\
+             try\n  let a = [e, print(\"side\")]\n  print(\"NOT REJECTED\")\ncatch err\n  print(err[\"type\"])\nend\n\
+             try\n  let b = {{\"a\": e, \"a\": 1}}\n  print(\"NOT REJECTED\")\ncatch err\n  print(err[\"type\"])\nend\n",
+            nest("e255", kind, 255)
+        );
+        let want = "overflow\noverflow\n";
+        for use_vm in [false, true] {
+            let r = run_cli(&source, use_vm, Duration::from_secs(60));
+            assert_eq!(
+                r.code,
+                Some(0),
+                "[kind={kind} vm={use_vm}] 失敗: {}",
+                r.stderr
+            );
+            assert_eq!(r.stdout, want, "[kind={kind} vm={use_vm}]");
+        }
+    }
+}
+
 /// VND-AT-02: issue #290 の再現 1（List / Dict を 20 万回入れ子にする）が abort せず、
 /// `overflow` の診断を出して exit 1 で終わる。
 #[test]

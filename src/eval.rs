@@ -2907,12 +2907,13 @@ impl Evaluator {
                 let evaluated = self.expr_frame_mut().operands.len();
                 if evaluated > 0 {
                     self.check_collection(evaluated, line)?;
+                    // 要素を入れるたびに深度を検査する（VM の `ListPush` と同じ位置、PR #301 判断 Q1=A）。
+                    self.expr_frame_mut().operands[evaluated - 1].check_element_depth(line)?;
                 }
                 if evaluated < items.len() {
                     return self.begin_expr_child(&owner, stmt_index, slot, &path, evaluated, line);
                 }
                 let values = std::mem::take(&mut self.expr_frame_mut().operands);
-                Value::check_elements_depth(values.iter(), line)?;
                 // heap 課金付きで tracked backing を作る（REV-015 案A、§5.2）。
                 let value = Value::new_list(values, &mut self.budget, ExecutionPhase::Run)
                     .map_err(|stop| self.control_stop_to_error(stop, line))?;
@@ -2955,6 +2956,8 @@ impl Evaluator {
                 if let Some(len) = new_len {
                     self.check_collection(len, line)?;
                 }
+                // 値を入れるたびに深度を検査する（VM の `DictInsert` と同じ位置、PR #301 判断 Q1=A）。
+                val.check_element_depth(line)?;
                 let frame = self.expr_frame_mut();
                 frame.map.insert(key, val);
                 frame.item += 1;
@@ -2962,7 +2965,6 @@ impl Evaluator {
                     return Ok(None);
                 }
                 let map = std::mem::take(&mut frame.map);
-                Value::check_elements_depth(map.values(), line)?;
                 let value = Value::new_dict(map, &mut self.budget, ExecutionPhase::Run)
                     .map_err(|stop| self.control_stop_to_error(stop, line))?;
                 self.finish_expr_frame(value)
@@ -3772,9 +3774,10 @@ impl Evaluator {
                 for item in items {
                     let value = self.eval_expr(item, line)?;
                     self.check_collection(values.len().saturating_add(1), line)?;
+                    // 要素を入れるたびに深度を検査する（VM の `ListPush` と同じ位置、PR #301 判断 Q1=A）。
+                    value.check_element_depth(line)?;
                     values.push(value);
                 }
-                Value::check_elements_depth(values.iter(), line)?;
                 // heap 課金付きで tracked backing を作る（REV-015 案A、§5.2）。
                 Value::new_list(values, &mut self.budget, ExecutionPhase::Run)
                     .map_err(|stop| self.control_stop_to_error(stop, line))
@@ -3793,9 +3796,10 @@ impl Evaluator {
                     if !map.contains_key(&key) {
                         self.check_collection(map.len().saturating_add(1), line)?;
                     }
+                    // 値を入れるたびに深度を検査する（VM の `DictInsert` と同じ位置、PR #301 判断 Q1=A）。
+                    val.check_element_depth(line)?;
                     map.insert(key, val);
                 }
-                Value::check_elements_depth(map.values(), line)?;
                 Value::new_dict(map, &mut self.budget, ExecutionPhase::Run)
                     .map_err(|stop| self.control_stop_to_error(stop, line))
             }
