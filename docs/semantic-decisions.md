@@ -1,6 +1,6 @@
 # Tsumugi — 次期意味論・実装決定
 
-最終更新: 2026-10-30
+最終更新: 2026-10-31
 
 設計ステータス: **次期仕様確定・未実装**
 
@@ -104,6 +104,7 @@ message内の型名は `Int`、`Float`、`Str`、`Bool`、`Null`、`List`、`Dic
 | import chain深度上限 | `import` | `import 失敗: ネストが深すぎます (上限: 128)` |
 | import先が存在しない・読めない | `import` | `import に失敗しました: モジュールを読み込めません: {module}` |
 | import先のparse失敗 | `import` | `import に失敗しました: モジュールの構文が不正です: {module}` |
+| 同じ`ExecutionContext`で同じmodule IDの別内容（source hashが違う）を展開しようとした | `import` | `import に失敗しました: 同じモジュールが別の内容で既に展開されています: {module}` |
 | loop外の`break` | `control_flow` | `break はループの中でのみ使用できます` |
 | loop外の`continue` | `control_flow` | `continue はループの中でのみ使用できます` |
 | step/fuel上限 | `limit` | `ステップ上限に達しました (上限: {limit})` |

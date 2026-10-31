@@ -566,12 +566,14 @@ ModuleIdは同じlogical moduleへ同じIDを返す。同ID/異hashのlink error
 **runはlinkが読んだsourceだけを実行する。** `LinkedScript`は、linkがresolverから読みUTF-8検証とmodule単体compileを通した各moduleのsourceを、`ModuleId`ごとに内部で保持する（公開型`ImportGraph`/`ImportNode`のfieldは増やさない）。runはroot sourceと同じく保持したmodule sourceを実行スレッド上で再parseし（[組み込みAPI仕様](embedding-api.md) §4.1 案A）、`import`文をその内容で展開する。run層はfilesystem・CWD・importerのディレクトリからmoduleを読み直さず、resolverも呼ばない（EMB-AT-05）。linkで確かめたmoduleと実行するmoduleを1経路にすることで、確認と使用の間の差し替え（TOCTOU、[脅威モデル](threat-model.md) TM-003）が入り込む余地を無くす（[マニフェスト](manifesto.md) 原則2「権限はホストが明示的に付与する」、原則8「小さく理解可能な中核を保つ」）。
 
 - module内の`import`もroot sourceの`import`と同じ規則でlink層が正規化しresolverへ渡す。specifierはimporterのディレクトリを基準にしない。unqualified pathはmount `default`のroot、`@NAME/...`はmount `NAME`のrootを基準にし、`..`・絶対pathはmalformed specifierとして`LinkError::Resolve`（code `invalid_import_specifier`）で拒否する（§14.1、§8.2の`FilesystemTarget`）。
-- 展開の規則は[言語仕様](language-spec.md)「モジュール / import」に従う。`import`文の位置にmoduleのtop-level文を置き、同じ`ModuleId`は1つの`ExecutionContext`の中で（contextの再利用をまたいでも）1回だけ展開する。実行が完了しなかったexecutionが新しく展開したmoduleは未展開に戻し、次のexecutionで再び展開できる。
+- 展開の規則は[言語仕様](language-spec.md)「モジュール / import」に従う。`import`文の位置にmoduleのtop-level文を置き、同じ`ModuleId`は1つの`ExecutionContext`の中で（contextの再利用をまたいでも）1回だけ展開する。展開済みかどうかは`ModuleId`ごとに展開したsourceのhash（[組み込みAPI仕様](embedding-api.md) §5.1の`ImportNode.source_hash`）と組で覚えて判定する。同じ`ModuleId`で同じhashなら展開しない。同じ`ModuleId`でhashが違うsourceを展開しようとしたら（例: rootの違うresolverでlinkした2つの`LinkedScript`を同じcontextで順にrunした2回目）、後勝ちにも黙ったskipにもせず、runの`Link`フェーズで1文も実行せずに失敗にする（outcomeと診断は§18のfix-import-run-from-link-graph小節）。同ID/異hashを後勝ちにしない上の規則を、runをまたぐ場合にも当てはめたものである。実行が完了しなかったexecutionが新しく展開したmoduleは未展開に戻し、次のexecutionで再び展開できる。
 - source・importの本数とbytes、imported module recordのheapは[実行予算・協調実行仕様](execution-control.md) §5.1・§5.3のとおり`ModuleId`単位で課金する（module recordは96 + `ModuleId`のUTF-8 byte長）。課金はこれまでどおりrunの`Link`フェーズ（最初の文を実行する前）で行う。
 - 展開中のどの`import`（rootにあるものもmoduleの中にあるものも）でも、specifierの正規化に失敗するか、`ModuleId`が`LinkedScript`の保持sourceに無いのは、linkを経ていない`LinkedScript`（例: `link_for_repl`の空graph）をrunへ渡した内部契約違反であり、scriptから見えるimport errorにせず`InternalFailure`にする。
 - REPLのimportは本段落の対象外で、評価器内蔵`ModuleLoader`が解決する既知の設計のまま（冒頭の設計ステータス段落、[組み込みAPI仕様](embedding-api.md) §12）。
 
 この段落はissue #291 のQ1=A（run層のimportはlinkで確認したmodule graphから読み、入れ子のimportもlink時にresolverの許可を通す。run層で`ModuleLoader`がファイルを読み直す経路をfile/stdinから無くす。REPLは範囲外）による。返信なしのため推奨案で確定した（[開発ループ手順書](loop-runbook.md) §7.5）。採らなかった案B（`ModuleLoader`を残しrun層にもresolverと同じroot検査を足す）は、確認と読み込みが2経路のまま残り、確認後の差し替えを防げないため採らない。
+
+展開済みの判定を`ModuleId → source_hash`で持ち、hashが違えば失敗にする規則は、PR #303 の判断待ちQ2=A（context再利用時の展開済みの判定）による。返信なしのため推奨案で確定した（[開発ループ手順書](loop-runbook.md) §7.5）。理由: 同ID/異hashを後勝ちにしない[組み込みAPI仕様](embedding-api.md) §5.1と本節の規則をrunをまたぐ場合にも当てはめ、runが自分のlinkで確かめた内容を実行することを保つ（[マニフェスト](manifesto.md) 原則5「予測可能性」、原則6「失敗を制御可能な結果にする」）。採らなかった案B（キーを`(ModuleId, source_hash)`にし、hashが違えば別moduleとして展開する）は、同じ名前の再定義が黙って起きるため採らない。案C（`ModuleId`だけをキーにし、hashが違ってもskipする）は、runが自分のlinkで確かめた内容を実行しないことがあるため採らない。
 
 ## 11. HostFunctionRegistry
 
@@ -782,7 +784,7 @@ OPTIONS:
 - CLI adapterだけが`TSUMUGI_SANDBOX`と`TSUMUGI_ENV_ALLOW`を1回読む。core evaluator/builtinは読まない。
 - sandbox設定あり: comma-separated host rootsをstart時CWD基準でabsolute化してdirectory handleとして開き、`legacy0`, `legacy1`, ... mountへ順序固定する。rootが1つなら`default` aliasも同じhandle/policy IDへ付ける。旧absolute pathはOS lexical componentで各rootへのrelative candidateを作り、含むrootのうちcomponent数が最長のものを選ぶ。同じ長さの候補が複数ならprofile構築error。旧relative pathはsnapshot CWDを含む最長rootへrouteし、該当rootがなければadapter/OS call 0の内部`Denial`からcatch可能なcanonical `sandbox` errorへ変換する。候補選択後の解決とI/Oはroot handleだけを使う。
 - sandbox未設定/空: legacy専用`LegacyFilesystemTranslator`へunrestricted filesystem namespace authorityを明示grantしsecurity warningをstderrへ1件出す。Unixは`/`とsnapshot CWD handle、Windowsは要求されたvolume rootとsnapshot CWD handleへ安全なhandle操作を使う。authority自体がunrestrictedなだけでcheck/use文字列fallbackは使わない。ここでの「空」は値が空文字列（0 byte）のときだけを指す。
-- sandbox設定ありでhost rootが0個（実質空）: 値は空文字列でないが、comma区切りの各要素をtrimすると空しか残らないもの（`,`・` , `・空白だけなど）は、未設定とみなさず**空の許可リスト**として扱う。filesystem capabilityをgrantせず、script filesystem操作はすべてI/O前に§8.5の単一denial（catch可能なcanonical `sandbox` error）になる。security warningをstderrへ1件出す（文言は「全体を許可」でなく「すべて拒否」を告げるもの）。REPLのimportが通る`sandbox.rs`も同じ値を空の許可リストと解釈するので、CLIのfilesystemとREPLのimportで意味が一致する。値を書いたのに全開放になる驚きを残さず、明示的に付与しない限り権限は無い（[マニフェスト](manifesto.md) 原則2、fail-closed）。issue #291 のQ2=A（返信なしのため推奨案で確定、[開発ループ手順書](loop-runbook.md) §7.5）による。採らなかった案B（未設定と同じunrestrictedにし警告だけ必ず出す）は、値を書いたのに全開放になる驚きが残るため採らない。
+- sandbox設定ありでhost rootが0個（実質空）: 値は空文字列でないが、comma区切りの各要素をtrimすると空しか残らないもの（`,`・` , `・空白だけなど）は、未設定とみなさず**空の許可リスト**として扱う。filesystem capabilityをgrantせず、script filesystem操作はすべてI/O前に§8.5の単一denial（catch可能なcanonical `sandbox` error）になる。security warningをstderrへ1件出す。出す場所と件数は未設定時の警告と同じにし、文言は未設定時の「全体を許可」でなく「すべて拒否」を告げる別のもの（`警告: TSUMUGI_SANDBOX にパスが含まれていないため、legacy profile はファイルシステム操作をすべて拒否します`）にする。REPLのimportが通る`sandbox.rs`も同じ値を空の許可リストと解釈するので、CLIのfilesystemとREPLのimportで意味が一致する。値を書いたのに全開放になる驚きを残さず、明示的に付与しない限り権限は無い（[マニフェスト](manifesto.md) 原則2、fail-closed）。issue #291 のQ2=A（返信なしのため推奨案で確定、[開発ループ手順書](loop-runbook.md) §7.5）による。採らなかった案B（未設定と同じunrestrictedにし警告だけ必ず出す）は、値を書いたのに全開放になる驚きが残るため採らない。警告の文言はPR #303 の判断待ちQ1=Aによる（返信なしのため推奨案で確定、[開発ループ手順書](loop-runbook.md) §7.5）。理由: legacy authorityの警告は付与の内容をホストへ告げるもので、全部拒否なのに「全体へのアクセスを許可」と告げると権限を誤解させる（[マニフェスト](manifesto.md) 原則2・原則6）。採らなかった案B（未設定時の警告をそのまま出す）は、挙動と正反対の内容を告げるため採らない。
 - env allow設定あり: comma-separated exact keyまたは末尾`*` prefixだけsnapshot。未設定/空は`TSUMUGI_`以外を全snapshotしwarning 1件。
 - translatorは旧absolute pathをnamespace root handle、旧relative pathをstart時CWD handleへ変換する。legacy filesystemは`OsDirectoryHandle` + `SymlinkPolicy::FollowWithinRoot`で構築し、旧`sandbox.rs`のcanonicalizeベースsymlink解決をroot拘束handle追従へ具体化する（symlink追従自体は互換維持。中間component symlinkはroot内へ拘束して追従し、root外へ逃げるものと final entry symlinkはhandle契約どおり拒否する）。safe profileは常に`DenyAll`、legacy profileは`FollowWithinRoot`とsymlink policyが異なる。root選択（candidate生成・component数比較）はCWD基準で絶対化したlexical path（symlink非追従）で行いcanonicalizeしない。Unix / Windowsはsecure handleを実装済みで、Windowsは§8.3契約3のreparse fail-closed（junction / mount point拒否）を伴う。secure handleを実装できないplatform（非Unix・非Windows）ではfilesystem capability構築を拒否。
 - legacy authorityは`ExecutionStarted.capability_policy_hash`と通常のcanonical decision/host-call eventで観測する。warning専用の別audit eventを追加しない。Phase 2完了条件はstderr warning、Phase 6では同じ8 event schemaとfail-closedを使う。
@@ -919,7 +921,22 @@ source だけを実行する」の段落）で確定している。本スライ�
      同じ関数を共有し、2 か所に別実装を置かない。module source は実行スレッド上で再 parse する（embedding-api §4.1 案 A）。
      展開の規則は `ModuleLoader::link_into` と同じ（`import` 文の位置に module の top-level 文を置く、展開済みの
      `ModuleId` は skip、展開した module の中の `import` も同じ関数で再帰的に展開）。展開済みの集合は `ModuleId` を
-     キーにし、`ExecutionContext` の評価器が持つ（context の再利用をまたいで保持し、`clear_user_state` で捨てる）。
+     キー、その module の `source_hash`（`ImportNode.source_hash` と同じ値）を値にする対応（例: `BTreeMap<ModuleId, SourceHash>`）とし、
+     `ExecutionContext` の評価器が持つ（context の再利用をまたいで保持し、`clear_user_state` で捨てる）。
+     同じ `ModuleId` で同じ hash なら skip する。同じ `ModuleId` で hash が違うときは、展開を止めて run の `Link` フェーズで失敗にする
+     （§10、PR #303 の Q2=A。返信なしのため推奨案で確定）。この失敗は次のとおりにする。
+     - outcome は `ExecutionOutcome::RuntimeError`（`ErrorKind::Import`、kind `import`）。今 run の `Link` フェーズで起きる import の失敗
+       （`ModuleLoader` の読込不能・構文不正・深度）と同じく `terminal_from_run_error` を通す。1 文も実行していないので catch の対象にならない。
+       [組み込みAPI仕様](embedding-api.md) §8 の目標の `ExecutionOutcome::LinkError` が無いのは同仕様の逸脱一覧の既存の行のとおりで、
+       その variant を足すときに一緒に移す（本スライスでは足さない）。
+     - 診断は新しい message template 1 つ。文言は `import に失敗しました: 同じモジュールが別の内容で既に展開されています: <ModuleId>`
+       （`<ModuleId>` は `@default/a.tsg` のような論理 ID で、host path を出さない。canonical message の正本の
+       [次期意味論・実装決定](semantic-decisions.md) の error 表に、この設計 PR で行を足してある）。`src/stable_error.rs` の Import の message_id に
+       `IMPORT_HASH_MISMATCH`（`"import.hash_mismatch"`）を末尾の番号で足す（per-template 採番の規則どおり。既存の番号は変えない）。
+       行番号は hash が食い違った `import` 文の行（module の中なら、その module の中の行）。
+     - context は poison しない（`InternalFailure` ではない）。失敗した run がそれまでに新しく展開した module は、実行が完了しなかった
+       execution と同じく未展開に戻す。それより前の run が展開した module（hash の食い違った相手を含む）は残り、同じ hash の
+       graph はその後も同じ context で run できる。課金は既存の `Link` フェーズの失敗と同じく rollback する。
      展開中のどの `import`（root にあるものも module の中にあるものも）でも、specifier の正規化に失敗するか、`ModuleId` が
      保持 source に無いときは `InternalFailure` にする（§10。例: `link_for_repl` の空 graph を `Engine::run` に渡したとき）。
   3. tree の `Engine::run`・`run_audited`（`src/embedding.rs` から `Evaluator::begin_execution` を呼ぶ経路）は、
@@ -959,6 +976,9 @@ source だけを実行する」の段落）で確定している。本スライ�
   - module の中の `import "b.tsg"` は、その module のディレクトリでなく mount `default` の root を基準にする（link が既に
     そう解決している。run が読む内容が link と一致するようになる）。
   - safe profile の file/stdin の import は `TSUMUGI_SANDBOX` を読まない。
+  - 同じ `ExecutionContext` で、同じ `ModuleId` が違う内容になる 2 つの `LinkedScript`（root の違う resolver で link したものなど）を
+    順に run すると、2 回目は `Link` フェーズで実装範囲 2 の import error になり 1 文も実行しない。今の `ModuleLoader` は canonical path を
+    キーにするので、別々のファイルなら 2 回目も展開する。
   - imported module record の heap 課金が canonical path の byte 長から `ModuleId` の byte 長になり、import を含む実行の
     `heap_bytes` の値が変わる（§5.1 の目標に合わせる変化）。source/import の本数と bytes は同じファイル内容なら変わらない。
   - 上記以外の既存テストの期待値は変えない。変える必要が出たら実装を止めて判断待ちにする。
@@ -978,8 +998,15 @@ source だけを実行する」の段落）で確定している。本スライ�
     (c) 2 つの module が同じ module を import する菱形で、共有 module の top-level 文は 1 回だけ、最初の `import` の位置で実行される。
     (d) 同じ `ExecutionContext` で同じ module を import する root を 2 回 run すると、2 回目は展開しない。1 回目が
     `RuntimeError` で終わった場合は 2 回目に再び展開する。
-    確かめ方: (a)(b)(c) は `tests/cli_safe_profile.rs` の subprocess test（tree / `--vm`）で stdout を照合する。(d) は
-    `src/embedding.rs` の unit test で、module の top-level の `print`（capture した stdout）の回数を照合する。
+    (e) 同じ `ExecutionContext` で、`@default/a.tsg` を import する root を、内容の違う `a.tsg` を返す 2 つの resolver でそれぞれ link し、
+    順に run すると、2 回目は `RuntimeError`（`ExecutionError` の `code` が `ErrorKind::Import`、`safe_message` が実装範囲 2 の文言、`line` が `import` 文の行）で終わり、
+    root と module のどの文も実行しない（2 回目の `a.tsg` の top-level の `print` が出ない）。そのあと 1 回目と同じ graph を同じ context で
+    run すると `Completed` になる（context は poison しない）。
+    確かめ方: (a)(b)(c) は `tests/cli_safe_profile.rs` の subprocess test（tree / `--vm`）で stdout を照合する。(d)(e) は
+    `src/embedding.rs` の unit test で、module の top-level の `print`（capture した stdout）の回数と、(e) は outcome の variant・
+    `ExecutionError` の `code`・`safe_message`・`line` を照合する。message_id は `src/stable_error.rs` の
+    `representative_errors_resolve_per_template_ids`（この error が `import.hash_mismatch` に解決する）と、既存の
+    `all_message_ids_are_unique`・`id_str_round_trips_all_tags` が通ることで確かめる。
   - **ILG-AT-04**（`TSUMUGI_SANDBOX` を読まない、REPL は不変）: safe profile で `TSUMUGI_SANDBOX` を import root と関係の無い
     ディレクトリに設定しても、file/stdin の import は成功する（tree / `--vm`）。REPL の import の既存テスト
     （`tree_repl_retries_failed_import`・`repl_imported_names_resolve_across_submissions_in_both_engines` ほか）は期待値を変えずに通る。
@@ -992,9 +1019,9 @@ source だけを実行する」の段落）で確定している。本スライ�
     `ModuleId` の長さの違う 2 つの graph で比べる。tree/VM の一致は `tests/differential.rs` の既存 `cap_at_17_source_count_charge_parity` で確かめる。
 - **想定の変更規模**: 本体（`#[cfg(test)]` を除く `src/`）は +250〜450 行・−50〜100 行程度。内訳の目安は
   `src/module.rs`（graph からの展開関数と正規化の共有、+100〜150）、`src/embedding.rs`（保持 source、run 経路の差し替え、
-  doc(hidden) の入口、doc comment、+60〜120）、`src/eval.rs`（`begin_execution` の読み込み元の切り替え、`ModuleId` キーの
-  展開済み集合と record token、+50〜100）、`src/vm.rs`（`charge_link` の入力を `ModuleId` 版に、+10〜30）、`src/main.rs`
-  （VM 経路、+15〜30・−15）、`src/sandbox.rs`（doc comment）。テストは unit / subprocess を合わせて +300〜450 行程度。
+  doc(hidden) の入口、doc comment、+60〜120）、`src/eval.rs`（`begin_execution` の読み込み元の切り替え、`ModuleId → source_hash` の
+  展開済み集合・hash 食い違いの error・record token、+60〜110）、`src/vm.rs`（`charge_link` の入力を `ModuleId` 版に、+10〜30）、`src/main.rs`
+  （VM 経路、+15〜30・−15）、`src/sandbox.rs`（doc comment）、`src/stable_error.rs`（message_id 1 つ、+1〜3）。テストは unit / subprocess を合わせて +300〜450 行程度。
   触る仕組みは run 層の import 展開 1 つ（tree と VM の両入口を同じ関数で揃える）、受入基準は 5 項目で、
   [開発ループ手順書](loop-runbook.md) §11.1 に収まる。
   done にする実装 PR で、逸脱一覧の「file/stdin の run 層の import 展開が、link が resolver で確かめた source を使わない」行を削除し、
@@ -1016,7 +1043,8 @@ security warning なしで許可する（逸脱一覧の該当行）。同じ値
      空しか残らないときは、filesystem capability を grant しない（`builder.filesystem(...)` を呼ばない）。
      `build_legacy_sandbox_fs` の「`hosts.is_empty()` なら `build_legacy_unrestricted_fs()`」の分岐は削除する
      （呼び出し側で 0 個を先に分けるので到達しない。到達したら profile 構築 error にしてよい）。
-  2. 1 のとき、security warning を stderr へ 1 件出す。文言は次の定数として置く（`WARN_EMPTY_SANDBOX` と並べて公開する）。
+  2. 1 のとき、security warning を stderr へ 1 件出す。出す場所と件数は `WARN_EMPTY_SANDBOX` と同じにし、文言は挙動に合わせた別のものを
+     次の定数として置く（`WARN_EMPTY_SANDBOX` と並べて公開する。§14.3、PR #303 の Q1=A。返信なしのため推奨案で確定）。
      `警告: TSUMUGI_SANDBOX にパスが含まれていないため、legacy profile はファイルシステム操作をすべて拒否します`
      未設定・空文字列のときの `WARN_EMPTY_SANDBOX` と unrestricted の grant は変えない。
   3. `TSUMUGI_SANDBOX` を読むのは従来どおり CLI adapter が 1 回だけ（§14.3）。`src/sandbox.rs` の解釈は変えない
