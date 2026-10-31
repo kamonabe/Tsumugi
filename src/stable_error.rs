@@ -205,6 +205,9 @@ pub mod message_id {
         // Sandbox（クラス B: 2 テンプレート）
         SANDBOX_FILESYSTEM_DENIED = 39 => "sandbox.filesystem_denied";
         SANDBOX_PATH_DENIED = 40 => "sandbox.path_denied";
+
+        // StackOverflow の 3 つ目のテンプレート（値のネスト深度、semantic-decisions §21）
+        OVERFLOW_VALUE_DEPTH = 41 => "overflow.value_depth";
     }
 }
 

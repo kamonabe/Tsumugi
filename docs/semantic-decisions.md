@@ -2315,7 +2315,7 @@ Tsumugi の時刻は内部表現も出力基準も UTC 固定である。`now()`
 
 ## 21. 値のネスト深度上限（issue #290）
 
-設計ステータス: **設計確定・未実装**
+設計ステータス: **実装済み・言語仕様へ統合済み**（言語仕様 0.21 の「実行安全性」「値のネスト深度制限」。実装は [実行予算・協調実行仕様](execution-control.md) §14 の fix-value-nesting-depth-limit、受入試験は `tests/value_nesting_depth_limit.rs`）
 
 ### 21.1 背景・課題
 
@@ -2362,4 +2362,4 @@ Tsumugi の時刻は内部表現も出力基準も UTC 固定である。`now()`
 
 - 深度 256 の値を作れ、257 になる操作が `overflow` で拒否され catch できる。tree-walk 版と VM 版で kind・message・line が一致する。
 - issue #290 の再現スクリプトが abort せず構造化エラーで終わる。
-- language-spec への統合（実行安全性の章と runtime error の表）が、paired test 通過を条件に行われている（revision の扱いは §21.6）。
+- language-spec への統合（実行安全性の章と runtime error の表）が、paired test 通過を条件に行われている（revision の扱いは §21.6）。統合済み（実装 PR で `tests/value_nesting_depth_limit.rs` の通過とともに行った）。
