@@ -9,7 +9,7 @@
 「無し」のときだけ、エージェントは文書を読まずに終了してよい。
 
 使い方:
-    python3 pickup.py [--repo kamonabe/Tsumugi] [--now 2026-10-28T12:00:00Z]
+    python3 pickup.py [--repo kamonabe1927/Tsumugi] [--now 2026-10-28T12:00:00Z]
 
 出力: JSON（標準出力）。`nothing_to_do` が true なら、GitHub 側で拾うものは無い。
 `slack_threads_to_read` が空でなければ、Slack のそのスレッドだけを読む（§6.1 の 2・7、§7.5 の確定後の返信）。
@@ -25,8 +25,12 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 
-OWNER = "kamonabe"
+# §3: kamonabe は user id で見分ける（login は改名で変わる。2026-10-31 に `kamonabe` → `kamonabe1927`）。
+# 旧 login `kamonabe` は今は別人が取れるので、login では見分けない。
+OWNER_ID = 19951033
+OWNER = "kamonabe1927"  # 判定用の名前（OWNER_ID の書き込みはこの名前にそろえる）
 LOOP_ACCOUNT = "kamonabe1927-stack"
+LOOP_ACCOUNT_ID = 348768222
 LOOP_LABELS = {"loop:design", "loop:impl"}
 BLOCK_LABELS = {"loop:stuck", "loop:running"}
 TRIAGE_EXCLUDE = {"needs-design", "loop:triaged", "wontfix"}
@@ -56,6 +60,17 @@ def parse_time(s: str | None) -> datetime | None:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
+def who(user: dict | None) -> str:
+    """書き込みの投稿者を、判定に使う名前にする。kamonabe とループ用アカウントは user id で見分ける。"""
+    user = user or {}
+    if user.get("id") == OWNER_ID:
+        return OWNER
+    if user.get("id") == LOOP_ACCOUNT_ID:
+        return LOOP_ACCOUNT
+    # どちらでもない投稿者は、login が同じ文字列でも kamonabe・ループ用アカウントとして扱わない
+    return "other:" + str(user.get("login", ""))
+
+
 def is_agent(author: str, body: str | None) -> bool:
     """§3.1: エージェントの書き込みか（GitHub の条件）。"""
     if author == LOOP_ACCOUNT:
@@ -81,18 +96,18 @@ def writes(item: dict) -> list[dict]:
     """PR・issue の本文と、付いた書き込み（コメント・レビュー・行コメント）を時刻順に並べる。"""
     out = []
     if item.get("user") and item.get("created_at"):
-        out.append(_w(item["user"]["login"], item.get("body"), item["created_at"], None, "body"))
+        out.append(_w(who(item["user"]), item.get("body"), item["created_at"], None, "body"))
     for c in item.get("comments", []):
         if c.get("user"):
-            out.append(_w(c["user"]["login"], c.get("body"), c["created_at"], c.get("updated_at"), "comment"))
+            out.append(_w(who(c["user"]), c.get("body"), c["created_at"], c.get("updated_at"), "comment"))
     for r in item.get("reviews", []):
         if r.get("state") == "PENDING" or not r.get("submitted_at") or not r.get("user"):
             continue
-        out.append(_w(r["user"]["login"], r.get("body"), r["submitted_at"], None, "review")
+        out.append(_w(who(r["user"]), r.get("body"), r["submitted_at"], None, "review")
                    | {"commit_id": r.get("commit_id")})
     for c in item.get("review_comments", []):
         if c.get("user"):
-            out.append(_w(c["user"]["login"], c.get("body"), c["created_at"], c.get("updated_at"),
+            out.append(_w(who(c["user"]), c.get("body"), c["created_at"], c.get("updated_at"),
                           "review_comment"))
     return sorted(out, key=lambda w: w["at"])
 
@@ -250,7 +265,7 @@ def judge(prs: list[dict], issues: list[dict], now: datetime, closed: list[dict]
         n = iss["number"]
         ws = writes(iss)
         owner_ws = owner_writes_after_last_agent(ws)
-        author = (iss.get("user") or {}).get("login", "")
+        author = who(iss.get("user"))
         new_for_triage = author == OWNER and not is_agent(author, iss.get("body")) and not lbs & TRIAGE_EXCLUDE
         if new_for_triage:
             found["issues_to_triage"].append({"issue": n, "title": (iss.get("title") or "")[:80]})
@@ -311,7 +326,7 @@ def collect(repo: str, now: datetime) -> tuple[list[dict], list[dict], list[dict
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--repo", default="kamonabe/Tsumugi")
+    ap.add_argument("--repo", default="kamonabe1927/Tsumugi")
     ap.add_argument("--now", help="判定に使う現在時刻（ISO 8601。試験用）")
     args = ap.parse_args()
     now = parse_time(args.now) if args.now else datetime.now(timezone.utc)
