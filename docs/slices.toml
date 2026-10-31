@@ -116,6 +116,7 @@ status     = "ready"
 parent     = "AUD-020"
 spec       = { doc = "docs/capability-model.md", section = "fix-import-run-from-link-graph 実装スライス（run 層の import を link で確かめた graph から展開）" }
 acceptance = ["ILG-AT-01..05"]
+design_pr  = 303
 order      = 6
 
 [[slice]]
@@ -125,6 +126,7 @@ status     = "ready"
 parent     = "AUD-020"
 spec       = { doc = "docs/capability-model.md", section = "fix-legacy-sandbox-empty-list 実装スライス（区切り文字だけの `TSUMUGI_SANDBOX` を空の許可リストにする）" }
 acceptance = ["LSE-AT-01..03"]
+design_pr  = 303
 order      = 7
 
 # issue #290（kamonabe、「優先」）から作った不具合の fix 2 本と、その設計で見つかった関連の 1 本。
