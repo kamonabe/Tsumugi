@@ -568,7 +568,7 @@ ModuleIdは同じlogical moduleへ同じIDを返す。同ID/異hashのlink error
 - module内の`import`もroot sourceの`import`と同じ規則でlink層が正規化しresolverへ渡す。specifierはimporterのディレクトリを基準にしない。unqualified pathはmount `default`のroot、`@NAME/...`はmount `NAME`のrootを基準にし、`..`・絶対pathはmalformed specifierとして`LinkError::Resolve`（code `invalid_import_specifier`）で拒否する（§14.1、§8.2の`FilesystemTarget`）。
 - 展開の規則は[言語仕様](language-spec.md)「モジュール / import」に従う。`import`文の位置にmoduleのtop-level文を置き、同じ`ModuleId`は1つの`ExecutionContext`の中で（contextの再利用をまたいでも）1回だけ展開する。実行が完了しなかったexecutionが新しく展開したmoduleは未展開に戻し、次のexecutionで再び展開できる。
 - source・importの本数とbytes、imported module recordのheapは[実行予算・協調実行仕様](execution-control.md) §5.1・§5.3のとおり`ModuleId`単位で課金する（module recordは96 + `ModuleId`のUTF-8 byte長）。課金はこれまでどおりrunの`Link`フェーズ（最初の文を実行する前）で行う。
-- rootにある`import`の`ModuleId`が`LinkedScript`の保持sourceに無いのは、linkを経ていない`LinkedScript`をrunへ渡した内部契約違反であり、scriptから見えるimport errorにせず`InternalFailure`にする。
+- 展開中のどの`import`（rootにあるものもmoduleの中にあるものも）でも、specifierの正規化に失敗するか、`ModuleId`が`LinkedScript`の保持sourceに無いのは、linkを経ていない`LinkedScript`（例: `link_for_repl`の空graph）をrunへ渡した内部契約違反であり、scriptから見えるimport errorにせず`InternalFailure`にする。
 - REPLのimportは本段落の対象外で、評価器内蔵`ModuleLoader`が解決する既知の設計のまま（冒頭の設計ステータス段落、[組み込みAPI仕様](embedding-api.md) §12）。
 
 この段落はissue #291 のQ1=A（run層のimportはlinkで確認したmodule graphから読み、入れ子のimportもlink時にresolverの許可を通す。run層で`ModuleLoader`がファイルを読み直す経路をfile/stdinから無くす。REPLは範囲外）による。返信なしのため推奨案で確定した（[開発ループ手順書](loop-runbook.md) §7.5）。採らなかった案B（`ModuleLoader`を残しrun層にもresolverと同じroot検査を足す）は、確認と読み込みが2経路のまま残り、確認後の差し替えを防げないため採らない。
@@ -920,10 +920,15 @@ source だけを実行する」の段落）で確定している。本スライ�
      展開の規則は `ModuleLoader::link_into` と同じ（`import` 文の位置に module の top-level 文を置く、展開済みの
      `ModuleId` は skip、展開した module の中の `import` も同じ関数で再帰的に展開）。展開済みの集合は `ModuleId` を
      キーにし、`ExecutionContext` の評価器が持つ（context の再利用をまたいで保持し、`clear_user_state` で捨てる）。
-     root の `import` の `ModuleId` が保持 source に無いときは `InternalFailure` にする（§10）。
+     展開中のどの `import`（root にあるものも module の中にあるものも）でも、specifier の正規化に失敗するか、`ModuleId` が
+     保持 source に無いときは `InternalFailure` にする（§10。例: `link_for_repl` の空 graph を `Engine::run` に渡したとき）。
   3. tree の `Engine::run`・`run_audited`（`src/embedding.rs` から `Evaluator::begin_execution` を呼ぶ経路）は、
-     2 の linked program を使い、評価器の `ModuleLoader` を通さない。`run_for_repl` は従来どおり `ModuleLoader` を使う
-     （`begin_execution` に読み込み元を選ぶ引数か別入口を足す。どちらにするかは実装の判断でよいが、REPL の観測挙動を変えない）。
+     2 の linked program を使い、評価器の `ModuleLoader` を通さない。`run_for_repl` と、scheduler の handle 経路
+     （`src/engine.rs` の `ExecutionHandle::poll` → `drive_one_slice` から呼ぶ `begin_execution`）は、従来どおり `ModuleLoader` を使い、
+     観測挙動を変えない（`begin_execution` に読み込み元を選ぶ引数か別入口を足す。どちらにするかは実装の判断でよい）。
+     scheduler の handle 経路の import を確かめるテストは `tests/scheduler_api.rs` に無いので、`begin_execution` を
+     その場で差し替えると壊れても検出されない。既定の読み込み元を `ModuleLoader` のままにし、graph を使うのは
+     `Engine::run`・`run_audited` が明示的に選んだときだけにする。
   4. VM file/stdin（`src/main.rs` の `execute_vm_with_path`）は `engine.link` の結果を捨てずに持ち、2 の関数で展開した
      program を `Compiler` に渡す。`ModuleLoader` をこの経路から外す。binary（別 crate）から 2 の関数と保持 source を
      使うための入口は、`link_for_repl` と同じく `#[doc(hidden)]` の CLI 内部 shim とし、外部 embedder 向けの公開契約を増やさない。
@@ -994,7 +999,8 @@ source だけを実行する」の段落）で確定している。本スライ�
   [開発ループ手順書](loop-runbook.md) §11.1 に収まる。
   done にする実装 PR で、逸脱一覧の「file/stdin の run 層の import 展開が、link が resolver で確かめた source を使わない」行を削除し、
   冒頭の設計ステータス段落の「run層のimport展開は依然評価器内蔵`ModuleLoader`」を REPL と scheduler の handle 経路だけに直す。
-  [言語仕様](language-spec.md)「現在の既知非適合」の issue #291 の項目を削除し、`TSUMUGI_SANDBOX` の項目を REPL だけに直す。
+  [言語仕様](language-spec.md)「現在の既知非適合」の issue #291 の項目を削除し、`TSUMUGI_SANDBOX` の項目を REPL だけに直す
+  （同「ファイルI/Oサンドボックス」の本文は、この設計 PR で file/stdin の import が `TSUMUGI_SANDBOX` を読まない目標の記述に直してある）。
   REPL の imported module record が canonical path の byte 長で課金される差は、[実行予算・協調実行仕様](execution-control.md) の
   逸脱一覧に事実を確かめて行を足す。
 

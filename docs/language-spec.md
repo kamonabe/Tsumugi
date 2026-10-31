@@ -979,7 +979,7 @@ CLI では環境変数 `TSUMUGI_MAX_COLLECTION_SIZE` で、List/Dictの要素数
 
 ### ファイルI/Oサンドボックス
 
-CLI の既定（safe profile）では、ファイル操作の範囲は `--fs-root` / `--fs-op` で許可した root と操作に限られ、許可が無ければ全て拒否する（[Capability Model仕様](capability-model.md) §14.1・§14.2）。ファイル操作に関して `TSUMUGI_SANDBOX` を読むのは `--profile legacy` のときだけである（同 §14.3）。ただし import の実行時の読み込みは、現在 profile にかかわらず `TSUMUGI_SANDBOX` を読む（冒頭の「現在の既知非適合」）。
+CLI の既定（safe profile）では、ファイル操作の範囲は `--fs-root` / `--fs-op` で許可した root と操作に限られ、許可が無ければ全て拒否する（[Capability Model仕様](capability-model.md) §14.1・§14.2）。ファイル操作に関して `TSUMUGI_SANDBOX` を読むのは `--profile legacy` のときだけである（同 §14.3）。import の許可は import root だけで決まり、ファイル・標準入力から実行するスクリプトの import は `TSUMUGI_SANDBOX` を読まない（「モジュール / import」の「制約」）。現在の実装との差は冒頭の「現在の既知非適合」にある。
 
 `--profile legacy` では、環境変数 `TSUMUGI_SANDBOX` でファイル操作（read_file, write_file, append_file 等）の対象パスを制限する。
 
@@ -989,7 +989,8 @@ CLI の既定（safe profile）では、ファイル操作の範囲は `--fs-roo
 - `remove` / `remove_dir` / `remove_tree` / `rename`は中間symlinkを解決したうえでfinal directory entryを認可対象とし、final symlinkのtargetは操作しない
 - targetが未作成のdangling final symlinkを通じた`write_file` / `append_file`は、targetの場所を認可できない既知の制約がある（AUD-020）
 - 検査と実I/Oの間のsymlink差し替えraceまでは防止しない
-- 未設定時は制限なし（全パス許可）。このとき起動時に標準エラーへ警告を1件出す
+- 未設定時は制限なし（全パス許可）。このとき起動時に標準エラーへ警告を1件出す。値が空文字列のときも未設定と同じ
+- 値が区切り文字（カンマ）と空白だけ（`,`・` , ` など）のときは、許可するパスが 0 個の設定として扱い、ファイル操作をすべてサンドボックス違反エラーにする。このとき起動時に標準エラーへ警告を1件出す（[Capability Model仕様](capability-model.md) §14.3）
 - 例: `TSUMUGI_SANDBOX=/home/user/scripts,/tmp tsumugi --profile legacy script.tsg`
 
 ### 環境変数アクセス制御
